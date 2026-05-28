@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"nfqws2strategy/internal/catalog"
+	"nfqws2strategy/internal/dns"
 	"nfqws2strategy/internal/engine"
 	"nfqws2strategy/internal/probe"
 	"nfqws2strategy/internal/store"
@@ -28,6 +29,52 @@ type RunRequest struct {
 	Threads     int      `json:"threads"`
 	Auto        bool     `json:"auto"`  // automatic selection over the candidate catalog
 	Blobs       []string `json:"blobs"` // each selected blob is tested as the fake payload (own pass)
+	DNS         []string `json:"dns"`   // server ids to resolve targets through; each is its own pass ("" = system)
+}
+
+// runJob is one unit of work: a strategy variant tested through one DNS choice
+// (nil = the system resolver). A run is the cross product of strategies and the
+// selected DNS servers.
+type runJob struct {
+	strat catalog.Strategy
+	dns   *dns.Server
+}
+
+// dnsLabel is the (id, display name) for a DNS choice; nil = the system resolver.
+func dnsLabel(d *dns.Server) (id, name string) {
+	if d == nil {
+		return "", "Системный"
+	}
+	return d.ID, d.Name
+}
+
+// runDNSChoices maps selected server ids to DNS choices. Empty selection (or an
+// unknown id list) means a single system-resolver pass. "system"/"" select the
+// system resolver as an explicit comparison row.
+func (a *App) runDNSChoices(ids []string) []*dns.Server {
+	if len(ids) == 0 {
+		return []*dns.Server{nil}
+	}
+	servers := a.DNSServers()
+	byID := make(map[string]dns.Server, len(servers))
+	for _, s := range servers {
+		byID[s.ID] = s
+	}
+	var out []*dns.Server
+	for _, id := range ids {
+		if id == "" || id == "system" {
+			out = append(out, nil)
+			continue
+		}
+		if s, ok := byID[id]; ok {
+			c := s
+			out = append(out, &c)
+		}
+	}
+	if len(out) == 0 {
+		out = []*dns.Server{nil}
+	}
+	return out
 }
 
 func (a *App) loadRuns() {
@@ -166,6 +213,16 @@ func (a *App) StartRun(req RunRequest) (*Run, error) {
 		return nil, fmt.Errorf("no strategies selected")
 	}
 
+	// Cross with the selected DNS servers: each strategy is tested through every
+	// DNS choice (empty selection = one system-resolver pass).
+	choices := a.runDNSChoices(req.DNS)
+	plan := make([]runJob, 0, len(strategies)*len(choices))
+	for _, s := range strategies {
+		for _, d := range choices {
+			plan = append(plan, runJob{strat: s, dns: d})
+		}
+	}
+
 	threads := req.Threads
 	if threads <= 0 {
 		threads = 4
@@ -173,8 +230,8 @@ func (a *App) StartRun(req RunRequest) (*Run, error) {
 	if threads > maxThreads {
 		threads = maxThreads
 	}
-	if threads > len(strategies) {
-		threads = len(strategies)
+	if threads > len(plan) {
+		threads = len(plan)
 	}
 
 	a.mu.Lock()
@@ -189,10 +246,10 @@ func (a *App) StartRun(req RunRequest) (*Run, error) {
 		Threads:   threads,
 		Auto:      req.Auto,
 		Status:    "running",
-		Total:     len(strategies),
+		Total:     len(plan),
 		StartedAt: time.Now().Unix(),
 		Targets:   targets,
-		Results:   make([]StrategyResult, 0, len(strategies)),
+		Results:   make([]StrategyResult, 0, len(plan)),
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	a.active = run
@@ -203,11 +260,12 @@ func (a *App) StartRun(req RunRequest) (*Run, error) {
 	a.trimRunsLocked()
 	a.mu.Unlock()
 
-	go a.executeRun(ctx, run, list, strategies, threads, targets)
+	go a.executeRun(ctx, run, list, plan, threads, targets)
 	return run, nil
 }
 
-func (a *App) executeRun(ctx context.Context, run *Run, list *List, strategies []catalog.Strategy, threads int, targets []string) {
+func (a *App) executeRun(ctx context.Context, run *Run, list *List, plan []runJob, threads int, targets []string) {
+	resolver := dns.NewResolver()
 	defer func() {
 		a.mu.Lock()
 		a.active = nil
@@ -281,7 +339,7 @@ func (a *App) executeRun(ctx context.Context, run *Run, list *List, strategies [
 			if ctx.Err() != nil {
 				return
 			}
-			res := a.testStrategy(ctx, sb, pr, strategies[idx], testTargets)
+			res := a.testStrategy(ctx, sb, pr, plan[idx], testTargets, resolver)
 			n := atomic.AddInt32(&done, 1)
 			// Append live so the UI fills the results table as each strategy completes.
 			a.mu.Lock()
@@ -353,7 +411,7 @@ func (a *App) executeRun(ctx context.Context, run *Run, list *List, strategies [
 		add(pend)
 	}
 
-	for i := range strategies {
+	for i := range plan {
 		select {
 		case <-ctx.Done():
 			goto wait
@@ -439,8 +497,20 @@ func classifyProbe(host string, r probe.Result) TargetCheck {
 	return tc
 }
 
-func (a *App) testStrategy(ctx context.Context, sb *engine.Sandbox, pr *probe.Prober, s catalog.Strategy, targets []string) StrategyResult {
-	res := StrategyResult{StrategyID: s.ID, Name: s.Name, ArgLine: s.ArgLine, L7: s.L7, TargetsTotal: len(targets)}
+func (a *App) testStrategy(ctx context.Context, sb *engine.Sandbox, pr *probe.Prober, job runJob, targets []string, resolver *dns.Resolver) StrategyResult {
+	s := job.strat
+	dnsID, dnsName := dnsLabel(job.dns)
+	res := StrategyResult{StrategyID: s.ID, Name: s.Name, ArgLine: s.ArgLine, L7: s.L7, DNS: dnsName, DNSID: dnsID, TargetsTotal: len(targets)}
+	// Resolve targets through this job's DNS (nil = system resolver). The worker
+	// runs one job at a time, so mutating the shared prober here is safe.
+	if job.dns != nil {
+		srv := *job.dns
+		pr.Resolve = func(ctx context.Context, host string) (string, error) {
+			return resolver.Resolve(ctx, srv, host)
+		}
+	} else {
+		pr.Resolve = nil
+	}
 	if err := sb.StartNfqws(nil, s.Args()); err != nil {
 		res.Error = firstLine(err.Error())
 		return res

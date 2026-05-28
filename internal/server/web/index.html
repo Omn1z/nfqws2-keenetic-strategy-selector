@@ -57,6 +57,10 @@
         <svg viewBox="0 0 24 24" width="18" height="18"><path d="M12 2 4 6v6c0 5 3.5 8 8 10 4.5-2 8-5 8-10V6z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/><path d="m9 12 2 2 4-4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
         <span>BlockCheck</span>
       </button>
+      <button class="nav-item" data-tab="dns">
+        <svg viewBox="0 0 24 24" width="18" height="18"><path d="M4 7h16M4 12h16M4 17h16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/><circle cx="7" cy="7" r="1.4" fill="currentColor"/><circle cx="7" cy="17" r="1.4" fill="currentColor"/></svg>
+        <span>DNS</span>
+      </button>
       <button class="nav-item" data-tab="strategies">
         <svg viewBox="0 0 24 24" width="18" height="18"><path d="M13 2 4 14h6l-1 8 9-12h-6z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg>
         <span>Стратегии</span>
@@ -181,6 +185,12 @@
                 <button type="button" class="btn btn-mini cl-all" data-target="runBlobs">Выбрать все</button></div>
               <div id="runBlobs" class="checklist"></div>
             </div>
+            <div class="field field-grow">
+              <div class="cl-head"><span>DNS <span class="hint">каждый DNS — отдельный прогон</span></span>
+                <button type="button" class="btn btn-mini cl-all" data-target="runDNS">Выбрать все</button></div>
+              <div id="runDNS" class="checklist"></div>
+              <div class="hint">Пусто = системный DNS. Управление списком — на вкладке «DNS».</div>
+            </div>
           </div>
           <div class="actions">
             <button id="startRun" class="btn btn-primary">▶ Запустить прогон</button>
@@ -211,6 +221,7 @@
               <thead><tr>
                 <th data-sort="status">Статус</th>
                 <th data-sort="name">Стратегия</th>
+                <th data-sort="dns">DNS</th>
                 <th data-sort="targets">Цели</th>
                 <th data-sort="latency">Задержка</th>
                 <th data-sort="speed">Скорость</th>
@@ -274,6 +285,35 @@
               <thead><tr><th>Цель</th><th>Статус</th><th>Задержка</th><th>Скорость</th><th>Код</th></tr></thead>
               <tbody></tbody>
             </table>
+          </div>
+        </div>
+      </section>
+
+      <!-- DNS -->
+      <section id="tab-dns" class="panel">
+        <div class="card">
+          <div class="card-head"><h2>DNS-серверы (DoH / DoT)</h2>
+            <button id="dnsReset" class="btn btn-mini head-action">Сбросить к стандартным</button>
+          </div>
+          <p class="hint">Шифрованные DNS для прогонов: в прогоне можно выбрать, через какие из них резолвить цели — какой IP отдаёт DNS, влияет на то, сработает ли обход. <b>DoH</b> — ссылка вида <code>https://…/dns-query</code>; <b>DoT</b> — <code>host</code> или <code>host:порт</code> (по умолчанию 853).</p>
+          <div class="table-wrap">
+            <table id="dnsTable" class="data">
+              <thead><tr><th>Название</th><th>Тип</th><th>Адрес</th><th class="col-actions"></th></tr></thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-head"><h2>Добавить DNS</h2></div>
+          <div class="run-row mid">
+            <label class="field">Название<input id="dnsName" type="text" placeholder="Мой DNS"></label>
+            <label class="field field-sm">Тип
+              <select id="dnsType"><option value="doh">DoH</option><option value="dot">DoT</option></select>
+            </label>
+            <label class="field field-grow">Адрес<input id="dnsAddr" type="text" placeholder="https://dns.example/dns-query  ·  dns.example[:853]"></label>
+          </div>
+          <div class="actions">
+            <button id="dnsSave" class="btn btn-primary">Добавить</button>
           </div>
         </div>
       </section>

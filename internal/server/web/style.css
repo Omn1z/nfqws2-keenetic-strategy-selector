@@ -205,6 +205,10 @@ tr.fail td:first-child { box-shadow: inset 3px 0 0 var(--bad); }
 .badge.ok { background: var(--ok-bg); color: var(--ok); }
 .badge.bad { background: var(--bad-bg); color: var(--bad); }
 
+/* DNS used by a result — underlined to stand out (system = muted) */
+.dns-tag { font-size: 11.5px; font-weight: 600; color: var(--accent-d); text-decoration: underline; text-decoration-color: var(--accent); text-underline-offset: 2px; white-space: nowrap; }
+.dns-tag.sys { color: var(--muted); text-decoration-color: var(--line); }
+
 /* ---------- progress ---------- */
 .progress { height: 9px; background: var(--line); border-radius: 999px; overflow: hidden; margin: 12px 0 6px; }
 .progress-bar {

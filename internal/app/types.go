@@ -73,12 +73,15 @@ type TargetCheck struct {
 	Err      string `json:"err,omitempty"`
 }
 
-// StrategyResult aggregates one strategy across all of a run's targets.
+// StrategyResult aggregates one strategy across all of a run's targets, for one
+// DNS choice (a run tests each strategy through every selected DNS).
 type StrategyResult struct {
 	StrategyID   string         `json:"strategy_id"`
 	Name         string         `json:"name"`
 	ArgLine      string         `json:"args"`
 	L7           string         `json:"l7"`
+	DNS          string         `json:"dns,omitempty"`    // label of the DNS used ("" = system)
+	DNSID        string         `json:"dns_id,omitempty"` // server id of the DNS used
 	TargetsTotal int            `json:"targets_total"`
 	TargetsOK    int            `json:"targets_ok"`
 	AvgTTFBms    int64          `json:"avg_ttfb_ms"`

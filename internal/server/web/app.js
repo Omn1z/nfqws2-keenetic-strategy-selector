@@ -46,7 +46,7 @@ function exportStrategy(name, l7, args) {
 }
 
 const state = {
-  lists: [], selected: null, strategies: [], geo: [],
+  lists: [], selected: null, strategies: [], geo: [], dns: [],
   run: null, poll: null, results: [], sort: { key: "coef", dir: -1 }, resultsPage: 1, savedPage: 1,
   bc: null, bcPoll: null,
   tgws: null, tgwsPoll: null,
@@ -61,6 +61,11 @@ const VERDICT = {
 function verdictBadge(v) {
   const [label, kind] = VERDICT[v] || [v || "?", "bad"];
   return `<span class="badge ${kind}">${esc(label)}</span>`;
+}
+// dnsBadge highlights which DNS produced a result (system = muted).
+function dnsBadge(name, id) {
+  if (!name) return "—";
+  return `<span class="dns-tag${id ? "" : " sys"}">${esc(name)}</span>`;
 }
 
 /* ---------- checkbox lists ---------- */
@@ -158,8 +163,9 @@ $$(".nav-item").forEach(b => b.addEventListener("click", () => {
   b.classList.add("active");
   const p = $("#tab-" + b.dataset.tab);
   p.classList.add("active");
-  if (b.dataset.tab === "runs") { fillRunLists(); fillGeoSelect("runGeoFile", "runGeoCat"); }
+  if (b.dataset.tab === "runs") { fillRunLists(); fillGeoSelect("runGeoFile", "runGeoCat"); fillRunDNS(); }
   if (b.dataset.tab === "blockcheck") { fillBCLists(); fillGeoSelect("bcGeoFile", "bcGeoCat"); }
+  if (b.dataset.tab === "dns") loadDNS();
   if (b.dataset.tab === "tgws") { loadTGWS(); startTGWSPolling(); } else { stopTGWSPolling(); }
 }));
 
@@ -268,14 +274,22 @@ async function deleteListById(id, name) {
 function fillRunStrategies() {
   renderChecklist("runStrategies", state.strategies.map(s => ({ value: s.id, label: s.name || s.id, sub: s.l7 || "?" })));
 }
+function fillRunDNS() {
+  const sel = clSelected("runDNS"); // preserve current selection across refresh
+  const items = [{ value: "system", label: "Системный", sub: "без DoH/DoT" }]
+    .concat((state.dns || []).map(d => ({ value: d.id, label: d.name || d.id, sub: (d.type || "").toUpperCase() })));
+  renderChecklist("runDNS", items);
+  if (sel.length) { clBoxes("runDNS").forEach(c => { c.checked = sel.includes(c.value); }); updateAllBtn("runDNS"); }
+}
 
 $("#startRun").addEventListener("click", async () => {
   const auto = $("#runAuto").checked;
   const ids = auto ? [] : clSelected("runStrategies");
   const blobs = clSelected("runBlobs");
+  const dnsSel = clSelected("runDNS");
   let target;
   try { target = await resolveTarget("run"); } catch (e) { toast(e.message, "err"); return; }
-  const req = { ...target, strategy_ids: ids, blobs, auto, threads: parseInt($("#runThreads").value, 10) || 4 };
+  const req = { ...target, strategy_ids: ids, blobs, dns: dnsSel, auto, threads: parseInt($("#runThreads").value, 10) || 4 };
   try { state.run = await api("POST", "/api/runs", req); startPolling(); }
   catch (e) { toast(e.message, "err"); }
 });
@@ -339,6 +353,7 @@ function sortVal(r, key) {
   switch (key) {
     case "status": return r.error ? 0 : (r.success ? 2 : 1);
     case "name": return (r.name || "").toLowerCase();
+    case "dns": return (r.dns || "").toLowerCase();
     case "targets": return r.targets_ok;
     case "latency": return r.avg_ttfb_ms || 1e12;
     case "speed": return r.avg_speed_bps;
@@ -377,6 +392,7 @@ function renderResults() {
     tr.innerHTML = `
       <td>${status}</td>
       <td>${esc(r.name || r.strategy_id)}<div class="args" title="${esc(r.args)}">${esc(r.args)}</div></td>
+      <td>${dnsBadge(r.dns, r.dns_id)}</td>
       <td class="num">${r.targets_ok}/${r.targets_total}</td>
       <td class="num">${r.avg_ttfb_ms ? r.avg_ttfb_ms + " мс" : "—"}</td>
       <td class="num">${r.avg_speed_bps ? kb(r.avg_speed_bps) + " КБ/с" : "—"}</td>
@@ -752,6 +768,53 @@ $("#btnLogout").addEventListener("click", async () => {
   location.reload();
 });
 
+/* ---------- dns (DoH/DoT servers) ---------- */
+async function loadDNS() {
+  try { state.dns = await api("GET", "/api/dns") || []; } catch (e) { toast(e.message, "err"); return; }
+  renderDNSTable();
+  fillRunDNS();
+}
+function renderDNSTable() {
+  const tb = $("#dnsTable tbody"); if (!tb) return;
+  tb.innerHTML = "";
+  const list = state.dns || [];
+  if (list.length === 0) {
+    tb.innerHTML = `<tr><td colspan="4" class="empty-cell">Список пуст — добавьте DNS ниже или нажмите «Сбросить к стандартным».</td></tr>`;
+    return;
+  }
+  list.forEach(d => {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `
+      <td>${esc(d.name || d.id)}</td>
+      <td>${dnsBadge((d.type || "").toUpperCase(), d.id)}</td>
+      <td><div class="args" title="${esc(d.addr)}">${esc(d.addr)}</div></td>
+      <td class="row-actions"><button class="btn btn-mini btn-ghost-danger" data-del="${esc(d.id)}" title="Удалить">×</button></td>`;
+    tb.appendChild(tr);
+  });
+  $$("#dnsTable button[data-del]").forEach(b => b.addEventListener("click", () => deleteDNS(b.dataset.del)));
+}
+$("#dnsSave").addEventListener("click", async () => {
+  const name = $("#dnsName").value.trim(), type = $("#dnsType").value, addr = $("#dnsAddr").value.trim();
+  if (!name || !addr) { toast("Заполните название и адрес", "err"); return; }
+  try {
+    await api("POST", "/api/dns", { name, type, addr });
+    $("#dnsName").value = ""; $("#dnsAddr").value = "";
+    await loadDNS();
+    toast("DNS добавлен", "ok");
+  } catch (e) { toast(e.message, "err"); }
+});
+async function deleteDNS(id) {
+  const d = (state.dns || []).find(x => x.id === id);
+  if (!confirm("Удалить DNS «" + ((d && d.name) || id) + "»?")) return;
+  try { await api("DELETE", "/api/dns/" + encodeURIComponent(id)); await loadDNS(); toast("DNS удалён", "ok"); }
+  catch (e) { toast(e.message, "err"); }
+}
+$("#dnsReset").addEventListener("click", async () => {
+  if (!confirm("Сбросить список DNS к стандартным? Добавленные вами записи будут удалены.")) return;
+  try { state.dns = await api("POST", "/api/dns/reset") || []; renderDNSTable(); fillRunDNS(); toast("Список DNS сброшен", "ok"); }
+  catch (e) { toast(e.message, "err"); }
+});
+
 /* ---------- geo ---------- */
 async function loadGeo() {
   let files = [];
@@ -934,6 +997,7 @@ async function boot() {
   await loadLists();
   await loadBlobs();
   await loadGeo();
+  await loadDNS();
   checkUpdate(false);
 }
 (async function init() {

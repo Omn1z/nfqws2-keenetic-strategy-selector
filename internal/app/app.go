@@ -17,6 +17,7 @@ import (
 	"nfqws2strategy/internal/auth"
 	"nfqws2strategy/internal/catalog"
 	"nfqws2strategy/internal/config"
+	"nfqws2strategy/internal/dns"
 	"nfqws2strategy/internal/store"
 	"nfqws2strategy/internal/tgws"
 )
@@ -42,6 +43,9 @@ type App struct {
 	authEnabled bool
 
 	tgws *tgws.Manager // Telegram MTProto->WS proxy (separate tab)
+
+	dnsMu      sync.Mutex
+	dnsServers []dns.Server // configured DoH/DoT servers (DNS tab + run matrix)
 }
 
 const (
@@ -62,6 +66,7 @@ func New(cfg *config.Config) (*App, error) {
 	a.initAuth()
 	a.loadRuns()
 	a.initTGWS()
+	a.initDNS()
 	return a, nil
 }
 

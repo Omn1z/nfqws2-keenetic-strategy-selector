@@ -13,6 +13,7 @@ import (
 
 	"nfqws2strategy/internal/app"
 	"nfqws2strategy/internal/catalog"
+	"nfqws2strategy/internal/dns"
 	"nfqws2strategy/internal/tgws"
 )
 
@@ -133,6 +134,11 @@ func (s *Server) routes() {
 	m.HandleFunc("POST /api/blockcheck", s.startBlockCheck)
 	m.HandleFunc("GET /api/blockcheck/{id}", s.getBlockCheck)
 	m.HandleFunc("POST /api/blockcheck/{id}/cancel", s.cancelBlockCheck)
+
+	m.HandleFunc("GET /api/dns", s.getDNS)
+	m.HandleFunc("POST /api/dns", s.saveDNS)
+	m.HandleFunc("POST /api/dns/reset", s.resetDNS)
+	m.HandleFunc("DELETE /api/dns/{id}", s.deleteDNS)
 
 	m.HandleFunc("GET /api/tgws", s.tgwsStatus)
 	m.HandleFunc("POST /api/tgws/config", s.tgwsConfig)
@@ -551,6 +557,43 @@ func (s *Server) cancelBlockCheck(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, map[string]string{"status": "cancelling"})
+}
+
+// ---------- DNS (DoH/DoT servers) ----------
+
+func (s *Server) getDNS(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, 200, s.app.DNSServers())
+}
+
+func (s *Server) saveDNS(w http.ResponseWriter, r *http.Request) {
+	var in dns.Server
+	if err := readJSON(r, &in); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	out, err := s.app.SaveDNSServer(in)
+	if err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, out)
+}
+
+func (s *Server) deleteDNS(w http.ResponseWriter, r *http.Request) {
+	if err := s.app.DeleteDNSServer(r.PathValue("id")); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, map[string]string{"status": "ok"})
+}
+
+func (s *Server) resetDNS(w http.ResponseWriter, r *http.Request) {
+	out, err := s.app.ResetDNSServers()
+	if err != nil {
+		httpErr(w, 500, err)
+		return
+	}
+	writeJSON(w, 200, out)
 }
 
 // ---------- TG WS Proxy ----------

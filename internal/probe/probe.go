@@ -36,6 +36,11 @@ type Prober struct {
 	MaxTime        time.Duration
 	MinBytes       int64 // a success must transfer more than this (defeats the ~16KB cap)
 	ReadCap        int64 // stop reading after this many bytes (enough to confirm + measure speed)
+
+	// Resolve, when set, maps a hostname to an IP via a chosen DNS server (DoH/
+	// DoT). The dial then targets that IP while the TLS SNI stays the original
+	// host. nil = use the system resolver. A worker sets this per job.
+	Resolve func(ctx context.Context, host string) (string, error)
 }
 
 func New(portLo, portHi int) *Prober {
@@ -80,6 +85,17 @@ func (p *Prober) ProbeURL(ctx context.Context, host, url string) Result {
 	}
 	tr := &http.Transport{
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			// Resolve the host through the chosen DNS server (if any) and dial the
+			// returned IP; the SNI/Host stays the original name from the URL.
+			if p.Resolve != nil {
+				if host, port, err := net.SplitHostPort(addr); err == nil && net.ParseIP(host) == nil {
+					ip, rerr := p.Resolve(ctx, host)
+					if rerr != nil {
+						return nil, rerr
+					}
+					addr = net.JoinHostPort(ip, port)
+				}
+			}
 			return dialer.DialContext(ctx, "tcp4", addr) // force IPv4 to match our v4 rules
 		},
 		TLSClientConfig:     &tls.Config{InsecureSkipVerify: true},
