@@ -5,6 +5,7 @@ import (
 	"compress/gzip"
 	"embed"
 	"encoding/json"
+	"errors"
 	"io"
 	"io/fs"
 	"log"
@@ -115,6 +116,10 @@ func (s *Server) routes() {
 	m.HandleFunc("GET /api/devices", s.getDevices)
 	m.HandleFunc("POST /api/devices/{ip}/trace", s.startDeviceTrace)
 	m.HandleFunc("GET /api/trace/{id}", s.getTrace)
+	m.HandleFunc("POST /api/devices/{ip}/pcap", s.startPcap)
+	m.HandleFunc("GET /api/pcap/{id}", s.getPcap)
+	m.HandleFunc("GET /api/pcap/{id}/download", s.downloadPcap)
+	m.HandleFunc("POST /api/system/install", s.installPackage)
 
 	m.HandleFunc("GET /api/logs", s.getLogs)
 	m.HandleFunc("POST /api/logs/clear", s.clearLogs)
@@ -252,6 +257,59 @@ func (s *Server) getTrace(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, t)
+}
+
+func (s *Server) startPcap(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Seconds int `json:"seconds"`
+	}
+	_ = readJSON(r, &in) // body optional; defaults to 30s
+	p, err := s.app.StartPcap(r.PathValue("ip"), in.Seconds)
+	if err != nil {
+		if errors.Is(err, app.ErrNeedTcpdump) {
+			writeJSON(w, 200, map[string]any{"need_install": true, "package": "tcpdump"})
+			return
+		}
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, p)
+}
+
+func (s *Server) getPcap(w http.ResponseWriter, r *http.Request) {
+	p, ok := s.app.GetPcap(r.PathValue("id"))
+	if !ok {
+		httpErr(w, 404, errNotFound)
+		return
+	}
+	writeJSON(w, 200, p)
+}
+
+func (s *Server) downloadPcap(w http.ResponseWriter, r *http.Request) {
+	path, name, ok := s.app.PcapFile(r.PathValue("id"))
+	if !ok {
+		httpErr(w, 404, errNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", "application/vnd.tcpdump.pcap")
+	w.Header().Set("Content-Disposition", `attachment; filename="`+name+`"`)
+	http.ServeFile(w, r, path)
+}
+
+func (s *Server) installPackage(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Package string `json:"package"`
+	}
+	if err := readJSON(r, &in); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	out, err := s.app.InstallPackage(in.Package)
+	if err != nil {
+		writeJSON(w, 200, map[string]any{"ok": false, "output": out, "error": err.Error()})
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": true, "output": out})
 }
 
 // ---------- logs (in-memory ring, UI "Логи" tab) ----------

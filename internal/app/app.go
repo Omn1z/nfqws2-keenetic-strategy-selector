@@ -51,6 +51,10 @@ type App struct {
 	traceMu    sync.Mutex
 	traces     map[string]*Trace // recent device network traces (id -> trace)
 	traceOrder []string
+
+	pcapMu    sync.Mutex
+	pcaps     map[string]*Pcap // recent tcpdump captures (id -> pcap)
+	pcapOrder []string
 }
 
 const (
@@ -63,7 +67,7 @@ func New(cfg *config.Config) (*App, error) {
 	if err != nil {
 		return nil, err
 	}
-	a := &App{Cfg: cfg, store: st, runs: map[string]*Run{}, traces: map[string]*Trace{}, sessions: auth.NewSessions(sessionTTL)}
+	a := &App{Cfg: cfg, store: st, runs: map[string]*Run{}, traces: map[string]*Trace{}, pcaps: map[string]*Pcap{}, sessions: auth.NewSessions(sessionTTL)}
 	_ = a.store.Load(customStrategiesFile, &a.custom)
 	if err := os.MkdirAll(a.blobsDir(), 0o755); err != nil {
 		return nil, err

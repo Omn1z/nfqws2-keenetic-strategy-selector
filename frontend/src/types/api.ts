@@ -278,3 +278,27 @@ export interface Trace {
   events: TraceEvent[];
   conns: TraceConn[];
 }
+
+export interface Pcap {
+  id: string;
+  ip: string;
+  iface: string;
+  seconds: number;
+  status: string; // running | done | error
+  error?: string;
+  started_at: number;
+  elapsed_ms: number;
+  packets: number;
+  dropped: number;
+  size_bytes: number;
+}
+
+/** POST /api/devices/{ip}/pcap → a started capture, or a prompt to install tcpdump first. */
+export type PcapStart = Pcap | { need_install: true; package: string };
+
+/** POST /api/system/install → opkg result. */
+export interface InstallResult {
+  ok: boolean;
+  output: string;
+  error?: string;
+}
