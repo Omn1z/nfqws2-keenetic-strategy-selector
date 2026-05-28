@@ -69,6 +69,10 @@
         <svg viewBox="0 0 24 24" width="18" height="18"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="2"/><path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18" fill="none" stroke="currentColor" stroke-width="2"/></svg>
         <span>GeoSite/GeoIP</span>
       </button>
+      <button class="nav-item" data-tab="tgws">
+        <svg viewBox="0 0 24 24" width="18" height="18"><path d="M22 3 2 11l6 2 2 6 3-4 5 4z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg>
+        <span>TG WS Proxy</span>
+      </button>
     </nav>
 
     <main class="content">
@@ -326,6 +330,89 @@
           </div>
         </div>
         <div id="geoFiles"></div>
+      </section>
+
+      <!-- TG WS PROXY -->
+      <section id="tab-tgws" class="panel">
+        <div class="card">
+          <div class="card-head"><h2>Telegram MTProto → WebSocket прокси</h2>
+            <span id="tgwsState" class="badge head-action">…</span>
+          </div>
+          <p class="hint">Прокси для Telegram прямо на роутере: клиенты в LAN ходят через <code>&lt;роутер&gt;:порт</code>, трафик идёт к Telegram по WSS (kws*.web.telegram.org) с запасными путями. Управление — здесь.</p>
+          <div class="run-row mid">
+            <div class="field auto-field"><span class="field-cap">Прокси включён</span>
+              <label class="switch"><input id="tgwsEnabled" type="checkbox"><span class="track"></span></label>
+            </div>
+            <span id="tgwsStatus" class="run-status"></span>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-head"><h2>Подключение Telegram</h2><span class="hint">ссылка содержит секрет</span></div>
+          <label class="field">tg:// ссылка
+            <div class="link-row">
+              <input id="tgwsLink" type="text" readonly>
+              <button id="tgwsCopy" class="btn">Копировать</button>
+            </div>
+          </label>
+          <p class="hint">Откройте ссылку на устройстве с Telegram (например, отправьте себе в «Избранное» и тапните) — прокси добавится автоматически.</p>
+        </div>
+
+        <div class="card">
+          <div class="card-head"><h2>Настройки</h2></div>
+          <div class="two">
+            <label class="field field-sm">Порт прокси<input id="tgwsPort" type="number" min="1" max="65535" value="1433"></label>
+            <label class="field">Секрет (32 hex)
+              <div class="link-row">
+                <input id="tgwsSecret" type="text" readonly>
+                <button id="tgwsNewSecret" class="btn">Сгенерировать</button>
+              </div>
+            </label>
+          </div>
+          <label class="field">DC-редиректы <span class="hint">по строке: <code>DC=IP</code> (например <code>2=149.154.167.220</code>)</span>
+            <textarea id="tgwsDC" rows="3" placeholder="2=149.154.167.220&#10;4=149.154.167.220"></textarea>
+          </label>
+          <div class="two">
+            <label class="field">Fake-TLS домен <span class="hint">пусто = выкл.</span><input id="tgwsFakeTLS" type="text" placeholder="напр. www.cloudflare.com"></label>
+            <label class="field">Хост для ссылки <span class="hint">пусто = авто</span><input id="tgwsLinkHost" type="text" placeholder="192.168.1.1"></label>
+          </div>
+          <div class="two">
+            <label class="field field-sm">Размер пула WS<input id="tgwsPool" type="number" min="0" max="16" value="4"></label>
+            <label class="field field-sm">Буфер сокета (байт)<input id="tgwsBuffer" type="number" min="4096" step="4096" value="262144"></label>
+          </div>
+          <div class="run-row mid">
+            <div class="field auto-field"><span class="field-cap">CF fallback</span>
+              <label class="switch"><input id="tgwsCF" type="checkbox"><span class="track"></span></label>
+            </div>
+            <div class="field auto-field"><span class="field-cap">PROXY protocol</span>
+              <label class="switch"><input id="tgwsPP" type="checkbox"><span class="track"></span></label>
+            </div>
+          </div>
+          <div class="two">
+            <label class="field">CF свой домен <span class="hint">перебивает встроенный пул</span><input id="tgwsCFUser" type="text"></label>
+            <label class="field">CF Worker домен <span class="hint">пробуется первым</span><input id="tgwsCFWorker" type="text"></label>
+          </div>
+          <div class="actions">
+            <button id="tgwsSave" class="btn btn-primary">Сохранить настройки</button>
+            <span class="hint">при включённом прокси сохранение перезапустит его</span>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-head"><h2>Статистика</h2><span class="hint">обновляется, пока открыта вкладка</span></div>
+          <div class="table-wrap">
+            <table class="data tgws-stats">
+              <tbody>
+                <tr><td>Соединения</td><td id="tgwsConn" class="num">—</td></tr>
+                <tr><td>Активные</td><td id="tgwsActive" class="num">—</td></tr>
+                <tr><td>WS / TCP-fallback / CF</td><td id="tgwsPaths" class="num">—</td></tr>
+                <tr><td>Отклонено (плохой секрет) / маскировка</td><td id="tgwsBad" class="num">—</td></tr>
+                <tr><td>Трафик ↑ / ↓</td><td id="tgwsTraffic" class="num">—</td></tr>
+                <tr><td>Пул (попаданий/всего) · ошибки WS</td><td id="tgwsPool" class="num">—</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
       </section>
     </main>
   </div>

@@ -329,3 +329,12 @@ table.data th.cb, table.data td.cb { width: 30px; }
 .badge.warn { background: rgba(240,160,32,.16); color: var(--warn); }
 .data tr.blocked td:first-child { box-shadow: inset 3px 0 0 var(--bad); }
 .data tr.reachable td:first-child { box-shadow: inset 3px 0 0 var(--ok); }
+
+/* ---------- TG WS Proxy ---------- */
+.link-row { display: flex; gap: 8px; align-items: stretch; }
+.link-row input { flex: 1 1 auto; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12.5px; }
+.link-row .btn { white-space: nowrap; }
+#tgwsLink, #tgwsSecret { background: var(--line-soft); }
+.tgws-stats td:first-child { color: var(--ink-soft); }
+.tgws-stats td.num { font-variant-numeric: tabular-nums; }
+.badge.head-action { align-self: center; }

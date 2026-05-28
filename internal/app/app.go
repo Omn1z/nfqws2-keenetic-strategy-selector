@@ -18,6 +18,7 @@ import (
 	"nfqws2strategy/internal/catalog"
 	"nfqws2strategy/internal/config"
 	"nfqws2strategy/internal/store"
+	"nfqws2strategy/internal/tgws"
 )
 
 type App struct {
@@ -39,6 +40,8 @@ type App struct {
 
 	sessions    *auth.Sessions
 	authEnabled bool
+
+	tgws *tgws.Manager // Telegram MTProto->WS proxy (separate tab)
 }
 
 const (
@@ -58,6 +61,7 @@ func New(cfg *config.Config) (*App, error) {
 	}
 	a.initAuth()
 	a.loadRuns()
+	a.initTGWS()
 	return a, nil
 }
 

@@ -49,6 +49,7 @@ const state = {
   lists: [], selected: null, strategies: [], geo: [],
   run: null, poll: null, results: [], sort: { key: "coef", dir: -1 },
   bc: null, bcPoll: null,
+  tgws: null, tgwsPoll: null,
   version: "", latest: "",
 };
 
@@ -159,6 +160,7 @@ $$(".nav-item").forEach(b => b.addEventListener("click", () => {
   p.classList.add("active");
   if (b.dataset.tab === "runs") { fillRunLists(); fillGeoSelect("runGeoFile", "runGeoCat"); }
   if (b.dataset.tab === "blockcheck") { fillBCLists(); fillGeoSelect("bcGeoFile", "bcGeoCat"); }
+  if (b.dataset.tab === "tgws") { loadTGWS(); startTGWSPolling(); } else { stopTGWSPolling(); }
 }));
 
 /* ---------- lists ---------- */
@@ -760,6 +762,104 @@ geoInput.addEventListener("change", () => { if (geoInput.files[0]) uploadGeo(geo
 ["dragenter", "dragover"].forEach(ev => geoDrop.addEventListener(ev, (e) => { e.preventDefault(); geoDrop.classList.add("drag"); }));
 geoDrop.addEventListener("dragleave", (e) => { if (!geoDrop.contains(e.relatedTarget)) geoDrop.classList.remove("drag"); });
 geoDrop.addEventListener("drop", (e) => { e.preventDefault(); geoDrop.classList.remove("drag"); const f = e.dataTransfer.files[0]; if (f) uploadGeo(f); });
+
+/* ---------- TG WS Proxy ---------- */
+function parseDCRedirects(text) {
+  const out = {};
+  text.split("\n").forEach(line => {
+    line = line.trim(); if (!line) return;
+    const parts = line.split(/[=:]/);
+    if (parts.length >= 2) {
+      const dc = parseInt(parts[0].trim(), 10), ip = parts[1].trim();
+      if (dc && ip) out[dc] = ip;
+    }
+  });
+  return out;
+}
+function collectTGWS() {
+  return {
+    port: parseInt($("#tgwsPort").value, 10) || 1433,
+    secret: $("#tgwsSecret").value.trim(),
+    dc_redirects: parseDCRedirects($("#tgwsDC").value),
+    fake_tls_domain: $("#tgwsFakeTLS").value.trim(),
+    link_host: $("#tgwsLinkHost").value.trim(),
+    pool_size: parseInt($("#tgwsPool").value, 10) || 0,
+    buffer_size: parseInt($("#tgwsBuffer").value, 10) || 262144,
+    cfproxy: $("#tgwsCF").checked,
+    proxy_protocol: $("#tgwsPP").checked,
+    cfproxy_user_domain: $("#tgwsCFUser").value.trim(),
+    cfproxy_worker_domain: $("#tgwsCFWorker").value.trim(),
+  };
+}
+async function loadTGWS() {
+  try { renderTGWSFull(await api("GET", "/api/tgws")); } catch (e) { toast(e.message, "err"); }
+}
+function renderTGWSFull(st) {
+  if (!st) return;
+  state.tgws = st;
+  const c = st.config || {};
+  $("#tgwsEnabled").checked = !!c.enabled;
+  $("#tgwsLink").value = st.link || "";
+  $("#tgwsSecret").value = c.secret || "";
+  $("#tgwsPort").value = c.port || 1433;
+  $("#tgwsDC").value = Object.entries(c.dc_redirects || {}).map(([k, v]) => k + "=" + v).join("\n");
+  $("#tgwsFakeTLS").value = c.fake_tls_domain || "";
+  $("#tgwsLinkHost").value = c.link_host || "";
+  $("#tgwsPool").value = (c.pool_size != null) ? c.pool_size : 4;
+  $("#tgwsBuffer").value = c.buffer_size || 262144;
+  $("#tgwsCF").checked = !!c.cfproxy;
+  $("#tgwsPP").checked = !!c.proxy_protocol;
+  $("#tgwsCFUser").value = c.cfproxy_user_domain || "";
+  $("#tgwsCFWorker").value = c.cfproxy_worker_domain || "";
+  renderTGWSLive(st);
+}
+function renderTGWSLive(st) {
+  if (!st) return;
+  const c = st.config || {};
+  const badge = $("#tgwsState");
+  badge.textContent = st.running ? "работает" : "остановлен";
+  badge.className = "badge head-action " + (st.running ? "ok" : "bad");
+  $("#tgwsStatus").textContent = st.running ? ("слушает порт " + c.port) : (c.enabled ? "не удалось запустить" : "");
+  renderTGWSStats(st.stats);
+}
+function renderTGWSStats(s) {
+  if (!s) return;
+  const c = s.connections || {}, t = s.traffic || {}, w = s.ws || {};
+  const v = (x) => (x == null ? 0 : x);
+  $("#tgwsConn").textContent = v(c.total);
+  $("#tgwsActive").textContent = v(c.active);
+  $("#tgwsPaths").textContent = `${v(c.ws)} / ${v(c.tcp_fallback)} / ${v(c.cfproxy)}`;
+  $("#tgwsBad").textContent = `${v(c.bad)} / ${v(c.masked)}`;
+  $("#tgwsTraffic").textContent = `${t.human_up || "0.0B"} / ${t.human_down || "0.0B"}`;
+  $("#tgwsPool").textContent = `${v(w.pool_hits)}/${v(w.pool_hits) + v(w.pool_misses)} · ${v(w.errors)}`;
+}
+function startTGWSPolling() {
+  stopTGWSPolling();
+  state.tgwsPoll = setInterval(async () => {
+    try { renderTGWSLive(await api("GET", "/api/tgws")); } catch (e) { /* leave last view */ }
+  }, 2000);
+}
+function stopTGWSPolling() { if (state.tgwsPoll) { clearInterval(state.tgwsPoll); state.tgwsPoll = null; } }
+
+$("#tgwsEnabled").addEventListener("change", async () => {
+  const on = $("#tgwsEnabled").checked;
+  try { renderTGWSFull(await api("POST", on ? "/api/tgws/start" : "/api/tgws/stop", {})); toast(on ? "Прокси запущен" : "Прокси остановлен", "ok"); }
+  catch (e) { toast(e.message, "err"); loadTGWS(); }
+});
+$("#tgwsSave").addEventListener("click", async () => {
+  try { renderTGWSFull(await api("POST", "/api/tgws/config", collectTGWS())); toast("Настройки сохранены", "ok"); }
+  catch (e) { toast(e.message, "err"); }
+});
+$("#tgwsNewSecret").addEventListener("click", async () => {
+  if (!confirm("Сгенерировать новый секрет? Старые tg:// ссылки перестанут работать.")) return;
+  try { await api("POST", "/api/tgws/secret", {}); await loadTGWS(); toast("Новый секрет сгенерирован", "ok"); }
+  catch (e) { toast(e.message, "err"); }
+});
+$("#tgwsCopy").addEventListener("click", async () => {
+  const v = $("#tgwsLink").value; if (!v) return;
+  try { await navigator.clipboard.writeText(v); toast("Ссылка скопирована", "ok"); }
+  catch (e) { $("#tgwsLink").select(); try { document.execCommand("copy"); toast("Ссылка скопирована", "ok"); } catch (_) { toast("Скопируйте вручную", "err"); } }
+});
 
 /* ---------- init ---------- */
 async function boot() {

@@ -13,6 +13,7 @@ import (
 
 	"nfqws2strategy/internal/app"
 	"nfqws2strategy/internal/catalog"
+	"nfqws2strategy/internal/tgws"
 )
 
 //go:embed all:web
@@ -132,6 +133,12 @@ func (s *Server) routes() {
 	m.HandleFunc("POST /api/blockcheck", s.startBlockCheck)
 	m.HandleFunc("GET /api/blockcheck/{id}", s.getBlockCheck)
 	m.HandleFunc("POST /api/blockcheck/{id}/cancel", s.cancelBlockCheck)
+
+	m.HandleFunc("GET /api/tgws", s.tgwsStatus)
+	m.HandleFunc("POST /api/tgws/config", s.tgwsConfig)
+	m.HandleFunc("POST /api/tgws/start", s.tgwsStart)
+	m.HandleFunc("POST /api/tgws/stop", s.tgwsStop)
+	m.HandleFunc("POST /api/tgws/secret", s.tgwsSecret)
 
 	m.HandleFunc("POST /api/apply", s.applyStrategy)
 
@@ -544,6 +551,68 @@ func (s *Server) cancelBlockCheck(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, map[string]string{"status": "cancelling"})
+}
+
+// ---------- TG WS Proxy ----------
+
+func (s *Server) tgwsStatus(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, 200, s.app.TGWSStatusFor(hostFromHeader(r.Host)))
+}
+
+func (s *Server) tgwsConfig(w http.ResponseWriter, r *http.Request) {
+	var in tgws.Config
+	if err := readJSON(r, &in); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	if err := s.app.TGWSSetConfig(&in); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, s.app.TGWSStatusFor(hostFromHeader(r.Host)))
+}
+
+func (s *Server) tgwsStart(w http.ResponseWriter, r *http.Request) {
+	if err := s.app.TGWSStart(); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, s.app.TGWSStatusFor(hostFromHeader(r.Host)))
+}
+
+func (s *Server) tgwsStop(w http.ResponseWriter, r *http.Request) {
+	if err := s.app.TGWSStop(); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, s.app.TGWSStatusFor(hostFromHeader(r.Host)))
+}
+
+func (s *Server) tgwsSecret(w http.ResponseWriter, r *http.Request) {
+	secret, err := s.app.TGWSNewSecret()
+	if err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, map[string]string{"secret": secret})
+}
+
+// hostFromHeader strips the port from a Host header so the tg:// link points at
+// whatever address the user reached the UI on.
+func hostFromHeader(host string) string {
+	if host == "" {
+		return ""
+	}
+	if strings.HasPrefix(host, "[") { // IPv6 literal: [::1]:8090
+		if i := strings.Index(host, "]"); i > 0 {
+			return host[:i+1]
+		}
+		return host
+	}
+	if i := strings.Index(host, ":"); i >= 0 {
+		return host[:i]
+	}
+	return host
 }
 
 func (s *Server) applyStrategy(w http.ResponseWriter, r *http.Request) {
