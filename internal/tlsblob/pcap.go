@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"sort"
 	"strconv"
 )
 
@@ -148,6 +149,8 @@ func ParsePcapClientHellos(data []byte) ([]Candidate, error) {
 			}
 		}
 	}
+	// Smallest first — a smaller ClientHello makes a better fake (fits in a packet).
+	sort.SliceStable(out, func(i, j int) bool { return out[i].Size < out[j].Size })
 	return out, nil
 }
 

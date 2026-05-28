@@ -209,6 +209,7 @@ func (a *App) StartRun(req RunRequest) (*Run, error) {
 	}
 	// Expand across selected blobs: each blob is tested as the fake payload.
 	strategies = a.buildRunStrategies(strategies, req.Blobs)
+	strategies = a.expandSNIs(strategies, a.SNIDomains())
 	if len(strategies) == 0 {
 		return nil, fmt.Errorf("no strategies selected")
 	}

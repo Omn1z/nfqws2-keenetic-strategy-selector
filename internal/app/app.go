@@ -27,8 +27,9 @@ type App struct {
 	Cfg   *config.Config
 	store *store.Store
 
-	mu       sync.Mutex
-	custom   []catalog.Strategy // custom strategies
+	mu         sync.Mutex
+	custom     []catalog.Strategy // custom strategies
+	sniDomains []string           // SNI domains to iterate in runs (Strategies tab)
 	runs     map[string]*Run    // in-memory runs (id -> run)
 	runOrder []string           // run ids, newest last
 	active         *Run      // currently running, if any
@@ -64,6 +65,7 @@ type App struct {
 
 const (
 	customStrategiesFile = "strategies_custom.json"
+	sniDomainsFile       = "sni_domains.json"
 	maxStoredRuns        = 30
 )
 
@@ -74,6 +76,7 @@ func New(cfg *config.Config) (*App, error) {
 	}
 	a := &App{Cfg: cfg, store: st, runs: map[string]*Run{}, traces: map[string]*Trace{}, pcaps: map[string]*Pcap{}, blobCaps: map[string]*BlobCapture{}, sessions: auth.NewSessions(sessionTTL)}
 	_ = a.store.Load(customStrategiesFile, &a.custom)
+	_ = a.store.Load(sniDomainsFile, &a.sniDomains)
 	if err := os.MkdirAll(a.blobsDir(), 0o755); err != nil {
 		return nil, err
 	}
@@ -277,6 +280,51 @@ func luaIdent(s string) string {
 // reFakeBlobRef matches a fake-payload blob reference inside a desync directive
 // (e.g. ":blob=tls_clienthello"), but not the "--blob=" definition flag.
 var reFakeBlobRef = regexp.MustCompile(`([\s:])blob=[^\s:]+`)
+
+// reSNIRef matches the fake-hello SNI (e.g. "sni=www.google.com") that some
+// strategies inject via tls_mod; the value runs to the next ':' or space.
+var reSNIRef = regexp.MustCompile(`(sni=)[^\s:]+`)
+
+// SNIDomains returns the user's SNI list (Strategies tab) for run iteration.
+func (a *App) SNIDomains() []string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return append([]string{}, a.sniDomains...)
+}
+
+// SetSNIDomains persists the SNI domain list used to iterate strategies in runs.
+func (a *App) SetSNIDomains(domains []string) ([]string, error) {
+	clean := cleanLines(domains)
+	a.mu.Lock()
+	a.sniDomains = clean
+	a.mu.Unlock()
+	return clean, a.store.Save(sniDomainsFile, clean)
+}
+
+// expandSNIs tests each strategy that injects a fake SNI (sni=) once per domain
+// in the list (the user's chosen SNIs first, then the strategy's own SNI as a
+// fallback). Strategies without sni= are unchanged; an empty list is a no-op.
+func (a *App) expandSNIs(base []catalog.Strategy, domains []string) []catalog.Strategy {
+	if len(domains) == 0 {
+		return base
+	}
+	out := make([]catalog.Strategy, 0, len(base)*(len(domains)+1))
+	for _, s := range base {
+		if !reSNIRef.MatchString(s.ArgLine) {
+			out = append(out, s)
+			continue
+		}
+		for _, d := range domains {
+			v := s
+			v.ID = s.ID + "/sni=" + d
+			v.Name = "(sni " + d + ") " + s.Name
+			v.ArgLine = reSNIRef.ReplaceAllString(s.ArgLine, "${1}"+d)
+			out = append(out, v)
+		}
+		out = append(out, s) // strategy's own SNI, tested last
+	}
+	return out
+}
 
 // buildRunStrategies expands the base set across the selected blobs: every
 // strategy that uses a fake blob is tested once per selected blob (with that blob

@@ -163,6 +163,8 @@ func (s *Server) routes() {
 
 	m.HandleFunc("GET /api/strategies", s.getStrategies)
 	m.HandleFunc("POST /api/strategies", s.saveStrategy)
+	m.HandleFunc("GET /api/strategies/sni", s.getSNI)
+	m.HandleFunc("POST /api/strategies/sni", s.setSNI)
 	m.HandleFunc("POST /api/strategies/export", s.exportStrategy)
 	m.HandleFunc("POST /api/strategies/import", s.importStrategy)
 	m.HandleFunc("DELETE /api/strategies/{id}", s.deleteStrategy)
@@ -499,6 +501,26 @@ func (s *Server) deleteList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, map[string]string{"status": "ok"})
+}
+
+func (s *Server) getSNI(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, 200, map[string]any{"domains": s.app.SNIDomains()})
+}
+
+func (s *Server) setSNI(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Domains []string `json:"domains"`
+	}
+	if err := readJSON(r, &in); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	out, err := s.app.SetSNIDomains(in.Domains)
+	if err != nil {
+		httpErr(w, 500, err)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"domains": out})
 }
 
 func (s *Server) getBlobs(w http.ResponseWriter, r *http.Request) {
