@@ -71,7 +71,13 @@ start() {
   if is_running; then echo "nfqws2-strategy started on :$PORT"; else echo "start failed; see $LOGFILE"; return 1; fi
 }
 stop() {
-  if is_running; then kill "$(cat "$PIDFILE")" 2>/dev/null; sleep 1; fi
+  if is_running; then
+    PID="$(cat "$PIDFILE")"
+    kill "$PID" 2>/dev/null
+    i=0
+    while kill -0 "$PID" 2>/dev/null && [ "$i" -lt 8 ]; do sleep 1; i=$((i+1)); done
+    kill -9 "$PID" 2>/dev/null
+  fi
   rm -f "$PIDFILE"; echo "nfqws2-strategy stopped"
 }
 case "$1" in

@@ -18,6 +18,7 @@ import (
 	"nfqws2strategy/internal/catalog"
 	"nfqws2strategy/internal/config"
 	"nfqws2strategy/internal/dns"
+	"nfqws2strategy/internal/engine"
 	"nfqws2strategy/internal/store"
 	"nfqws2strategy/internal/tgws"
 )
@@ -67,7 +68,32 @@ func New(cfg *config.Config) (*App, error) {
 	a.loadRuns()
 	a.initTGWS()
 	a.initDNS()
+	// Repair any sandbox state leaked by a previous unclean exit (stale STRAT_*
+	// iptables chains / orphaned test nfqws2 children). Without this a killed run
+	// leaves an exclude-connmark rule that makes the MAIN nfqws2 skip connections.
+	engine.CleanupSandboxes(cfg, maxThreads)
 	return a, nil
+}
+
+// Shutdown cancels any active run/block check, tears down every test sandbox
+// (iptables chains + orphaned nfqws2 children) and stops the TG WS proxy. It is
+// called on SIGTERM so a service stop/restart/update never leaves the main
+// nfqws2 service skipping connections. Idempotent.
+func (a *App) Shutdown() {
+	a.mu.Lock()
+	cancel, cancelBC := a.cancel, a.cancelBC
+	a.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	if cancelBC != nil {
+		cancelBC()
+	}
+	// Give the worker goroutines a moment to run their own teardown, then force a
+	// full cleanup in case they were killed before their defers ran.
+	time.Sleep(300 * time.Millisecond)
+	engine.CleanupSandboxes(a.Cfg, maxThreads)
+	a.StopTGWS()
 }
 
 func (a *App) blobsDir() string { return a.store.Path("blobs") }

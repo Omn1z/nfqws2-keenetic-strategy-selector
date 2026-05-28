@@ -139,7 +139,7 @@ func cmdServe(args []string) {
 	signal.Notify(sigc, os.Interrupt, syscall.SIGTERM)
 	<-sigc
 	log.Println("shutting down...")
-	a.StopTGWS()
+	a.Shutdown()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	_ = srv.Shutdown(ctx)
