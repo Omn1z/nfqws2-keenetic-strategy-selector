@@ -119,7 +119,9 @@ func (s *Server) routes() {
 	m.HandleFunc("GET /api/blobs", s.getBlobs)
 	m.HandleFunc("POST /api/blobs", s.uploadBlob)
 	m.HandleFunc("GET /api/blobs/export", s.exportBlobs)
+	m.HandleFunc("POST /api/blobs/export", s.exportBlobsSel)
 	m.HandleFunc("POST /api/blobs/zip", s.importBlobsZip)
+	m.HandleFunc("DELETE /api/blobs/{name}", s.deleteBlob)
 
 	m.HandleFunc("POST /api/runs", s.startRun)
 	m.HandleFunc("GET /api/runs", s.getRuns)
@@ -340,7 +342,28 @@ func (s *Server) uploadBlob(w http.ResponseWriter, r *http.Request) {
 func (s *Server) exportBlobs(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/zip")
 	w.Header().Set("Content-Disposition", `attachment; filename="blobs.zip"`)
-	_ = s.app.ExportBlobsZip(w)
+	_ = s.app.ExportBlobsZip(w, nil)
+}
+
+func (s *Server) exportBlobsSel(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Names []string `json:"names"`
+	}
+	if err := readJSON(r, &in); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	w.Header().Set("Content-Type", "application/zip")
+	w.Header().Set("Content-Disposition", `attachment; filename="blobs.zip"`)
+	_ = s.app.ExportBlobsZip(w, in.Names)
+}
+
+func (s *Server) deleteBlob(w http.ResponseWriter, r *http.Request) {
+	if err := s.app.DeleteBlob(r.PathValue("name")); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, map[string]string{"status": "ok"})
 }
 
 func (s *Server) importBlobsZip(w http.ResponseWriter, r *http.Request) {

@@ -19,21 +19,29 @@ const maxBlobBytes = 8 << 20
 // reBlobPath matches a blob DEFINITION carrying a file path: --blob=NAME:@PATH.
 var reBlobPath = regexp.MustCompile(`--blob=([^:\s]+):@(\S+)`)
 
-// ExportBlobsZip writes a zip of all custom (user-uploaded) blobs to w.
-func (a *App) ExportBlobsZip(w io.Writer) error {
-	names, _ := a.store.ListFiles("blobs")
+// ExportBlobsZip writes a zip of blobs to w. With no names it exports all custom
+// blobs; with names it exports exactly those (custom or system, resolved like a
+// run does), so system blobs can be exported too.
+func (a *App) ExportBlobsZip(w io.Writer, names []string) error {
 	zw := zip.NewWriter(w)
-	for _, n := range names {
-		data, err := os.ReadFile(filepath.Join(a.blobsDir(), n))
-		if err != nil {
-			continue
+	add := func(zipName, path string) {
+		if data, err := os.ReadFile(path); err == nil {
+			if f, e := zw.Create(zipName); e == nil {
+				_, _ = f.Write(data)
+			}
 		}
-		f, err := zw.Create(n)
-		if err != nil {
-			return err
+	}
+	if len(names) == 0 {
+		blobNames, _ := a.store.ListFiles("blobs")
+		for _, n := range blobNames {
+			add(n, filepath.Join(a.blobsDir(), n))
 		}
-		if _, err := f.Write(data); err != nil {
-			return err
+	} else {
+		for _, n := range names {
+			base := filepath.Base(n)
+			if _, path, ok := a.resolveBlob(base); ok {
+				add(base, path)
+			}
 		}
 	}
 	return zw.Close()

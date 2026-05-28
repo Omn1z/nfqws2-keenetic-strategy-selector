@@ -262,6 +262,16 @@ func (a *App) SaveBlob(name string, data []byte) (string, error) {
 	return filepath.Join(a.blobsDir(), name), nil
 }
 
+// DeleteBlob removes a custom (user-uploaded) blob. System blobs live outside the
+// data dir and are never touched.
+func (a *App) DeleteBlob(name string) error {
+	name = filepath.Base(name)
+	if name == "" || name == "." || strings.ContainsAny(name, "/\\") {
+		return fmt.Errorf("invalid blob name")
+	}
+	return a.store.Delete(filepath.Join("blobs", name))
+}
+
 // ---------- Apply strategy to live config ----------
 
 var reArgsBlock = regexp.MustCompile(`(?s)(NFQWS_ARGS=")[^"]*(")`)

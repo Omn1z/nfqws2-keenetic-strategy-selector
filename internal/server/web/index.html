@@ -147,7 +147,9 @@
           </div>
           <div class="run-row mid">
             <label class="field field-sm">Потоков<input id="runThreads" type="number" min="1" max="8" value="4"></label>
-            <label class="switch"><input id="runAuto" type="checkbox"><span class="track"></span><span class="switch-label">Автоподбор</span></label>
+            <div class="field auto-field"><span class="field-cap">Автоподбор</span>
+              <label class="switch"><input id="runAuto" type="checkbox"><span class="track"></span></label>
+            </div>
           </div>
           <div class="run-row cols">
             <div class="field field-grow">
@@ -277,7 +279,7 @@
       <!-- BLOBS -->
       <section id="tab-blobs" class="panel">
         <div class="card">
-          <div class="card-head"><h2>Блобы</h2><button id="blobExport" class="btn btn-mini head-action">Экспорт всех (ZIP)</button></div>
+          <div class="card-head"><h2>Загрузка блобов</h2></div>
           <p class="hint">Свой блоб используется в стратегии так: <code>--blob=имя:@/путь</code>. Можно загрузить несколько файлов сразу или ZIP-архив.</p>
           <div id="blobDrop" class="dropzone" tabindex="0" role="button" aria-label="Загрузить блобы">
             <svg class="dz-icon" viewBox="0 0 24 24" width="34" height="34"><path d="M12 16V4m0 0 4 4m-4-4L8 8M5 16v2a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-2" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
@@ -285,9 +287,19 @@
             <div id="blobName" class="dz-name"></div>
             <input type="file" id="blobFile" multiple hidden>
           </div>
-          <div class="two">
-            <div><h3 class="sub">Пользовательские</h3><ul id="customBlobs" class="chips"></ul></div>
-            <div><h3 class="sub">Системные</h3><ul id="systemBlobs" class="chips mono"></ul></div>
+        </div>
+        <div class="card">
+          <div class="card-head"><h2>Список блобов</h2>
+            <div class="head-action blob-bulk">
+              <button id="blobExportSel" class="btn btn-mini">Экспорт выбранных (ZIP)</button>
+              <button id="blobDeleteSel" class="btn btn-mini btn-ghost-danger">Удалить выбранные</button>
+            </div>
+          </div>
+          <div class="table-wrap">
+            <table id="blobTable" class="data">
+              <thead><tr><th class="cb"><input type="checkbox" id="blobAll" title="Выбрать все"></th><th>Имя</th><th>Тип</th><th></th></tr></thead>
+              <tbody></tbody>
+            </table>
           </div>
         </div>
       </section>

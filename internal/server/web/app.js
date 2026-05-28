@@ -113,7 +113,7 @@ function currentSrc(seg) {
 function fillRunLists() {
   const sel = $("#runList"); if (!sel) return;
   const cur = sel.value;
-  sel.innerHTML = state.lists.map(l => `<option value="${esc(l.id)}">${esc(l.name || l.id)} (${(l.domains || []).length} дом.)</option>`).join("");
+  sel.innerHTML = state.lists.map(l => `<option value="${esc(l.id)}">${esc(l.name || l.id)} (${(l.domains || []).length} дом. / ${(l.ips || []).length} IP)</option>`).join("");
   if (cur) sel.value = cur;
 }
 function fillGeoSelect(fileId, catId) {
@@ -170,7 +170,7 @@ async function loadLists() {
     if (state.selected && state.selected.id === l.id) li.classList.add("active");
     li.innerHTML = `<div class="li-main">
         <div class="nm">${esc(l.name || "(без имени)")}</div>
-        <div class="meta">${(l.domains || []).length} доменов · ${(l.successful_strategies || []).length} рабочих</div>
+        <div class="meta">${(l.domains || []).length} дом. · ${(l.ips || []).length} IP · ${(l.successful_strategies || []).length} рабочих</div>
       </div>
       <button class="li-del" title="Удалить список" aria-label="Удалить">×</button>`;
     li.querySelector(".li-main").addEventListener("click", () => selectList(l.id));
@@ -413,7 +413,7 @@ function fillBCLists() {
   sel.innerHTML = "";
   state.lists.forEach(l => {
     const o = document.createElement("option");
-    o.value = l.id; o.textContent = `${l.name || l.id} (${(l.domains || []).length} дом.)`;
+    o.value = l.id; o.textContent = `${l.name || l.id} (${(l.domains || []).length} дом. / ${(l.ips || []).length} IP)`;
     sel.appendChild(o);
   });
   if (cur) sel.value = cur;
@@ -533,18 +533,51 @@ $("#stratImportFile").addEventListener("change", async () => {
 });
 
 /* ---------- blobs ---------- */
+let blobList = { custom: [], system: [] };
 async function loadBlobs() {
   const b = await api("GET", "/api/blobs");
-  const cu = $("#customBlobs"); cu.innerHTML = "";
-  (b.custom || []).forEach(n => { const li = document.createElement("li"); li.textContent = n; cu.appendChild(li); });
-  const sy = $("#systemBlobs"); sy.innerHTML = "";
-  (b.system || []).forEach(n => { const li = document.createElement("li"); li.textContent = n; sy.appendChild(li); });
+  blobList = { custom: b.custom || [], system: b.system || [] };
+  renderBlobTable();
   // run-config blob checklist (custom first, then system)
   const items = [];
-  (b.custom || []).forEach(n => items.push({ value: n, label: n, sub: "свой" }));
-  (b.system || []).forEach(n => items.push({ value: n, label: n }));
+  blobList.custom.forEach(n => items.push({ value: n, label: n, sub: "свой" }));
+  blobList.system.forEach(n => items.push({ value: n, label: n }));
   renderChecklist("runBlobs", items);
 }
+function renderBlobTable() {
+  const tb = $("#blobTable tbody"); tb.innerHTML = "";
+  const addRow = (name, custom) => {
+    const tr = document.createElement("tr");
+    tr.innerHTML = `<td class="cb"><input type="checkbox" class="blob-cb" value="${esc(name)}"></td>
+      <td class="mono">${esc(name)}</td>
+      <td>${custom ? "свой" : "системный"}</td>
+      <td>${custom ? `<button class="btn btn-mini btn-ghost-danger" data-delblob="${esc(name)}">×</button>` : ""}</td>`;
+    tb.appendChild(tr);
+  };
+  blobList.custom.forEach(n => addRow(n, true));
+  blobList.system.forEach(n => addRow(n, false));
+  $$("#blobTable button[data-delblob]").forEach(b => b.addEventListener("click", () => deleteBlob(b.dataset.delblob)));
+  $("#blobAll").checked = false;
+}
+function selectedBlobs() { return $$("#blobTable .blob-cb:checked").map(c => c.value); }
+async function deleteBlob(name) {
+  if (!confirm("Удалить блоб «" + name + "»?")) return;
+  try { await api("DELETE", "/api/blobs/" + encodeURIComponent(name)); toast("Блоб удалён", "ok"); await loadBlobs(); }
+  catch (e) { toast(e.message, "err"); }
+}
+$("#blobAll").addEventListener("change", () => { const on = $("#blobAll").checked; $$("#blobTable .blob-cb").forEach(c => { c.checked = on; }); });
+$("#blobExportSel").addEventListener("click", () => {
+  const names = selectedBlobs();
+  if (!names.length) { toast("Выберите блобы для экспорта", "err"); return; }
+  downloadFile("/api/blobs/export", "blobs.zip", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ names }) }).catch(e => toast(e.message, "err"));
+});
+$("#blobDeleteSel").addEventListener("click", async () => {
+  const names = selectedBlobs().filter(n => blobList.custom.includes(n));
+  if (!names.length) { toast("Выберите пользовательские блобы", "err"); return; }
+  if (!confirm("Удалить выбранные блобы (" + names.length + ")?")) return;
+  for (const n of names) { try { await api("DELETE", "/api/blobs/" + encodeURIComponent(n)); } catch (e) { toast(n + ": " + e.message, "err"); } }
+  toast("Удалено: " + names.length, "ok"); await loadBlobs();
+});
 const blobDrop = $("#blobDrop"), blobInput = $("#blobFile");
 async function uploadBlobs(files) {
   files = Array.from(files || []);
@@ -567,7 +600,6 @@ async function uploadBlobs(files) {
   if (ok) toast("Блобы загружены: " + ok, "ok");
   await loadBlobs();
 }
-$("#blobExport").addEventListener("click", () => downloadFile("/api/blobs/export", "blobs.zip").catch(e => toast(e.message, "err")));
 blobDrop.addEventListener("click", () => blobInput.click());
 blobDrop.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); blobInput.click(); } });
 blobInput.addEventListener("change", () => { uploadBlobs(blobInput.files); blobInput.value = ""; });
