@@ -16,6 +16,9 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version: '1.22'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
       - name: Build all architectures
         run: sh scripts/build.sh "${GITHUB_REF_NAME:-dev}"
       - name: Publish release

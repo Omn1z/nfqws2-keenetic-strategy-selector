@@ -2,6 +2,7 @@
 package server
 
 import (
+	"compress/gzip"
 	"embed"
 	"encoding/json"
 	"io"
@@ -166,31 +167,34 @@ func (s *Server) routes() {
 	m.HandleFunc("POST /api/geo/import", s.importGeo)
 	m.HandleFunc("POST /api/geo/resolve", s.resolveGeo)
 
-	sub, _ := fs.Sub(webAssets, "web")
-	m.HandleFunc("GET /{$}", s.serveIndex)
-	m.HandleFunc("GET /index.html", s.serveIndex)
-	m.Handle("/", noStore(http.FileServerFS(sub)))
+	// Single-file React app: any non-/api path serves the inlined index.html
+	// (hash-based routing). /api/* patterns are more specific and take precedence.
+	m.HandleFunc("/", s.serveIndex)
 }
 
 // ---------- handlers ----------
 
-// serveIndex serves index.html with version-stamped asset URLs so a self-update
-// busts the browser cache for style.css / app.js.
+// serveIndex serves the single inlined index.html (JS+CSS embedded by the Vite
+// build). It is served with no-store — the whole UI is one file, so there are no
+// sub-assets to cache-bust, and a self-update is reflected immediately. The
+// response is gzipped when the client accepts it (the inlined file is ~280 KB
+// → ~84 KB on the wire).
 func (s *Server) serveIndex(w http.ResponseWriter, r *http.Request) {
 	b, err := fs.ReadFile(webAssets, "web/index.html")
 	if err != nil {
 		http.Error(w, "index missing", 500)
 		return
 	}
-	v := s.app.Cfg.Version
-	if v == "" {
-		v = "0"
-	}
-	html := strings.ReplaceAll(string(b), "style.css", "style.css?v="+v)
-	html = strings.ReplaceAll(html, "app.js", "app.js?v="+v)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
-	_, _ = w.Write([]byte(html))
+	if strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
+		w.Header().Set("Content-Encoding", "gzip")
+		gz := gzip.NewWriter(w)
+		defer gz.Close()
+		_, _ = gz.Write(b)
+		return
+	}
+	_, _ = w.Write(b)
 }
 
 func (s *Server) getConfig(w http.ResponseWriter, r *http.Request) {
@@ -743,17 +747,6 @@ func httpErr(w http.ResponseWriter, code int, err error) {
 func readJSON(r *http.Request, v any) error {
 	defer r.Body.Close()
 	return json.NewDecoder(io.LimitReader(r.Body, 8<<20)).Decode(v)
-}
-
-// noStore stops browsers from heuristically caching the embedded web assets, so
-// a self-update is reflected immediately instead of serving a stale UI.
-func noStore(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		r.Header.Del("If-Modified-Since")
-		r.Header.Del("If-None-Match")
-		w.Header().Set("Cache-Control", "no-store, must-revalidate")
-		next.ServeHTTP(w, r)
-	})
 }
 
 func logging(next http.Handler) http.Handler {

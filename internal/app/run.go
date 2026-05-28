@@ -577,6 +577,7 @@ func (a *App) mergeSuccessful(list *List, run *Run, results []StrategyResult) {
 		if !ok || r.Coefficient > prev.Coefficient {
 			byID[r.StrategyID] = SavedStrategy{
 				StrategyID: r.StrategyID, Name: r.Name, ArgLine: r.ArgLine,
+				DNS: r.DNS, DNSID: r.DNSID,
 				AvgTTFBms: r.AvgTTFBms, AvgSpeedBps: r.AvgSpeedBps, Coefficient: r.Coefficient,
 				FoundAt: now, RunID: run.ID,
 			}

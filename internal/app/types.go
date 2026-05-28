@@ -20,6 +20,8 @@ type SavedStrategy struct {
 	StrategyID  string  `json:"strategy_id"`
 	Name        string  `json:"name"`
 	ArgLine     string  `json:"args"`
+	DNS         string  `json:"dns,omitempty"`    // label of the DNS this best result used ("" = system)
+	DNSID       string  `json:"dns_id,omitempty"` // server id of that DNS
 	AvgTTFBms   int64   `json:"avg_ttfb_ms"`
 	AvgSpeedBps int64   `json:"avg_speed_bps"`
 	Coefficient float64 `json:"coefficient"`

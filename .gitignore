@@ -6,3 +6,6 @@
 # router IP) and extracted GPL lua — not for redistribution.
 /dev/
 /tmp/
+# React/Vite frontend deps (source + package-lock are committed; the built
+# single-file internal/server/web/index.html is committed and embedded).
+/frontend/node_modules/

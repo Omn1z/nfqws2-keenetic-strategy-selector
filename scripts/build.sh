@@ -5,6 +5,12 @@ set -e
 VERSION="${1:-dev}"
 OUT=dist
 mkdir -p "$OUT"
+
+# Build the React UI into the single embedded internal/server/web/index.html first.
+echo "building frontend (vite single-file)..."
+npm --prefix frontend install
+npm --prefix frontend run build
+
 LD="-s -w -X main.version=$VERSION"
 PKG=./cmd/nfqws2-strategy
 

@@ -87,7 +87,8 @@ curl -fsSL https://raw.githubusercontent.com/Omn1z/nfqws2-keenetic-strategy-sele
 
 ## Сборка из исходников
 
-Нужен Go ≥ 1.22.
+Нужны Go ≥ 1.22 и Node ≥ 20 (веб-интерфейс — React 19 + Vite). Скрипты сборки
+сами собирают фронтенд (`npm`) в один встраиваемый файл, а затем линкуют бинарь.
 
 ```sh
 sh scripts/build.sh v1.0.0        # Linux/macOS

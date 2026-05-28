@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>NFQWS2 Strategy Selector</title>
+<script>
+// Apply theme before first paint to avoid a flash. Default = system preference.
+(function () {
+  try {
+    var q = (location.search.match(/[?&]theme=(auto|light|dark)/) || [])[1];
+    var m = q || localStorage.getItem("theme") || "auto";
+    var dark = m === "dark" || (m === "auto" && matchMedia("(prefers-color-scheme: dark)").matches);
+    document.documentElement.dataset.theme = dark ? "dark" : "light";
+  } catch (e) {}
+})();
+</script>
+</head>
+<body>
+<div id="root"></div>
+<script type="module" src="/src/main.jsx"></script>
+</body>
+</html>

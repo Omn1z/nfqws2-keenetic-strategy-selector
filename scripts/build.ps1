@@ -6,6 +6,14 @@ $ErrorActionPreference = "Stop"
 $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 New-Item -ItemType Directory -Force -Path dist | Out-Null
+
+# Build the React UI into the single embedded internal/server/web/index.html first.
+Write-Output "building frontend (vite single-file)..."
+npm --prefix frontend install
+if ($LASTEXITCODE -ne 0) { throw "npm install failed" }
+npm --prefix frontend run build
+if ($LASTEXITCODE -ne 0) { throw "frontend build failed" }
+
 $ld = "-s -w -X main.version=$Version"
 $pkg = "./cmd/nfqws2-strategy"
 
