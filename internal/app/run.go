@@ -24,6 +24,7 @@ type RunRequest struct {
 	StrategyIDs []string `json:"strategy_ids"` // empty = all known strategies
 	Threads     int      `json:"threads"`
 	IncludeIPs  bool     `json:"include_ips"`
+	Blobs       []string `json:"blobs"` // blob filenames loaded for every tested strategy
 }
 
 func (a *App) loadRuns() {
@@ -150,11 +151,11 @@ func (a *App) StartRun(req RunRequest) (*Run, error) {
 	a.trimRunsLocked()
 	a.mu.Unlock()
 
-	go a.executeRun(ctx, run, list, strategies, threads, targets)
+	go a.executeRun(ctx, run, list, strategies, threads, targets, a.blobArgs(req.Blobs))
 	return run, nil
 }
 
-func (a *App) executeRun(ctx context.Context, run *Run, list *List, strategies []catalog.Strategy, threads int, targets []string) {
+func (a *App) executeRun(ctx context.Context, run *Run, list *List, strategies []catalog.Strategy, threads int, targets []string, blobArgs []string) {
 	defer func() {
 		a.mu.Lock()
 		a.active = nil
@@ -201,7 +202,7 @@ func (a *App) executeRun(ctx context.Context, run *Run, list *List, strategies [
 				if ctx.Err() != nil {
 					return
 				}
-				results[idx] = a.testStrategy(ctx, sb, pr, strategies[idx], targets)
+				results[idx] = a.testStrategy(ctx, sb, pr, strategies[idx], targets, blobArgs)
 				n := atomic.AddInt32(&done, 1)
 				a.mu.Lock()
 				run.Done = int(n)
@@ -240,9 +241,9 @@ wait:
 	a.mergeSuccessful(list, run, final)
 }
 
-func (a *App) testStrategy(ctx context.Context, sb *engine.Sandbox, pr *probe.Prober, s catalog.Strategy, targets []string) StrategyResult {
+func (a *App) testStrategy(ctx context.Context, sb *engine.Sandbox, pr *probe.Prober, s catalog.Strategy, targets []string, blobArgs []string) StrategyResult {
 	res := StrategyResult{StrategyID: s.ID, Name: s.Name, ArgLine: s.ArgLine, L7: s.L7, TargetsTotal: len(targets)}
-	if err := sb.StartNfqws(s.Args()); err != nil {
+	if err := sb.StartNfqws(blobArgs, s.Args()); err != nil {
 		res.Error = firstLine(err.Error())
 		return res
 	}

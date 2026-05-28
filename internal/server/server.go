@@ -29,7 +29,77 @@ func New(a *app.App) *Server {
 	return s
 }
 
-func (s *Server) Handler() http.Handler { return logging(s.mux) }
+func (s *Server) Handler() http.Handler { return logging(s.authGate(s.mux)) }
+
+const sessionCookie = "n2s_sess"
+
+// authGate blocks protected /api/* endpoints unless a valid session cookie is
+// present. Static assets and the login/status endpoints stay public.
+func (s *Server) authGate(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.app.AuthEnabled() && strings.HasPrefix(r.URL.Path, "/api/") && !publicAPI(r.URL.Path) {
+			c, _ := r.Cookie(sessionCookie)
+			if c == nil || !s.app.ValidSession(c.Value) {
+				writeJSON(w, http.StatusUnauthorized, apiError{Error: "unauthorized"})
+				return
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func publicAPI(p string) bool {
+	return p == "/api/auth/status" || p == "/api/auth/login"
+}
+
+func (s *Server) authStatus(w http.ResponseWriter, r *http.Request) {
+	authed := false
+	if c, _ := r.Cookie(sessionCookie); c != nil {
+		authed = s.app.ValidSession(c.Value)
+	}
+	writeJSON(w, 200, map[string]any{"enabled": s.app.AuthEnabled(), "authed": authed})
+}
+
+func (s *Server) authLogin(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		User     string `json:"user"`
+		Password string `json:"password"`
+	}
+	if err := readJSON(r, &in); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	tok, ok := s.app.Login(in.User, in.Password)
+	if !ok {
+		writeJSON(w, http.StatusUnauthorized, apiError{Error: "неверный логин или пароль"})
+		return
+	}
+	http.SetCookie(w, &http.Cookie{Name: sessionCookie, Value: tok, Path: "/", HttpOnly: true, SameSite: http.SameSiteLaxMode, MaxAge: 7 * 24 * 3600})
+	writeJSON(w, 200, map[string]string{"status": "ok"})
+}
+
+func (s *Server) authLogout(w http.ResponseWriter, r *http.Request) {
+	if c, _ := r.Cookie(sessionCookie); c != nil {
+		s.app.Logout(c.Value)
+	}
+	http.SetCookie(w, &http.Cookie{Name: sessionCookie, Value: "", Path: "/", MaxAge: -1})
+	writeJSON(w, 200, map[string]string{"status": "ok"})
+}
+
+func (s *Server) authConfig(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Enabled bool `json:"enabled"`
+	}
+	if err := readJSON(r, &in); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	if err := s.app.SetAuthEnabled(in.Enabled); err != nil {
+		httpErr(w, 500, err)
+		return
+	}
+	writeJSON(w, 200, map[string]bool{"enabled": in.Enabled})
+}
 
 func (s *Server) routes() {
 	m := s.mux
@@ -56,6 +126,16 @@ func (s *Server) routes() {
 
 	m.HandleFunc("GET /api/update/check", s.checkUpdate)
 	m.HandleFunc("POST /api/update", s.doUpdate)
+
+	m.HandleFunc("GET /api/auth/status", s.authStatus)
+	m.HandleFunc("POST /api/auth/login", s.authLogin)
+	m.HandleFunc("POST /api/auth/logout", s.authLogout)
+	m.HandleFunc("POST /api/auth/config", s.authConfig)
+
+	m.HandleFunc("GET /api/geo", s.getGeo)
+	m.HandleFunc("POST /api/geo", s.uploadGeo)
+	m.HandleFunc("DELETE /api/geo/{name}", s.deleteGeo)
+	m.HandleFunc("POST /api/geo/import", s.importGeo)
 
 	sub, _ := fs.Sub(webAssets, "web")
 	m.HandleFunc("GET /{$}", s.serveIndex)
@@ -181,6 +261,62 @@ func (s *Server) uploadBlob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, map[string]string{"name": hdr.Filename, "path": path})
+}
+
+func (s *Server) getGeo(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, 200, s.app.GeoFiles())
+}
+
+func (s *Server) uploadGeo(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseMultipartForm(16 << 20); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	kind := r.FormValue("kind")
+	f, hdr, err := r.FormFile("file")
+	if err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	defer f.Close()
+	data, err := io.ReadAll(io.LimitReader(f, 48<<20))
+	if err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	if err := s.app.SaveGeoFile(hdr.Filename, kind, data); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, map[string]string{"name": hdr.Filename, "kind": kind})
+}
+
+func (s *Server) deleteGeo(w http.ResponseWriter, r *http.Request) {
+	if err := s.app.DeleteGeoFile(r.PathValue("name")); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, map[string]string{"status": "ok"})
+}
+
+func (s *Server) importGeo(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Geo      string `json:"geo"`
+		Category string `json:"category"`
+		Limit    int    `json:"limit"`
+		ListID   string `json:"list_id"`
+		ListName string `json:"list_name"`
+	}
+	if err := readJSON(r, &in); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	list, err := s.app.ImportGeo(in.Geo, in.Category, in.Limit, in.ListID, in.ListName)
+	if err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, list)
 }
 
 func (s *Server) startRun(w http.ResponseWriter, r *http.Request) {

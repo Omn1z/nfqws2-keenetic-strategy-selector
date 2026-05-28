@@ -7,6 +7,7 @@ async function api(method, path, body) {
   const opt = { method, headers: {} };
   if (body !== undefined) { opt.headers["Content-Type"] = "application/json"; opt.body = JSON.stringify(body); }
   const res = await fetch(path, opt);
+  if (res.status === 401) { showLogin(); throw new Error("Требуется вход"); }
   const txt = await res.text();
   const data = txt ? JSON.parse(txt) : null;
   if (!res.ok) throw new Error((data && data.error) || res.statusText);
@@ -125,7 +126,8 @@ function fillRunStrategies() {
 $("#startRun").addEventListener("click", async () => {
   if (!state.selected || !state.selected.id) { toast("Сначала сохраните список", "err"); return; }
   const ids = $$("#runStrategies option:checked").map(o => o.value);
-  const req = { list_id: state.selected.id, strategy_ids: ids, threads: parseInt($("#runThreads").value, 10) || 4, include_ips: $("#runIncludeIPs").checked };
+  const blobs = $$("#runBlobs option:checked").map(o => o.value);
+  const req = { list_id: state.selected.id, strategy_ids: ids, blobs, threads: parseInt($("#runThreads").value, 10) || 4, include_ips: $("#runIncludeIPs").checked };
   try { state.run = await api("POST", "/api/runs", req); startPolling(); }
   catch (e) { toast(e.message, "err"); }
 });
@@ -272,6 +274,10 @@ async function loadBlobs() {
   (b.custom || []).forEach(n => { const li = document.createElement("li"); li.textContent = n; cu.appendChild(li); });
   const sy = $("#systemBlobs"); sy.innerHTML = "";
   (b.system || []).forEach(n => { const li = document.createElement("li"); li.textContent = n; sy.appendChild(li); });
+  // run-config blob multiselect (custom first, then system)
+  const sel = $("#runBlobs"); sel.innerHTML = "";
+  (b.custom || []).forEach(n => { const o = document.createElement("option"); o.value = n; o.textContent = n + " (свой)"; sel.appendChild(o); });
+  (b.system || []).forEach(n => { const o = document.createElement("option"); o.value = n; o.textContent = n; sel.appendChild(o); });
 }
 const blobDrop = $("#blobDrop"), blobInput = $("#blobFile");
 async function uploadBlob(file) {
@@ -356,16 +362,113 @@ $("#btnTheme").addEventListener("click", () => applyTheme(THEMES[(THEMES.indexOf
 prefersDark.addEventListener("change", () => { if (themeMode === "auto") applyTheme("auto"); });
 applyTheme(themeMode);
 
+/* ---------- auth ---------- */
+function showLogin() {
+  $("#loginOverlay").classList.remove("hidden");
+  setTimeout(() => $("#loginPass").focus(), 50);
+}
+$("#loginForm").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  $("#loginErr").textContent = "";
+  try {
+    await api("POST", "/api/auth/login", { user: $("#loginUser").value, password: $("#loginPass").value });
+    $("#loginOverlay").classList.add("hidden");
+    $("#btnLogout").classList.remove("hidden");
+    boot();
+  } catch (err) { $("#loginErr").textContent = err.message; }
+});
+$("#btnLogout").addEventListener("click", async () => {
+  try { await api("POST", "/api/auth/logout"); } catch (_) {}
+  location.reload();
+});
+
+/* ---------- geo ---------- */
+async function loadGeo() {
+  let files = [];
+  try { files = await api("GET", "/api/geo") || []; } catch (e) { return; }
+  const wrap = $("#geoFiles"); wrap.innerHTML = "";
+  files.forEach(f => wrap.appendChild(geoCard(f)));
+}
+function geoCard(f) {
+  const card = document.createElement("div"); card.className = "card";
+  const cats = f.categories || [];
+  const opts = cats.map(c => `<option value="${esc(c.name)}">${esc(c.name)} (${c.count})</option>`).join("");
+  const listOpts = `<option value="">— новый список —</option>` +
+    state.lists.map(l => `<option value="${esc(l.id)}">${esc(l.name || l.id)}</option>`).join("");
+  card.innerHTML = `
+    <div class="card-head geo-title"><h2>${esc(f.name)}</h2><span class="badge">${esc(f.kind)}</span>
+      <span class="hint">${cats.length} категорий</span>
+      <button class="btn btn-mini btn-ghost-danger" data-geodel style="margin-left:auto">Удалить</button></div>
+    <div class="geo-row">
+      <label class="field field-grow">Категория<select class="geo-cat">${opts}</select></label>
+      <label class="field field-sm">Лимит<input class="geo-limit" type="number" min="0" value="25"></label>
+      <label class="field field-grow">В список<select class="geo-list">${listOpts}</select></label>
+      <label class="field field-grow geo-newname">Имя нового<input class="geo-newname-in" type="text" placeholder="${esc(f.name)}:категория"></label>
+      <button class="btn btn-primary geo-import">Импортировать</button>
+    </div>`;
+  const listSel = card.querySelector(".geo-list"), newName = card.querySelector(".geo-newname");
+  listSel.addEventListener("change", () => { newName.style.display = listSel.value ? "none" : ""; });
+  card.querySelector("[data-geodel]").addEventListener("click", async () => {
+    if (!confirm("Удалить geo-файл «" + f.name + "»?")) return;
+    try { await api("DELETE", "/api/geo/" + encodeURIComponent(f.name)); loadGeo(); } catch (e) { toast(e.message, "err"); }
+  });
+  card.querySelector(".geo-import").addEventListener("click", async () => {
+    const category = card.querySelector(".geo-cat").value;
+    if (!category) { toast("Нет категорий в файле", "err"); return; }
+    const req = {
+      geo: f.name, category,
+      limit: parseInt(card.querySelector(".geo-limit").value, 10) || 0,
+      list_id: listSel.value,
+      list_name: card.querySelector(".geo-newname-in").value.trim(),
+    };
+    try {
+      const list = await api("POST", "/api/geo/import", req);
+      toast(`Импортировано в «${list.name}» (${(list.domains || []).length} дом. / ${(list.ips || []).length} IP)`, "ok");
+      await loadLists(); state.selected = list; renderListEditor();
+    } catch (e) { toast(e.message, "err"); }
+  });
+  return card;
+}
+const geoDrop = $("#geoDrop"), geoInput = $("#geoFile");
+async function uploadGeo(file) {
+  if (!file) return;
+  $("#geoName").textContent = "Загрузка: " + file.name;
+  geoDrop.classList.add("busy");
+  const fd = new FormData(); fd.append("file", file); fd.append("kind", $("#geoKind").value);
+  try {
+    const res = await fetch("/api/geo", { method: "POST", body: fd });
+    if (res.status === 401) { showLogin(); throw new Error("Требуется вход"); }
+    const d = await res.json(); if (!res.ok) throw new Error(d.error || res.statusText);
+    $("#geoName").textContent = "✓ " + d.name; toast("Загружено: " + d.name, "ok"); await loadGeo();
+  } catch (e) { $("#geoName").textContent = ""; toast(e.message, "err"); }
+  finally { geoDrop.classList.remove("busy"); }
+}
+geoDrop.addEventListener("click", () => geoInput.click());
+geoDrop.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); geoInput.click(); } });
+geoInput.addEventListener("change", () => { if (geoInput.files[0]) uploadGeo(geoInput.files[0]); });
+["dragenter", "dragover"].forEach(ev => geoDrop.addEventListener(ev, (e) => { e.preventDefault(); geoDrop.classList.add("drag"); }));
+geoDrop.addEventListener("dragleave", (e) => { if (!geoDrop.contains(e.relatedTarget)) geoDrop.classList.remove("drag"); });
+geoDrop.addEventListener("drop", (e) => { e.preventDefault(); geoDrop.classList.remove("drag"); const f = e.dataTransfer.files[0]; if (f) uploadGeo(f); });
+
 /* ---------- init ---------- */
-(async function init() {
+async function boot() {
   try {
     const cfg = await api("GET", "/api/config");
     state.version = cfg.version || "";
     $("#verCurrent").textContent = cfg.version || "?";
     $("#envInfo").textContent = `iface ${(cfg.wan_ifaces || []).join(",")}`;
-  } catch (e) { /* ignore */ }
+  } catch (e) { return; }
   await loadStrategies();
   await loadLists();
   await loadBlobs();
+  await loadGeo();
   checkUpdate(false);
+}
+(async function init() {
+  try {
+    const st = await api("GET", "/api/auth/status");
+    $("#btnLogout").classList.toggle("hidden", !(st.enabled && st.authed));
+    if (st.enabled && !st.authed) { showLogin(); return; }
+  } catch (e) { /* fall through to boot */ }
+  boot();
 })();

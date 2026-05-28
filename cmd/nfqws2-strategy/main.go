@@ -212,7 +212,7 @@ func cmdSelftest(args []string) {
 	}()
 	defer cleanup()
 
-	if err := sb.StartNfqws(strat.Args()); err != nil {
+	if err := sb.StartNfqws(nil, strat.Args()); err != nil {
 		fmt.Fprintln(os.Stderr, "start nfqws:", err)
 		os.Exit(1)
 	}

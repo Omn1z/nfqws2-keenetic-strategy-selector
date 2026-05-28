@@ -126,15 +126,16 @@ func (s *Sandbox) RulesDown() {
 }
 
 // StartNfqws launches a dedicated nfqws2 child bound to this sandbox's queue,
-// loaded with the shared base args plus the strategy args. It returns once the
-// queue is bound or after a timeout.
-func (s *Sandbox) StartNfqws(strategyArgs []string) error {
+// loaded with the shared base args, any extra args (e.g. run-selected blobs),
+// then the strategy args. It returns once the queue is bound or after a timeout.
+func (s *Sandbox) StartNfqws(extraArgs, strategyArgs []string) error {
 	s.StopNfqws()
 	if err := os.MkdirAll(s.wrDir, 0o755); err != nil {
 		return err
 	}
 	args := []string{fmt.Sprintf("--qnum=%d", s.QNum), "--writeable=" + s.wrDir}
 	args = append(args, s.cfg.BaseArgs...)
+	args = append(args, extraArgs...)
 	args = append(args, strategyArgs...)
 
 	cmd := exec.Command(s.cfg.NfqwsBin, args...)

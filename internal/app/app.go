@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"nfqws2strategy/internal/auth"
 	"nfqws2strategy/internal/catalog"
 	"nfqws2strategy/internal/config"
 	"nfqws2strategy/internal/store"
@@ -29,6 +30,9 @@ type App struct {
 	runOrder []string           // run ids, newest last
 	active   *Run               // currently running, if any
 	cancel   func()             // cancel for the active run
+
+	sessions    *auth.Sessions
+	authEnabled bool
 }
 
 const (
@@ -41,11 +45,12 @@ func New(cfg *config.Config) (*App, error) {
 	if err != nil {
 		return nil, err
 	}
-	a := &App{Cfg: cfg, store: st, runs: map[string]*Run{}}
+	a := &App{Cfg: cfg, store: st, runs: map[string]*Run{}, sessions: auth.NewSessions(sessionTTL)}
 	_ = a.store.Load(customStrategiesFile, &a.custom)
 	if err := os.MkdirAll(a.blobsDir(), 0o755); err != nil {
 		return nil, err
 	}
+	a.initAuth()
 	a.loadRuns()
 	return a, nil
 }
@@ -181,6 +186,29 @@ func (a *App) Blobs() (system []string, custom []string) {
 	sort.Strings(system)
 	sort.Strings(custom)
 	return
+}
+
+// blobArgs resolves blob filenames to nfqws2 `--blob=<name>:@<path>` arguments.
+// Custom (uploaded) blobs take precedence over system blobs with the same name.
+// The lua variable name is the filename without extension.
+func (a *App) blobArgs(names []string) []string {
+	var out []string
+	for _, n := range names {
+		n = filepath.Base(n)
+		if n == "" || n == "." {
+			continue
+		}
+		path := filepath.Join(a.blobsDir(), n)
+		if _, err := os.Stat(path); err != nil {
+			path = filepath.Join(a.Cfg.SystemBlobsDir, n)
+			if _, err := os.Stat(path); err != nil {
+				continue
+			}
+		}
+		name := strings.TrimSuffix(n, filepath.Ext(n))
+		out = append(out, "--blob="+name+":@"+path)
+	}
+	return out
 }
 
 // SaveBlob stores an uploaded blob and returns the absolute path to reference

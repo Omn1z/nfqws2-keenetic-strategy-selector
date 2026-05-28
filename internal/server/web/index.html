@@ -37,6 +37,9 @@
         </button>
         <button id="btnUpdate" class="btn-update hidden"></button>
       </div>
+      <button id="btnLogout" class="icon-btn hidden" title="Выход">
+        <svg viewBox="0 0 24 24" width="16" height="16"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      </button>
     </div>
   </header>
 
@@ -53,6 +56,10 @@
       <button class="nav-item" data-tab="blobs">
         <svg viewBox="0 0 24 24" width="18" height="18"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg>
         <span>Блобы</span>
+      </button>
+      <button class="nav-item" data-tab="geo">
+        <svg viewBox="0 0 24 24" width="18" height="18"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="2"/><path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18" fill="none" stroke="currentColor" stroke-width="2"/></svg>
+        <span>GeoSite/GeoIP</span>
       </button>
     </nav>
 
@@ -93,6 +100,9 @@
                   <label class="switch"><input id="runIncludeIPs" type="checkbox"><span class="track"></span><span class="switch-label">Включать IP</span></label>
                   <label class="field field-grow">Стратегии <span class="hint">пусто = все</span>
                     <select id="runStrategies" multiple size="5"></select>
+                  </label>
+                  <label class="field field-grow">Блобы <span class="hint">загрузятся в прогон</span>
+                    <select id="runBlobs" multiple size="5"></select>
                   </label>
                 </div>
                 <div class="actions">
@@ -182,6 +192,30 @@
           </div>
         </div>
       </section>
+
+      <!-- GEO -->
+      <section id="tab-geo" class="panel">
+        <div class="card">
+          <div class="card-head"><h2>GeoSite / GeoIP</h2></div>
+          <p class="hint">Загрузите <code>geosite.dat</code> / <code>geoip.dat</code> (формат v2ray) или текстовый список (домен/IP в строке). Затем импортируйте нужную категорию в тестовый список.</p>
+          <div class="geo-upload">
+            <label class="field field-sm">Тип
+              <select id="geoKind">
+                <option value="geosite">geosite.dat</option>
+                <option value="geoip">geoip.dat</option>
+                <option value="text">текст</option>
+              </select>
+            </label>
+            <div id="geoDrop" class="dropzone" tabindex="0" role="button">
+              <svg class="dz-icon" viewBox="0 0 24 24" width="30" height="30"><path d="M12 16V4m0 0 4 4m-4-4L8 8M5 16v2a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-2" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+              <div class="dz-text"><b>Перетащите файл</b> или нажмите</div>
+              <div id="geoName" class="dz-name"></div>
+              <input type="file" id="geoFile" hidden>
+            </div>
+          </div>
+        </div>
+        <div id="geoFiles"></div>
+      </section>
     </main>
   </div>
 </div>
@@ -194,6 +228,20 @@
     <h3 id="updateTitle">Обновление…</h3>
     <p id="updateMsg" class="hint">Скачиваем новую версию и перезапускаем сервис.</p>
   </div>
+</div>
+
+<div id="loginOverlay" class="overlay hidden">
+  <form id="loginForm" class="overlay-card login-card">
+    <span class="logo big" aria-hidden="true">
+      <svg viewBox="0 0 24 24" width="26" height="26"><path d="M13 2 4 14h6l-1 8 9-12h-6z" fill="currentColor"/></svg>
+    </span>
+    <h3>Вход</h3>
+    <p class="hint">Логин и пароль роутера (как в веб-интерфейсе nfqws).</p>
+    <label class="field">Логин<input id="loginUser" type="text" autocomplete="username" value="root"></label>
+    <label class="field">Пароль<input id="loginPass" type="password" autocomplete="current-password"></label>
+    <button class="btn btn-primary btn-block" type="submit">Войти</button>
+    <div id="loginErr" class="login-err"></div>
+  </form>
 </div>
 
 <script src="app.js"></script>

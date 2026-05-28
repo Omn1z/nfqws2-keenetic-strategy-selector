@@ -225,6 +225,23 @@ tr.fail td:first-child { box-shadow: inset 3px 0 0 var(--bad); }
 .dz-text b { color: var(--ink); }
 .dz-name { margin-top: 7px; font-size: 12.5px; color: var(--accent-d); font-weight: 600; min-height: 16px; }
 
+/* login */
+.login-card { width: 330px; text-align: center; }
+.login-card .field { text-align: left; }
+.login-card h3 { margin: 12px 0 2px; }
+.login-card .btn-block { margin-top: 8px; }
+.logo.big { width: 48px; height: 48px; border-radius: 14px; }
+.login-err { color: var(--bad); font-size: 13px; min-height: 18px; margin-top: 8px; }
+
+/* geo */
+.geo-upload { display: flex; gap: 14px; align-items: stretch; }
+.geo-upload .field-sm { margin: 0; }
+.geo-upload .dropzone { flex: 1; margin: 0; padding: 16px; display: flex; flex-direction: column; justify-content: center; }
+.geo-row { display: flex; gap: 10px; align-items: flex-end; flex-wrap: wrap; }
+.geo-row .field { margin: 0; }
+.geo-title { display: flex; align-items: center; gap: 10px; }
+.geo-title .badge { background: var(--accent-w); color: var(--accent-d); }
+
 /* ---------- toast ---------- */
 .toast {
   position: fixed; bottom: 22px; right: 22px; background: var(--toast-bg); color: var(--toast-ink);
