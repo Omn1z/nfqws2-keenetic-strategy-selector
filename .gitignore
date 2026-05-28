@@ -1,0 +1,8 @@
+/dist/
+*.exe
+# Claude Code session/harness artifacts
+/.claude/
+# dev/ holds device-specific helpers (kssh has the router password, spikes have the
+# router IP) and extracted GPL lua — not for redistribution.
+/dev/
+/tmp/

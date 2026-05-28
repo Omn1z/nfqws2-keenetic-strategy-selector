@@ -1,0 +1,130 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NFQWS2 Strategy Selector</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <h1>NFQWS2 Strategy Selector</h1>
+  <nav>
+    <button class="tab active" data-tab="lists">Списки и прогоны</button>
+    <button class="tab" data-tab="strategies">Стратегии</button>
+    <button class="tab" data-tab="blobs">Блобы</button>
+  </nav>
+  <span id="cfg" class="muted"></span>
+</header>
+
+<main>
+  <!-- LISTS TAB -->
+  <section id="tab-lists" class="tab-panel active">
+    <div class="cols">
+      <aside class="sidebar">
+        <button id="newList" class="primary">+ Новый список</button>
+        <ul id="listList" class="vlist"></ul>
+      </aside>
+      <div class="content">
+        <div id="listEditor" class="hidden">
+          <h2>Список</h2>
+          <label>Название<input id="listName" type="text" placeholder="Мой список"></label>
+          <div class="row">
+            <label class="grow">Домены (по одному в строке)
+              <textarea id="listDomains" rows="8" placeholder="rutracker.org&#10;x.com"></textarea>
+            </label>
+            <label class="grow">IP / CIDR (по одному в строке)
+              <textarea id="listIPs" rows="8" placeholder="1.2.3.0/24"></textarea>
+            </label>
+          </div>
+          <label>Тестовый URL (необязательно, по умолчанию https://&lt;домен&gt;/)
+            <input id="listTestURL" type="text" placeholder="https://example.com/big.bin"></label>
+          <div class="actions">
+            <button id="saveList" class="primary">Сохранить</button>
+            <button id="deleteList" class="danger">Удалить</button>
+          </div>
+
+          <hr>
+          <h2>Прогон стратегий</h2>
+          <div class="row wrap">
+            <label>Потоков<input id="runThreads" type="number" min="1" max="8" value="4"></label>
+            <label class="check"><input id="runIncludeIPs" type="checkbox"> Включать IP в прогон</label>
+            <label class="grow">Стратегии
+              <select id="runStrategies" multiple size="5"></select>
+              <small class="muted">Ничего не выбрано = все стратегии</small>
+            </label>
+          </div>
+          <div class="actions">
+            <button id="startRun" class="primary">▶ Запустить прогон</button>
+            <button id="cancelRun" class="danger hidden">■ Отменить</button>
+            <span id="runStatus" class="muted"></span>
+          </div>
+          <div id="progressWrap" class="hidden">
+            <div class="progress"><div id="progressBar"></div></div>
+            <span id="progressText" class="muted"></span>
+          </div>
+
+          <h3>Результаты прогона <small class="muted">(клик по заголовку — сортировка)</small></h3>
+          <table id="resultsTable" class="data">
+            <thead><tr>
+              <th data-sort="name">Стратегия</th>
+              <th data-sort="targets">Цели OK</th>
+              <th data-sort="latency">Задержка, мс</th>
+              <th data-sort="speed">Скорость, КБ/с</th>
+              <th data-sort="coef">Коэффициент</th>
+              <th></th>
+            </tr></thead>
+            <tbody></tbody>
+          </table>
+
+          <h3>Сохранённые рабочие стратегии списка <small class="muted">(по скорости)</small></h3>
+          <table id="savedTable" class="data">
+            <thead><tr><th>Стратегия</th><th>Задержка</th><th>Скорость</th><th>Коэф.</th><th></th></tr></thead>
+            <tbody></tbody>
+          </table>
+        </div>
+        <p id="listsEmpty" class="muted">Выберите список слева или создайте новый.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- STRATEGIES TAB -->
+  <section id="tab-strategies" class="tab-panel">
+    <h2>Каталог стратегий</h2>
+    <table id="stratTable" class="data">
+      <thead><tr><th>ID</th><th>Название</th><th>L7</th><th>Args</th><th>Источник</th><th></th></tr></thead>
+      <tbody></tbody>
+    </table>
+    <hr>
+    <h3 id="stratFormTitle">Добавить свою стратегию</h3>
+    <input id="stratId" type="hidden">
+    <label>Название<input id="stratName" type="text"></label>
+    <label>L7 (tls / http / quic)<input id="stratL7" type="text" value="tls"></label>
+    <label>Args (строка аргументов nfqws2 без --new)
+      <textarea id="stratArgs" rows="4" placeholder="--filter-tcp=443 --filter-l7=tls --payload=tls_client_hello --lua-desync=..."></textarea>
+    </label>
+    <div class="actions">
+      <button id="saveStrat" class="primary">Сохранить</button>
+      <button id="resetStrat">Очистить</button>
+    </div>
+  </section>
+
+  <!-- BLOBS TAB -->
+  <section id="tab-blobs" class="tab-panel">
+    <h2>Блобы</h2>
+    <p class="muted">Свой блоб можно использовать в стратегии так: <code>--blob=имя:@/путь</code>. После загрузки путь показывается ниже.</p>
+    <form id="blobForm">
+      <input type="file" id="blobFile" required>
+      <button class="primary" type="submit">Загрузить</button>
+    </form>
+    <div class="row">
+      <div class="grow"><h3>Пользовательские</h3><ul id="customBlobs" class="vlist"></ul></div>
+      <div class="grow"><h3>Системные</h3><ul id="systemBlobs" class="vlist mono"></ul></div>
+    </div>
+  </section>
+</main>
+
+<div id="toast" class="toast hidden"></div>
+<script src="app.js"></script>
+</body>
+</html>

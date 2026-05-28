@@ -1,0 +1,11 @@
+# Force LF for all text files. The shell scripts and the generated init script
+# run on busybox sh on the router, which chokes on CRLF; Go also expects LF.
+* text=auto eol=lf
+*.sh text eol=lf
+*.go text eol=lf
+*.js text eol=lf
+*.css text eol=lf
+*.html text eol=lf
+*.md text eol=lf
+*.yml text eol=lf
+*.ps1 text eol=lf
