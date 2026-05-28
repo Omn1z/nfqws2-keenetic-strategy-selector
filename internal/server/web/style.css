@@ -270,3 +270,34 @@ tr.fail td:first-child { box-shadow: inset 3px 0 0 var(--bad); }
   .grid { flex-direction: column; }
   .col-lists { width: 100%; }
 }
+
+/* ---------- checkbox lists ---------- */
+.cl-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 6px; }
+.cl-all { flex: none; }
+.checklist {
+  border: 1px solid var(--line); border-radius: 10px; background: var(--input-bg);
+  max-height: 168px; overflow-y: auto; padding: 4px;
+}
+.checklist:empty::after { content: "—"; color: var(--muted); display: block; padding: 10px; font-size: 12.5px; }
+.cl-item {
+  display: flex; align-items: center; gap: 9px; padding: 6px 8px; border-radius: 7px;
+  font-size: 13px; color: var(--ink); cursor: pointer; font-weight: 400;
+}
+.cl-item:hover { background: var(--line-soft); }
+.cl-item input { width: 16px; height: 16px; flex: none; accent-color: var(--accent); cursor: pointer; margin: 0; }
+.cl-item .cl-sub { margin-left: auto; color: var(--muted); font-size: 11.5px; }
+.checklist.disabled { opacity: .5; pointer-events: none; }
+
+/* ---------- baseline info ---------- */
+.baseline {
+  border: 1px solid var(--line); border-radius: 10px; background: var(--line-soft);
+  padding: 10px 12px; margin-bottom: 12px; font-size: 12.5px; color: var(--ink-soft);
+  animation: fadeIn .25s ease both;
+}
+.baseline b { color: var(--ink); }
+.baseline .badge { margin: 0 3px; }
+
+/* ---------- verdict badges ---------- */
+.badge.warn { background: rgba(240,160,32,.16); color: var(--warn); }
+.data tr.blocked td:first-child { box-shadow: inset 3px 0 0 var(--bad); }
+.data tr.reachable td:first-child { box-shadow: inset 3px 0 0 var(--ok); }

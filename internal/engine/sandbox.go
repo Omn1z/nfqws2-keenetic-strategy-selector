@@ -63,9 +63,18 @@ func iptQuiet(args ...string) {
 	_ = exec.Command("iptables", append([]string{"-w"}, args...)...).Run()
 }
 
-// RulesUp installs the sandbox's iptables chains and jumps. Idempotent-ish: it
-// flushes existing chains of the same name first.
-func (s *Sandbox) RulesUp() error {
+// RulesUp installs the sandbox's iptables chains and jumps so the test
+// connection is excluded from the main nfqws service and queued to this
+// sandbox's nfqws. Idempotent-ish: it flushes existing chains first.
+func (s *Sandbox) RulesUp() error { return s.rulesUp(true) }
+
+// RulesUpExcludeOnly installs chains that only mark the test connection as
+// excluded from the main nfqws service WITHOUT queuing it anywhere, i.e. the
+// connection gets no desync at all. This yields a true baseline ("is the host
+// blocked with no bypass?") even while the main nfqws service is running.
+func (s *Sandbox) RulesUpExcludeOnly() error { return s.rulesUp(false) }
+
+func (s *Sandbox) rulesUp(queue bool) error {
 	pc, prc := s.postChain(), s.preChain()
 	sport := fmt.Sprintf("%d:%d", s.PortLo, s.PortHi)
 	q := strconv.Itoa(s.QNum)
@@ -90,6 +99,9 @@ func (s *Sandbox) RulesUp() error {
 		if err := ipt("-t", "mangle", "-A", pc, "-o", ifc, "-p", "tcp", "--dport", "443", "--sport", sport,
 			"-j", "CONNMARK", "--set-xmark", exclMark); err != nil {
 			return err
+		}
+		if !queue {
+			continue
 		}
 		// Queue first outgoing packets of the test connection to our nfqws.
 		if err := ipt("-t", "mangle", "-A", pc, "-o", ifc, "-p", "tcp", "--dport", "443", "--sport", sport,

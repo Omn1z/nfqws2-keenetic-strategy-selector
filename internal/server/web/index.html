@@ -49,6 +49,10 @@
         <svg viewBox="0 0 24 24" width="18" height="18"><path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
         <span>Списки и прогоны</span>
       </button>
+      <button class="nav-item" data-tab="blockcheck">
+        <svg viewBox="0 0 24 24" width="18" height="18"><path d="M12 2 4 6v6c0 5 3.5 8 8 10 4.5-2 8-5 8-10V6z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/><path d="m9 12 2 2 4-4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        <span>BlockCheck</span>
+      </button>
       <button class="nav-item" data-tab="strategies">
         <svg viewBox="0 0 24 24" width="18" height="18"><path d="M13 2 4 14h6l-1 8 9-12h-6z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg>
         <span>Стратегии</span>
@@ -98,12 +102,20 @@
                 <div class="run-row">
                   <label class="field field-sm">Потоков<input id="runThreads" type="number" min="1" max="8" value="4"></label>
                   <label class="switch"><input id="runIncludeIPs" type="checkbox"><span class="track"></span><span class="switch-label">Включать IP</span></label>
-                  <label class="field field-grow">Стратегии <span class="hint">пусто = все</span>
-                    <select id="runStrategies" multiple size="5"></select>
-                  </label>
-                  <label class="field field-grow">Блобы <span class="hint">загрузятся в прогон</span>
-                    <select id="runBlobs" multiple size="5"></select>
-                  </label>
+                  <label class="switch"><input id="runAuto" type="checkbox"><span class="track"></span><span class="switch-label">Автоподбор</span></label>
+                </div>
+                <div class="run-row">
+                  <div class="field field-grow">
+                    <div class="cl-head"><span>Стратегии <span class="hint">пусто = все</span></span>
+                      <button type="button" class="btn btn-mini cl-all" data-target="runStrategies">Выбрать все</button></div>
+                    <div id="runStrategies" class="checklist"></div>
+                    <div id="autoHint" class="hint hidden">Автоподбор сам перебирает встроенный каталог кандидатов — выбор стратегий не используется.</div>
+                  </div>
+                  <div class="field field-grow">
+                    <div class="cl-head"><span>Блобы <span class="hint">загрузятся в прогон</span></span>
+                      <button type="button" class="btn btn-mini cl-all" data-target="runBlobs">Выбрать все</button></div>
+                    <div id="runBlobs" class="checklist"></div>
+                  </div>
                 </div>
                 <div class="actions">
                   <button id="startRun" class="btn btn-primary">▶ Запустить прогон</button>
@@ -118,6 +130,7 @@
 
               <div class="card">
                 <div class="card-head"><h2>Результаты прогона</h2><span class="hint">клик по заголовку — сортировка</span></div>
+                <div id="baselineInfo" class="baseline hidden"></div>
                 <div class="table-wrap">
                   <table id="resultsTable" class="data">
                     <thead><tr>
@@ -143,6 +156,37 @@
                 </div>
               </div>
             </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- BLOCKCHECK -->
+      <section id="tab-blockcheck" class="panel">
+        <div class="card">
+          <div class="card-head"><h2>BlockCheck</h2><span class="hint">проверка блокировки без обхода</span></div>
+          <p class="hint">Проверяет доступность доменов/IP из списка напрямую: тестовое соединение исключается из основного сервиса nfqws2 и не обходится, поэтому видно, что реально блокирует провайдер (RST, таймаут, обрыв на ~16 КБ).</p>
+          <div class="run-row">
+            <label class="field field-grow">Список<select id="bcList"></select></label>
+            <label class="field field-sm">Потоков<input id="bcThreads" type="number" min="1" max="8" value="4"></label>
+            <label class="switch"><input id="bcIncludeIPs" type="checkbox"><span class="track"></span><span class="switch-label">Включать IP</span></label>
+          </div>
+          <div class="actions">
+            <button id="startBC" class="btn btn-primary">▶ Проверить</button>
+            <button id="cancelBC" class="btn btn-ghost-danger hidden">■ Отменить</button>
+            <span id="bcStatus" class="run-status"></span>
+          </div>
+          <div id="bcProgressWrap" class="hidden">
+            <div class="progress"><div id="bcProgressBar" class="progress-bar"></div></div>
+            <span id="bcProgressText" class="hint"></span>
+          </div>
+        </div>
+        <div class="card">
+          <div class="card-head"><h2>Результаты проверки</h2><span class="hint">заблокированные сверху</span></div>
+          <div class="table-wrap">
+            <table id="bcTable" class="data">
+              <thead><tr><th>Цель</th><th>Статус</th><th>Задержка</th><th>Скорость</th><th>Код</th></tr></thead>
+              <tbody></tbody>
+            </table>
           </div>
         </div>
       </section>

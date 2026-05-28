@@ -30,8 +30,54 @@ const kb = (bps) => (bps / 1024).toFixed(0);
 const state = {
   lists: [], selected: null, strategies: [],
   run: null, poll: null, results: [], sort: { key: "coef", dir: -1 },
+  bc: null, bcPoll: null,
   version: "", latest: "",
 };
+
+/* verdict labels shared by baseline (auto run) and BlockCheck */
+const VERDICT = {
+  ok: ["доступен", "ok"], cap16k: ["обрыв 16КБ", "bad"], reset: ["RST", "bad"],
+  timeout: ["таймаут", "bad"], refused: ["отказ", "warn"], dns: ["DNS", "warn"], error: ["ошибка", "bad"],
+};
+function verdictBadge(v) {
+  const [label, kind] = VERDICT[v] || [v || "?", "bad"];
+  return `<span class="badge ${kind}">${esc(label)}</span>`;
+}
+
+/* ---------- checkbox lists ---------- */
+function clBoxes(elId) { return $$("#" + elId + " input[type=checkbox]"); }
+function clSelected(elId) { return clBoxes(elId).filter(c => c.checked).map(c => c.value); }
+function renderChecklist(elId, items) {
+  const box = $("#" + elId); if (!box) return;
+  box.innerHTML = "";
+  items.forEach(it => {
+    const lbl = document.createElement("label");
+    lbl.className = "cl-item";
+    lbl.innerHTML = `<input type="checkbox" value="${esc(it.value)}"><span class="cl-text">${esc(it.label)}</span>` +
+      (it.sub ? `<span class="cl-sub">${esc(it.sub)}</span>` : "");
+    box.appendChild(lbl);
+  });
+  updateAllBtn(elId);
+}
+function updateAllBtn(elId) {
+  const boxes = clBoxes(elId);
+  const all = boxes.length > 0 && boxes.every(c => c.checked);
+  const btn = $(`.cl-all[data-target="${elId}"]`);
+  if (btn) btn.textContent = all ? "Снять все" : "Выбрать все";
+}
+function toggleAll(elId) {
+  const boxes = clBoxes(elId);
+  const all = boxes.length > 0 && boxes.every(c => c.checked);
+  boxes.forEach(c => { c.checked = !all; });
+  updateAllBtn(elId);
+}
+$$(".cl-all").forEach(b => b.addEventListener("click", () => toggleAll(b.dataset.target)));
+$$(".checklist").forEach(box => box.addEventListener("change", () => updateAllBtn(box.id)));
+$("#runAuto").addEventListener("change", () => {
+  const on = $("#runAuto").checked;
+  $("#runStrategies").classList.toggle("disabled", on);
+  $("#autoHint").classList.toggle("hidden", !on);
+});
 
 /* ---------- navigation ---------- */
 $$(".nav-item").forEach(b => b.addEventListener("click", () => {
@@ -40,6 +86,7 @@ $$(".nav-item").forEach(b => b.addEventListener("click", () => {
   b.classList.add("active");
   const p = $("#tab-" + b.dataset.tab);
   p.classList.add("active");
+  if (b.dataset.tab === "blockcheck") fillBCLists();
 }));
 
 /* ---------- lists ---------- */
@@ -58,6 +105,7 @@ async function loadLists() {
     li.querySelector(".li-del").addEventListener("click", (e) => { e.stopPropagation(); deleteListById(l.id, l.name); });
     ul.appendChild(li);
   });
+  fillBCLists();
 }
 
 async function selectList(id) {
@@ -115,19 +163,15 @@ async function deleteListById(id, name) {
 
 /* ---------- run ---------- */
 function fillRunStrategies() {
-  const sel = $("#runStrategies"); sel.innerHTML = "";
-  state.strategies.forEach(s => {
-    const o = document.createElement("option");
-    o.value = s.id; o.textContent = `${s.name || s.id} [${s.l7 || "?"}]`;
-    sel.appendChild(o);
-  });
+  renderChecklist("runStrategies", state.strategies.map(s => ({ value: s.id, label: s.name || s.id, sub: s.l7 || "?" })));
 }
 
 $("#startRun").addEventListener("click", async () => {
   if (!state.selected || !state.selected.id) { toast("Сначала сохраните список", "err"); return; }
-  const ids = $$("#runStrategies option:checked").map(o => o.value);
-  const blobs = $$("#runBlobs option:checked").map(o => o.value);
-  const req = { list_id: state.selected.id, strategy_ids: ids, blobs, threads: parseInt($("#runThreads").value, 10) || 4, include_ips: $("#runIncludeIPs").checked };
+  const auto = $("#runAuto").checked;
+  const ids = auto ? [] : clSelected("runStrategies");
+  const blobs = clSelected("runBlobs");
+  const req = { list_id: state.selected.id, strategy_ids: ids, blobs, auto, threads: parseInt($("#runThreads").value, 10) || 4, include_ips: $("#runIncludeIPs").checked };
   try { state.run = await api("POST", "/api/runs", req); startPolling(); }
   catch (e) { toast(e.message, "err"); }
 });
@@ -150,13 +194,16 @@ function startPolling() {
       $("#runStatus").textContent = r.status;
       state.results = r.results || [];
       renderResults();
+      renderBaseline(r);
       if (r.status !== "running") {
         clearInterval(state.poll); state.poll = null;
         $("#cancelRun").classList.add("hidden");
         $("#startRun").disabled = false;
         if (state.selected) state.selected = await api("GET", "/api/lists/" + state.selected.id);
         renderSaved(); loadLists();
-        toast("Прогон завершён: " + r.status, "ok");
+        const ok = (r.results || []).filter(x => x.success).length;
+        if (r.auto && r.total === 0) toast("Цели доступны без обхода — обходить нечего", "ok");
+        else toast(`Прогон завершён: найдено рабочих ${ok}`, "ok");
       }
     } catch (e) { clearInterval(state.poll); state.poll = null; $("#startRun").disabled = false; toast(e.message, "err"); }
   };
@@ -203,6 +250,19 @@ function renderResults() {
   $$("#resultsTable button[data-apply]").forEach(b => b.addEventListener("click", () => applyStrategy(b.dataset.apply)));
 }
 
+function renderBaseline(r) {
+  const el = $("#baselineInfo");
+  const base = (r && r.baseline) || [];
+  if (!r || !r.auto || base.length === 0) { el.classList.add("hidden"); return; }
+  const blocked = base.filter(b => b.blocked).length;
+  const parts = base.map(b => `${esc(b.host)} ${verdictBadge(b.verdict)}`).join(" · ");
+  let head = `<b>Базовый замер без обхода:</b> заблокировано ${blocked} из ${base.length}. `;
+  if (blocked === 0) head += "Обходить нечего — всё доступно.";
+  else head += "Автоподбор тестируется только на заблокированных целях.";
+  el.innerHTML = head + `<div style="margin-top:6px">${parts}</div>`;
+  el.classList.remove("hidden");
+}
+
 function renderSaved() {
   const tb = $("#savedTable tbody"); tb.innerHTML = "";
   ((state.selected && state.selected.successful_strategies) || []).forEach(s => {
@@ -223,6 +283,69 @@ async function applyStrategy(args) {
   const restart = confirm("Перезапустить сервис nfqws2 сейчас? (затронет всю сеть)\n\nOK — перезапустить, Отмена — только записать конфиг.");
   try { await api("POST", "/api/apply", { args, restart }); toast(restart ? "Применено и перезапущено" : "Записано в конфиг", "ok"); }
   catch (e) { toast(e.message, "err"); }
+}
+
+/* ---------- blockcheck ---------- */
+function fillBCLists() {
+  const sel = $("#bcList"); if (!sel) return;
+  const cur = sel.value;
+  sel.innerHTML = "";
+  state.lists.forEach(l => {
+    const o = document.createElement("option");
+    o.value = l.id; o.textContent = `${l.name || l.id} (${(l.domains || []).length} дом.)`;
+    sel.appendChild(o);
+  });
+  if (cur) sel.value = cur;
+}
+$("#startBC").addEventListener("click", async () => {
+  const listId = $("#bcList").value;
+  if (!listId) { toast("Нет списков — создайте список во вкладке «Списки»", "err"); return; }
+  const req = { list_id: listId, threads: parseInt($("#bcThreads").value, 10) || 4, include_ips: $("#bcIncludeIPs").checked };
+  try { state.bc = await api("POST", "/api/blockcheck", req); startBCPolling(); }
+  catch (e) { toast(e.message, "err"); }
+});
+$("#cancelBC").addEventListener("click", async () => {
+  if (state.bc) { try { await api("POST", "/api/blockcheck/" + state.bc.id + "/cancel"); } catch (e) { toast(e.message, "err"); } }
+});
+function startBCPolling() {
+  $("#bcProgressWrap").classList.remove("hidden");
+  $("#cancelBC").classList.remove("hidden");
+  $("#startBC").disabled = true;
+  if (state.bcPoll) clearInterval(state.bcPoll);
+  const tick = async () => {
+    try {
+      const r = await api("GET", "/api/blockcheck/" + state.bc.id);
+      state.bc = r;
+      const pct = r.total ? Math.round(r.done * 100 / r.total) : 0;
+      $("#bcProgressBar").style.width = pct + "%";
+      $("#bcProgressText").textContent = `${r.done}/${r.total} целей · ${r.status}`;
+      $("#bcStatus").textContent = r.status;
+      renderBC(r);
+      if (r.status !== "running") {
+        clearInterval(state.bcPoll); state.bcPoll = null;
+        $("#cancelBC").classList.add("hidden");
+        $("#startBC").disabled = false;
+        const blocked = (r.targets || []).filter(t => t.blocked).length;
+        toast(`Проверка завершена: заблокировано ${blocked} из ${r.total}`, "ok");
+      }
+    } catch (e) { clearInterval(state.bcPoll); state.bcPoll = null; $("#startBC").disabled = false; toast(e.message, "err"); }
+  };
+  tick();
+  state.bcPoll = setInterval(tick, 1000);
+}
+function renderBC(r) {
+  const tb = $("#bcTable tbody"); tb.innerHTML = "";
+  (r.targets || []).forEach(t => {
+    const tr = document.createElement("tr");
+    tr.className = t.blocked ? "blocked" : "reachable";
+    tr.innerHTML = `
+      <td>${esc(t.host)}</td>
+      <td>${verdictBadge(t.verdict)}${t.err ? `<div class="args" title="${esc(t.err)}">${esc(t.err)}</div>` : ""}</td>
+      <td class="num">${t.ttfb_ms ? t.ttfb_ms + " мс" : "—"}</td>
+      <td class="num">${t.speed_bps ? kb(t.speed_bps) + " КБ/с" : "—"}</td>
+      <td class="num">${t.code || "—"}</td>`;
+    tb.appendChild(tr);
+  });
 }
 
 /* ---------- strategies ---------- */
@@ -274,10 +397,11 @@ async function loadBlobs() {
   (b.custom || []).forEach(n => { const li = document.createElement("li"); li.textContent = n; cu.appendChild(li); });
   const sy = $("#systemBlobs"); sy.innerHTML = "";
   (b.system || []).forEach(n => { const li = document.createElement("li"); li.textContent = n; sy.appendChild(li); });
-  // run-config blob multiselect (custom first, then system)
-  const sel = $("#runBlobs"); sel.innerHTML = "";
-  (b.custom || []).forEach(n => { const o = document.createElement("option"); o.value = n; o.textContent = n + " (свой)"; sel.appendChild(o); });
-  (b.system || []).forEach(n => { const o = document.createElement("option"); o.value = n; o.textContent = n; sel.appendChild(o); });
+  // run-config blob checklist (custom first, then system)
+  const items = [];
+  (b.custom || []).forEach(n => items.push({ value: n, label: n, sub: "свой" }));
+  (b.system || []).forEach(n => items.push({ value: n, label: n }));
+  renderChecklist("runBlobs", items);
 }
 const blobDrop = $("#blobDrop"), blobInput = $("#blobFile");
 async function uploadBlob(file) {

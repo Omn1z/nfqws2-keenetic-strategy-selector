@@ -122,6 +122,10 @@ func (s *Server) routes() {
 	m.HandleFunc("GET /api/runs/{id}", s.getRun)
 	m.HandleFunc("POST /api/runs/{id}/cancel", s.cancelRun)
 
+	m.HandleFunc("POST /api/blockcheck", s.startBlockCheck)
+	m.HandleFunc("GET /api/blockcheck/{id}", s.getBlockCheck)
+	m.HandleFunc("POST /api/blockcheck/{id}/cancel", s.cancelBlockCheck)
+
 	m.HandleFunc("POST /api/apply", s.applyStrategy)
 
 	m.HandleFunc("GET /api/update/check", s.checkUpdate)
@@ -348,6 +352,37 @@ func (s *Server) getRun(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) cancelRun(w http.ResponseWriter, r *http.Request) {
 	if err := s.app.CancelRun(r.PathValue("id")); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, map[string]string{"status": "cancelling"})
+}
+
+func (s *Server) startBlockCheck(w http.ResponseWriter, r *http.Request) {
+	var req app.BlockCheckRequest
+	if err := readJSON(r, &req); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	bc, err := s.app.StartBlockCheck(req)
+	if err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, bc)
+}
+
+func (s *Server) getBlockCheck(w http.ResponseWriter, r *http.Request) {
+	bc, ok := s.app.GetBlockCheck(r.PathValue("id"))
+	if !ok {
+		httpErr(w, 404, errNotFound)
+		return
+	}
+	writeJSON(w, 200, bc)
+}
+
+func (s *Server) cancelBlockCheck(w http.ResponseWriter, r *http.Request) {
+	if err := s.app.CancelBlockCheck(r.PathValue("id")); err != nil {
 		httpErr(w, 400, err)
 		return
 	}

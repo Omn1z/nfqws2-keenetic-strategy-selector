@@ -24,6 +24,7 @@ type RunRequest struct {
 	StrategyIDs []string `json:"strategy_ids"` // empty = all known strategies
 	Threads     int      `json:"threads"`
 	IncludeIPs  bool     `json:"include_ips"`
+	Auto        bool     `json:"auto"`  // automatic selection over the candidate catalog
 	Blobs       []string `json:"blobs"` // blob filenames loaded for every tested strategy
 }
 
@@ -63,7 +64,15 @@ func (a *App) GetRun(id string) (*Run, bool) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	r, ok := a.runs[id]
-	return r, ok
+	if !ok {
+		return nil, false
+	}
+	// Snapshot under the lock: workers append to the live run concurrently, so the
+	// caller must not encode the original slices.
+	cp := *r
+	cp.Results = append([]StrategyResult(nil), r.Results...)
+	cp.Baseline = append([]TargetCheck(nil), r.Baseline...)
+	return &cp, true
 }
 
 func (a *App) ActiveRun() *Run {
@@ -97,18 +106,22 @@ func (a *App) StartRun(req RunRequest) (*Run, error) {
 		return nil, fmt.Errorf("list has no targets")
 	}
 
-	all := a.Strategies()
 	var strategies []catalog.Strategy
-	if len(req.StrategyIDs) == 0 {
-		strategies = all
+	if req.Auto {
+		strategies = catalog.AutoCandidates()
 	} else {
-		want := map[string]bool{}
-		for _, id := range req.StrategyIDs {
-			want[id] = true
-		}
-		for _, s := range all {
-			if want[s.ID] {
-				strategies = append(strategies, s)
+		all := a.Strategies()
+		if len(req.StrategyIDs) == 0 {
+			strategies = all
+		} else {
+			want := map[string]bool{}
+			for _, id := range req.StrategyIDs {
+				want[id] = true
+			}
+			for _, s := range all {
+				if want[s.ID] {
+					strategies = append(strategies, s)
+				}
 			}
 		}
 	}
@@ -128,7 +141,7 @@ func (a *App) StartRun(req RunRequest) (*Run, error) {
 	}
 
 	a.mu.Lock()
-	if a.active != nil {
+	if a.active != nil || a.activeBC != nil {
 		a.mu.Unlock()
 		return nil, fmt.Errorf("a run is already in progress")
 	}
@@ -137,6 +150,7 @@ func (a *App) StartRun(req RunRequest) (*Run, error) {
 		ListID:    list.ID,
 		ListName:  list.Name,
 		Threads:   threads,
+		Auto:      req.Auto,
 		Status:    "running",
 		Total:     len(strategies),
 		StartedAt: time.Now().Unix(),
@@ -168,6 +182,39 @@ func (a *App) executeRun(ctx context.Context, run *Run, list *List, strategies [
 		_ = a.saveRun(run)
 	}()
 
+	testTargets := targets
+	if run.Auto {
+		// Baseline: probe each target with NO bypass at all (exclude-only sandbox,
+		// so the running main nfqws service skips it and nothing desyncs it). This
+		// reveals what's truly blocked; we then test candidates only on those.
+		bsb := engine.NewSandbox(a.Cfg, threads)
+		if err := bsb.RulesUpExcludeOnly(); err != nil {
+			a.failRun(run, fmt.Sprintf("baseline rules: %v", err))
+			return
+		}
+		base := baselineCheck(ctx, probe.New(bsb.PortLo, bsb.PortHi), targets)
+		bsb.RulesDown()
+		a.mu.Lock()
+		run.Baseline = base
+		a.mu.Unlock()
+		if ctx.Err() != nil {
+			return
+		}
+		var blocked []string
+		for _, tc := range base {
+			if tc.Blocked {
+				blocked = append(blocked, tc.Host)
+			}
+		}
+		if len(blocked) == 0 {
+			a.mu.Lock()
+			run.Total = 0 // nothing blocked without bypass — no strategy needed
+			a.mu.Unlock()
+			return
+		}
+		testTargets = blocked
+	}
+
 	// Build sandboxes (one per worker) and bring up their iptables rules.
 	sandboxes := make([]*engine.Sandbox, threads)
 	for w := 0; w < threads; w++ {
@@ -188,7 +235,6 @@ func (a *App) executeRun(ctx context.Context, run *Run, list *List, strategies [
 		}
 	}()
 
-	results := make([]StrategyResult, len(strategies))
 	jobs := make(chan int)
 	var done int32
 	var wg sync.WaitGroup
@@ -202,9 +248,11 @@ func (a *App) executeRun(ctx context.Context, run *Run, list *List, strategies [
 				if ctx.Err() != nil {
 					return
 				}
-				results[idx] = a.testStrategy(ctx, sb, pr, strategies[idx], targets, blobArgs)
+				res := a.testStrategy(ctx, sb, pr, strategies[idx], testTargets, blobArgs)
 				n := atomic.AddInt32(&done, 1)
+				// Append live so the UI fills the results table as each strategy completes.
 				a.mu.Lock()
+				run.Results = append(run.Results, res)
 				run.Done = int(n)
 				a.mu.Unlock()
 			}
@@ -222,23 +270,71 @@ wait:
 	close(jobs)
 	wg.Wait()
 
-	// Collect results that were actually computed.
-	final := make([]StrategyResult, 0, len(results))
-	for _, r := range results {
-		if r.StrategyID != "" {
-			final = append(final, r)
-		}
-	}
-	sortResults(final)
-
 	a.mu.Lock()
-	run.Results = final
+	sortResults(run.Results)
 	if ctx.Err() != nil {
 		run.Status = "cancelled"
 	}
+	final := append([]StrategyResult{}, run.Results...)
 	a.mu.Unlock()
 
 	a.mergeSuccessful(list, run, final)
+}
+
+// baselineCheck probes each target with no bypass and classifies reachability.
+func baselineCheck(ctx context.Context, pr *probe.Prober, targets []string) []TargetCheck {
+	out := make([]TargetCheck, len(targets))
+	sem := make(chan struct{}, 8)
+	var wg sync.WaitGroup
+	for i, t := range targets {
+		if ctx.Err() != nil {
+			break
+		}
+		wg.Add(1)
+		go func(i int, t string) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			out[i] = classifyProbe(t, pr.Probe(t))
+		}(i, t)
+	}
+	wg.Wait()
+	res := make([]TargetCheck, 0, len(out))
+	for _, tc := range out {
+		if tc.Host != "" {
+			res = append(res, tc)
+		}
+	}
+	return res
+}
+
+// classifyProbe turns a raw probe result into a no-bypass reachability verdict.
+// The 16 KB truncation (the cap this whole tool targets), connection resets and
+// timeouts are the block signals; an HTTP response that isn't cut means reachable.
+func classifyProbe(host string, r probe.Result) TargetCheck {
+	tc := TargetCheck{Host: host, Code: r.Code, Size: r.Size, TTFBms: r.TTFBms, SpeedBps: r.SpeedBps, Err: r.Err}
+	switch {
+	case r.Truncated:
+		tc.Verdict, tc.Blocked = "cap16k", true
+	case r.Code != 0:
+		tc.Verdict, tc.Blocked = "ok", false
+	default:
+		e := strings.ToLower(r.Err)
+		switch {
+		case strings.Contains(e, "no such host"), strings.Contains(e, "lookup"), strings.Contains(e, "server misbehaving"):
+			tc.Verdict = "dns"
+		case strings.Contains(e, "reset"), strings.Contains(e, "forcibly closed"):
+			tc.Verdict = "reset"
+		case strings.Contains(e, "refused"):
+			tc.Verdict = "refused"
+		case strings.Contains(e, "timeout"), strings.Contains(e, "deadline"):
+			tc.Verdict = "timeout"
+		default:
+			tc.Verdict = "error"
+		}
+		tc.Blocked = true
+	}
+	return tc
 }
 
 func (a *App) testStrategy(ctx context.Context, sb *engine.Sandbox, pr *probe.Prober, s catalog.Strategy, targets []string, blobArgs []string) StrategyResult {

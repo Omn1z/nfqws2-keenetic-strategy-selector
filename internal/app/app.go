@@ -31,6 +31,10 @@ type App struct {
 	active   *Run               // currently running, if any
 	cancel   func()             // cancel for the active run
 
+	activeBC *BlockCheck // currently running block check, if any
+	cancelBC func()      // cancel for the active block check
+	lastBC   *BlockCheck // most recently finished block check (for the final poll)
+
 	sessions    *auth.Sessions
 	authEnabled bool
 }
@@ -132,8 +136,8 @@ func (a *App) GetStrategy(id string) (catalog.Strategy, bool) {
 
 func (a *App) SaveCustomStrategy(s catalog.Strategy) (catalog.Strategy, error) {
 	s.Source = "custom"
-	if strings.TrimSpace(s.ArgLine) == "" {
-		return s, fmt.Errorf("strategy args are empty")
+	if err := catalog.Validate(s.ArgLine); err != nil {
+		return s, err
 	}
 	a.mu.Lock()
 	defer a.mu.Unlock()

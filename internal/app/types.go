@@ -33,6 +33,7 @@ type Run struct {
 	ListID     string           `json:"list_id"`
 	ListName   string           `json:"list_name"`
 	Threads    int              `json:"threads"`
+	Auto       bool             `json:"auto"` // automatic strategy selection over the candidate catalog
 	Status     string           `json:"status"` // running | done | cancelled | error
 	Error      string           `json:"error,omitempty"`
 	Total      int              `json:"total"` // strategies to test
@@ -40,7 +41,36 @@ type Run struct {
 	StartedAt  int64            `json:"started_at"`
 	FinishedAt int64            `json:"finished_at,omitempty"`
 	Targets    []string         `json:"targets"`
+	Baseline   []TargetCheck    `json:"baseline,omitempty"` // no-bypass reachability of each target (auto runs)
 	Results    []StrategyResult `json:"results"`
+}
+
+// BlockCheck captures a plain reachability check of a list's targets without any
+// bypass: it tells the user which domains/IPs are actually DPI-blocked.
+type BlockCheck struct {
+	ID         string        `json:"id"`
+	ListID     string        `json:"list_id"`
+	ListName   string        `json:"list_name"`
+	Threads    int           `json:"threads"`
+	Status     string        `json:"status"` // running | done | cancelled | error
+	Error      string        `json:"error,omitempty"`
+	Total      int           `json:"total"`
+	Done       int           `json:"done"`
+	StartedAt  int64         `json:"started_at"`
+	FinishedAt int64         `json:"finished_at,omitempty"`
+	Targets    []TargetCheck `json:"targets"`
+}
+
+// TargetCheck is the no-bypass reachability verdict for one domain/IP.
+type TargetCheck struct {
+	Host     string `json:"host"`
+	Blocked  bool   `json:"blocked"`
+	Verdict  string `json:"verdict"` // ok | timeout | reset | refused | cap16k | dns | error
+	Code     int    `json:"code"`
+	Size     int64  `json:"size"`
+	TTFBms   int64  `json:"ttfb_ms"`
+	SpeedBps int64  `json:"speed_bps"`
+	Err      string `json:"err,omitempty"`
 }
 
 // StrategyResult aggregates one strategy across all of a run's targets.
