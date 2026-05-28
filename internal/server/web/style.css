@@ -294,6 +294,17 @@ tr.fail td:first-child { box-shadow: inset 3px 0 0 var(--bad); }
 .card-head .head-action { margin-left: auto; align-self: center; }
 .login-card .logo.big { margin: 0 auto 4px; }
 
+/* segmented source selector (Список / GeoSite-GeoIP / Текст) */
+.srcsel { margin-bottom: 4px; }
+.seg { display: inline-flex; border: 1px solid var(--line); border-radius: 9px; overflow: hidden; margin-bottom: 12px; }
+.seg-btn { border: 0; background: var(--panel); color: var(--ink-soft); padding: 7px 14px; font-size: 13px; cursor: pointer; border-right: 1px solid var(--line); transition: background .15s, color .15s; }
+.seg-btn:last-child { border-right: 0; }
+.seg-btn.active { background: var(--accent); color: #fff; }
+.seg-btn:not(.active):hover { background: var(--line-soft); }
+/* vertically center the threads + Автоподбор row */
+.run-row.mid { align-items: center; }
+.run-row.mid > * { margin-bottom: 0; }
+
 /* ---------- baseline info ---------- */
 .baseline {
   border: 1px solid var(--line); border-radius: 10px; background: var(--line-soft);

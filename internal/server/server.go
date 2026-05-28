@@ -140,6 +140,7 @@ func (s *Server) routes() {
 	m.HandleFunc("POST /api/geo", s.uploadGeo)
 	m.HandleFunc("DELETE /api/geo/{name}", s.deleteGeo)
 	m.HandleFunc("POST /api/geo/import", s.importGeo)
+	m.HandleFunc("POST /api/geo/resolve", s.resolveGeo)
 
 	sub, _ := fs.Sub(webAssets, "web")
 	m.HandleFunc("GET /{$}", s.serveIndex)
@@ -321,6 +322,24 @@ func (s *Server) importGeo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, list)
+}
+
+func (s *Server) resolveGeo(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Geo      string `json:"geo"`
+		Category string `json:"category"`
+		Limit    int    `json:"limit"`
+	}
+	if err := readJSON(r, &in); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	targets, err := s.app.ResolveGeo(in.Geo, in.Category, in.Limit)
+	if err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"targets": targets})
 }
 
 func (s *Server) startRun(w http.ResponseWriter, r *http.Request) {

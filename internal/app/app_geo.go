@@ -119,6 +119,24 @@ func (a *App) ImportGeo(geoName, category string, limit int, listID, listName st
 	return a.SaveList(list)
 }
 
+// ResolveGeo returns a category's entries (capped at limit, 0 = all) as a flat
+// target list, without creating a list — used for ad-hoc runs/checks against a
+// geo category.
+func (a *App) ResolveGeo(geoName, category string, limit int) ([]string, error) {
+	_, m, err := a.parseGeo(geoName)
+	if err != nil {
+		return nil, err
+	}
+	items, ok := m[strings.ToLower(category)]
+	if !ok {
+		return nil, fmt.Errorf("category %q not found", category)
+	}
+	if limit > 0 && len(items) > limit {
+		items = items[:limit]
+	}
+	return append([]string{}, items...), nil
+}
+
 func isIPish(s string) bool {
 	if _, _, err := net.ParseCIDR(s); err == nil {
 		return true

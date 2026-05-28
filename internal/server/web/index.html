@@ -47,7 +47,11 @@
     <nav class="sidenav">
       <button class="nav-item active" data-tab="lists">
         <svg viewBox="0 0 24 24" width="18" height="18"><path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
-        <span>Списки и прогоны</span>
+        <span>Списки</span>
+      </button>
+      <button class="nav-item" data-tab="runs">
+        <svg viewBox="0 0 24 24" width="18" height="18"><path d="M6 4l14 8-14 8z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg>
+        <span>Прогоны</span>
       </button>
       <button class="nav-item" data-tab="blockcheck">
         <svg viewBox="0 0 24 24" width="18" height="18"><path d="M12 2 4 6v6c0 5 3.5 8 8 10 4.5-2 8-5 8-10V6z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/><path d="m9 12 2 2 4-4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
@@ -103,55 +107,6 @@
               </div>
 
               <div class="card">
-                <div class="card-head"><h2>Прогон стратегий</h2></div>
-                <div class="run-row">
-                  <label class="field field-sm">Потоков<input id="runThreads" type="number" min="1" max="8" value="4"></label>
-                  <label class="switch"><input id="runAuto" type="checkbox"><span class="track"></span><span class="switch-label">Автоподбор</span></label>
-                </div>
-                <div class="run-row cols">
-                  <div class="field field-grow">
-                    <div class="cl-head"><span>Стратегии <span class="hint">пусто = все</span></span>
-                      <button type="button" class="btn btn-mini cl-all" data-target="runStrategies">Выбрать все</button></div>
-                    <div id="runStrategies" class="checklist"></div>
-                    <div id="autoHint" class="hint hidden">Автоподбор сам перебирает встроенный каталог кандидатов — выбор стратегий не используется.</div>
-                  </div>
-                  <div class="field field-grow">
-                    <div class="cl-head"><span>Блобы <span class="hint">загрузятся в прогон</span></span>
-                      <button type="button" class="btn btn-mini cl-all" data-target="runBlobs">Выбрать все</button></div>
-                    <div id="runBlobs" class="checklist"></div>
-                  </div>
-                </div>
-                <div class="actions">
-                  <button id="startRun" class="btn btn-primary">▶ Запустить прогон</button>
-                  <button id="cancelRun" class="btn btn-ghost-danger hidden">■ Отменить</button>
-                  <span id="runStatus" class="run-status"></span>
-                </div>
-                <div id="progressWrap" class="hidden">
-                  <div class="progress"><div id="progressBar" class="progress-bar"></div></div>
-                  <span id="progressText" class="hint"></span>
-                </div>
-              </div>
-
-              <div class="card">
-                <div class="card-head"><h2>Результаты прогона</h2><span class="hint">клик по заголовку — сортировка</span></div>
-                <div id="baselineInfo" class="baseline hidden"></div>
-                <div class="table-wrap">
-                  <table id="resultsTable" class="data">
-                    <thead><tr>
-                      <th data-sort="status">Статус</th>
-                      <th data-sort="name">Стратегия</th>
-                      <th data-sort="targets">Цели</th>
-                      <th data-sort="latency">Задержка</th>
-                      <th data-sort="speed">Скорость</th>
-                      <th data-sort="coef">Коэф.</th>
-                      <th></th>
-                    </tr></thead>
-                    <tbody></tbody>
-                  </table>
-                </div>
-              </div>
-
-              <div class="card">
                 <div class="card-head"><h2>Рабочие стратегии списка</h2><span class="hint">по скорости</span></div>
                 <div class="table-wrap">
                   <table id="savedTable" class="data">
@@ -165,13 +120,106 @@
         </div>
       </section>
 
+      <!-- RUNS -->
+      <section id="tab-runs" class="panel">
+        <div class="card">
+          <div class="card-head"><h2>Прогон стратегий</h2><span class="hint">подбор рабочих стратегий обхода</span></div>
+          <div class="srcsel">
+            <div class="seg" data-seg="run">
+              <button type="button" class="seg-btn active" data-src="list">Список</button>
+              <button type="button" class="seg-btn" data-src="geo">GeoSite/GeoIP</button>
+              <button type="button" class="seg-btn" data-src="text">Текст</button>
+            </div>
+            <div class="srcbody" data-src="list">
+              <label class="field field-grow">Список<select id="runList"></select></label>
+            </div>
+            <div class="srcbody hidden" data-src="geo">
+              <div class="geo-row">
+                <label class="field field-grow">Файл<select id="runGeoFile"></select></label>
+                <label class="field field-grow">Категория<select id="runGeoCat"></select></label>
+                <label class="field field-sm">Лимит<input id="runGeoLimit" type="number" min="0" value="50"></label>
+              </div>
+            </div>
+            <div class="srcbody hidden" data-src="text">
+              <label class="field">Домены / IP <span class="hint">по одному в строке</span>
+                <textarea id="runText" rows="5" placeholder="rutracker.org&#10;1.2.3.4"></textarea></label>
+            </div>
+          </div>
+          <div class="run-row mid">
+            <label class="field field-sm">Потоков<input id="runThreads" type="number" min="1" max="8" value="4"></label>
+            <label class="switch"><input id="runAuto" type="checkbox"><span class="track"></span><span class="switch-label">Автоподбор</span></label>
+          </div>
+          <div class="run-row cols">
+            <div class="field field-grow">
+              <div class="cl-head"><span>Стратегии <span class="hint">пусто = все</span></span>
+                <button type="button" class="btn btn-mini cl-all" data-target="runStrategies">Выбрать все</button></div>
+              <div id="runStrategies" class="checklist"></div>
+              <div id="autoHint" class="hint hidden">Автоподбор сам перебирает встроенный каталог кандидатов — выбор стратегий не используется.</div>
+            </div>
+            <div class="field field-grow">
+              <div class="cl-head"><span>Блобы <span class="hint">каждый блоб — отдельный прогон</span></span>
+                <button type="button" class="btn btn-mini cl-all" data-target="runBlobs">Выбрать все</button></div>
+              <div id="runBlobs" class="checklist"></div>
+            </div>
+          </div>
+          <div class="actions">
+            <button id="startRun" class="btn btn-primary">▶ Запустить прогон</button>
+            <button id="cancelRun" class="btn btn-ghost-danger hidden">■ Отменить</button>
+            <span id="runStatus" class="run-status"></span>
+          </div>
+          <div id="progressWrap" class="hidden">
+            <div class="progress"><div id="progressBar" class="progress-bar"></div></div>
+            <span id="progressText" class="hint"></span>
+          </div>
+        </div>
+
+        <div class="card">
+          <div class="card-head"><h2>Результаты прогона</h2><span class="hint">клик по заголовку — сортировка</span></div>
+          <div id="baselineInfo" class="baseline hidden"></div>
+          <div class="table-wrap">
+            <table id="resultsTable" class="data">
+              <thead><tr>
+                <th data-sort="status">Статус</th>
+                <th data-sort="name">Стратегия</th>
+                <th data-sort="targets">Цели</th>
+                <th data-sort="latency">Задержка</th>
+                <th data-sort="speed">Скорость</th>
+                <th data-sort="coef">Коэф.</th>
+                <th></th>
+              </tr></thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
       <!-- BLOCKCHECK -->
       <section id="tab-blockcheck" class="panel">
         <div class="card">
           <div class="card-head"><h2>BlockCheck</h2><span class="hint">проверка блокировки без обхода</span></div>
           <p class="hint">Проверяет доступность доменов/IP из списка напрямую: тестовое соединение исключается из основного сервиса nfqws2 и не обходится, поэтому видно, что реально блокирует провайдер (RST, таймаут, обрыв на ~16 КБ).</p>
-          <div class="run-row">
-            <label class="field field-grow">Список<select id="bcList"></select></label>
+          <div class="srcsel">
+            <div class="seg" data-seg="bc">
+              <button type="button" class="seg-btn active" data-src="list">Список</button>
+              <button type="button" class="seg-btn" data-src="geo">GeoSite/GeoIP</button>
+              <button type="button" class="seg-btn" data-src="text">Текст</button>
+            </div>
+            <div class="srcbody" data-src="list">
+              <label class="field field-grow">Список<select id="bcList"></select></label>
+            </div>
+            <div class="srcbody hidden" data-src="geo">
+              <div class="geo-row">
+                <label class="field field-grow">Файл<select id="bcGeoFile"></select></label>
+                <label class="field field-grow">Категория<select id="bcGeoCat"></select></label>
+                <label class="field field-sm">Лимит<input id="bcGeoLimit" type="number" min="0" value="50"></label>
+              </div>
+            </div>
+            <div class="srcbody hidden" data-src="text">
+              <label class="field">Домены / IP <span class="hint">по одному в строке</span>
+                <textarea id="bcText" rows="5" placeholder="rutracker.org&#10;1.2.3.4"></textarea></label>
+            </div>
+          </div>
+          <div class="run-row mid">
             <label class="field field-sm">Потоков<input id="bcThreads" type="number" min="1" max="8" value="4"></label>
           </div>
           <div class="actions">

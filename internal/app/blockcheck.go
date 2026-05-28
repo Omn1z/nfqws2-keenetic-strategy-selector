@@ -13,23 +13,32 @@ import (
 	"nfqws2strategy/internal/store"
 )
 
-// BlockCheckRequest starts a no-bypass reachability check of a list's targets.
+// BlockCheckRequest starts a no-bypass reachability check. Targets come from a
+// saved list (ListID) or, for an ad-hoc check, directly via Targets.
 type BlockCheckRequest struct {
-	ListID  string `json:"list_id"`
-	Threads int    `json:"threads"`
+	ListID  string   `json:"list_id"`
+	Targets []string `json:"targets"` // ad-hoc targets when ListID is empty
+	Threads int      `json:"threads"`
 }
 
 // StartBlockCheck launches an asynchronous reachability check. It shares the
 // "one operation at a time" guard with runs (both touch the mangle table).
 func (a *App) StartBlockCheck(req BlockCheckRequest) (*BlockCheck, error) {
-	list, err := a.GetList(req.ListID)
-	if err != nil {
-		return nil, fmt.Errorf("list not found")
+	var targets []string
+	listName := "произвольный набор"
+	if req.ListID != "" {
+		list, err := a.GetList(req.ListID)
+		if err != nil {
+			return nil, fmt.Errorf("list not found")
+		}
+		listName = list.Name
+		targets = append([]string{}, list.Domains...)
+		targets = append(targets, list.IPs...)
+	} else {
+		targets = cleanLines(req.Targets)
 	}
-	targets := append([]string{}, list.Domains...)
-	targets = append(targets, list.IPs...)
 	if len(targets) == 0 {
-		return nil, fmt.Errorf("list has no targets")
+		return nil, fmt.Errorf("no targets")
 	}
 	threads := req.Threads
 	if threads <= 0 {
@@ -49,8 +58,8 @@ func (a *App) StartBlockCheck(req BlockCheckRequest) (*BlockCheck, error) {
 	}
 	bc := &BlockCheck{
 		ID:        store.NewID(),
-		ListID:    list.ID,
-		ListName:  list.Name,
+		ListID:    req.ListID,
+		ListName:  listName,
 		Threads:   threads,
 		Status:    "running",
 		Total:     len(targets),

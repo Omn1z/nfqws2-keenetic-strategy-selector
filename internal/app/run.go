@@ -18,9 +18,12 @@ import (
 
 const maxThreads = 8
 
-// RunRequest describes a test run to start.
+// RunRequest describes a test run to start. The targets come either from a saved
+// list (ListID) or, for an ad-hoc run, directly via Targets (geo category or
+// pasted text); successful strategies are only persisted when a list is used.
 type RunRequest struct {
 	ListID      string   `json:"list_id"`
+	Targets     []string `json:"targets"` // ad-hoc targets when ListID is empty
 	StrategyIDs []string `json:"strategy_ids"` // empty = all known strategies
 	Threads     int      `json:"threads"`
 	Auto        bool     `json:"auto"`  // automatic selection over the candidate catalog
@@ -93,14 +96,22 @@ func (a *App) CancelRun(id string) error {
 
 // StartRun validates and launches a run asynchronously.
 func (a *App) StartRun(req RunRequest) (*Run, error) {
-	list, err := a.GetList(req.ListID)
-	if err != nil {
-		return nil, fmt.Errorf("list not found")
+	var list *List
+	var targets []string
+	listName := "произвольный набор"
+	if req.ListID != "" {
+		l, err := a.GetList(req.ListID)
+		if err != nil {
+			return nil, fmt.Errorf("list not found")
+		}
+		list, listName = l, l.Name
+		targets = append([]string{}, l.Domains...)
+		targets = append(targets, l.IPs...)
+	} else {
+		targets = cleanLines(req.Targets)
 	}
-	targets := append([]string{}, list.Domains...)
-	targets = append(targets, list.IPs...)
 	if len(targets) == 0 {
-		return nil, fmt.Errorf("list has no targets")
+		return nil, fmt.Errorf("no targets")
 	}
 
 	var strategies []catalog.Strategy
@@ -146,8 +157,8 @@ func (a *App) StartRun(req RunRequest) (*Run, error) {
 	}
 	run := &Run{
 		ID:        store.NewID(),
-		ListID:    list.ID,
-		ListName:  list.Name,
+		ListID:    req.ListID,
+		ListName:  listName,
 		Threads:   threads,
 		Auto:      req.Auto,
 		Status:    "running",
@@ -277,7 +288,9 @@ wait:
 	final := append([]StrategyResult{}, run.Results...)
 	a.mu.Unlock()
 
-	a.mergeSuccessful(list, run, final)
+	if list != nil { // ad-hoc runs have no list to persist into
+		a.mergeSuccessful(list, run, final)
+	}
 }
 
 // baselineCheck probes each target with no bypass and classifies reachability.

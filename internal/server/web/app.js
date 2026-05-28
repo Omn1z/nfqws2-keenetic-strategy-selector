@@ -82,6 +82,56 @@ $("#runAuto").addEventListener("change", () => {
   if (on) { clBoxes("runStrategies").forEach(c => { c.checked = false; }); updateAllBtn("runStrategies"); }
 });
 
+/* ---------- source selector (Список / GeoSite-GeoIP / Текст) ---------- */
+$$(".seg-btn").forEach(b => b.addEventListener("click", () => {
+  const sel = b.closest(".srcsel");
+  sel.querySelectorAll(".seg-btn").forEach(x => x.classList.toggle("active", x === b));
+  sel.querySelectorAll(".srcbody").forEach(x => x.classList.toggle("hidden", x.dataset.src !== b.dataset.src));
+}));
+function currentSrc(seg) {
+  const b = $(`.seg[data-seg="${seg}"] .seg-btn.active`);
+  return b ? b.dataset.src : "list";
+}
+function fillRunLists() {
+  const sel = $("#runList"); if (!sel) return;
+  const cur = sel.value;
+  sel.innerHTML = state.lists.map(l => `<option value="${esc(l.id)}">${esc(l.name || l.id)} (${(l.domains || []).length} дом.)</option>`).join("");
+  if (cur) sel.value = cur;
+}
+function fillGeoSelect(fileId, catId) {
+  const fsel = $("#" + fileId); if (!fsel) return;
+  const prev = fsel.value;
+  fsel.innerHTML = (state.geo || []).map(f => `<option value="${esc(f.name)}">${esc(f.name)} [${esc(f.kind)}]</option>`).join("");
+  if (prev) fsel.value = prev;
+  fillGeoCats(fileId, catId);
+}
+function fillGeoCats(fileId, catId) {
+  const f = (state.geo || []).find(x => x.name === $("#" + fileId).value);
+  $("#" + catId).innerHTML = ((f && f.categories) || []).map(c => `<option value="${esc(c.name)}">${esc(c.name)} (${c.count})</option>`).join("");
+}
+$("#runGeoFile").addEventListener("change", () => fillGeoCats("runGeoFile", "runGeoCat"));
+$("#bcGeoFile").addEventListener("change", () => fillGeoCats("bcGeoFile", "bcGeoCat"));
+// Returns {list_id} or {targets} depending on the chosen source for a seg group.
+async function resolveTarget(seg) {
+  const src = currentSrc(seg);
+  if (src === "list") {
+    const id = $("#" + seg + "List").value;
+    if (!id) throw new Error("Нет списков — создайте список во вкладке «Списки»");
+    return { list_id: id };
+  }
+  if (src === "geo") {
+    const geo = $("#" + seg + "GeoFile").value, category = $("#" + seg + "GeoCat").value;
+    if (!geo || !category) throw new Error("Загрузите GeoSite/GeoIP и выберите категорию");
+    const r = await api("POST", "/api/geo/resolve", { geo, category, limit: parseInt($("#" + seg + "GeoLimit").value, 10) || 0 });
+    const targets = (r && r.targets) || [];
+    if (!targets.length) throw new Error("Категория пустая");
+    return { targets };
+  }
+  const targets = $("#" + seg + "Text").value.split("\n").map(s => s.trim()).filter(Boolean);
+  if (!targets.length) throw new Error("Введите домены или IP");
+  return { targets };
+}
+
 /* ---------- navigation ---------- */
 $$(".nav-item").forEach(b => b.addEventListener("click", () => {
   $$(".nav-item").forEach(x => x.classList.remove("active"));
@@ -89,7 +139,8 @@ $$(".nav-item").forEach(b => b.addEventListener("click", () => {
   b.classList.add("active");
   const p = $("#tab-" + b.dataset.tab);
   p.classList.add("active");
-  if (b.dataset.tab === "blockcheck") fillBCLists();
+  if (b.dataset.tab === "runs") { fillRunLists(); fillGeoSelect("runGeoFile", "runGeoCat"); }
+  if (b.dataset.tab === "blockcheck") { fillBCLists(); fillGeoSelect("bcGeoFile", "bcGeoCat"); }
 }));
 
 /* ---------- lists ---------- */
@@ -109,6 +160,7 @@ async function loadLists() {
     ul.appendChild(li);
   });
   fillBCLists();
+  fillRunLists();
 }
 
 async function selectList(id) {
@@ -128,7 +180,6 @@ function renderListEditor() {
   $("#listIPs").value = (l.ips || []).join("\n");
   $("#deleteList").classList.toggle("hidden", !l.id);
   renderListGeo();
-  renderResults();
   renderSaved();
 }
 
@@ -198,17 +249,25 @@ function fillRunStrategies() {
 }
 
 $("#startRun").addEventListener("click", async () => {
-  if (!state.selected || !state.selected.id) { toast("Сначала сохраните список", "err"); return; }
   const auto = $("#runAuto").checked;
   const ids = auto ? [] : clSelected("runStrategies");
   const blobs = clSelected("runBlobs");
-  const req = { list_id: state.selected.id, strategy_ids: ids, blobs, auto, threads: parseInt($("#runThreads").value, 10) || 4 };
+  let target;
+  try { target = await resolveTarget("run"); } catch (e) { toast(e.message, "err"); return; }
+  const req = { ...target, strategy_ids: ids, blobs, auto, threads: parseInt($("#runThreads").value, 10) || 4 };
   try { state.run = await api("POST", "/api/runs", req); startPolling(); }
   catch (e) { toast(e.message, "err"); }
 });
 $("#cancelRun").addEventListener("click", async () => {
-  if (state.run) { try { await api("POST", "/api/runs/" + state.run.id + "/cancel"); } catch (e) { toast(e.message, "err"); } }
+  if (state.poll) { clearInterval(state.poll); state.poll = null; }
+  resetRunUI(true); // hide the cancel button and loader immediately, like before the run
+  if (state.run) { try { await api("POST", "/api/runs/" + state.run.id + "/cancel"); } catch (e) { /* already stopping */ } }
 });
+function resetRunUI(full) {
+  $("#cancelRun").classList.add("hidden");
+  $("#startRun").disabled = false;
+  if (full) { $("#progressWrap").classList.add("hidden"); $("#runStatus").textContent = ""; }
+}
 
 function startPolling() {
   $("#progressWrap").classList.remove("hidden");
@@ -228,15 +287,14 @@ function startPolling() {
       renderBaseline(r);
       if (r.status !== "running") {
         clearInterval(state.poll); state.poll = null;
-        $("#cancelRun").classList.add("hidden");
-        $("#startRun").disabled = false;
-        if (state.selected) state.selected = await api("GET", "/api/lists/" + state.selected.id);
-        renderSaved(); loadLists();
+        resetRunUI(false);
+        loadLists();
         const ok = (r.results || []).filter(x => x.success).length;
-        if (r.auto && r.total === 0) toast("Цели доступны без обхода — обходить нечего", "ok");
+        if (r.status === "cancelled") toast("Прогон отменён", "ok");
+        else if (r.auto && r.total === 0) toast("Цели доступны без обхода — обходить нечего", "ok");
         else toast(`Прогон завершён: найдено рабочих ${ok}`, "ok");
       }
-    } catch (e) { clearInterval(state.poll); state.poll = null; $("#startRun").disabled = false; toast(e.message, "err"); }
+    } catch (e) { clearInterval(state.poll); state.poll = null; resetRunUI(true); toast(e.message, "err"); }
   };
   tick();
   state.poll = setInterval(tick, 1000);
@@ -331,15 +389,22 @@ function fillBCLists() {
   if (cur) sel.value = cur;
 }
 $("#startBC").addEventListener("click", async () => {
-  const listId = $("#bcList").value;
-  if (!listId) { toast("Нет списков — создайте список во вкладке «Списки»", "err"); return; }
-  const req = { list_id: listId, threads: parseInt($("#bcThreads").value, 10) || 4 };
+  let target;
+  try { target = await resolveTarget("bc"); } catch (e) { toast(e.message, "err"); return; }
+  const req = { ...target, threads: parseInt($("#bcThreads").value, 10) || 4 };
   try { state.bc = await api("POST", "/api/blockcheck", req); startBCPolling(); }
   catch (e) { toast(e.message, "err"); }
 });
 $("#cancelBC").addEventListener("click", async () => {
-  if (state.bc) { try { await api("POST", "/api/blockcheck/" + state.bc.id + "/cancel"); } catch (e) { toast(e.message, "err"); } }
+  if (state.bcPoll) { clearInterval(state.bcPoll); state.bcPoll = null; }
+  resetBCUI(true);
+  if (state.bc) { try { await api("POST", "/api/blockcheck/" + state.bc.id + "/cancel"); } catch (e) { /* already stopping */ } }
 });
+function resetBCUI(full) {
+  $("#cancelBC").classList.add("hidden");
+  $("#startBC").disabled = false;
+  if (full) { $("#bcProgressWrap").classList.add("hidden"); $("#bcStatus").textContent = ""; }
+}
 function startBCPolling() {
   $("#bcProgressWrap").classList.remove("hidden");
   $("#cancelBC").classList.remove("hidden");
@@ -356,12 +421,12 @@ function startBCPolling() {
       renderBC(r);
       if (r.status !== "running") {
         clearInterval(state.bcPoll); state.bcPoll = null;
-        $("#cancelBC").classList.add("hidden");
-        $("#startBC").disabled = false;
+        resetBCUI(false);
         const blocked = (r.targets || []).filter(t => t.blocked).length;
-        toast(`Проверка завершена: заблокировано ${blocked} из ${r.total}`, "ok");
+        if (r.status === "cancelled") toast("Проверка отменена", "ok");
+        else toast(`Проверка завершена: заблокировано ${blocked} из ${r.total}`, "ok");
       }
-    } catch (e) { clearInterval(state.bcPoll); state.bcPoll = null; $("#startBC").disabled = false; toast(e.message, "err"); }
+    } catch (e) { clearInterval(state.bcPoll); state.bcPoll = null; resetBCUI(true); toast(e.message, "err"); }
   };
   tick();
   state.bcPoll = setInterval(tick, 1000);
@@ -547,6 +612,8 @@ async function loadGeo() {
   const wrap = $("#geoFiles"); wrap.innerHTML = "";
   files.forEach(f => wrap.appendChild(geoCard(f)));
   renderListGeo();
+  fillGeoSelect("runGeoFile", "runGeoCat");
+  fillGeoSelect("bcGeoFile", "bcGeoCat");
 }
 function geoCard(f) {
   const card = document.createElement("div"); card.className = "card";
