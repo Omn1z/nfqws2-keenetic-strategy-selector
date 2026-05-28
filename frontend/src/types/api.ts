@@ -243,6 +243,14 @@ export interface ClientHelloCandidate {
   dst_port: number;
   sni: string;
   size: number;
+  valid: boolean;
+  detail: string;
+}
+
+export interface SystemSettings {
+  auth_enabled: boolean;
+  auth_forced_off: boolean;
+  logging_enabled: boolean;
 }
 
 export interface BlobCapture {

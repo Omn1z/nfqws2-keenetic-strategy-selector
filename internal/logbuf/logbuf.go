@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -34,7 +35,17 @@ var (
 
 	sinkMu  sync.Mutex
 	partial []byte
+
+	enabled atomic.Bool // logging on/off (the "Система" tab can disable it)
 )
+
+func init() { enabled.Store(true) }
+
+// SetEnabled turns logging (ring + file) on or off. When off, Append is a no-op.
+func SetEnabled(on bool) { enabled.Store(on) }
+
+// Enabled reports whether logging is currently on.
+func Enabled() bool { return enabled.Load() }
 
 // Init sets the underlying writer (the -log file / stderr) and returns a Sink to
 // pass to log.SetOutput. Call log.SetFlags(0) too so the stdlib timestamp isn't

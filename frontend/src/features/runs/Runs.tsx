@@ -1,9 +1,8 @@
 import { useEffect, useRef, useState } from "react";
-import { api, exportStrategy } from "@/lib/api";
+import { exportStrategy } from "@/lib/api";
 import { cn } from "@/lib/cn";
 import { kb } from "@/lib/format";
 import { applyStrategyToConfig } from "@/lib/actions";
-import { usePoll } from "@/lib/hooks";
 import { useStore } from "@/providers/StoreProvider";
 import { toast } from "@/components/ui/Toast";
 import { Card } from "@/components/ui/Card";
@@ -17,7 +16,7 @@ import { Args, EmptyRow, SortTh, TableWrap, nextSort, tableCls, tdCls, thBase } 
 import type { Sort } from "@/components/ui/Table";
 import { SourceSelector } from "@/components/SourceSelector";
 import type { SourceSelectorHandle } from "@/components/SourceSelector";
-import type { Run, RunRequest, StrategyResult, TargetSource } from "@/types/api";
+import type { RunRequest, StrategyResult, TargetSource } from "@/types/api";
 
 const sortVal = (r: StrategyResult, k: string): string | number => {
   switch (k) {
@@ -40,8 +39,32 @@ const FILTERS: Record<string, (r: StrategyResult) => boolean> = {
   "100": (r) => r.targets_total > 0 && r.targets_ok === r.targets_total,
 };
 
+// Live run log built from results (chronological completion order), errors in red.
+function RunLog({ results, status, done, total }: { results: StrategyResult[]; status: string; done: number; total: number }) {
+  const ref = useRef<HTMLDivElement>(null);
+  useEffect(() => { if (ref.current) ref.current.scrollTop = ref.current.scrollHeight; }, [results.length]);
+  return (
+    <div className="flex h-full flex-col">
+      <div className="mb-2 text-xs text-ink-soft">статус <b>{status}</b> · {done}/{total}</div>
+      <div ref={ref} className="max-h-[420px] min-h-[120px] flex-1 overflow-auto rounded-lg border border-line bg-input p-2.5 font-mono text-[11.5px] leading-relaxed">
+        {results.length === 0 && <div className="text-muted">Лог появится по мере прогона…</div>}
+        {results.map((r, i) => {
+          const cls = r.error ? "text-bad" : r.success ? "text-ok" : "text-ink-soft";
+          const mark = r.error ? "✗" : r.success ? "✓" : "·";
+          const tail = r.error ? r.error : `${r.targets_ok}/${r.targets_total}${r.avg_speed_bps ? ` · ${kb(r.avg_speed_bps)} КБ/с` : ""}`;
+          return (
+            <div key={i} className={cn("whitespace-pre-wrap [overflow-wrap:anywhere]", cls)}>
+              <span className="font-semibold">{mark}</span> {r.name || r.strategy_id} — {tail}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 export default function Runs() {
-  const { lists, geo, strategies, blobs, dns, reloadLists, pendingTargets, setPendingTargets } = useStore();
+  const { lists, geo, strategies, blobs, dns, activeRun, runActive, startRun, cancelRun, addRunThread, pendingTargets, setPendingTargets } = useStore();
   const srcRef = useRef<SourceSelectorHandle>(null);
   const [initialText] = useState(() => pendingTargets?.join("\n") ?? "");
   useEffect(() => { if (pendingTargets) setPendingTargets(null); /* consume hand-off once */ }, []); // eslint-disable-line react-hooks/exhaustive-deps
@@ -51,52 +74,31 @@ export default function Runs() {
   const [stratSel, setStratSel] = useState<string[]>([]);
   const [blobSel, setBlobSel] = useState<string[]>([]);
   const [dnsSel, setDnsSel] = useState<string[]>([]);
-  const [run, setRun] = useState<Run | null>(null);
-  const [running, setRunning] = useState(false);
   const [sort, setSort] = useState<Sort>({ key: "coef", dir: -1 });
   const [filterMode, setFilterMode] = useState("all");
+  const [query, setQuery] = useState("");
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState("20");
 
+  const run = activeRun;
+  const running = runActive;
   const stratItems = strategies.map((s) => ({ value: s.id, label: s.name || s.id, sub: s.l7 || "?" }));
   const blobItems = [...blobs.custom.map((n) => ({ value: n, label: n, sub: "свой" })), ...blobs.system.map((n) => ({ value: n, label: n }))];
   const dnsItems = [{ value: "system", label: "Системный", sub: "без DoH/DoT" }, ...dns.map((d) => ({ value: d.id, label: d.name || d.id, sub: d.type.toUpperCase() }))];
-
-  usePoll(async () => {
-    if (!run) return;
-    try {
-      const r = await api<Run>("GET", `/api/runs/${run.id}`);
-      setRun(r);
-      if (r.status !== "running") {
-        setRunning(false);
-        void reloadLists();
-        const ok = r.results.filter((x) => x.success).length;
-        if (r.status === "cancelled") toast("Прогон отменён", "ok");
-        else if (r.auto && r.total === 0) toast("Цели доступны без обхода — обходить нечего", "ok");
-        else toast(`Прогон завершён: найдено рабочих ${ok}`, "ok");
-      }
-    } catch (e) { setRunning(false); toast((e as Error).message, "err"); }
-  }, 1000, running);
 
   const start = async () => {
     if (!srcRef.current) return;
     let target: TargetSource;
     try { target = await srcRef.current.resolve(); } catch (e) { toast((e as Error).message, "err"); return; }
     const req: RunRequest = { ...target, strategy_ids: auto ? [] : stratSel, blobs: blobSel, dns: dnsSel, auto, threads: parseInt(threads, 10) || 4 };
-    try { const r = await api<Run>("POST", "/api/runs", req); setRun(r); setPage(1); setRunning(true); }
-    catch (e) { toast((e as Error).message, "err"); }
-  };
-  const cancel = async () => { setRunning(false); if (run) { try { await api("POST", `/api/runs/${run.id}/cancel`); } catch { /* already stopping */ } } };
-  const addThread = async () => {
-    if (!run) return;
-    const next = (run.threads || 1) + 1;
-    if (next > 8) { toast("Максимум 8 потоков", "err"); return; }
-    try { const d = await api<{ threads: number }>("POST", `/api/runs/${run.id}/threads`, { threads: next }); toast(`Потоков: ${d.threads}`, "ok"); }
+    try { await startRun(req); setPage(1); }
     catch (e) { toast((e as Error).message, "err"); }
   };
 
   const results = run?.results ?? [];
-  const sorted = results.filter(FILTERS[filterMode]).sort((a, b) => { const va = sortVal(a, sort.key), vb = sortVal(b, sort.key); return va < vb ? -sort.dir : va > vb ? sort.dir : 0; });
+  const q = query.trim().toLowerCase();
+  const matchQ = (r: StrategyResult) => !q || `${r.name} ${r.args} ${r.dns ?? ""}`.toLowerCase().includes(q);
+  const sorted = results.filter(FILTERS[filterMode]).filter(matchQ).sort((a, b) => { const va = sortVal(a, sort.key), vb = sortVal(b, sort.key); return va < vb ? -sort.dir : va > vb ? sort.dir : 0; });
   const onSort = (k: string) => setSort((s) => nextSort(s, k, k === "latency" ? 1 : -1));
   const found = results.filter((x) => x.success).length;
   const errored = results.filter((x) => x.error).length;
@@ -105,44 +107,58 @@ export default function Runs() {
 
   return (
     <>
-      <Card title="Прогон стратегий" sub="подбор рабочих стратегий обхода">
-        <SourceSelector ref={srcRef} lists={lists} geo={geo} initialText={initialText} />
-        <div className="mb-1.5 flex flex-wrap items-end gap-4">
-          <Field label="Потоков" className="w-28 shrink-0"><Input type="number" min={1} max={8} value={threads} onChange={(e) => setThreads(e.target.value)} /></Field>
-          <div className="mb-3"><div className="mb-1.5 text-[13px] font-medium text-ink-soft">Автоподбор</div><Switch checked={auto} onChange={setAuto} /></div>
+      <div className="flex items-start gap-4 max-[980px]:flex-col">
+        <div className="min-w-0 flex-1">
+          <Card title="Прогон стратегий" sub="подбор рабочих стратегий обхода">
+            <SourceSelector ref={srcRef} lists={lists} geo={geo} initialText={initialText} />
+            <div className="mb-1.5 flex flex-wrap items-end gap-4">
+              <Field label="Потоков" className="w-28 shrink-0"><Input type="number" min={1} max={8} value={threads} onChange={(e) => setThreads(e.target.value)} /></Field>
+              <div className="mb-3"><div className="mb-1.5 text-[13px] font-medium text-ink-soft">Автоподбор</div><Switch checked={auto} onChange={setAuto} /></div>
+            </div>
+            <div className="flex flex-wrap items-start gap-4">
+              <Checklist title="Стратегии" hint="пусто = все" items={stratItems} value={stratSel} onChange={setStratSel} disabled={auto} />
+              <Checklist title="Фейк-пейлоад (blob)" hint="по умолч. tls_clienthello" items={blobItems} value={blobSel} onChange={setBlobSel} />
+              <Checklist title="DNS" hint="каждый DNS — отдельный прогон" items={dnsItems} value={dnsSel} onChange={setDnsSel} />
+            </div>
+            <p className="mt-2 text-xs text-muted">Сначала прогоняются выбранные блобы (фейк <code>blob=</code>), затем — пейлоад по умолчанию. <code>--payload=tls_client_hello</code> — это L7-фильтр, а не сам пейлоад.</p>
+            {auto && <p className="mt-2 text-xs text-muted">Автоподбор сам перебирает встроенный каталог кандидатов — выбор стратегий не используется.</p>}
+            <div className="mt-3 flex flex-wrap items-center gap-2.5">
+              <Button variant="primary" onClick={start} disabled={running}>▶ Запустить прогон</Button>
+              {running && <Button variant="danger" onClick={cancelRun}>■ Отменить</Button>}
+              {running && <Button mini onClick={addRunThread} disabled={(run?.threads ?? 0) >= 8}>+ поток</Button>}
+              {run && <span className="text-xs text-muted">{run.status}</span>}
+            </div>
+            {running && run && (
+              <div className="mt-2">
+                <div className="h-2 overflow-hidden rounded-full bg-line"><div className="h-full rounded-full bg-gradient-to-r from-accent to-[#5cb3ff] transition-[width]" style={{ width: `${pct}%` }} /></div>
+                <span className="text-xs text-muted">{run.done}/{run.total} стратегий · {run.threads} потоков · найдено {found} · с ошибкой {errored} · {run.status}</span>
+              </div>
+            )}
+          </Card>
         </div>
-        <div className="flex flex-wrap items-start gap-4">
-          <Checklist title="Стратегии" hint="пусто = все" items={stratItems} value={stratSel} onChange={setStratSel} disabled={auto} />
-          <Checklist title="Фейк-пейлоад (blob)" hint="по умолч. tls_clienthello" items={blobItems} value={blobSel} onChange={setBlobSel} />
-          <Checklist title="DNS" hint="каждый DNS — отдельный прогон" items={dnsItems} value={dnsSel} onChange={setDnsSel} />
-        </div>
-        <p className="mt-2 text-xs text-muted">Выбранный блоб подставляется в стратегии как фейковый пейлоад (<code>blob=</code>), каждый — отдельным прогоном; без выбора используется <code>tls_clienthello</code>. <code>--payload=tls_client_hello</code> в аргументах — это L7-фильтр (на какие пакеты влиять), а не сам пейлоад.</p>
-        {auto && <p className="mt-2 text-xs text-muted">Автоподбор сам перебирает встроенный каталог кандидатов — выбор стратегий не используется.</p>}
-        <div className="mt-3 flex flex-wrap items-center gap-2.5">
-          <Button variant="primary" onClick={start} disabled={running}>▶ Запустить прогон</Button>
-          {running && <Button variant="danger" onClick={cancel}>■ Отменить</Button>}
-          {running && <Button mini onClick={addThread} disabled={(run?.threads ?? 0) >= 8}>+ поток</Button>}
-          {run && <span className="text-xs text-muted">{run.status}</span>}
-        </div>
-        {running && run && (
-          <div className="mt-2">
-            <div className="h-2 overflow-hidden rounded-full bg-line"><div className="h-full rounded-full bg-gradient-to-r from-accent to-[#5cb3ff] transition-[width]" style={{ width: `${pct}%` }} /></div>
-            <span className="text-xs text-muted">{run.done}/{run.total} стратегий · {run.threads} потоков · найдено {found} · с ошибкой {errored} · {run.status}</span>
+        {run && (
+          <div className="w-[360px] shrink-0 max-[980px]:w-full">
+            <Card title="Лог прогона" sub="ошибки и ход подбора">
+              <RunLog results={results} status={run.status} done={run.done} total={run.total} />
+            </Card>
           </div>
         )}
-      </Card>
+      </div>
 
       <Card
         title="Результаты прогона"
         sub="клик по заголовку — сортировка"
         head={
-          <Select value={filterMode} onChange={(e) => { setFilterMode(e.target.value); setPage(1); }} className="w-auto">
-            <option value="all">Все</option>
-            <option value="one">≥1 цель пройдена</option>
-            <option value="50">≥50% целей</option>
-            <option value="75">≥75% целей</option>
-            <option value="100">100% целей</option>
-          </Select>
+          <div className="flex flex-wrap items-center gap-2">
+            <Input value={query} onChange={(e) => { setQuery(e.target.value); setPage(1); }} placeholder="Поиск по стратегии / args / DNS" className="h-8 w-56 py-1" />
+            <Select value={filterMode} onChange={(e) => { setFilterMode(e.target.value); setPage(1); }} className="w-auto">
+              <option value="all">Все</option>
+              <option value="one">≥1 цель пройдена</option>
+              <option value="50">≥50% целей</option>
+              <option value="75">≥75% целей</option>
+              <option value="100">100% целей</option>
+            </Select>
+          </div>
         }
       >
         {base.length > 0 && (

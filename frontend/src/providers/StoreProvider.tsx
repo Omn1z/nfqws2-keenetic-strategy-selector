@@ -1,8 +1,9 @@
 import { createContext, useCallback, useContext, useEffect, useState } from "react";
 import type { ReactNode } from "react";
 import { api } from "@/lib/api";
+import { usePoll } from "@/lib/hooks";
 import { toast } from "@/components/ui/Toast";
-import type { Blobs, Config, DnsServer, GeoFile, List, Strategy } from "@/types/api";
+import type { Blobs, Config, DnsServer, GeoFile, List, Run, RunRequest, Strategy } from "@/types/api";
 
 interface Store {
   config: Config | null;
@@ -11,6 +12,12 @@ interface Store {
   dns: DnsServer[];
   geo: GeoFile[];
   blobs: Blobs;
+  /** Active run, lifted here so it survives tab switches (poll keeps running). */
+  activeRun: Run | null;
+  runActive: boolean;
+  startRun: (req: RunRequest) => Promise<Run>;
+  cancelRun: () => Promise<void>;
+  addRunThread: () => Promise<void>;
   /** Devices "→ run" hand-off: failing IPs to pre-fill the Runs text source. */
   pendingTargets: string[] | null;
   setPendingTargets: (t: string[] | null) => void;
@@ -39,6 +46,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const [dns, setDns] = useState<DnsServer[]>([]);
   const [geo, setGeo] = useState<GeoFile[]>([]);
   const [blobs, setBlobs] = useState<Blobs>({ system: [], custom: [], trash: [] });
+  const [activeRun, setActiveRun] = useState<Run | null>(null);
+  const [runActive, setRunActive] = useState(false);
   const [pendingTargets, setPendingTargets] = useState<string[] | null>(null);
 
   const reloadConfig = useCallback(async () => { try { setConfig(await api<Config>("GET", "/api/config")); } catch { /* non-fatal */ } }, []);
@@ -58,8 +67,45 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     void reloadDns(); void reloadGeo(); void reloadBlobs();
   }, [reloadConfig, reloadLists, reloadStrategies, reloadDns, reloadGeo, reloadBlobs]);
 
+  // Active-run poll lives here (not in the Runs tab) so the run keeps updating and
+  // is still shown after switching tabs.
+  usePoll(async () => {
+    if (!activeRun) return;
+    try {
+      const r = await api<Run>("GET", `/api/runs/${activeRun.id}`);
+      setActiveRun(r);
+      if (r.status !== "running") {
+        setRunActive(false);
+        void reloadLists();
+        const ok = (r.results ?? []).filter((x) => x.success).length;
+        if (r.status === "cancelled") toast("Прогон отменён", "ok");
+        else if (r.auto && r.total === 0) toast("Цели доступны без обхода — обходить нечего", "ok");
+        else toast(`Прогон завершён: найдено рабочих ${ok}`, "ok");
+      }
+    } catch (e) { setRunActive(false); err(e); }
+  }, 1000, runActive);
+
+  const startRun = useCallback(async (req: RunRequest) => {
+    const r = await api<Run>("POST", "/api/runs", req);
+    setActiveRun(r); setRunActive(true);
+    return r;
+  }, []);
+  const cancelRun = useCallback(async () => {
+    setRunActive(false);
+    if (activeRun) { try { await api("POST", `/api/runs/${activeRun.id}/cancel`); } catch { /* already stopping */ } }
+  }, [activeRun]);
+  const addRunThread = useCallback(async () => {
+    if (!activeRun) return;
+    const next = (activeRun.threads || 1) + 1;
+    if (next > 8) { toast("Максимум 8 потоков", "err"); return; }
+    try { const d = await api<{ threads: number }>("POST", `/api/runs/${activeRun.id}/threads`, { threads: next }); toast(`Потоков: ${d.threads}`, "ok"); }
+    catch (e) { err(e); }
+  }, [activeRun]);
+
   const value: Store = {
-    config, lists, strategies, dns, geo, blobs, pendingTargets, setPendingTargets,
+    config, lists, strategies, dns, geo, blobs,
+    activeRun, runActive, startRun, cancelRun, addRunThread,
+    pendingTargets, setPendingTargets,
     reloadConfig, reloadLists, reloadStrategies, reloadDns, reloadGeo, reloadBlobs,
   };
   return <StoreCtx.Provider value={value}>{children}</StoreCtx.Provider>;

@@ -3,6 +3,7 @@ package tlsblob
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"net"
 	"strconv"
 )
@@ -14,7 +15,40 @@ type Candidate struct {
 	DstPort int    `json:"dst_port"`
 	SNI     string `json:"sni"`
 	Size    int    `json:"size"`
+	Valid   bool   `json:"valid"`
+	Detail  string `json:"detail"`
 	Bytes   []byte `json:"-"` // raw TLS record; held server-side, saved as the blob
+}
+
+// ValidateClientHello reports whether b is a structurally complete TLS
+// ClientHello record usable as an nfqws2 fake payload, with a short ru detail.
+// It checks the record (0x16 0x03) and handshake (0x01) headers and that their
+// nested lengths run exactly to the end (a truncated/garbled capture won't).
+func ValidateClientHello(b []byte) (ok bool, detail string) {
+	if len(b) < 9 {
+		return false, "слишком короткий для ClientHello"
+	}
+	if b[0] != 0x16 || b[1] != 0x03 {
+		return false, "не TLS-запись (нет 16 03)"
+	}
+	if recLen := int(b[3])<<8 | int(b[4]); 5+recLen != len(b) {
+		return false, fmt.Sprintf("длина TLS-записи %d ≠ размеру %d", 5+recLen, len(b))
+	}
+	if b[5] != 0x01 {
+		return false, "не ClientHello (handshake-тип не 0x01)"
+	}
+	if hsLen := int(b[6])<<16 | int(b[7])<<8 | int(b[8]); 9+hsLen != len(b) {
+		return false, "длина handshake не сходится с записью"
+	}
+	sni := parseSNI(b)
+	switch {
+	case sni == "":
+		return true, "валидный ClientHello, но без SNI"
+	case len(b) > 1500:
+		return true, "валидный ClientHello (SNI " + sni + "), но крупный — фейк может не уместиться в пакет"
+	default:
+		return true, "валидный ClientHello, SNI " + sni
+	}
 }
 
 // link-layer (DLT) types we understand
@@ -104,9 +138,10 @@ func ParsePcapClientHellos(data []byte) ([]Candidate, error) {
 				}
 				seen[sni] = true
 			}
+			valid, detail := ValidateClientHello(ch)
 			out = append(out, Candidate{
 				SrcIP: f.src, DstIP: f.dst, DstPort: f.dport,
-				SNI: sni, Size: len(ch), Bytes: append([]byte(nil), ch...),
+				SNI: sni, Size: len(ch), Valid: valid, Detail: detail, Bytes: append([]byte(nil), ch...),
 			})
 			if len(out) >= maxCandidates {
 				break

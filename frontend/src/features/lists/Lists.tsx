@@ -18,6 +18,7 @@ export default function Lists() {
   const [sel, setSel] = useState<List | null>(null);
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState("20");
+  const [stratQ, setStratQ] = useState("");
   const [gFile, setGFile] = useState("");
   const [gCat, setGCat] = useState("");
   const [gLimit, setGLimit] = useState("50");
@@ -54,7 +55,8 @@ export default function Lists() {
     } catch (e) { toast((e as Error).message, "err"); }
   };
 
-  const saved = sel?.successful_strategies ?? [];
+  const sq = stratQ.trim().toLowerCase();
+  const saved = (sel?.successful_strategies ?? []).filter((s) => !sq || `${s.name} ${s.args} ${s.dns ?? ""}`.toLowerCase().includes(sq));
 
   return (
     <div className="flex items-start gap-5 max-[860px]:flex-col">
@@ -98,7 +100,7 @@ export default function Lists() {
               <div className="mt-2 flex gap-2.5"><Button variant="primary" onClick={save}>Сохранить</Button></div>
             </Card>
 
-            <Card title="Рабочие стратегии списка" sub="по скорости">
+            <Card title="Рабочие стратегии списка" sub="по скорости" head={<Input value={stratQ} onChange={(e) => { setStratQ(e.target.value); setPage(1); }} placeholder="Поиск по стратегии / args / DNS" className="h-8 w-56 py-1" />}>
               <TableWrap scrollable>
                 <table className={tableCls}>
                   <thead><tr><th className={thBase}>Стратегия</th><th className={thBase}>DNS</th><th className={thBase}>Задержка</th><th className={thBase}>Скорость</th><th className={thBase}>Коэф.</th><th className={thBase} /></tr></thead>

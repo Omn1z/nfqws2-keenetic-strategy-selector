@@ -9,6 +9,7 @@ import { Button } from "@/components/ui/Button";
 import { Modal } from "@/components/ui/Modal";
 import { Dropzone } from "@/components/ui/Dropzone";
 import { Field, Input, Select } from "@/components/ui/form";
+import { Pager, pageSlice } from "@/components/ui/Pager";
 import { EmptyRow, TableWrap, tableCls, tdCls, thBase } from "@/components/ui/Table";
 import type { BlobCapture, BlobCaptureStart, ClientHelloCandidate, Device, InstallResult } from "@/types/api";
 
@@ -30,11 +31,15 @@ const VER_OPTS = [
 function CandidateRow({ c, index, onSave }: { c: ClientHelloCandidate; index: number; onSave: (i: number, name: string) => void }) {
   const [name, setName] = useState(blobName(c.sni, c.dst_ip));
   return (
-    <div className="flex flex-wrap items-center gap-2 border-t border-line-soft py-2 first:border-t-0">
-      <span className="font-mono text-[13px] font-semibold">{c.sni || "(без SNI)"}</span>
-      <span className="text-xs text-muted">→ {c.dst_ip}:{c.dst_port} · {c.size} Б</span>
-      <Input className="ml-auto w-56" value={name} onChange={(e) => setName(e.target.value)} />
-      <Button mini onClick={() => onSave(index, name)}>Сохранить</Button>
+    <div className="border-t border-line-soft py-2 first:border-t-0">
+      <div className="flex flex-wrap items-center gap-2">
+        <span className={cn("text-xs font-bold", c.valid ? "text-ok" : "text-bad")} title={c.detail}>{c.valid ? "✓" : "✗"}</span>
+        <span className="font-mono text-[13px] font-semibold">{c.sni || "(без SNI)"}</span>
+        <span className="text-xs text-muted">→ {c.dst_ip}:{c.dst_port} · {c.size} Б</span>
+        <Input className="ml-auto w-56" value={name} onChange={(e) => setName(e.target.value)} />
+        <Button mini onClick={() => onSave(index, name)}>Сохранить</Button>
+      </div>
+      <div className={cn("mt-0.5 text-[11px]", c.valid ? "text-muted" : "text-bad")}>{c.detail}</div>
     </div>
   );
 }
@@ -59,6 +64,13 @@ export default function Blobs() {
   const [installShow, setInstallShow] = useState(false);
   const [installing, setInstalling] = useState(false);
 
+  const [blobQ, setBlobQ] = useState("");
+  const [blobPage, setBlobPage] = useState(1);
+  const [blobPageSize, setBlobPageSize] = useState("20");
+  const [trashQ, setTrashQ] = useState("");
+  const [trashPage, setTrashPage] = useState(1);
+  const [trashPageSize, setTrashPageSize] = useState("20");
+
   usePoll(async () => {
     try { const v = await api<{ devices: Device[] }>("GET", "/api/devices"); setDevices(v.devices ?? []); } catch { /* ignore */ }
   }, 15000);
@@ -78,9 +90,20 @@ export default function Blobs() {
   }, 1000, capturing);
 
   const all = [...blobs.custom.map((n) => ({ name: n, custom: true })), ...blobs.system.map((n) => ({ name: n, custom: false }))];
+  const bq = blobQ.trim().toLowerCase();
+  const shown = bq ? all.filter((b) => b.name.toLowerCase().includes(bq)) : all;
+  const allShownSelected = shown.length > 0 && shown.every((b) => sel.has(b.name));
   const toggle = (n: string) => setSel((s) => { const x = new Set(s); if (x.has(n)) x.delete(n); else x.add(n); return x; });
-  const toggleAll = () => setSel((s) => (s.size === all.length ? new Set() : new Set(all.map((b) => b.name))));
+  const toggleAll = () => setSel((s) => { const x = new Set(s); shown.forEach((b) => (allShownSelected ? x.delete(b.name) : x.add(b.name))); return x; });
   const selCustom = () => [...sel].filter((n) => blobs.custom.includes(n));
+
+  const tq = trashQ.trim().toLowerCase();
+  const shownTrash = tq ? blobs.trash.filter((n) => n.toLowerCase().includes(tq)) : blobs.trash;
+
+  const validate = async (name: string) => {
+    try { const r = await api<{ valid: boolean; detail: string }>("GET", `/api/blobs/${encodeURIComponent(name)}/validate`); toast(`${name}: ${r.detail}`, r.valid ? "ok" : "warn"); }
+    catch (e) { toast((e as Error).message, "err"); }
+  };
 
   const upload = async (files: FileList) => {
     const arr = Array.from(files);
@@ -255,34 +278,56 @@ export default function Blobs() {
 
       <Card
         title="Список блобов"
-        head={<div className="flex gap-2"><Button mini onClick={exportSel}>Экспорт выбранных (ZIP)</Button>{selCustom().length > 0 && <Button mini variant="danger" onClick={delSel}>В корзину</Button>}</div>}
+        head={
+          <div className="flex flex-wrap items-center gap-2">
+            <Input value={blobQ} onChange={(e) => { setBlobQ(e.target.value); setBlobPage(1); }} placeholder="Поиск по имени" className="h-8 w-48 py-1" />
+            <Button mini onClick={exportSel}>Экспорт выбранных (ZIP)</Button>
+            {selCustom().length > 0 && <Button mini variant="danger" onClick={delSel}>В корзину</Button>}
+          </div>
+        }
       >
         <TableWrap>
           <table className={tableCls}>
-            <thead><tr><th className={cn(thBase, "w-8")}><input type="checkbox" className={cb} checked={all.length > 0 && sel.size === all.length} onChange={toggleAll} /></th><th className={thBase}>Имя</th><th className={thBase}>Тип</th><th className={thBase} /></tr></thead>
+            <thead><tr><th className={cn(thBase, "w-8")}><input type="checkbox" className={cb} checked={allShownSelected} onChange={toggleAll} /></th><th className={thBase}>Имя</th><th className={thBase}>Тип</th><th className={cn(thBase, "text-right")} /></tr></thead>
             <tbody>
-              {all.length === 0 && <EmptyRow colSpan={4}>Нет блобов.</EmptyRow>}
-              {all.map((b) => (
+              {shown.length === 0 && <EmptyRow colSpan={4}>{all.length ? "Ничего не найдено." : "Нет блобов."}</EmptyRow>}
+              {pageSlice(shown, blobPage, blobPageSize).map((b) => (
                 <tr key={b.name} className="hover:bg-line-soft">
                   <td className={tdCls}><input type="checkbox" className={cb} checked={sel.has(b.name)} onChange={() => toggle(b.name)} /></td>
                   <td className={cn(tdCls, "font-mono")}>{b.name}</td>
                   <td className={tdCls}>{b.custom ? "свой" : "системный"}</td>
-                  <td className={tdCls}>{b.custom && <Button mini variant="danger" onClick={() => del(b.name)}>×</Button>}</td>
+                  <td className={cn(tdCls, "text-right")}>
+                    <div className="flex justify-end gap-1.5">
+                      <Button mini variant="ghost" onClick={() => validate(b.name)}>проверить</Button>
+                      {b.custom && <Button mini variant="danger" onClick={() => del(b.name)}>×</Button>}
+                    </div>
+                  </td>
                 </tr>
               ))}
             </tbody>
           </table>
         </TableWrap>
+        <Pager total={shown.length} page={blobPage} setPage={setBlobPage} pageSize={blobPageSize} setPageSize={setBlobPageSize} />
       </Card>
 
       {blobs.trash.length > 0 && (
-        <Card title="Корзина" sub={`${blobs.trash.length}`} head={<Button mini variant="danger" onClick={emptyTrash}>Очистить корзину</Button>}>
+        <Card
+          title="Корзина"
+          sub={`${blobs.trash.length}`}
+          head={
+            <div className="flex flex-wrap items-center gap-2">
+              <Input value={trashQ} onChange={(e) => { setTrashQ(e.target.value); setTrashPage(1); }} placeholder="Поиск по имени" className="h-8 w-48 py-1" />
+              <Button mini variant="danger" onClick={emptyTrash}>Очистить корзину</Button>
+            </div>
+          }
+        >
           <p className="mb-3 text-xs text-muted">Удалённые блобы хранятся здесь — можно восстановить или удалить навсегда.</p>
           <TableWrap>
             <table className={tableCls}>
               <thead><tr><th className={thBase}>Имя</th><th className={cn(thBase, "w-44 text-right")} /></tr></thead>
               <tbody>
-                {blobs.trash.map((n) => (
+                {shownTrash.length === 0 && <EmptyRow colSpan={2}>Ничего не найдено.</EmptyRow>}
+                {pageSlice(shownTrash, trashPage, trashPageSize).map((n) => (
                   <tr key={n} className="hover:bg-line-soft">
                     <td className={cn(tdCls, "font-mono")}>{n}</td>
                     <td className={cn(tdCls, "text-right")}>
@@ -296,6 +341,7 @@ export default function Blobs() {
               </tbody>
             </table>
           </TableWrap>
+          <Pager total={shownTrash.length} page={trashPage} setPage={setTrashPage} pageSize={trashPageSize} setPageSize={setTrashPageSize} />
         </Card>
       )}
 

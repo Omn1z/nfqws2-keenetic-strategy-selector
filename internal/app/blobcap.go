@@ -148,6 +148,21 @@ func (a *App) SaveCapturedBlob(id string, index int, name string) (string, error
 	return a.SaveBlob(name, data)
 }
 
+// ValidateBlob reads a blob (custom or system) and reports whether it is a
+// structurally valid TLS ClientHello usable as a fake payload.
+func (a *App) ValidateBlob(name string) (bool, string, error) {
+	_, path, ok := a.resolveBlob(name)
+	if !ok {
+		return false, "", fmt.Errorf("блоб не найден")
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return false, "", err
+	}
+	valid, detail := tlsblob.ValidateClientHello(b)
+	return valid, detail, nil
+}
+
 // GenerateBlob builds a TLS ClientHello for the chosen domain and saves it as a
 // custom blob. alpn/minVer are optional knobs (see tlsblob.GenerateClientHello).
 func (a *App) GenerateBlob(sni string, alpn []string, minVer uint16, name string) (string, error) {

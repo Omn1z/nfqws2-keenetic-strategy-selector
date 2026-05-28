@@ -107,6 +107,38 @@ func (s *Server) authConfig(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]bool{"enabled": in.Enabled})
 }
 
+func (s *Server) getSystemSettings(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, 200, map[string]any{
+		"auth_enabled":    s.app.AuthEnabled(),
+		"auth_forced_off": s.app.AuthForcedOff(),
+		"logging_enabled": s.app.LoggingEnabled(),
+	})
+}
+
+func (s *Server) setSystemSettings(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		AuthEnabled    *bool `json:"auth_enabled"`
+		LoggingEnabled *bool `json:"logging_enabled"`
+	}
+	if err := readJSON(r, &in); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	if in.AuthEnabled != nil && !s.app.AuthForcedOff() {
+		if err := s.app.SetAuthEnabled(*in.AuthEnabled); err != nil {
+			httpErr(w, 500, err)
+			return
+		}
+	}
+	if in.LoggingEnabled != nil {
+		if err := s.app.SetLoggingEnabled(*in.LoggingEnabled); err != nil {
+			httpErr(w, 500, err)
+			return
+		}
+	}
+	s.getSystemSettings(w, r)
+}
+
 func (s *Server) routes() {
 	m := s.mux
 	m.HandleFunc("GET /api/config", s.getConfig)
@@ -123,6 +155,8 @@ func (s *Server) routes() {
 	m.HandleFunc("GET /api/blobcap/{id}", s.getBlobCapture)
 	m.HandleFunc("POST /api/blobcap/{id}/save", s.saveCapturedBlob)
 	m.HandleFunc("POST /api/system/install", s.installPackage)
+	m.HandleFunc("GET /api/system/settings", s.getSystemSettings)
+	m.HandleFunc("POST /api/system/settings", s.setSystemSettings)
 
 	m.HandleFunc("GET /api/logs", s.getLogs)
 	m.HandleFunc("POST /api/logs/clear", s.clearLogs)
@@ -147,6 +181,7 @@ func (s *Server) routes() {
 	m.HandleFunc("POST /api/blobs/trash/empty", s.emptyTrash)
 	m.HandleFunc("DELETE /api/blobs/trash/{name}", s.purgeBlob)
 	m.HandleFunc("POST /api/blobs/{name}/restore", s.restoreBlob)
+	m.HandleFunc("GET /api/blobs/{name}/validate", s.validateBlob)
 	m.HandleFunc("DELETE /api/blobs/{name}", s.deleteBlob)
 
 	m.HandleFunc("POST /api/runs", s.startRun)
@@ -563,6 +598,15 @@ func (s *Server) generateBlob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, map[string]string{"name": in.Name, "path": path})
+}
+
+func (s *Server) validateBlob(w http.ResponseWriter, r *http.Request) {
+	valid, detail, err := s.app.ValidateBlob(r.PathValue("name"))
+	if err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"valid": valid, "detail": detail})
 }
 
 func (s *Server) restoreBlob(w http.ResponseWriter, r *http.Request) {

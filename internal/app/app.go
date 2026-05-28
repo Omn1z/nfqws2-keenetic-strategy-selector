@@ -40,8 +40,9 @@ type App struct {
 	cancelBC func()      // cancel for the active block check
 	lastBC   *BlockCheck // most recently finished block check (for the final poll)
 
-	sessions    *auth.Sessions
-	authEnabled bool
+	sessions        *auth.Sessions
+	authEnabled     bool
+	loggingDisabled bool
 
 	tgws *tgws.Manager // Telegram MTProto->WS proxy (separate tab)
 
@@ -256,7 +257,21 @@ func (a *App) resolveBlob(name string) (luaName, path string, ok bool) {
 			return "", "", false
 		}
 	}
-	return strings.TrimSuffix(name, filepath.Ext(name)), path, true
+	return luaIdent(strings.TrimSuffix(name, filepath.Ext(name))), path, true
+}
+
+// reNonIdent matches characters not allowed in an nfqws2 blob (Lua) identifier.
+var reNonIdent = regexp.MustCompile(`[^A-Za-z0-9_]`)
+
+// luaIdent turns a blob filename stem into a valid nfqws2 --blob=NAME identifier.
+// Captured/generated blobs are named after the SNI (e.g. clienthello_edge.microsoft.com),
+// and nfqws2 rejects dots/dashes as a "bad identifier", so they're folded to '_'.
+func luaIdent(s string) string {
+	s = reNonIdent.ReplaceAllString(s, "_")
+	if s == "" || (s[0] >= '0' && s[0] <= '9') {
+		s = "b_" + s
+	}
+	return s
 }
 
 // reFakeBlobRef matches a fake-payload blob reference inside a desync directive
@@ -279,12 +294,14 @@ func (a *App) buildRunStrategies(base []catalog.Strategy, blobNames []string) []
 	if len(blobs) == 0 {
 		return base
 	}
-	out := make([]catalog.Strategy, 0, len(base))
+	out := make([]catalog.Strategy, 0, len(base)*(len(blobs)+1))
 	for _, s := range base {
 		if !reFakeBlobRef.MatchString(s.ArgLine) {
 			out = append(out, s) // blob-independent — test once
 			continue
 		}
+		// Selected blobs first (the user's chosen payloads), then the strategy's
+		// own default (tls_clienthello) as a fallback pass.
 		for _, b := range blobs {
 			v := s
 			v.ID = s.ID + "/" + b.lua
@@ -292,6 +309,7 @@ func (a *App) buildRunStrategies(base []catalog.Strategy, blobNames []string) []
 			v.ArgLine = "--blob=" + b.lua + ":@" + b.path + " " + reFakeBlobRef.ReplaceAllString(s.ArgLine, "${1}blob="+b.lua)
 			out = append(out, v)
 		}
+		out = append(out, s) // default payload, tested last
 	}
 	return out
 }
