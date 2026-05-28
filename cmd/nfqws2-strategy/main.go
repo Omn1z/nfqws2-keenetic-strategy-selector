@@ -23,6 +23,9 @@ import (
 // version is set at build time via -ldflags "-X main.version=...".
 var version = "dev"
 
+// repo is the GitHub owner/name used for self-update checks and downloads.
+var repo = "Omn1z/nfqws2-keenetic-strategy-selector"
+
 func main() {
 	if len(os.Args) < 2 {
 		usage()
@@ -37,10 +40,42 @@ func main() {
 		cmdSelftest(os.Args[2:])
 	case "config":
 		cmdConfig()
+	case "checkupdate":
+		cmdCheckUpdate()
+	case "update":
+		cmdUpdate()
 	default:
 		usage()
 		os.Exit(2)
 	}
+}
+
+func cmdCheckUpdate() {
+	a, err := app.New(loadConfig())
+	if err != nil {
+		log.Fatalln("init:", err)
+	}
+	info, err := a.CheckUpdate()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "check failed:", err)
+		os.Exit(1)
+	}
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	_ = enc.Encode(info)
+}
+
+func cmdUpdate() {
+	a, err := app.New(loadConfig())
+	if err != nil {
+		log.Fatalln("init:", err)
+	}
+	info, err := a.SelfUpdate()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "update failed:", err)
+		os.Exit(1)
+	}
+	fmt.Printf("updating %s -> %s; service will restart\n", info.Current, info.Latest)
 }
 
 func usage() {
@@ -48,6 +83,8 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "  nfqws2-strategy serve [-l <addr>]                                run web UI + API (default :8090)")
 	fmt.Fprintln(os.Stderr, "  nfqws2-strategy selftest [-s <strategyIndex>] <host> [host...]   run one strategy against hosts, print JSON")
 	fmt.Fprintln(os.Stderr, "  nfqws2-strategy config                                          print resolved config")
+	fmt.Fprintln(os.Stderr, "  nfqws2-strategy checkupdate                                     check GitHub for a newer release")
+	fmt.Fprintln(os.Stderr, "  nfqws2-strategy update                                          download the latest release and restart")
 }
 
 func cmdServe(args []string) {
@@ -118,6 +155,11 @@ func loadConfig() *config.Config {
 	if v := os.Getenv("N2S_LISTEN"); v != "" {
 		cfg.ListenAddr = v
 	}
+	if v := os.Getenv("N2S_INIT"); v != "" {
+		cfg.InitScript = v
+	}
+	cfg.Version = version
+	cfg.Repo = repo
 	return cfg
 }
 

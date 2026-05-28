@@ -53,6 +53,9 @@ func (s *Server) routes() {
 
 	m.HandleFunc("POST /api/apply", s.applyStrategy)
 
+	m.HandleFunc("GET /api/update/check", s.checkUpdate)
+	m.HandleFunc("POST /api/update", s.doUpdate)
+
 	sub, _ := fs.Sub(webAssets, "web")
 	m.Handle("/", http.FileServerFS(sub))
 }
@@ -207,6 +210,24 @@ func (s *Server) applyStrategy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, map[string]string{"status": "applied"})
+}
+
+func (s *Server) checkUpdate(w http.ResponseWriter, r *http.Request) {
+	info, err := s.app.CheckUpdate()
+	if err != nil {
+		writeJSON(w, 200, map[string]any{"current": info.Current, "latest": info.Latest, "available": false, "error": err.Error()})
+		return
+	}
+	writeJSON(w, 200, info)
+}
+
+func (s *Server) doUpdate(w http.ResponseWriter, r *http.Request) {
+	info, err := s.app.SelfUpdate()
+	if err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"status": "updating", "from": info.Current, "to": info.Latest})
 }
 
 // ---------- helpers ----------

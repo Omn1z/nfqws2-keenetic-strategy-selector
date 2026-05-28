@@ -19,6 +19,11 @@ type Config struct {
 	SystemBlobsDir string   `json:"system_blobs_dir"`
 	LuaDir         string   `json:"lua_dir"`
 
+	// Self-update.
+	Version    string `json:"version"`
+	Repo       string `json:"repo"`        // owner/name on GitHub
+	InitScript string `json:"init_script"` // service control script used to restart after update
+
 	// Worker sandbox parameters.
 	FirstQueue     int `json:"first_queue"`
 	PortBase       int `json:"port_base"`
@@ -37,6 +42,7 @@ func Default() *Config {
 		FirstQueue:     200,
 		PortBase:       50000,
 		PortsPerWorker: 200,
+		InitScript:     "/opt/etc/init.d/S52nfqws2-strategy",
 	}
 }
 
