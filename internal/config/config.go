@@ -28,6 +28,10 @@ type Config struct {
 	FirstQueue     int `json:"first_queue"`
 	PortBase       int `json:"port_base"`
 	PortsPerWorker int `json:"ports_per_worker"`
+
+	// MainQueue is the NFQUEUE the live nfqws2 service binds (for the dashboard
+	// "packets" card). Distinct from FirstQueue, which is the test-sandbox base.
+	MainQueue int `json:"main_queue"`
 }
 
 func Default() *Config {
@@ -42,6 +46,7 @@ func Default() *Config {
 		FirstQueue:     200,
 		PortBase:       50000,
 		PortsPerWorker: 200,
+		MainQueue:      300,
 		InitScript:     "/opt/etc/init.d/S52nfqws2-strategy",
 	}
 }

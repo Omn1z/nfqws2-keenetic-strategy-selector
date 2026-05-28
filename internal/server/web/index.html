@@ -45,7 +45,19 @@
 
   <div class="layout">
     <nav class="sidenav">
-      <button class="nav-item active" data-tab="lists">
+      <button class="nav-item active" data-tab="dashboard">
+        <svg viewBox="0 0 24 24" width="18" height="18"><rect x="3" y="3" width="7" height="8" rx="1" fill="none" stroke="currentColor" stroke-width="2"/><rect x="14" y="3" width="7" height="5" rx="1" fill="none" stroke="currentColor" stroke-width="2"/><rect x="14" y="11" width="7" height="10" rx="1" fill="none" stroke="currentColor" stroke-width="2"/><rect x="3" y="14" width="7" height="7" rx="1" fill="none" stroke="currentColor" stroke-width="2"/></svg>
+        <span>Дашборд</span>
+      </button>
+      <button class="nav-item" data-tab="conns">
+        <svg viewBox="0 0 24 24" width="18" height="18"><path d="M22 12h-4l-3 8L9 4l-3 8H2" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        <span>Соединения</span>
+      </button>
+      <button class="nav-item" data-tab="devices">
+        <svg viewBox="0 0 24 24" width="18" height="18"><rect x="2" y="4" width="20" height="13" rx="2" fill="none" stroke="currentColor" stroke-width="2"/><path d="M8 21h8M12 17v4" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+        <span>Устройства</span>
+      </button>
+      <button class="nav-item" data-tab="lists">
         <svg viewBox="0 0 24 24" width="18" height="18"><path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
         <span>Списки</span>
       </button>
@@ -80,8 +92,64 @@
     </nav>
 
     <main class="content">
+      <!-- DASHBOARD -->
+      <section id="tab-dashboard" class="panel active">
+        <div id="dashGrid" class="dash-grid"></div>
+      </section>
+
+      <!-- CONNECTIONS -->
+      <section id="tab-conns" class="panel">
+        <div class="card">
+          <div class="card-head"><h2>Активные соединения</h2><span class="hint">обновляется, пока открыта вкладка</span>
+            <label class="field field-sm head-action pager-size">Показывать
+              <select id="connsPageSize">
+                <option value="20">20</option>
+                <option value="50" selected>50</option>
+                <option value="100">100</option>
+                <option value="all">Все</option>
+              </select>
+            </label>
+          </div>
+          <div class="conns-toolbar">
+            <input id="connsFilter" type="search" placeholder="Фильтр: IP, порт, протокол, состояние…">
+            <label class="switch"><input id="connsFailOnly" type="checkbox"><span class="track"></span>только проблемные</label>
+            <span id="connsSummary" class="hint"></span>
+          </div>
+          <div class="table-wrap scrollable">
+            <table id="connsTable" class="data">
+              <thead><tr>
+                <th data-sort="proto">Proto</th>
+                <th data-sort="state">Состояние</th>
+                <th data-sort="src">Источник (LAN)</th>
+                <th data-sort="dst">Назначение</th>
+                <th data-sort="dport">Порт</th>
+                <th data-sort="bytes">Трафик</th>
+                <th data-sort="zone">Зона</th>
+              </tr></thead>
+              <tbody></tbody>
+            </table>
+          </div>
+          <div id="connsPager" class="pager hidden">
+            <button id="connsPrev" class="btn btn-mini" type="button">‹ Назад</button>
+            <span id="connsPageInfo" class="hint"></span>
+            <button id="connsNext" class="btn btn-mini" type="button">Вперёд ›</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- DEVICES -->
+      <section id="tab-devices" class="panel">
+        <div class="card">
+          <div class="card-head"><h2>Активность устройств</h2><span class="hint">кто к чему подключается</span>
+            <button id="devicesRefresh" class="btn btn-mini head-action">Обновить</button>
+          </div>
+          <p class="hint">Соединения сгруппированы по устройству LAN (по исходному IP). «Не отвечают» — соединения без ответа (<code>[UNREPLIED]</code>) или TCP в <code>SYN_SENT</code>: именно эти адреса стоит прогнать на вкладке «Прогоны» (кнопка «→ В прогон»).</p>
+          <div id="devicesList"></div>
+        </div>
+      </section>
+
       <!-- LISTS -->
-      <section id="tab-lists" class="panel active">
+      <section id="tab-lists" class="panel">
         <div class="grid">
           <aside class="col-lists">
             <button id="newList" class="btn btn-primary btn-block">+ Новый список</button>

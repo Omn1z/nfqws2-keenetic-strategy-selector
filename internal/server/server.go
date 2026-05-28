@@ -107,6 +107,10 @@ func (s *Server) routes() {
 	m := s.mux
 	m.HandleFunc("GET /api/config", s.getConfig)
 
+	m.HandleFunc("GET /api/dashboard", s.getDashboard)
+	m.HandleFunc("GET /api/connections", s.getConnections)
+	m.HandleFunc("GET /api/devices", s.getDevices)
+
 	m.HandleFunc("GET /api/strategies", s.getStrategies)
 	m.HandleFunc("POST /api/strategies", s.saveStrategy)
 	m.HandleFunc("POST /api/strategies/export", s.exportStrategy)
@@ -191,6 +195,30 @@ func (s *Server) serveIndex(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) getConfig(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, s.app.Cfg)
+}
+
+// ---------- monitoring (dashboard / connections / devices) ----------
+
+func (s *Server) getDashboard(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, 200, s.app.Dashboard(hostFromHeader(r.Host)))
+}
+
+func (s *Server) getConnections(w http.ResponseWriter, r *http.Request) {
+	v, err := s.app.Connections()
+	if err != nil {
+		httpErr(w, 500, err)
+		return
+	}
+	writeJSON(w, 200, v)
+}
+
+func (s *Server) getDevices(w http.ResponseWriter, r *http.Request) {
+	v, err := s.app.DeviceActivity()
+	if err != nil {
+		httpErr(w, 500, err)
+		return
+	}
+	writeJSON(w, 200, v)
 }
 
 func (s *Server) getStrategies(w http.ResponseWriter, r *http.Request) {

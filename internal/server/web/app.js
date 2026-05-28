@@ -26,6 +26,9 @@ function toast(msg, kind) {
 
 const esc = (s) => String(s == null ? "" : s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 const kb = (bps) => (bps / 1024).toFixed(0);
+// human-readable bytes; fmtNum groups thousands (ru locale)
+const human = (b) => { b = Number(b) || 0; const u = ["Б", "КБ", "МБ", "ГБ", "ТБ"]; let i = 0; while (b >= 1024 && i < u.length - 1) { b /= 1024; i++; } return (i === 0 ? b : b.toFixed(b < 10 ? 1 : 0)) + " " + u[i]; };
+const fmtNum = (n) => (Number(n) || 0).toLocaleString("ru-RU");
 
 // downloadFile fetches (with the auth cookie) and saves the response as a file.
 async function downloadFile(url, filename, opts) {
@@ -50,6 +53,9 @@ const state = {
   run: null, poll: null, results: [], sort: { key: "coef", dir: -1 }, resultsPage: 1, savedPage: 1,
   bc: null, bcPoll: null,
   tgws: null, tgwsPoll: null,
+  dash: null, dashPoll: null, dashWanPrev: {},
+  conns: [], connsPoll: null, connsSort: { key: "bytes", dir: -1 }, connsPage: 1,
+  devices: [],
   version: "", latest: "",
 };
 
@@ -157,17 +163,35 @@ async function resolveTarget(seg) {
 }
 
 /* ---------- navigation ---------- */
-$$(".nav-item").forEach(b => b.addEventListener("click", () => {
-  $$(".nav-item").forEach(x => x.classList.remove("active"));
+function switchTab(tab) {
+  $$(".nav-item").forEach(x => x.classList.toggle("active", x.dataset.tab === tab));
   $$(".panel").forEach(x => x.classList.remove("active"));
-  b.classList.add("active");
-  const p = $("#tab-" + b.dataset.tab);
-  p.classList.add("active");
-  if (b.dataset.tab === "runs") { fillRunLists(); fillGeoSelect("runGeoFile", "runGeoCat"); fillRunDNS(); }
-  if (b.dataset.tab === "blockcheck") { fillBCLists(); fillGeoSelect("bcGeoFile", "bcGeoCat"); }
-  if (b.dataset.tab === "dns") loadDNS();
-  if (b.dataset.tab === "tgws") { loadTGWS(); startTGWSPolling(); } else { stopTGWSPolling(); }
-}));
+  const p = $("#tab-" + tab);
+  if (p) p.classList.add("active");
+  if (tab === "runs") { fillRunLists(); fillGeoSelect("runGeoFile", "runGeoCat"); fillRunDNS(); }
+  if (tab === "blockcheck") { fillBCLists(); fillGeoSelect("bcGeoFile", "bcGeoCat"); }
+  if (tab === "dns") loadDNS();
+  if (tab === "dashboard") { loadDashboard(); startDashPolling(); } else { stopDashPolling(); }
+  if (tab === "conns") { loadConns(); startConnsPolling(); } else { stopConnsPolling(); }
+  if (tab === "devices") loadDevices();
+  if (tab === "tgws") { loadTGWS(); startTGWSPolling(); } else { stopTGWSPolling(); }
+}
+$$(".nav-item").forEach(b => b.addEventListener("click", () => switchTab(b.dataset.tab)));
+// hostOf strips the port from an "ip:port" / "[ipv6]:port" destination.
+function hostOf(hp) { if (hp.startsWith("[")) { const i = hp.indexOf("]"); return i > 0 ? hp.slice(1, i) : hp; } const i = hp.lastIndexOf(":"); return i > 0 ? hp.slice(0, i) : hp; }
+// sendToRun jumps to the Прогоны tab with the given targets pre-filled as text.
+function sendToRun(targets) {
+  if (!targets.length) return;
+  switchTab("runs");
+  const seg = $('.seg[data-seg="run"]');
+  if (seg) {
+    seg.querySelectorAll(".seg-btn").forEach(x => x.classList.toggle("active", x.dataset.src === "text"));
+    const sel = seg.closest(".srcsel");
+    sel.querySelectorAll(".srcbody").forEach(x => x.classList.toggle("hidden", x.dataset.src !== "text"));
+  }
+  $("#runText").value = targets.join("\n");
+  toast(`В прогон добавлено целей: ${targets.length}`, "ok");
+}
 
 /* ---------- lists ---------- */
 async function loadLists() {
@@ -985,6 +1009,197 @@ $("#tgwsCopy").addEventListener("click", async () => {
   catch (e) { $("#tgwsLink").select(); try { document.execCommand("copy"); toast("Ссылка скопирована", "ok"); } catch (_) { toast("Скопируйте вручную", "err"); } }
 });
 
+/* ---------- dashboard ---------- */
+async function loadDashboard() {
+  try { state.dash = await api("GET", "/api/dashboard"); renderDash(state.dash); }
+  catch (e) { /* keep last view; 401 handled by api() */ }
+}
+function startDashPolling() { stopDashPolling(); state.dashPoll = setInterval(loadDashboard, 2500); }
+function stopDashPolling() { if (state.dashPoll) { clearInterval(state.dashPoll); state.dashPoll = null; } }
+function dashCard(title, body, sub) {
+  return `<div class="card dash-card"><div class="card-head"><h2>${esc(title)}</h2>${sub ? `<span class="hint">${esc(sub)}</span>` : ""}</div>${body}</div>`;
+}
+function statRow(label, val) { return `<div class="stat-row"><span>${esc(label)}</span><b>${val}</b></div>`; }
+// wanRate diffs successive byte samples (per iface) into a bytes/sec rate.
+function wanRate(f) {
+  const now = Date.now(), prev = state.dashWanPrev[f.iface];
+  let r = null;
+  if (prev && now > prev.t) {
+    const dt = (now - prev.t) / 1000;
+    r = { rx: Math.max(0, (f.rx_bytes - prev.rx) / dt), tx: Math.max(0, (f.tx_bytes - prev.tx) / dt) };
+  }
+  state.dashWanPrev[f.iface] = { rx: f.rx_bytes, tx: f.tx_bytes, t: now };
+  return r;
+}
+function renderDash(d) {
+  const grid = $("#dashGrid"); if (!grid || !d) return;
+  const cards = [];
+
+  // TG WS Proxy
+  const tg = d.tgws || {}, st = tg.stats || {}, cc = st.connections || {}, tr = st.traffic || {};
+  const tgBadge = tg.running ? `<span class="badge ok">работает</span>` : `<span class="badge bad">остановлен</span>`;
+  cards.push(dashCard("TG WS Proxy",
+    statRow("Статус", tgBadge) +
+    statRow("Активные / всего", `${cc.active || 0} / ${cc.total || 0}`) +
+    statRow("WS / TCP / CF", `${cc.ws || 0} / ${cc.tcp_fallback || 0} / ${cc.cfproxy || 0}`) +
+    statRow("Трафик ↑ / ↓", `${tr.human_up || "0 Б"} / ${tr.human_down || "0 Б"}`)));
+
+  // Active connections
+  const cn = d.conns || {}, ct = d.conntrack || {}, bp = cn.by_proto || {};
+  cards.push(dashCard("Активные соединения",
+    `<div class="stat-big">${fmtNum(cn.total)}<span class="stat-big-sub">из ${fmtNum(ct.max)} макс.</span></div>` +
+    statRow("TCP / UDP / ICMP", `${bp.tcp || 0} / ${bp.udp || 0} / ${bp.icmp || 0}`) +
+    statRow("Не отвечают", `<span class="${cn.failing ? "txt-bad" : ""}">${cn.failing || 0}</span>`),
+    "conntrack"));
+
+  // Packets (DPI engine main queue)
+  const q = (d.queues || []).find(x => x.queue === d.main_queue);
+  if (q) {
+    cards.push(dashCard("Пакеты DPI",
+      `<div class="stat-big">${fmtNum(q.id_seq)}<span class="stat-big-sub">пакетов · очередь ${d.main_queue}</span></div>` +
+      statRow("В очереди сейчас", fmtNum(q.queued)) +
+      statRow("Отброшено (ядро / польз.)", `<span class="${(q.queue_drop || q.user_drop) ? "txt-bad" : ""}">${fmtNum(q.queue_drop)} / ${fmtNum(q.user_drop)}</span>`),
+      "nfqws2"));
+  } else {
+    cards.push(dashCard("Пакеты DPI", `<p class="hint">Очередь ${d.main_queue} не активна — сервис nfqws2 не запущен?</p>`, "nfqws2"));
+  }
+
+  // WAN bandwidth
+  const wans = d.wan || [];
+  if (wans.length) {
+    cards.push(dashCard("WAN", wans.map(f => {
+      const r = wanRate(f);
+      return statRow(`${f.iface} всего ↓ / ↑`, `${human(f.rx_bytes)} / ${human(f.tx_bytes)}`) +
+        statRow("скорость ↓ / ↑", r ? `${human(r.rx)}/с / ${human(r.tx)}/с` : "…");
+    }).join(""), "интерфейс"));
+  } else {
+    cards.push(dashCard("WAN", `<p class="hint">Нет данных по WAN-интерфейсу.</p>`, "интерфейс"));
+  }
+
+  grid.innerHTML = cards.join("");
+}
+
+/* ---------- connections ---------- */
+function connFailing(c) { return c.unreplied || (c.proto === "tcp" && c.state === "SYN_SENT"); }
+function connSortVal(c, key) {
+  switch (key) {
+    case "proto": return c.proto || "";
+    case "state": return c.state || (c.unreplied ? "UNREPLIED" : "");
+    case "src": return c.src || "";
+    case "dst": return c.dst || "";
+    case "dport": return c.dport || 0;
+    case "bytes": return (c.bytes || 0) + (c.reply_bytes || 0);
+    case "zone": return c.zone || "";
+  }
+  return 0;
+}
+async function loadConns() {
+  try { const v = await api("GET", "/api/connections"); state.conns = v.items || []; renderConns(); }
+  catch (e) { toast(e.message, "err"); }
+}
+function startConnsPolling() {
+  stopConnsPolling();
+  state.connsPoll = setInterval(async () => {
+    try { const v = await api("GET", "/api/connections"); state.conns = v.items || []; renderConns(); } catch (e) { /* keep last */ }
+  }, 3000);
+}
+function stopConnsPolling() { if (state.connsPoll) { clearInterval(state.connsPoll); state.connsPoll = null; } }
+function renderConns() {
+  const tb = $("#connsTable tbody"); if (!tb) return; tb.innerHTML = "";
+  const filter = ($("#connsFilter").value || "").toLowerCase().trim();
+  const failOnly = $("#connsFailOnly").checked;
+  let rows = state.conns.filter(c => {
+    if (failOnly && !connFailing(c)) return false;
+    if (!filter) return true;
+    return [c.proto, c.state, c.src, c.dst, String(c.dport || ""), c.zone].some(x => String(x || "").toLowerCase().includes(filter));
+  });
+  rows.sort((a, b) => { const va = connSortVal(a, state.connsSort.key), vb = connSortVal(b, state.connsSort.key); return va < vb ? -state.connsSort.dir : va > vb ? state.connsSort.dir : 0; });
+  const failTotal = state.conns.filter(connFailing).length;
+  $("#connsSummary").textContent = `${rows.length} из ${state.conns.length} · не отвечают ${failTotal}`;
+
+  const total = rows.length;
+  const sizeVal = $("#connsPageSize").value;
+  const size = sizeVal === "all" ? Math.max(total, 1) : parseInt(sizeVal, 10);
+  const pages = Math.max(1, Math.ceil(total / size));
+  if (state.connsPage > pages) state.connsPage = pages;
+  if (state.connsPage < 1) state.connsPage = 1;
+  const start = (state.connsPage - 1) * size;
+  rows.slice(start, start + size).forEach(c => {
+    const failing = connFailing(c);
+    const label = c.state || (c.unreplied ? "нет ответа" : (c.proto === "udp" ? "udp" : "—"));
+    const cls = failing ? "bad" : (c.state === "ESTABLISHED" ? "ok" : "");
+    const tr = document.createElement("tr");
+    if (failing) tr.className = "fail";
+    tr.innerHTML = `
+      <td>${esc(c.proto)}</td>
+      <td><span class="conn-badge ${cls}">${esc(label)}</span></td>
+      <td class="mono">${esc(c.src)}</td>
+      <td class="mono">${esc(c.dst)}</td>
+      <td class="num">${c.dport || "—"}</td>
+      <td class="num">${human((c.bytes || 0) + (c.reply_bytes || 0))}</td>
+      <td>${esc(c.zone || "")}</td>`;
+    tb.appendChild(tr);
+  });
+  const pager = $("#connsPager");
+  pager.classList.toggle("hidden", total === 0);
+  if (total > 0) {
+    $("#connsPageInfo").textContent = `стр. ${state.connsPage} из ${pages} · ${total} записей`;
+    $("#connsPrev").disabled = state.connsPage <= 1;
+    $("#connsNext").disabled = state.connsPage >= pages;
+  }
+}
+$$("#connsTable th[data-sort]").forEach(th => th.addEventListener("click", () => {
+  const k = th.dataset.sort;
+  if (state.connsSort.key === k) state.connsSort.dir *= -1; else state.connsSort = { key: k, dir: k === "bytes" || k === "dport" ? -1 : 1 };
+  state.connsPage = 1; renderConns();
+}));
+$("#connsPageSize").addEventListener("change", () => { state.connsPage = 1; renderConns(); });
+$("#connsPrev").addEventListener("click", () => { state.connsPage--; renderConns(); });
+$("#connsNext").addEventListener("click", () => { state.connsPage++; renderConns(); });
+$("#connsFilter").addEventListener("input", () => { state.connsPage = 1; renderConns(); });
+$("#connsFailOnly").addEventListener("change", () => { state.connsPage = 1; renderConns(); });
+
+/* ---------- device activity ---------- */
+async function loadDevices() {
+  try { const v = await api("GET", "/api/devices"); state.devices = v.devices || []; renderDevices(); }
+  catch (e) { $("#devicesList").innerHTML = `<p class="empty">Нет данных (${esc(e.message)}).</p>`; }
+}
+function dstList(items) {
+  if (!items.length) return `<ul class="dst-list"><li class="muted">—</li></ul>`;
+  return `<ul class="dst-list">${items.slice(0, 50).map(x => `<li>${esc(x)}</li>`).join("")}${items.length > 50 ? `<li class="muted">…ещё ${items.length - 50}</li>` : ""}</ul>`;
+}
+function renderDevices() {
+  const wrap = $("#devicesList"); if (!wrap) return; wrap.innerHTML = "";
+  if (!state.devices.length) { wrap.innerHTML = `<p class="empty">Нет активных устройств LAN.</p>`; return; }
+  state.devices.forEach(d => {
+    const working = d.working || [], failing = d.failing_dsts || [];
+    const card = document.createElement("div"); card.className = "dev-card";
+    card.innerHTML = `
+      <div class="dev-head">
+        <span class="dev-ip mono">${esc(d.ip)}</span>
+        ${d.mac ? `<span class="dev-mac mono">${esc(d.mac)}</span>` : ""}
+        ${d.iface ? `<span class="badge">${esc(d.iface)}</span>` : ""}
+        <span class="dev-counts"><span class="txt-ok">${d.established} работают</span> · <span class="${d.failing ? "txt-bad" : "muted"}">${d.failing} не отвечают</span></span>
+      </div>
+      <div class="dev-cols">
+        <div class="dev-col">
+          <div class="dev-col-h txt-ok">Работают (${working.length})</div>
+          ${dstList(working)}
+        </div>
+        <div class="dev-col">
+          <div class="dev-col-h txt-bad">Не отвечают (${failing.length})${failing.length ? `<button class="btn btn-mini" data-torun="${esc(failing.join(","))}">→ В прогон</button>` : ""}</div>
+          ${dstList(failing)}
+        </div>
+      </div>`;
+    wrap.appendChild(card);
+  });
+  $$("#devicesList button[data-torun]").forEach(b => b.addEventListener("click", () => {
+    const ips = [...new Set(b.dataset.torun.split(",").map(x => hostOf(x.trim())).filter(Boolean))];
+    sendToRun(ips);
+  }));
+}
+$("#devicesRefresh").addEventListener("click", loadDevices);
+
 /* ---------- init ---------- */
 async function boot() {
   try {
@@ -999,6 +1214,8 @@ async function boot() {
   await loadGeo();
   await loadDNS();
   checkUpdate(false);
+  loadDashboard();
+  startDashPolling();
 }
 (async function init() {
   try {

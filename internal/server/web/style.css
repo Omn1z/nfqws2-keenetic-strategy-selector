@@ -358,3 +358,38 @@ table.data th.cb, table.data td.cb { width: 30px; }
 table.data td.row-actions, table.data th.col-actions { position: sticky; right: 0; background: var(--panel); border-left: 1px solid var(--line-soft); }
 table.data tbody tr:hover td.row-actions { background: var(--line-soft); }
 .empty-cell { text-align: center; color: var(--muted); padding: 20px 11px; }
+
+/* ---------- dashboard ---------- */
+.dash-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(252px, 1fr)); gap: 16px; align-items: start; }
+.dash-grid .card { margin-bottom: 0; }
+.stat-big { font-size: 30px; font-weight: 700; color: var(--accent-d); font-variant-numeric: tabular-nums; line-height: 1.1; margin-bottom: 10px; }
+.stat-big-sub { display: block; font-size: 12px; font-weight: 500; color: var(--muted); margin-top: 3px; }
+.stat-row { display: flex; justify-content: space-between; gap: 12px; padding: 6px 0; border-top: 1px solid var(--line-soft); font-size: 13px; }
+.stat-row:first-child { border-top: 0; }
+.stat-row > span { color: var(--ink-soft); }
+.stat-row b { font-variant-numeric: tabular-nums; white-space: nowrap; }
+.txt-ok { color: var(--ok); }
+.txt-bad { color: var(--bad); }
+.muted { color: var(--muted); }
+
+/* ---------- connections ---------- */
+.conns-toolbar { display: flex; gap: 14px; align-items: center; margin-bottom: 12px; flex-wrap: wrap; }
+.conns-toolbar input[type=search] { flex: 1; min-width: 220px; margin-top: 0; }
+.conns-toolbar .switch { margin: 0; white-space: nowrap; }
+.conn-badge { font-size: 11px; padding: 2px 8px; border-radius: 999px; font-weight: 600; white-space: nowrap; background: var(--line-soft); color: var(--ink-soft); }
+.conn-badge.ok { background: var(--ok-bg); color: var(--ok); }
+.conn-badge.bad { background: var(--bad-bg); color: var(--bad); }
+
+/* ---------- device activity ---------- */
+.dev-card { border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; margin-bottom: 12px; background: var(--panel); animation: fadeIn .25s ease both; }
+.dev-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 10px; }
+.dev-ip { font-weight: 700; font-size: 14px; }
+.dev-mac { color: var(--muted); font-size: 12px; }
+.dev-card .badge { background: var(--accent-w); color: var(--accent-d); }
+.dev-counts { margin-left: auto; font-size: 12.5px; }
+.dev-cols { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+.dev-col-h { font-size: 12.5px; font-weight: 600; margin-bottom: 6px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.dst-list { list-style: none; margin: 0; padding: 0; max-height: 168px; overflow-y: auto; font-family: ui-monospace, Consolas, monospace; font-size: 12px; }
+.dst-list li { padding: 3px 0; border-bottom: 1px solid var(--line-soft); color: var(--ink-soft); overflow-wrap: anywhere; }
+.dst-list li.muted { color: var(--muted); border: 0; }
+@media (max-width: 640px) { .dev-cols { grid-template-columns: 1fr; } }
