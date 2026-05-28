@@ -48,9 +48,13 @@ async function loadLists() {
   state.lists.forEach(l => {
     const li = document.createElement("li");
     if (state.selected && state.selected.id === l.id) li.classList.add("active");
-    li.innerHTML = `<div class="nm">${esc(l.name || "(без имени)")}</div>
-      <div class="meta">${(l.domains || []).length} доменов · ${(l.successful_strategies || []).length} рабочих</div>`;
-    li.addEventListener("click", () => selectList(l.id));
+    li.innerHTML = `<div class="li-main">
+        <div class="nm">${esc(l.name || "(без имени)")}</div>
+        <div class="meta">${(l.domains || []).length} доменов · ${(l.successful_strategies || []).length} рабочих</div>
+      </div>
+      <button class="li-del" title="Удалить список" aria-label="Удалить">×</button>`;
+    li.querySelector(".li-main").addEventListener("click", () => selectList(l.id));
+    li.querySelector(".li-del").addEventListener("click", (e) => { e.stopPropagation(); deleteListById(l.id, l.name); });
     ul.appendChild(li);
   });
 }
@@ -93,12 +97,20 @@ $("#saveList").addEventListener("click", async () => {
   try { state.selected = await api("POST", "/api/lists", collectList()); await loadLists(); toast("Список сохранён", "ok"); }
   catch (e) { toast(e.message, "err"); }
 });
-$("#deleteList").addEventListener("click", async () => {
+$("#deleteList").addEventListener("click", () => {
   if (!state.selected || !state.selected.id) { state.selected = null; renderListEditor(); return; }
-  if (!confirm("Удалить список?")) return;
-  try { await api("DELETE", "/api/lists/" + state.selected.id); state.selected = null; renderListEditor(); await loadLists(); }
-  catch (e) { toast(e.message, "err"); }
+  deleteListById(state.selected.id, state.selected.name);
 });
+
+async function deleteListById(id, name) {
+  if (!confirm("Удалить список «" + (name || "без имени") + "»?")) return;
+  try {
+    await api("DELETE", "/api/lists/" + id);
+    if (state.selected && state.selected.id === id) { state.selected = null; renderListEditor(); }
+    await loadLists();
+    toast("Список удалён", "ok");
+  } catch (e) { toast(e.message, "err"); }
+}
 
 /* ---------- run ---------- */
 function fillRunStrategies() {
@@ -261,16 +273,26 @@ async function loadBlobs() {
   const sy = $("#systemBlobs"); sy.innerHTML = "";
   (b.system || []).forEach(n => { const li = document.createElement("li"); li.textContent = n; sy.appendChild(li); });
 }
-$("#blobForm").addEventListener("submit", async (e) => {
-  e.preventDefault();
-  const f = $("#blobFile").files[0]; if (!f) return;
-  const fd = new FormData(); fd.append("file", f);
+const blobDrop = $("#blobDrop"), blobInput = $("#blobFile");
+async function uploadBlob(file) {
+  if (!file) return;
+  $("#blobName").textContent = "Загрузка: " + file.name;
+  blobDrop.classList.add("busy");
+  const fd = new FormData(); fd.append("file", file);
   try {
     const res = await fetch("/api/blobs", { method: "POST", body: fd });
     const d = await res.json(); if (!res.ok) throw new Error(d.error || res.statusText);
+    $("#blobName").textContent = "✓ " + d.name;
     toast("Загружено: " + d.path, "ok"); await loadBlobs();
-  } catch (e) { toast(e.message, "err"); }
-});
+  } catch (e) { $("#blobName").textContent = ""; toast(e.message, "err"); }
+  finally { blobDrop.classList.remove("busy"); }
+}
+blobDrop.addEventListener("click", () => blobInput.click());
+blobDrop.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); blobInput.click(); } });
+blobInput.addEventListener("change", () => { if (blobInput.files[0]) uploadBlob(blobInput.files[0]); });
+["dragenter", "dragover"].forEach(ev => blobDrop.addEventListener(ev, (e) => { e.preventDefault(); blobDrop.classList.add("drag"); }));
+blobDrop.addEventListener("dragleave", (e) => { if (!blobDrop.contains(e.relatedTarget)) blobDrop.classList.remove("drag"); });
+blobDrop.addEventListener("drop", (e) => { e.preventDefault(); blobDrop.classList.remove("drag"); const f = e.dataTransfer.files[0]; if (f) uploadBlob(f); });
 
 /* ---------- updates ---------- */
 async function checkUpdate(manual) {
@@ -311,6 +333,28 @@ $("#btnUpdate").addEventListener("click", async () => {
   if (ok) { $("#updateMsg").textContent = "Готово, перезагружаем страницу…"; setTimeout(() => location.reload(), 1200); }
   else { $("#updateMsg").textContent = "Перезапуск занимает дольше обычного. Обновите страницу вручную."; }
 });
+
+/* ---------- theme ---------- */
+const THEMES = ["auto", "light", "dark"];
+const THEME_ICON = {
+  auto: '<svg viewBox="0 0 24 24" width="16" height="16"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="2"/><path d="M12 3a9 9 0 0 0 0 18z" fill="currentColor"/></svg>',
+  light: '<svg viewBox="0 0 24 24" width="16" height="16"><circle cx="12" cy="12" r="4.3" fill="none" stroke="currentColor" stroke-width="2"/><path d="M12 1.6v3M12 19.4v3M4.2 4.2l2.1 2.1M17.7 17.7l2.1 2.1M1.6 12h3M19.4 12h3M4.2 19.8l2.1-2.1M17.7 6.3l2.1-2.1" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>',
+  dark: '<svg viewBox="0 0 24 24" width="16" height="16"><path d="M21 12.8A9 9 0 1 1 11.2 3 7 7 0 0 0 21 12.8z" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round"/></svg>',
+};
+const prefersDark = matchMedia("(prefers-color-scheme: dark)");
+let themeMode = (location.search.match(/[?&]theme=(auto|light|dark)/) || [])[1] || localStorage.getItem("theme") || "auto";
+function applyTheme(mode) {
+  themeMode = mode;
+  localStorage.setItem("theme", mode);
+  const dark = mode === "dark" || (mode === "auto" && prefersDark.matches);
+  document.documentElement.dataset.theme = dark ? "dark" : "light";
+  const b = $("#btnTheme");
+  b.innerHTML = THEME_ICON[mode];
+  b.title = "Тема: " + (mode === "auto" ? "авто (как в браузере)" : mode === "light" ? "светлая" : "тёмная");
+}
+$("#btnTheme").addEventListener("click", () => applyTheme(THEMES[(THEMES.indexOf(themeMode) + 1) % THEMES.length]));
+prefersDark.addEventListener("change", () => { if (themeMode === "auto") applyTheme("auto"); });
+applyTheme(themeMode);
 
 /* ---------- init ---------- */
 (async function init() {

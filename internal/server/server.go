@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"log"
 	"net/http"
+	"strings"
 	"time"
 
 	"nfqws2strategy/internal/app"
@@ -57,10 +58,31 @@ func (s *Server) routes() {
 	m.HandleFunc("POST /api/update", s.doUpdate)
 
 	sub, _ := fs.Sub(webAssets, "web")
-	m.Handle("/", http.FileServerFS(sub))
+	m.HandleFunc("GET /{$}", s.serveIndex)
+	m.HandleFunc("GET /index.html", s.serveIndex)
+	m.Handle("/", noStore(http.FileServerFS(sub)))
 }
 
 // ---------- handlers ----------
+
+// serveIndex serves index.html with version-stamped asset URLs so a self-update
+// busts the browser cache for style.css / app.js.
+func (s *Server) serveIndex(w http.ResponseWriter, r *http.Request) {
+	b, err := fs.ReadFile(webAssets, "web/index.html")
+	if err != nil {
+		http.Error(w, "index missing", 500)
+		return
+	}
+	v := s.app.Cfg.Version
+	if v == "" {
+		v = "0"
+	}
+	html := strings.ReplaceAll(string(b), "style.css", "style.css?v="+v)
+	html = strings.ReplaceAll(html, "app.js", "app.js?v="+v)
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	_, _ = w.Write([]byte(html))
+}
 
 func (s *Server) getConfig(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, s.app.Cfg)
@@ -253,6 +275,17 @@ func httpErr(w http.ResponseWriter, code int, err error) {
 func readJSON(r *http.Request, v any) error {
 	defer r.Body.Close()
 	return json.NewDecoder(io.LimitReader(r.Body, 8<<20)).Decode(v)
+}
+
+// noStore stops browsers from heuristically caching the embedded web assets, so
+// a self-update is reflected immediately instead of serving a stale UI.
+func noStore(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		r.Header.Del("If-Modified-Since")
+		r.Header.Del("If-None-Match")
+		w.Header().Set("Cache-Control", "no-store, must-revalidate")
+		next.ServeHTTP(w, r)
+	})
 }
 
 func logging(next http.Handler) http.Handler {

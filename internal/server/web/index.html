@@ -4,6 +4,17 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>NFQWS2 Strategy Selector</title>
+<script>
+// Apply theme before first paint to avoid a flash. Default = browser preference.
+(function () {
+  try {
+    var q = (location.search.match(/[?&]theme=(auto|light|dark)/) || [])[1];
+    var m = q || localStorage.getItem("theme") || "auto";
+    var dark = m === "dark" || (m === "auto" && matchMedia("(prefers-color-scheme: dark)").matches);
+    document.documentElement.dataset.theme = dark ? "dark" : "light";
+  } catch (e) {}
+})();
+</script>
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -17,6 +28,7 @@
     </div>
     <div class="topbar-right">
       <span id="envInfo" class="env"></span>
+      <button id="btnTheme" class="icon-btn" title="Тема"></button>
       <div class="ver">
         <span class="ver-label">версия</span>
         <span id="verCurrent" class="ver-num">…</span>
@@ -158,10 +170,12 @@
         <div class="card">
           <div class="card-head"><h2>Блобы</h2></div>
           <p class="hint">Свой блоб используется в стратегии так: <code>--blob=имя:@/путь</code>. После загрузки путь показывается в уведомлении.</p>
-          <form id="blobForm" class="blob-form">
-            <input type="file" id="blobFile" required>
-            <button class="btn btn-primary" type="submit">Загрузить</button>
-          </form>
+          <div id="blobDrop" class="dropzone" tabindex="0" role="button" aria-label="Загрузить блоб">
+            <svg class="dz-icon" viewBox="0 0 24 24" width="34" height="34"><path d="M12 16V4m0 0 4 4m-4-4L8 8M5 16v2a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-2" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+            <div class="dz-text"><b>Перетащите файл сюда</b> или нажмите, чтобы выбрать</div>
+            <div id="blobName" class="dz-name"></div>
+            <input type="file" id="blobFile" hidden>
+          </div>
           <div class="two">
             <div><h3 class="sub">Пользовательские</h3><ul id="customBlobs" class="chips"></ul></div>
             <div><h3 class="sub">Системные</h3><ul id="systemBlobs" class="chips mono"></ul></div>
