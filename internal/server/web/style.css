@@ -256,6 +256,7 @@ tr.fail td:first-child { box-shadow: inset 3px 0 0 var(--bad); }
 }
 .toast.err { background: var(--bad); }
 .toast.ok { background: var(--ok); }
+.toast.warn { background: var(--warn); }
 
 /* ---------- update overlay ---------- */
 .overlay { position: fixed; inset: 0; background: rgba(20,30,45,.55); backdrop-filter: blur(3px); display: grid; place-items: center; z-index: 60; animation: fadeIn .2s ease both; }
@@ -338,3 +339,13 @@ table.data th.cb, table.data td.cb { width: 30px; }
 .tgws-stats td:first-child { color: var(--ink-soft); }
 .tgws-stats td.num { font-variant-numeric: tabular-nums; }
 .badge.head-action { align-self: center; }
+
+/* ---------- results: scroll + pagination + even action buttons ---------- */
+.table-wrap.scrollable { max-height: 520px; overflow: auto; }
+.table-wrap.scrollable table.data thead th { position: sticky; top: 0; background: var(--panel); z-index: 1; }
+.row-actions .btn { min-height: 28px; display: inline-flex; align-items: center; justify-content: center; line-height: 1; }
+.pager { display: flex; gap: 12px; align-items: center; justify-content: center; margin-top: 12px; }
+.pager .hint { min-width: 170px; text-align: center; }
+.pager .btn:disabled { opacity: .45; cursor: default; }
+.pager-size { flex-direction: row; align-items: center; gap: 6px; }
+.pager-size select { width: auto; }

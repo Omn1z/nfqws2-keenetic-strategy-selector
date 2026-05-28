@@ -47,7 +47,7 @@ function exportStrategy(name, l7, args) {
 
 const state = {
   lists: [], selected: null, strategies: [], geo: [],
-  run: null, poll: null, results: [], sort: { key: "coef", dir: -1 },
+  run: null, poll: null, results: [], sort: { key: "coef", dir: -1 }, resultsPage: 1,
   bc: null, bcPoll: null,
   tgws: null, tgwsPoll: null,
   version: "", latest: "",
@@ -302,6 +302,7 @@ function startPolling() {
   $("#cancelRun").classList.remove("hidden");
   $("#addThread").classList.remove("hidden");
   $("#startRun").disabled = true;
+  state.resultsPage = 1;
   if (state.poll) clearInterval(state.poll);
   const tick = async () => {
     try {
@@ -309,7 +310,9 @@ function startPolling() {
       state.run = r;
       const pct = r.total ? Math.round(r.done * 100 / r.total) : 0;
       $("#progressBar").style.width = pct + "%";
-      $("#progressText").textContent = `${r.done}/${r.total} стратегий · ${r.threads} потоков · ${r.status}`;
+      const found = (r.results || []).filter(x => x.success).length;
+      const errored = (r.results || []).filter(x => x.error).length;
+      $("#progressText").textContent = `${r.done}/${r.total} стратегий · ${r.threads} потоков · найдено ${found} · с ошибкой ${errored} · ${r.status}`;
       $("#addThread").disabled = (r.threads || 0) >= 8;
       $("#runStatus").textContent = r.status;
       state.results = r.results || [];
@@ -345,15 +348,27 @@ function sortVal(r, key) {
 $$("#resultsTable th[data-sort]").forEach(th => th.addEventListener("click", () => {
   const k = th.dataset.sort;
   if (state.sort.key === k) state.sort.dir *= -1; else state.sort = { key: k, dir: k === "latency" ? 1 : -1 };
+  state.resultsPage = 1;
   renderResults();
 }));
+$("#resultsPageSize").addEventListener("change", () => { state.resultsPage = 1; renderResults(); });
+$("#resultsPrev").addEventListener("click", () => { state.resultsPage--; renderResults(); });
+$("#resultsNext").addEventListener("click", () => { state.resultsPage++; renderResults(); });
 
 function renderResults() {
   const tb = $("#resultsTable tbody"); tb.innerHTML = "";
-  [...state.results].sort((a, b) => {
+  const sorted = [...state.results].sort((a, b) => {
     const va = sortVal(a, state.sort.key), vb = sortVal(b, state.sort.key);
     return va < vb ? -state.sort.dir : va > vb ? state.sort.dir : 0;
-  }).forEach(r => {
+  });
+  const total = sorted.length;
+  const sizeVal = $("#resultsPageSize").value;
+  const size = sizeVal === "all" ? Math.max(total, 1) : parseInt(sizeVal, 10);
+  const pages = Math.max(1, Math.ceil(total / size));
+  if (state.resultsPage > pages) state.resultsPage = pages;
+  if (state.resultsPage < 1) state.resultsPage = 1;
+  const start = (state.resultsPage - 1) * size;
+  sorted.slice(start, start + size).forEach(r => {
     const tr = document.createElement("tr");
     tr.className = r.success ? "ok" : "fail";
     const status = r.error ? `<span class="badge bad" title="${esc(r.error)}">ошибка</span>`
@@ -370,6 +385,14 @@ function renderResults() {
   });
   $$("#resultsTable button[data-apply]").forEach(b => b.addEventListener("click", () => applyStrategy(b.dataset.apply)));
   $$("#resultsTable button[data-exp]").forEach(b => b.addEventListener("click", () => exportStrategy(b.dataset.name, b.dataset.l7, b.dataset.args)));
+
+  const pager = $("#resultsPager");
+  pager.classList.toggle("hidden", total === 0);
+  if (total > 0) {
+    $("#resultsPageInfo").textContent = `стр. ${state.resultsPage} из ${pages} · ${total} записей`;
+    $("#resultsPrev").disabled = state.resultsPage <= 1;
+    $("#resultsNext").disabled = state.resultsPage >= pages;
+  }
 }
 
 function renderBaseline(r) {
@@ -560,14 +583,20 @@ function renderBlobTable() {
   blobList.system.forEach(n => addRow(n, false));
   $$("#blobTable button[data-delblob]").forEach(b => b.addEventListener("click", () => deleteBlob(b.dataset.delblob)));
   $("#blobAll").checked = false;
+  updateBlobBulk();
 }
 function selectedBlobs() { return $$("#blobTable .blob-cb:checked").map(c => c.value); }
+function updateBlobBulk() {
+  const hasCustom = selectedBlobs().some(n => blobList.custom.includes(n));
+  $("#blobDeleteSel").classList.toggle("hidden", !hasCustom);
+}
+$("#blobTable").addEventListener("change", (e) => { if (e.target && e.target.classList.contains("blob-cb")) updateBlobBulk(); });
 async function deleteBlob(name) {
   if (!confirm("Удалить блоб «" + name + "»?")) return;
   try { await api("DELETE", "/api/blobs/" + encodeURIComponent(name)); toast("Блоб удалён", "ok"); await loadBlobs(); }
   catch (e) { toast(e.message, "err"); }
 }
-$("#blobAll").addEventListener("change", () => { const on = $("#blobAll").checked; $$("#blobTable .blob-cb").forEach(c => { c.checked = on; }); });
+$("#blobAll").addEventListener("change", () => { const on = $("#blobAll").checked; $$("#blobTable .blob-cb").forEach(c => { c.checked = on; }); updateBlobBulk(); });
 $("#blobExportSel").addEventListener("click", () => {
   const names = selectedBlobs();
   if (!names.length) { toast("Выберите блобы для экспорта", "err"); return; }
@@ -584,9 +613,19 @@ const blobDrop = $("#blobDrop"), blobInput = $("#blobFile");
 async function uploadBlobs(files) {
   files = Array.from(files || []);
   if (!files.length) return;
+  // Skip files that already exist as custom blobs (ZIPs are checked server-side).
+  const existing = new Set(blobList.custom.map(n => n.toLowerCase()));
+  const dups = [];
+  const queue = files.filter(f => {
+    if (/\.zip$/i.test(f.name)) return true;
+    if (existing.has(f.name.toLowerCase())) { dups.push(f.name); return false; }
+    return true;
+  });
+  if (dups.length) toast(`Пропущены дубликаты (${dups.length}): ` + dups.join(", "), "warn");
+  if (!queue.length) { $("#blobName").textContent = "дубликаты пропущены: " + dups.length; return; }
   blobDrop.classList.add("busy");
   let ok = 0;
-  for (const file of files) {
+  for (const file of queue) {
     $("#blobName").textContent = "Загрузка: " + file.name;
     const zip = /\.zip$/i.test(file.name);
     const fd = new FormData(); fd.append("file", file);
@@ -597,7 +636,7 @@ async function uploadBlobs(files) {
       ok += zip ? (d.imported || 0) : 1;
     } catch (e) { toast(file.name + ": " + e.message, "err"); }
   }
-  $("#blobName").textContent = "✓ загружено: " + ok;
+  $("#blobName").textContent = "✓ загружено: " + ok + (dups.length ? " · пропущено дубликатов: " + dups.length : "");
   blobDrop.classList.remove("busy");
   if (ok) toast("Блобы загружены: " + ok, "ok");
   await loadBlobs();

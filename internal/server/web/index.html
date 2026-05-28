@@ -181,9 +181,18 @@
         </div>
 
         <div class="card">
-          <div class="card-head"><h2>Результаты прогона</h2><span class="hint">клик по заголовку — сортировка</span></div>
+          <div class="card-head"><h2>Результаты прогона</h2><span class="hint">клик по заголовку — сортировка</span>
+            <label class="field field-sm head-action pager-size">Показывать
+              <select id="resultsPageSize">
+                <option value="20" selected>20</option>
+                <option value="50">50</option>
+                <option value="100">100</option>
+                <option value="all">Все</option>
+              </select>
+            </label>
+          </div>
           <div id="baselineInfo" class="baseline hidden"></div>
-          <div class="table-wrap">
+          <div class="table-wrap scrollable">
             <table id="resultsTable" class="data">
               <thead><tr>
                 <th data-sort="status">Статус</th>
@@ -196,6 +205,11 @@
               </tr></thead>
               <tbody></tbody>
             </table>
+          </div>
+          <div id="resultsPager" class="pager hidden">
+            <button id="resultsPrev" class="btn btn-mini" type="button">‹ Назад</button>
+            <span id="resultsPageInfo" class="hint"></span>
+            <button id="resultsNext" class="btn btn-mini" type="button">Вперёд ›</button>
           </div>
         </div>
       </section>
@@ -296,7 +310,7 @@
           <div class="card-head"><h2>Список блобов</h2>
             <div class="head-action blob-bulk">
               <button id="blobExportSel" class="btn btn-mini">Экспорт выбранных (ZIP)</button>
-              <button id="blobDeleteSel" class="btn btn-mini btn-ghost-danger">Удалить выбранные</button>
+              <button id="blobDeleteSel" class="btn btn-mini btn-ghost-danger hidden">Удалить выбранные</button>
             </div>
           </div>
           <div class="table-wrap">
