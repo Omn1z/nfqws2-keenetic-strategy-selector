@@ -57,7 +57,7 @@ func (s *Server) authStatus(w http.ResponseWriter, r *http.Request) {
 	if c, _ := r.Cookie(sessionCookie); c != nil {
 		authed = s.app.ValidSession(c.Value)
 	}
-	writeJSON(w, 200, map[string]any{"enabled": s.app.AuthEnabled(), "authed": authed})
+	writeJSON(w, 200, map[string]any{"enabled": s.app.AuthEnabled(), "authed": authed, "version": s.app.Cfg.Version})
 }
 
 func (s *Server) authLogin(w http.ResponseWriter, r *http.Request) {

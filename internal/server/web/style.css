@@ -129,7 +129,7 @@ code { background: var(--line-soft); padding: 1px 6px; border-radius: 6px; font-
 .field { display: block; margin-bottom: 12px; font-size: 13px; color: var(--ink-soft); font-weight: 500; }
 .field-sm { width: 110px; flex: none; }
 .field-grow { flex: 1; min-width: 220px; }
-input[type=text], input[type=number], textarea, select {
+input[type=text], input[type=password], input[type=number], input[type=search], input[type=email], textarea, select {
   width: 100%; margin-top: 5px; background: var(--input-bg); color: var(--ink);
   border: 1px solid var(--line); border-radius: 9px; padding: 9px 11px; font-size: 13.5px; font-family: inherit;
   transition: border-color .15s, box-shadow .15s;

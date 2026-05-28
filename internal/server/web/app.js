@@ -332,8 +332,8 @@ $("#btnUpdate").addEventListener("click", async () => {
   for (let i = 0; i < 40; i++) {
     await new Promise(r => setTimeout(r, 1500));
     try {
-      const cfg = await api("GET", "/api/config");
-      if (cfg.version && cfg.version === target) { ok = true; break; }
+      const st = await api("GET", "/api/auth/status"); // public; survives auth + restart
+      if (st.version && st.version === target) { ok = true; break; }
     } catch (_) { /* server restarting */ }
   }
   if (ok) { $("#updateMsg").textContent = "Готово, перезагружаем страницу…"; setTimeout(() => location.reload(), 1200); }
