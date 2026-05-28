@@ -196,7 +196,7 @@ table.data th[data-sort] { cursor: pointer; user-select: none; white-space: nowr
 table.data th[data-sort]:hover { color: var(--accent); }
 table.data tbody tr { transition: background .12s; animation: fadeIn .3s ease both; }
 table.data tbody tr:hover { background: var(--line-soft); }
-td.args { font-family: ui-monospace, Consolas, monospace; font-size: 11px; color: var(--muted); max-width: 380px; word-break: break-all; }
+.args { font-family: ui-monospace, Consolas, monospace; font-size: 11px; color: var(--muted); max-width: 560px; overflow-wrap: anywhere; word-break: break-word; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3; line-clamp: 3; overflow: hidden; cursor: help; }
 tr.ok td:first-child { box-shadow: inset 3px 0 0 var(--ok); }
 tr.fail td:first-child { box-shadow: inset 3px 0 0 var(--bad); }
 .num { font-variant-numeric: tabular-nums; white-space: nowrap; }
@@ -349,3 +349,8 @@ table.data th.cb, table.data td.cb { width: 30px; }
 .pager .btn:disabled { opacity: .45; cursor: default; }
 .pager-size { flex-direction: row; align-items: center; gap: 6px; }
 .pager-size select { width: auto; }
+
+/* keep the actions column reachable without horizontal scrolling */
+table.data td.row-actions, table.data th.col-actions { position: sticky; right: 0; background: var(--panel); border-left: 1px solid var(--line-soft); }
+table.data tbody tr:hover td.row-actions { background: var(--line-soft); }
+.empty-cell { text-align: center; color: var(--muted); padding: 20px 11px; }

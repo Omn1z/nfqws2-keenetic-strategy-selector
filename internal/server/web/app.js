@@ -47,7 +47,7 @@ function exportStrategy(name, l7, args) {
 
 const state = {
   lists: [], selected: null, strategies: [], geo: [],
-  run: null, poll: null, results: [], sort: { key: "coef", dir: -1 }, resultsPage: 1,
+  run: null, poll: null, results: [], sort: { key: "coef", dir: -1 }, resultsPage: 1, savedPage: 1,
   bc: null, bcPoll: null,
   tgws: null, tgwsPoll: null,
   version: "", latest: "",
@@ -186,6 +186,7 @@ async function loadLists() {
 async function selectList(id) {
   state.selected = await api("GET", "/api/lists/" + id);
   state.results = [];
+  state.savedPage = 1;
   renderListEditor();
   loadLists();
 }
@@ -375,7 +376,7 @@ function renderResults() {
       : (r.success ? `<span class="badge ok">OK</span>` : `<span class="badge bad">нет</span>`);
     tr.innerHTML = `
       <td>${status}</td>
-      <td>${esc(r.name || r.strategy_id)}<div class="args">${esc(r.args)}</div></td>
+      <td>${esc(r.name || r.strategy_id)}<div class="args" title="${esc(r.args)}">${esc(r.args)}</div></td>
       <td class="num">${r.targets_ok}/${r.targets_total}</td>
       <td class="num">${r.avg_ttfb_ms ? r.avg_ttfb_ms + " мс" : "—"}</td>
       <td class="num">${r.avg_speed_bps ? kb(r.avg_speed_bps) + " КБ/с" : "—"}</td>
@@ -410,10 +411,23 @@ function renderBaseline(r) {
 
 function renderSaved() {
   const tb = $("#savedTable tbody"); tb.innerHTML = "";
-  ((state.selected && state.selected.successful_strategies) || []).forEach(s => {
+  const all = (state.selected && state.selected.successful_strategies) || [];
+  const total = all.length;
+  if (total === 0) {
+    tb.innerHTML = `<tr><td colspan="5" class="empty-cell">Пока нет рабочих стратегий — запустите прогон на этом списке.</td></tr>`;
+    $("#savedPager").classList.add("hidden");
+    return;
+  }
+  const sizeVal = $("#savedPageSize").value;
+  const size = sizeVal === "all" ? Math.max(total, 1) : parseInt(sizeVal, 10);
+  const pages = Math.max(1, Math.ceil(total / size));
+  if (state.savedPage > pages) state.savedPage = pages;
+  if (state.savedPage < 1) state.savedPage = 1;
+  const start = (state.savedPage - 1) * size;
+  all.slice(start, start + size).forEach(s => {
     const tr = document.createElement("tr"); tr.className = "ok";
     tr.innerHTML = `
-      <td>${esc(s.name || s.strategy_id)}<div class="args">${esc(s.args)}</div></td>
+      <td>${esc(s.name || s.strategy_id)}<div class="args" title="${esc(s.args)}">${esc(s.args)}</div></td>
       <td class="num">${s.avg_ttfb_ms} мс</td>
       <td class="num">${kb(s.avg_speed_bps)} КБ/с</td>
       <td class="num">${Math.round(s.coefficient)}</td>
@@ -422,7 +436,15 @@ function renderSaved() {
   });
   $$("#savedTable button[data-apply]").forEach(b => b.addEventListener("click", () => applyStrategy(b.dataset.apply)));
   $$("#savedTable button[data-exp]").forEach(b => b.addEventListener("click", () => exportStrategy(b.dataset.name, b.dataset.l7, b.dataset.args)));
+  const pager = $("#savedPager");
+  pager.classList.remove("hidden");
+  $("#savedPageInfo").textContent = `стр. ${state.savedPage} из ${pages} · ${total} записей`;
+  $("#savedPrev").disabled = state.savedPage <= 1;
+  $("#savedNext").disabled = state.savedPage >= pages;
 }
+$("#savedPageSize").addEventListener("change", () => { state.savedPage = 1; renderSaved(); });
+$("#savedPrev").addEventListener("click", () => { state.savedPage--; renderSaved(); });
+$("#savedNext").addEventListener("click", () => { state.savedPage++; renderSaved(); });
 
 async function applyStrategy(args) {
   if (!confirm("Применить стратегию в основной конфиг nfqws2?\n\n" + args + "\n\nБудет создан бэкап nfqws2.conf.")) return;
@@ -513,7 +535,7 @@ async function loadStrategies() {
       <td class="mono">${esc(s.id)}</td>
       <td>${esc(s.name || "")}</td>
       <td>${esc(s.l7 || "")}</td>
-      <td class="args">${esc(s.args)}</td>
+      <td><div class="args" title="${esc(s.args)}">${esc(s.args)}</div></td>
       <td>${esc(s.source)}</td>
       <td class="row-actions"><button class="btn btn-mini" title="Экспорт (ZIP)" data-exp data-name="${esc(s.name || s.id)}" data-l7="${esc(s.l7 || "")}" data-args="${esc(s.args)}">⤓</button>${custom ? `<button class="btn btn-mini" data-edit="${esc(s.id)}">Изм.</button><button class="btn btn-mini btn-ghost-danger" data-del="${esc(s.id)}">×</button>` : ""}</td>`;
     tb.appendChild(tr);

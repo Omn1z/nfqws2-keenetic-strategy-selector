@@ -111,12 +111,26 @@
               </div>
 
               <div class="card">
-                <div class="card-head"><h2>Рабочие стратегии списка</h2><span class="hint">по скорости</span></div>
-                <div class="table-wrap">
+                <div class="card-head"><h2>Рабочие стратегии списка</h2><span class="hint">по скорости</span>
+                  <label class="field field-sm head-action pager-size">Показывать
+                    <select id="savedPageSize">
+                      <option value="20" selected>20</option>
+                      <option value="50">50</option>
+                      <option value="100">100</option>
+                      <option value="all">Все</option>
+                    </select>
+                  </label>
+                </div>
+                <div class="table-wrap scrollable">
                   <table id="savedTable" class="data">
-                    <thead><tr><th>Стратегия</th><th>Задержка</th><th>Скорость</th><th>Коэф.</th><th></th></tr></thead>
+                    <thead><tr><th>Стратегия</th><th>Задержка</th><th>Скорость</th><th>Коэф.</th><th class="col-actions"></th></tr></thead>
                     <tbody></tbody>
                   </table>
+                </div>
+                <div id="savedPager" class="pager hidden">
+                  <button id="savedPrev" class="btn btn-mini" type="button">‹ Назад</button>
+                  <span id="savedPageInfo" class="hint"></span>
+                  <button id="savedNext" class="btn btn-mini" type="button">Вперёд ›</button>
                 </div>
               </div>
             </div>
@@ -201,7 +215,7 @@
                 <th data-sort="latency">Задержка</th>
                 <th data-sort="speed">Скорость</th>
                 <th data-sort="coef">Коэф.</th>
-                <th></th>
+                <th class="col-actions"></th>
               </tr></thead>
               <tbody></tbody>
             </table>
@@ -272,7 +286,7 @@
             <input type="file" id="stratImportFile" accept=".zip" hidden></div>
           <div class="table-wrap">
             <table id="stratTable" class="data">
-              <thead><tr><th>ID</th><th>Название</th><th>L7</th><th>Args</th><th>Источник</th><th></th></tr></thead>
+              <thead><tr><th>ID</th><th>Название</th><th>L7</th><th>Args</th><th>Источник</th><th class="col-actions"></th></tr></thead>
               <tbody></tbody>
             </table>
           </div>
