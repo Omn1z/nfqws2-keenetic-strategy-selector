@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef } from "react";
 
 /** Run fn() once on mount and every `ms` while `active` is true; stops on unmount. */
 export function usePoll(fn: () => void | Promise<void>, ms: number, active = true): void {
@@ -17,20 +17,4 @@ export function usePoll(fn: () => void | Promise<void>, ms: number, active = tru
       clearInterval(id);
     };
   }, [ms, active]);
-}
-
-/** Active tab synced to location.hash (falls back to `fallback` for unknown hashes). */
-export function useHashTab(valid: readonly string[], fallback: string): [string, (t: string) => void] {
-  const read = () => {
-    const t = location.hash.replace(/^#/, "");
-    return valid.includes(t) ? t : fallback;
-  };
-  const [tab, setTab] = useState<string>(read);
-  useEffect(() => {
-    const onHash = () => setTab(read());
-    window.addEventListener("hashchange", onHash);
-    return () => window.removeEventListener("hashchange", onHash);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-  return [tab, (t: string) => { location.hash = t; setTab(t); }];
 }

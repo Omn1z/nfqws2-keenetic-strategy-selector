@@ -186,8 +186,9 @@ func (s *Server) routes() {
 	m.HandleFunc("POST /api/geo/import", s.importGeo)
 	m.HandleFunc("POST /api/geo/resolve", s.resolveGeo)
 
-	// Single-file React app: any non-/api path serves the inlined index.html
-	// (hash-based routing). /api/* patterns are more specific and take precedence.
+	// Single-file React app: any non-/api path serves the inlined index.html, so
+	// History-API routes (/lists, /runs, …) deep-link and refresh cleanly. /api/*
+	// patterns are more specific and take precedence.
 	m.HandleFunc("/", s.serveIndex)
 }
 

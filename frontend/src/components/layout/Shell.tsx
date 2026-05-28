@@ -1,11 +1,11 @@
-import { useHashTab } from "@/lib/hooks";
+import { useTab } from "@/lib/router";
 import { TAB_KEYS, TABS } from "@/config/nav";
 import { SideNav } from "@/components/layout/SideNav";
 import { TopBar } from "@/components/layout/TopBar";
 
 export function Shell({ authEnabled }: { authEnabled: boolean }) {
-  const [tab, select] = useHashTab(TAB_KEYS, "dashboard");
-  const Active = TABS[tab].Component;
+  const [tab, select] = useTab(TAB_KEYS, "dashboard");
+  const Active = (TABS[tab] ?? TABS.dashboard).Component;
   return (
     <div className="flex h-screen flex-col overflow-hidden">
       <TopBar authEnabled={authEnabled} />

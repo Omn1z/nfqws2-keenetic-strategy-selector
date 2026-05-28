@@ -113,9 +113,10 @@ export default function Runs() {
         </div>
         <div className="flex flex-wrap items-start gap-4">
           <Checklist title="Стратегии" hint="пусто = все" items={stratItems} value={stratSel} onChange={setStratSel} disabled={auto} />
-          <Checklist title="Блобы" hint="каждый блоб — отдельный прогон" items={blobItems} value={blobSel} onChange={setBlobSel} />
+          <Checklist title="Фейк-пейлоад (blob)" hint="по умолч. tls_clienthello" items={blobItems} value={blobSel} onChange={setBlobSel} />
           <Checklist title="DNS" hint="каждый DNS — отдельный прогон" items={dnsItems} value={dnsSel} onChange={setDnsSel} />
         </div>
+        <p className="mt-2 text-xs text-muted">Выбранный блоб подставляется в стратегии как фейковый пейлоад (<code>blob=</code>), каждый — отдельным прогоном; без выбора используется <code>tls_clienthello</code>. <code>--payload=tls_client_hello</code> в аргументах — это L7-фильтр (на какие пакеты влиять), а не сам пейлоад.</p>
         {auto && <p className="mt-2 text-xs text-muted">Автоподбор сам перебирает встроенный каталог кандидатов — выбор стратегий не используется.</p>}
         <div className="mt-3 flex flex-wrap items-center gap-2.5">
           <Button variant="primary" onClick={start} disabled={running}>▶ Запустить прогон</Button>

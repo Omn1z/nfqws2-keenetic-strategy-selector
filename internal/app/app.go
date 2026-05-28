@@ -360,7 +360,7 @@ func escapeRepl(s string) string {
 
 func cleanLines(in []string) []string {
 	seen := map[string]bool{}
-	var out []string
+	out := []string{} // non-nil so an empty list marshals as [] not null (the UI joins it)
 	for _, s := range in {
 		s = strings.TrimSpace(s)
 		if s == "" || seen[s] {

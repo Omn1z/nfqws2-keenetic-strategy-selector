@@ -81,10 +81,10 @@ export default function Lists() {
               <Field label="Название"><Input value={sel.name} placeholder="Мой список" onChange={(e) => patch({ name: e.target.value })} /></Field>
               <div className="flex flex-wrap gap-4">
                 <Field label="Домены" hint="по одному в строке" className="min-w-[200px] flex-1">
-                  <Textarea rows={7} value={sel.domains.join("\n")} placeholder={"rutracker.org\nx.com"} onChange={(e) => patch({ domains: e.target.value.split("\n") })} />
+                  <Textarea rows={7} value={(sel.domains ?? []).join("\n")} placeholder={"rutracker.org\nx.com"} onChange={(e) => patch({ domains: e.target.value.split("\n") })} />
                 </Field>
                 <Field label="IP / CIDR" hint="по одному в строке" className="min-w-[200px] flex-1">
-                  <Textarea rows={7} value={sel.ips.join("\n")} placeholder="1.2.3.0/24" onChange={(e) => patch({ ips: e.target.value.split("\n") })} />
+                  <Textarea rows={7} value={(sel.ips ?? []).join("\n")} placeholder="1.2.3.0/24" onChange={(e) => patch({ ips: e.target.value.split("\n") })} />
                 </Field>
               </div>
               {geo.length > 0 && (

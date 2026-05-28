@@ -3,6 +3,7 @@ import { api, downloadFile } from "@/lib/api";
 import { cn } from "@/lib/cn";
 import { usePoll } from "@/lib/hooks";
 import { hostOf, human } from "@/lib/format";
+import { navigate } from "@/lib/router";
 import { useStore } from "@/providers/StoreProvider";
 import { toast } from "@/components/ui/Toast";
 import { Card } from "@/components/ui/Card";
@@ -92,7 +93,7 @@ export default function Devices() {
 
   const sendToRun = (failing: string[]) => {
     setPendingTargets([...new Set(failing.map(hostOf).filter(Boolean))]);
-    location.hash = "runs";
+    navigate("runs");
   };
   const startTrace = async (ip: string) => {
     try { const t = await api<Trace>("POST", `/api/devices/${encodeURIComponent(ip)}/trace`, { seconds: 30 }); setTrace(t); setTracing(true); toast(`Трассировка ${ip} запущена на 30 с`, "ok"); }
