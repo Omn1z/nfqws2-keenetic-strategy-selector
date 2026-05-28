@@ -107,6 +107,8 @@ func (s *Server) routes() {
 
 	m.HandleFunc("GET /api/strategies", s.getStrategies)
 	m.HandleFunc("POST /api/strategies", s.saveStrategy)
+	m.HandleFunc("POST /api/strategies/export", s.exportStrategy)
+	m.HandleFunc("POST /api/strategies/import", s.importStrategy)
 	m.HandleFunc("DELETE /api/strategies/{id}", s.deleteStrategy)
 
 	m.HandleFunc("GET /api/lists", s.getLists)
@@ -116,11 +118,14 @@ func (s *Server) routes() {
 
 	m.HandleFunc("GET /api/blobs", s.getBlobs)
 	m.HandleFunc("POST /api/blobs", s.uploadBlob)
+	m.HandleFunc("GET /api/blobs/export", s.exportBlobs)
+	m.HandleFunc("POST /api/blobs/zip", s.importBlobsZip)
 
 	m.HandleFunc("POST /api/runs", s.startRun)
 	m.HandleFunc("GET /api/runs", s.getRuns)
 	m.HandleFunc("GET /api/runs/{id}", s.getRun)
 	m.HandleFunc("POST /api/runs/{id}/cancel", s.cancelRun)
+	m.HandleFunc("POST /api/runs/{id}/threads", s.addRunThreads)
 
 	m.HandleFunc("POST /api/blockcheck", s.startBlockCheck)
 	m.HandleFunc("GET /api/blockcheck/{id}", s.getBlockCheck)
@@ -189,6 +194,70 @@ func (s *Server) saveStrategy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, out)
+}
+
+func (s *Server) exportStrategy(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Name string `json:"name"`
+		L7   string `json:"l7"`
+		Args string `json:"args"`
+	}
+	if err := readJSON(r, &in); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	if strings.TrimSpace(in.Args) == "" {
+		httpErr(w, 400, &simpleErr{"empty strategy args"})
+		return
+	}
+	w.Header().Set("Content-Type", "application/zip")
+	w.Header().Set("Content-Disposition", `attachment; filename="`+safeFile(in.Name)+`.zip"`)
+	_ = s.app.ExportStrategyZip(in.Name, in.L7, in.Args, w)
+}
+
+func (s *Server) importStrategy(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseMultipartForm(32 << 20); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	f, _, err := r.FormFile("file")
+	if err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	defer f.Close()
+	data, err := io.ReadAll(io.LimitReader(f, 32<<20))
+	if err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	st, err := s.app.ImportStrategyZip(data)
+	if err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, st)
+}
+
+// safeFile sanitizes a user-provided name for use in a Content-Disposition filename.
+func safeFile(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_':
+			b.WriteRune(r)
+		default:
+			b.WriteByte('_')
+		}
+	}
+	out := b.String()
+	if out == "" {
+		out = "strategy"
+	}
+	if len(out) > 60 {
+		out = out[:60]
+	}
+	return out
 }
 
 func (s *Server) deleteStrategy(w http.ResponseWriter, r *http.Request) {
@@ -266,6 +335,36 @@ func (s *Server) uploadBlob(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, map[string]string{"name": hdr.Filename, "path": path})
+}
+
+func (s *Server) exportBlobs(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/zip")
+	w.Header().Set("Content-Disposition", `attachment; filename="blobs.zip"`)
+	_ = s.app.ExportBlobsZip(w)
+}
+
+func (s *Server) importBlobsZip(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseMultipartForm(32 << 20); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	f, _, err := r.FormFile("file")
+	if err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	defer f.Close()
+	data, err := io.ReadAll(io.LimitReader(f, 32<<20))
+	if err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	n, err := s.app.ImportBlobsZip(data)
+	if err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, map[string]int{"imported": n})
 }
 
 func (s *Server) getGeo(w http.ResponseWriter, r *http.Request) {
@@ -375,6 +474,22 @@ func (s *Server) cancelRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, map[string]string{"status": "cancelling"})
+}
+
+func (s *Server) addRunThreads(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Threads int `json:"threads"`
+	}
+	if err := readJSON(r, &in); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	threads, err := s.app.AddRunThreads(r.PathValue("id"), in.Threads)
+	if err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, map[string]int{"threads": threads})
 }
 
 func (s *Server) startBlockCheck(w http.ResponseWriter, r *http.Request) {

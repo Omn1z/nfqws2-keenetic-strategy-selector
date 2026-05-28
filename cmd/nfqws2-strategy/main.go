@@ -220,7 +220,7 @@ func cmdSelftest(args []string) {
 	pr := probe.New(sb.PortLo, sb.PortHi)
 	results := make([]probe.Result, 0, len(hosts))
 	for _, h := range hosts {
-		results = append(results, pr.Probe(h))
+		results = append(results, pr.Probe(context.Background(), h))
 	}
 
 	out := map[string]any{

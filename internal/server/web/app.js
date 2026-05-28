@@ -27,6 +27,24 @@ function toast(msg, kind) {
 const esc = (s) => String(s == null ? "" : s).replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 const kb = (bps) => (bps / 1024).toFixed(0);
 
+// downloadFile fetches (with the auth cookie) and saves the response as a file.
+async function downloadFile(url, filename, opts) {
+  const res = await fetch(url, opts || {});
+  if (res.status === 401) { showLogin(); throw new Error("Требуется вход"); }
+  if (!res.ok) { let m = res.statusText; try { m = (await res.json()).error || m; } catch (_) {} throw new Error(m); }
+  const blob = await res.blob();
+  const a = document.createElement("a");
+  a.href = URL.createObjectURL(blob); a.download = filename;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+}
+function exportStrategy(name, l7, args) {
+  if (!args) { toast("Нет аргументов для экспорта", "err"); return; }
+  downloadFile("/api/strategies/export", (name || "strategy").replace(/[^\w-]+/g, "_") + ".zip",
+    { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name, l7, args }) })
+    .catch(e => toast(e.message, "err"));
+}
+
 const state = {
   lists: [], selected: null, strategies: [], geo: [],
   run: null, poll: null, results: [], sort: { key: "coef", dir: -1 },
@@ -265,13 +283,22 @@ $("#cancelRun").addEventListener("click", async () => {
 });
 function resetRunUI(full) {
   $("#cancelRun").classList.add("hidden");
+  $("#addThread").classList.add("hidden");
   $("#startRun").disabled = false;
   if (full) { $("#progressWrap").classList.add("hidden"); $("#runStatus").textContent = ""; }
 }
+$("#addThread").addEventListener("click", async () => {
+  if (!state.run) return;
+  const next = (state.run.threads || 1) + 1;
+  if (next > 8) { toast("Максимум 8 потоков", "err"); return; }
+  try { const d = await api("POST", "/api/runs/" + state.run.id + "/threads", { threads: next }); toast("Потоков: " + d.threads, "ok"); }
+  catch (e) { toast(e.message, "err"); }
+});
 
 function startPolling() {
   $("#progressWrap").classList.remove("hidden");
   $("#cancelRun").classList.remove("hidden");
+  $("#addThread").classList.remove("hidden");
   $("#startRun").disabled = true;
   if (state.poll) clearInterval(state.poll);
   const tick = async () => {
@@ -280,7 +307,8 @@ function startPolling() {
       state.run = r;
       const pct = r.total ? Math.round(r.done * 100 / r.total) : 0;
       $("#progressBar").style.width = pct + "%";
-      $("#progressText").textContent = `${r.done}/${r.total} стратегий · ${r.status}`;
+      $("#progressText").textContent = `${r.done}/${r.total} стратегий · ${r.threads} потоков · ${r.status}`;
+      $("#addThread").disabled = (r.threads || 0) >= 8;
       $("#runStatus").textContent = r.status;
       state.results = r.results || [];
       renderResults();
@@ -335,10 +363,11 @@ function renderResults() {
       <td class="num">${r.avg_ttfb_ms ? r.avg_ttfb_ms + " мс" : "—"}</td>
       <td class="num">${r.avg_speed_bps ? kb(r.avg_speed_bps) + " КБ/с" : "—"}</td>
       <td class="num">${r.coefficient ? Math.round(r.coefficient) : "—"}</td>
-      <td>${r.success ? `<button class="btn btn-mini" data-apply="${esc(r.args)}">Применить</button>` : ""}</td>`;
+      <td class="row-actions">${r.success ? `<button class="btn btn-mini" data-apply="${esc(r.args)}">Применить</button>` : ""}<button class="btn btn-mini" title="Экспорт (ZIP)" data-exp data-name="${esc(r.name || r.strategy_id)}" data-l7="${esc(r.l7 || "")}" data-args="${esc(r.args)}">⤓</button></td>`;
     tb.appendChild(tr);
   });
   $$("#resultsTable button[data-apply]").forEach(b => b.addEventListener("click", () => applyStrategy(b.dataset.apply)));
+  $$("#resultsTable button[data-exp]").forEach(b => b.addEventListener("click", () => exportStrategy(b.dataset.name, b.dataset.l7, b.dataset.args)));
 }
 
 function renderBaseline(r) {
@@ -363,10 +392,11 @@ function renderSaved() {
       <td class="num">${s.avg_ttfb_ms} мс</td>
       <td class="num">${kb(s.avg_speed_bps)} КБ/с</td>
       <td class="num">${Math.round(s.coefficient)}</td>
-      <td><button class="btn btn-mini" data-apply="${esc(s.args)}">Применить</button></td>`;
+      <td class="row-actions"><button class="btn btn-mini" data-apply="${esc(s.args)}">Применить</button><button class="btn btn-mini" title="Экспорт (ZIP)" data-exp data-name="${esc(s.name || s.strategy_id)}" data-l7="" data-args="${esc(s.args)}">⤓</button></td>`;
     tb.appendChild(tr);
   });
   $$("#savedTable button[data-apply]").forEach(b => b.addEventListener("click", () => applyStrategy(b.dataset.apply)));
+  $$("#savedTable button[data-exp]").forEach(b => b.addEventListener("click", () => exportStrategy(b.dataset.name, b.dataset.l7, b.dataset.args)));
 }
 
 async function applyStrategy(args) {
@@ -460,11 +490,12 @@ async function loadStrategies() {
       <td>${esc(s.l7 || "")}</td>
       <td class="args">${esc(s.args)}</td>
       <td>${esc(s.source)}</td>
-      <td>${custom ? `<button class="btn btn-mini" data-edit="${esc(s.id)}">Изм.</button> <button class="btn btn-mini btn-ghost-danger" data-del="${esc(s.id)}">×</button>` : ""}</td>`;
+      <td class="row-actions"><button class="btn btn-mini" title="Экспорт (ZIP)" data-exp data-name="${esc(s.name || s.id)}" data-l7="${esc(s.l7 || "")}" data-args="${esc(s.args)}">⤓</button>${custom ? `<button class="btn btn-mini" data-edit="${esc(s.id)}">Изм.</button><button class="btn btn-mini btn-ghost-danger" data-del="${esc(s.id)}">×</button>` : ""}</td>`;
     tb.appendChild(tr);
   });
   $$("#stratTable button[data-edit]").forEach(b => b.addEventListener("click", () => editStrat(b.dataset.edit)));
   $$("#stratTable button[data-del]").forEach(b => b.addEventListener("click", () => delStrat(b.dataset.del)));
+  $$("#stratTable button[data-exp]").forEach(b => b.addEventListener("click", () => exportStrategy(b.dataset.name, b.dataset.l7, b.dataset.args)));
 }
 function editStrat(id) {
   const s = state.strategies.find(x => x.id === id); if (!s) return;
@@ -487,6 +518,19 @@ function resetStratForm() {
   $("#stratId").value = ""; $("#stratName").value = ""; $("#stratL7").value = "tls"; $("#stratArgs").value = "";
   $("#stratFormTitle").textContent = "Добавить свою стратегию";
 }
+$("#stratImport").addEventListener("click", () => $("#stratImportFile").click());
+$("#stratImportFile").addEventListener("change", async () => {
+  const f = $("#stratImportFile").files[0]; if (!f) return;
+  const fd = new FormData(); fd.append("file", f);
+  try {
+    const res = await fetch("/api/strategies/import", { method: "POST", body: fd });
+    if (res.status === 401) { showLogin(); throw new Error("Требуется вход"); }
+    const d = await res.json(); if (!res.ok) throw new Error(d.error || res.statusText);
+    await loadStrategies(); await loadBlobs();
+    toast("Импортирована стратегия: " + (d.name || d.id), "ok");
+  } catch (e) { toast(e.message, "err"); }
+  $("#stratImportFile").value = "";
+});
 
 /* ---------- blobs ---------- */
 async function loadBlobs() {
@@ -502,25 +546,34 @@ async function loadBlobs() {
   renderChecklist("runBlobs", items);
 }
 const blobDrop = $("#blobDrop"), blobInput = $("#blobFile");
-async function uploadBlob(file) {
-  if (!file) return;
-  $("#blobName").textContent = "Загрузка: " + file.name;
+async function uploadBlobs(files) {
+  files = Array.from(files || []);
+  if (!files.length) return;
   blobDrop.classList.add("busy");
-  const fd = new FormData(); fd.append("file", file);
-  try {
-    const res = await fetch("/api/blobs", { method: "POST", body: fd });
-    const d = await res.json(); if (!res.ok) throw new Error(d.error || res.statusText);
-    $("#blobName").textContent = "✓ " + d.name;
-    toast("Загружено: " + d.path, "ok"); await loadBlobs();
-  } catch (e) { $("#blobName").textContent = ""; toast(e.message, "err"); }
-  finally { blobDrop.classList.remove("busy"); }
+  let ok = 0;
+  for (const file of files) {
+    $("#blobName").textContent = "Загрузка: " + file.name;
+    const zip = /\.zip$/i.test(file.name);
+    const fd = new FormData(); fd.append("file", file);
+    try {
+      const res = await fetch(zip ? "/api/blobs/zip" : "/api/blobs", { method: "POST", body: fd });
+      if (res.status === 401) { showLogin(); throw new Error("Требуется вход"); }
+      const d = await res.json(); if (!res.ok) throw new Error(d.error || res.statusText);
+      ok += zip ? (d.imported || 0) : 1;
+    } catch (e) { toast(file.name + ": " + e.message, "err"); }
+  }
+  $("#blobName").textContent = "✓ загружено: " + ok;
+  blobDrop.classList.remove("busy");
+  if (ok) toast("Блобы загружены: " + ok, "ok");
+  await loadBlobs();
 }
+$("#blobExport").addEventListener("click", () => downloadFile("/api/blobs/export", "blobs.zip").catch(e => toast(e.message, "err")));
 blobDrop.addEventListener("click", () => blobInput.click());
 blobDrop.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); blobInput.click(); } });
-blobInput.addEventListener("change", () => { if (blobInput.files[0]) uploadBlob(blobInput.files[0]); });
+blobInput.addEventListener("change", () => { uploadBlobs(blobInput.files); blobInput.value = ""; });
 ["dragenter", "dragover"].forEach(ev => blobDrop.addEventListener(ev, (e) => { e.preventDefault(); blobDrop.classList.add("drag"); }));
 blobDrop.addEventListener("dragleave", (e) => { if (!blobDrop.contains(e.relatedTarget)) blobDrop.classList.remove("drag"); });
-blobDrop.addEventListener("drop", (e) => { e.preventDefault(); blobDrop.classList.remove("drag"); const f = e.dataTransfer.files[0]; if (f) uploadBlob(f); });
+blobDrop.addEventListener("drop", (e) => { e.preventDefault(); blobDrop.classList.remove("drag"); uploadBlobs(e.dataTransfer.files); });
 
 /* ---------- updates ---------- */
 async function checkUpdate(manual) {

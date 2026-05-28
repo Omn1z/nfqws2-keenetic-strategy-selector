@@ -123,7 +123,7 @@ func (a *App) executeBlockCheck(ctx context.Context, bc *BlockCheck, targets []s
 				if ctx.Err() != nil {
 					return
 				}
-				tc := classifyProbe(host, pr.Probe(host))
+				tc := classifyProbe(host, pr.Probe(ctx, host))
 				n := atomic.AddInt32(&done, 1)
 				a.mu.Lock()
 				bc.Targets = append(bc.Targets, tc)

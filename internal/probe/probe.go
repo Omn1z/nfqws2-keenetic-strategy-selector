@@ -58,16 +58,17 @@ func (p *Prober) pickPort() int {
 	return p.PortLo + int(uint32(n)%uint32(span))
 }
 
-// Probe fetches https://host/ through the sandbox and reports metrics.
-func (p *Prober) Probe(host string) Result {
-	return p.ProbeURL(host, "https://"+host+"/")
+// Probe fetches https://host/ through the sandbox and reports metrics. The ctx
+// lets a run cancellation abort an in-flight probe immediately (quick cancel).
+func (p *Prober) Probe(ctx context.Context, host string) Result {
+	return p.ProbeURL(ctx, host, "https://"+host+"/")
 }
 
 // ProbeURL fetches an explicit URL (used when a list specifies a large test
 // resource) but still keys the result on host.
-func (p *Prober) ProbeURL(host, url string) Result {
+func (p *Prober) ProbeURL(ctx context.Context, host, url string) Result {
 	r := Result{Host: host}
-	ctx, cancel := context.WithTimeout(context.Background(), p.MaxTime)
+	ctx, cancel := context.WithTimeout(ctx, p.MaxTime)
 	defer cancel()
 
 	dialer := &net.Dialer{

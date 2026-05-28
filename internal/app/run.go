@@ -94,6 +94,33 @@ func (a *App) CancelRun(id string) error {
 	return fmt.Errorf("run not active")
 }
 
+// AddRunThreads raises the active run's worker count to threads (capped at
+// maxThreads) while it's in progress. Returns the resulting worker count.
+func (a *App) AddRunThreads(id string, threads int) (int, error) {
+	a.mu.Lock()
+	if a.active == nil || a.active.ID != id {
+		a.mu.Unlock()
+		return 0, fmt.Errorf("run not active")
+	}
+	cur := a.active.Threads
+	add := a.addWorker
+	if add == nil {
+		// The worker pool isn't up yet (auto baseline phase); remember the target
+		// and apply it the moment the pool starts.
+		a.pendingThreads = threads
+		a.mu.Unlock()
+		return threads, nil
+	}
+	a.mu.Unlock()
+	add(threads)
+	a.mu.Lock()
+	if a.active != nil {
+		cur = a.active.Threads
+	}
+	a.mu.Unlock()
+	return cur, nil
+}
+
 // StartRun validates and launches a run asynchronously.
 func (a *App) StartRun(req RunRequest) (*Run, error) {
 	var list *List
@@ -170,6 +197,7 @@ func (a *App) StartRun(req RunRequest) (*Run, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	a.active = run
 	a.cancel = cancel
+	a.pendingThreads = 0
 	a.runs[run.ID] = run
 	a.runOrder = append(a.runOrder, run.ID)
 	a.trimRunsLocked()
@@ -184,6 +212,7 @@ func (a *App) executeRun(ctx context.Context, run *Run, list *List, strategies [
 		a.mu.Lock()
 		a.active = nil
 		a.cancel = nil
+		a.addWorker = nil
 		if run.Status == "running" {
 			run.Status = "done"
 		}
@@ -225,48 +254,103 @@ func (a *App) executeRun(ctx context.Context, run *Run, list *List, strategies [
 		testTargets = blocked
 	}
 
-	// Build sandboxes (one per worker) and bring up their iptables rules.
-	sandboxes := make([]*engine.Sandbox, threads)
-	for w := 0; w < threads; w++ {
-		sb := engine.NewSandbox(a.Cfg, w)
-		if err := sb.RulesUp(); err != nil {
-			a.failRun(run, fmt.Sprintf("worker %d rules: %v", w, err))
-			for k := 0; k < w; k++ {
-				sandboxes[k].RulesDown()
-			}
-			return
-		}
-		sandboxes[w] = sb
-	}
+	// Dynamic worker pool: workers can be added mid-run (AddRunThreads) to speed
+	// things up. Each worker owns one sandbox (queue + port range + iptables).
+	jobs := make(chan int)
+	var done int32
+	var wg sync.WaitGroup
+	var smu sync.Mutex
+	var sandboxes []*engine.Sandbox
+	started := 0
+	feeding := true
+
 	defer func() {
-		for _, sb := range sandboxes {
+		smu.Lock()
+		sbs := append([]*engine.Sandbox(nil), sandboxes...)
+		smu.Unlock()
+		for _, sb := range sbs {
 			sb.StopNfqws()
 			sb.RulesDown()
 		}
 	}()
 
-	jobs := make(chan int)
-	var done int32
-	var wg sync.WaitGroup
-
-	for w := 0; w < threads; w++ {
-		wg.Add(1)
-		go func(sb *engine.Sandbox) {
-			defer wg.Done()
-			pr := probe.New(sb.PortLo, sb.PortHi)
-			for idx := range jobs {
-				if ctx.Err() != nil {
-					return
-				}
-				res := a.testStrategy(ctx, sb, pr, strategies[idx], testTargets)
-				n := atomic.AddInt32(&done, 1)
-				// Append live so the UI fills the results table as each strategy completes.
-				a.mu.Lock()
-				run.Results = append(run.Results, res)
-				run.Done = int(n)
-				a.mu.Unlock()
+	worker := func(sb *engine.Sandbox) {
+		defer wg.Done()
+		pr := probe.New(sb.PortLo, sb.PortHi)
+		for idx := range jobs {
+			if ctx.Err() != nil {
+				return
 			}
-		}(sandboxes[w])
+			res := a.testStrategy(ctx, sb, pr, strategies[idx], testTargets)
+			n := atomic.AddInt32(&done, 1)
+			// Append live so the UI fills the results table as each strategy completes.
+			a.mu.Lock()
+			run.Results = append(run.Results, res)
+			run.Done = int(n)
+			a.mu.Unlock()
+		}
+	}
+	// startWorker brings up one more worker if we're still feeding jobs and under
+	// the cap. wg.Add happens under smu, before feeding is cleared, so Wait is safe.
+	startWorker := func() bool {
+		smu.Lock()
+		if !feeding || started >= maxThreads {
+			smu.Unlock()
+			return false
+		}
+		w := started
+		started++
+		wg.Add(1)
+		smu.Unlock()
+		sb := engine.NewSandbox(a.Cfg, w)
+		if err := sb.RulesUp(); err != nil {
+			wg.Done()
+			return false
+		}
+		smu.Lock()
+		sandboxes = append(sandboxes, sb)
+		smu.Unlock()
+		go worker(sb)
+		return true
+	}
+
+	for i := 0; i < threads; i++ {
+		startWorker()
+	}
+	smu.Lock()
+	live := started
+	smu.Unlock()
+	if live == 0 {
+		a.failRun(run, "could not start any worker")
+		return
+	}
+	a.mu.Lock()
+	run.Threads = live
+	a.addWorker = func(target int) {
+		if target > maxThreads {
+			target = maxThreads
+		}
+		for {
+			smu.Lock()
+			cur := started
+			smu.Unlock()
+			if cur >= target || !startWorker() {
+				break
+			}
+		}
+		smu.Lock()
+		cur := started
+		smu.Unlock()
+		a.mu.Lock()
+		run.Threads = cur
+		a.mu.Unlock()
+	}
+	pend := a.pendingThreads // a +threads requested during the baseline phase
+	a.pendingThreads = 0
+	add := a.addWorker
+	a.mu.Unlock()
+	if pend > live {
+		add(pend)
 	}
 
 	for i := range strategies {
@@ -277,6 +361,12 @@ func (a *App) executeRun(ctx context.Context, run *Run, list *List, strategies [
 		}
 	}
 wait:
+	smu.Lock()
+	feeding = false
+	smu.Unlock()
+	a.mu.Lock()
+	a.addWorker = nil
+	a.mu.Unlock()
 	close(jobs)
 	wg.Wait()
 
@@ -307,7 +397,7 @@ func baselineCheck(ctx context.Context, pr *probe.Prober, targets []string) []Ta
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			out[i] = classifyProbe(t, pr.Probe(t))
+			out[i] = classifyProbe(t, pr.Probe(ctx, t))
 		}(i, t)
 	}
 	wg.Wait()
@@ -371,7 +461,7 @@ func (a *App) testStrategy(ctx context.Context, sb *engine.Sandbox, pr *probe.Pr
 			defer wg.Done()
 			sem <- struct{}{}
 			defer func() { <-sem }()
-			perTarget[i] = pr.Probe(t)
+			perTarget[i] = pr.Probe(ctx, t)
 		}(i, t)
 	}
 	wg.Wait()

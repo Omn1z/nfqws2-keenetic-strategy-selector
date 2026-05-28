@@ -165,6 +165,7 @@
           <div class="actions">
             <button id="startRun" class="btn btn-primary">▶ Запустить прогон</button>
             <button id="cancelRun" class="btn btn-ghost-danger hidden">■ Отменить</button>
+            <button id="addThread" class="btn btn-mini hidden" title="Добавить поток для ускорения">+ поток</button>
             <span id="runStatus" class="run-status"></span>
           </div>
           <div id="progressWrap" class="hidden">
@@ -246,7 +247,9 @@
       <!-- STRATEGIES -->
       <section id="tab-strategies" class="panel">
         <div class="card">
-          <div class="card-head"><h2>Каталог стратегий</h2></div>
+          <div class="card-head"><h2>Каталог стратегий</h2>
+            <button id="stratImport" class="btn btn-mini head-action">Импорт стратегии (ZIP)</button>
+            <input type="file" id="stratImportFile" accept=".zip" hidden></div>
           <div class="table-wrap">
             <table id="stratTable" class="data">
               <thead><tr><th>ID</th><th>Название</th><th>L7</th><th>Args</th><th>Источник</th><th></th></tr></thead>
@@ -274,13 +277,13 @@
       <!-- BLOBS -->
       <section id="tab-blobs" class="panel">
         <div class="card">
-          <div class="card-head"><h2>Блобы</h2></div>
-          <p class="hint">Свой блоб используется в стратегии так: <code>--blob=имя:@/путь</code>. После загрузки путь показывается в уведомлении.</p>
-          <div id="blobDrop" class="dropzone" tabindex="0" role="button" aria-label="Загрузить блоб">
+          <div class="card-head"><h2>Блобы</h2><button id="blobExport" class="btn btn-mini head-action">Экспорт всех (ZIP)</button></div>
+          <p class="hint">Свой блоб используется в стратегии так: <code>--blob=имя:@/путь</code>. Можно загрузить несколько файлов сразу или ZIP-архив.</p>
+          <div id="blobDrop" class="dropzone" tabindex="0" role="button" aria-label="Загрузить блобы">
             <svg class="dz-icon" viewBox="0 0 24 24" width="34" height="34"><path d="M12 16V4m0 0 4 4m-4-4L8 8M5 16v2a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-2" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
-            <div class="dz-text"><b>Перетащите файл сюда</b> или нажмите, чтобы выбрать</div>
+            <div class="dz-text"><b>Перетащите файлы или ZIP</b> или нажмите, чтобы выбрать</div>
             <div id="blobName" class="dz-name"></div>
-            <input type="file" id="blobFile" hidden>
+            <input type="file" id="blobFile" multiple hidden>
           </div>
           <div class="two">
             <div><h3 class="sub">Пользовательские</h3><ul id="customBlobs" class="chips"></ul></div>

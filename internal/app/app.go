@@ -28,8 +28,10 @@ type App struct {
 	custom   []catalog.Strategy // custom strategies
 	runs     map[string]*Run    // in-memory runs (id -> run)
 	runOrder []string           // run ids, newest last
-	active   *Run               // currently running, if any
-	cancel   func()             // cancel for the active run
+	active         *Run      // currently running, if any
+	cancel         func()    // cancel for the active run
+	addWorker      func(int) // raises the active run's worker count (add threads live)
+	pendingThreads int       // a thread target requested before the worker pool was up (auto baseline phase)
 
 	activeBC *BlockCheck // currently running block check, if any
 	cancelBC func()      // cancel for the active block check

@@ -304,6 +304,7 @@ tr.fail td:first-child { box-shadow: inset 3px 0 0 var(--bad); }
 /* vertically center the threads + Автоподбор row */
 .run-row.mid { align-items: center; }
 .run-row.mid > * { margin-bottom: 0; }
+.row-actions { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
 
 /* ---------- baseline info ---------- */
 .baseline {
