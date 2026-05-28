@@ -234,7 +234,31 @@ export interface GeoFile {
 export interface Blobs {
   system: string[];
   custom: string[];
+  trash: string[];
 }
+
+export interface ClientHelloCandidate {
+  src_ip: string;
+  dst_ip: string;
+  dst_port: number;
+  sni: string;
+  size: number;
+}
+
+export interface BlobCapture {
+  id: string;
+  ip: string;
+  iface: string;
+  seconds: number;
+  status: string; // running | done | error
+  error?: string;
+  started_at: number;
+  elapsed_ms: number;
+  candidates: ClientHelloCandidate[];
+}
+
+/** POST /api/devices/{ip}/blobcap → a started capture, or a prompt to install tcpdump. */
+export type BlobCaptureStart = BlobCapture | { need_install: true; package: string };
 
 /** {list_id} for a saved list, or {targets} for an ad-hoc/geo set. */
 export type TargetSource = { list_id: string } | { targets: string[] };

@@ -38,7 +38,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const [strategies, setStrategies] = useState<Strategy[]>([]);
   const [dns, setDns] = useState<DnsServer[]>([]);
   const [geo, setGeo] = useState<GeoFile[]>([]);
-  const [blobs, setBlobs] = useState<Blobs>({ system: [], custom: [] });
+  const [blobs, setBlobs] = useState<Blobs>({ system: [], custom: [], trash: [] });
   const [pendingTargets, setPendingTargets] = useState<string[] | null>(null);
 
   const reloadConfig = useCallback(async () => { try { setConfig(await api<Config>("GET", "/api/config")); } catch { /* non-fatal */ } }, []);
@@ -49,7 +49,7 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const reloadBlobs = useCallback(async () => {
     try {
       const b = await api<Blobs>("GET", "/api/blobs");
-      setBlobs({ system: b.system ?? [], custom: b.custom ?? [] });
+      setBlobs({ system: b.system ?? [], custom: b.custom ?? [], trash: b.trash ?? [] });
     } catch (e) { err(e); }
   }, []);
 

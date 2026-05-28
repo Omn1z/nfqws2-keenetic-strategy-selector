@@ -119,6 +119,9 @@ func (s *Server) routes() {
 	m.HandleFunc("POST /api/devices/{ip}/pcap", s.startPcap)
 	m.HandleFunc("GET /api/pcap/{id}", s.getPcap)
 	m.HandleFunc("GET /api/pcap/{id}/download", s.downloadPcap)
+	m.HandleFunc("POST /api/devices/{ip}/blobcap", s.startBlobCapture)
+	m.HandleFunc("GET /api/blobcap/{id}", s.getBlobCapture)
+	m.HandleFunc("POST /api/blobcap/{id}/save", s.saveCapturedBlob)
 	m.HandleFunc("POST /api/system/install", s.installPackage)
 
 	m.HandleFunc("GET /api/logs", s.getLogs)
@@ -137,9 +140,13 @@ func (s *Server) routes() {
 
 	m.HandleFunc("GET /api/blobs", s.getBlobs)
 	m.HandleFunc("POST /api/blobs", s.uploadBlob)
+	m.HandleFunc("POST /api/blobs/generate", s.generateBlob)
 	m.HandleFunc("GET /api/blobs/export", s.exportBlobs)
 	m.HandleFunc("POST /api/blobs/export", s.exportBlobsSel)
 	m.HandleFunc("POST /api/blobs/zip", s.importBlobsZip)
+	m.HandleFunc("POST /api/blobs/trash/empty", s.emptyTrash)
+	m.HandleFunc("DELETE /api/blobs/trash/{name}", s.purgeBlob)
+	m.HandleFunc("POST /api/blobs/{name}/restore", s.restoreBlob)
 	m.HandleFunc("DELETE /api/blobs/{name}", s.deleteBlob)
 
 	m.HandleFunc("POST /api/runs", s.startRun)
@@ -460,7 +467,7 @@ func (s *Server) deleteList(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) getBlobs(w http.ResponseWriter, r *http.Request) {
 	sys, custom := s.app.Blobs()
-	writeJSON(w, 200, map[string]any{"system": sys, "custom": custom})
+	writeJSON(w, 200, map[string]any{"system": sys, "custom": custom, "trash": s.app.TrashedBlobs()})
 }
 
 func (s *Server) uploadBlob(w http.ResponseWriter, r *http.Request) {
@@ -536,6 +543,92 @@ func (s *Server) importBlobsZip(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, map[string]int{"imported": n})
+}
+
+func (s *Server) generateBlob(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		SNI        string   `json:"sni"`
+		ALPN       []string `json:"alpn"`
+		MinVersion int      `json:"min_version"`
+		Name       string   `json:"name"`
+	}
+	if err := readJSON(r, &in); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	path, err := s.app.GenerateBlob(in.SNI, in.ALPN, uint16(in.MinVersion), in.Name)
+	if err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, map[string]string{"name": in.Name, "path": path})
+}
+
+func (s *Server) restoreBlob(w http.ResponseWriter, r *http.Request) {
+	if err := s.app.RestoreBlob(r.PathValue("name")); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, map[string]string{"status": "ok"})
+}
+
+func (s *Server) purgeBlob(w http.ResponseWriter, r *http.Request) {
+	if err := s.app.PurgeBlob(r.PathValue("name")); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, map[string]string{"status": "ok"})
+}
+
+func (s *Server) emptyTrash(w http.ResponseWriter, r *http.Request) {
+	if err := s.app.EmptyTrash(); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, map[string]string{"status": "ok"})
+}
+
+func (s *Server) startBlobCapture(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Seconds int `json:"seconds"`
+	}
+	_ = readJSON(r, &in) // body optional; defaults to 20s
+	c, err := s.app.StartBlobCapture(r.PathValue("ip"), in.Seconds)
+	if err != nil {
+		if errors.Is(err, app.ErrNeedTcpdump) {
+			writeJSON(w, 200, map[string]any{"need_install": true, "package": "tcpdump"})
+			return
+		}
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, c)
+}
+
+func (s *Server) getBlobCapture(w http.ResponseWriter, r *http.Request) {
+	c, ok := s.app.GetBlobCapture(r.PathValue("id"))
+	if !ok {
+		httpErr(w, 404, errNotFound)
+		return
+	}
+	writeJSON(w, 200, c)
+}
+
+func (s *Server) saveCapturedBlob(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Index int    `json:"index"`
+		Name  string `json:"name"`
+	}
+	if err := readJSON(r, &in); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	path, err := s.app.SaveCapturedBlob(r.PathValue("id"), in.Index, in.Name)
+	if err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, map[string]string{"name": in.Name, "path": path})
 }
 
 func (s *Server) getGeo(w http.ResponseWriter, r *http.Request) {

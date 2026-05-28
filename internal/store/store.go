@@ -101,6 +101,18 @@ func (s *Store) ListFiles(subdir string) ([]string, error) {
 	return out, nil
 }
 
+// Move renames a file within the store (used to move a blob to/from the trash).
+// The destination directory is created; an existing destination is overwritten.
+func (s *Store) Move(srcRel, dstRel string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	dst := filepath.Join(s.dir, dstRel)
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return err
+	}
+	return os.Rename(filepath.Join(s.dir, srcRel), dst)
+}
+
 // WriteBytes writes raw bytes atomically (used for uploaded blobs).
 func (s *Store) WriteBytes(rel string, data []byte) error {
 	s.mu.Lock()

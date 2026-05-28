@@ -55,6 +55,10 @@ type App struct {
 	pcapMu    sync.Mutex
 	pcaps     map[string]*Pcap // recent tcpdump captures (id -> pcap)
 	pcapOrder []string
+
+	blobCapMu    sync.Mutex
+	blobCaps     map[string]*BlobCapture // recent ClientHello captures (id -> capture)
+	blobCapOrder []string
 }
 
 const (
@@ -67,7 +71,7 @@ func New(cfg *config.Config) (*App, error) {
 	if err != nil {
 		return nil, err
 	}
-	a := &App{Cfg: cfg, store: st, runs: map[string]*Run{}, traces: map[string]*Trace{}, pcaps: map[string]*Pcap{}, sessions: auth.NewSessions(sessionTTL)}
+	a := &App{Cfg: cfg, store: st, runs: map[string]*Run{}, traces: map[string]*Trace{}, pcaps: map[string]*Pcap{}, blobCaps: map[string]*BlobCapture{}, sessions: auth.NewSessions(sessionTTL)}
 	_ = a.store.Load(customStrategiesFile, &a.custom)
 	if err := os.MkdirAll(a.blobsDir(), 0o755); err != nil {
 		return nil, err
@@ -295,9 +299,9 @@ func (a *App) buildRunStrategies(base []catalog.Strategy, blobNames []string) []
 // SaveBlob stores an uploaded blob and returns the absolute path to reference
 // it in a strategy via --blob=name:@<path>.
 func (a *App) SaveBlob(name string, data []byte) (string, error) {
-	name = filepath.Base(name)
-	if name == "" || name == "." || strings.ContainsAny(name, "/\\") {
-		return "", fmt.Errorf("invalid blob name")
+	name, err := sanitizeBlobName(name)
+	if err != nil {
+		return "", err
 	}
 	if err := a.store.WriteBytes(filepath.Join("blobs", name), data); err != nil {
 		return "", err
@@ -305,14 +309,15 @@ func (a *App) SaveBlob(name string, data []byte) (string, error) {
 	return filepath.Join(a.blobsDir(), name), nil
 }
 
-// DeleteBlob removes a custom (user-uploaded) blob. System blobs live outside the
-// data dir and are never touched.
+// DeleteBlob soft-deletes a custom (user-uploaded) blob by moving it to the
+// recycle bin (TrashedBlobs / RestoreBlob / PurgeBlob). System blobs live
+// outside the data dir and are never touched.
 func (a *App) DeleteBlob(name string) error {
-	name = filepath.Base(name)
-	if name == "" || name == "." || strings.ContainsAny(name, "/\\") {
-		return fmt.Errorf("invalid blob name")
+	name, err := sanitizeBlobName(name)
+	if err != nil {
+		return err
 	}
-	return a.store.Delete(filepath.Join("blobs", name))
+	return a.trashBlob(name)
 }
 
 // ---------- Apply strategy to live config ----------
