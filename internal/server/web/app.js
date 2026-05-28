@@ -28,7 +28,7 @@ const esc = (s) => String(s == null ? "" : s).replace(/[&<>"]/g, c => ({ "&": "&
 const kb = (bps) => (bps / 1024).toFixed(0);
 
 const state = {
-  lists: [], selected: null, strategies: [],
+  lists: [], selected: null, strategies: [], geo: [],
   run: null, poll: null, results: [], sort: { key: "coef", dir: -1 },
   bc: null, bcPoll: null,
   version: "", latest: "",
@@ -77,6 +77,9 @@ $("#runAuto").addEventListener("change", () => {
   const on = $("#runAuto").checked;
   $("#runStrategies").classList.toggle("disabled", on);
   $("#autoHint").classList.toggle("hidden", !on);
+  const allBtn = $('.cl-all[data-target="runStrategies"]');
+  if (allBtn) allBtn.disabled = on;
+  if (on) { clBoxes("runStrategies").forEach(c => { c.checked = false; }); updateAllBtn("runStrategies"); }
 });
 
 /* ---------- navigation ---------- */
@@ -123,7 +126,8 @@ function renderListEditor() {
   $("#listName").value = l.name || "";
   $("#listDomains").value = (l.domains || []).join("\n");
   $("#listIPs").value = (l.ips || []).join("\n");
-  $("#listTestURL").value = l.test_url || "";
+  $("#deleteList").classList.toggle("hidden", !l.id);
+  renderListGeo();
   renderResults();
   renderSaved();
 }
@@ -135,11 +139,38 @@ function collectList() {
     name: $("#listName").value.trim(),
     domains: $("#listDomains").value.split("\n").map(s => s.trim()).filter(Boolean),
     ips: $("#listIPs").value.split("\n").map(s => s.trim()).filter(Boolean),
-    test_url: $("#listTestURL").value.trim(),
     base_strategy_ids: l.base_strategy_ids || [],
     successful_strategies: l.successful_strategies || [],
   };
 }
+
+/* geo import inside the list editor */
+function renderListGeo() {
+  const row = $("#listGeoRow"), files = state.geo || [];
+  if (!state.selected || files.length === 0) { row.classList.add("hidden"); return; }
+  row.classList.remove("hidden");
+  const fsel = $("#listGeoFile"), prev = fsel.value;
+  fsel.innerHTML = files.map(f => `<option value="${esc(f.name)}">${esc(f.name)} [${esc(f.kind)}]</option>`).join("");
+  if (prev) fsel.value = prev;
+  renderListGeoCats();
+}
+function renderListGeoCats() {
+  const f = (state.geo || []).find(x => x.name === $("#listGeoFile").value);
+  const cats = (f && f.categories) || [];
+  $("#listGeoCat").innerHTML = cats.map(c => `<option value="${esc(c.name)}">${esc(c.name)} (${c.count})</option>`).join("");
+}
+$("#listGeoFile").addEventListener("change", renderListGeoCats);
+$("#listGeoAdd").addEventListener("click", async () => {
+  if (!state.selected || !state.selected.id) { toast("Сначала сохраните список", "err"); return; }
+  const category = $("#listGeoCat").value;
+  if (!category) { toast("Нет категорий в файле", "err"); return; }
+  const req = { geo: $("#listGeoFile").value, category, limit: parseInt($("#listGeoLimit").value, 10) || 0, list_id: state.selected.id };
+  try {
+    const list = await api("POST", "/api/geo/import", req);
+    state.selected = list; renderListEditor(); await loadLists();
+    toast(`Добавлено из Geo: ${(list.domains || []).length} дом. / ${(list.ips || []).length} IP`, "ok");
+  } catch (e) { toast(e.message, "err"); }
+});
 
 $("#newList").addEventListener("click", () => { state.selected = { name: "", domains: [], ips: [] }; state.results = []; renderListEditor(); });
 $("#saveList").addEventListener("click", async () => {
@@ -171,7 +202,7 @@ $("#startRun").addEventListener("click", async () => {
   const auto = $("#runAuto").checked;
   const ids = auto ? [] : clSelected("runStrategies");
   const blobs = clSelected("runBlobs");
-  const req = { list_id: state.selected.id, strategy_ids: ids, blobs, auto, threads: parseInt($("#runThreads").value, 10) || 4, include_ips: $("#runIncludeIPs").checked };
+  const req = { list_id: state.selected.id, strategy_ids: ids, blobs, auto, threads: parseInt($("#runThreads").value, 10) || 4 };
   try { state.run = await api("POST", "/api/runs", req); startPolling(); }
   catch (e) { toast(e.message, "err"); }
 });
@@ -214,6 +245,7 @@ function startPolling() {
 /* ---------- results ---------- */
 function sortVal(r, key) {
   switch (key) {
+    case "status": return r.error ? 0 : (r.success ? 2 : 1);
     case "name": return (r.name || "").toLowerCase();
     case "targets": return r.targets_ok;
     case "latency": return r.avg_ttfb_ms || 1e12;
@@ -239,7 +271,8 @@ function renderResults() {
     const status = r.error ? `<span class="badge bad" title="${esc(r.error)}">ошибка</span>`
       : (r.success ? `<span class="badge ok">OK</span>` : `<span class="badge bad">нет</span>`);
     tr.innerHTML = `
-      <td>${esc(r.name || r.strategy_id)} ${status}<div class="args">${esc(r.args)}</div></td>
+      <td>${status}</td>
+      <td>${esc(r.name || r.strategy_id)}<div class="args">${esc(r.args)}</div></td>
       <td class="num">${r.targets_ok}/${r.targets_total}</td>
       <td class="num">${r.avg_ttfb_ms ? r.avg_ttfb_ms + " мс" : "—"}</td>
       <td class="num">${r.avg_speed_bps ? kb(r.avg_speed_bps) + " КБ/с" : "—"}</td>
@@ -300,7 +333,7 @@ function fillBCLists() {
 $("#startBC").addEventListener("click", async () => {
   const listId = $("#bcList").value;
   if (!listId) { toast("Нет списков — создайте список во вкладке «Списки»", "err"); return; }
-  const req = { list_id: listId, threads: parseInt($("#bcThreads").value, 10) || 4, include_ips: $("#bcIncludeIPs").checked };
+  const req = { list_id: listId, threads: parseInt($("#bcThreads").value, 10) || 4 };
   try { state.bc = await api("POST", "/api/blockcheck", req); startBCPolling(); }
   catch (e) { toast(e.message, "err"); }
 });
@@ -510,8 +543,10 @@ $("#btnLogout").addEventListener("click", async () => {
 async function loadGeo() {
   let files = [];
   try { files = await api("GET", "/api/geo") || []; } catch (e) { return; }
+  state.geo = files;
   const wrap = $("#geoFiles"); wrap.innerHTML = "";
   files.forEach(f => wrap.appendChild(geoCard(f)));
+  renderListGeo();
 }
 function geoCard(f) {
   const card = document.createElement("div"); card.className = "card";

@@ -192,25 +192,57 @@ func (a *App) Blobs() (system []string, custom []string) {
 	return
 }
 
-// blobArgs resolves blob filenames to nfqws2 `--blob=<name>:@<path>` arguments.
-// Custom (uploaded) blobs take precedence over system blobs with the same name.
-// The lua variable name is the filename without extension.
-func (a *App) blobArgs(names []string) []string {
-	var out []string
-	for _, n := range names {
-		n = filepath.Base(n)
-		if n == "" || n == "." {
+// resolveBlob maps a selected blob filename to its lua name and absolute path,
+// preferring a custom upload over a system blob of the same name. The lua name is
+// the filename without extension.
+func (a *App) resolveBlob(name string) (luaName, path string, ok bool) {
+	name = filepath.Base(name)
+	if name == "" || name == "." {
+		return "", "", false
+	}
+	path = filepath.Join(a.blobsDir(), name)
+	if _, err := os.Stat(path); err != nil {
+		path = filepath.Join(a.Cfg.SystemBlobsDir, name)
+		if _, err := os.Stat(path); err != nil {
+			return "", "", false
+		}
+	}
+	return strings.TrimSuffix(name, filepath.Ext(name)), path, true
+}
+
+// reFakeBlobRef matches a fake-payload blob reference inside a desync directive
+// (e.g. ":blob=tls_clienthello"), but not the "--blob=" definition flag.
+var reFakeBlobRef = regexp.MustCompile(`([\s:])blob=[^\s:]+`)
+
+// buildRunStrategies expands the base set across the selected blobs: every
+// strategy that uses a fake blob is tested once per selected blob (with that blob
+// substituted as the fake payload — "свой прогон на каждый блоб"); strategies
+// without a fake blob are tested once. With no blobs selected the set is returned
+// unchanged.
+func (a *App) buildRunStrategies(base []catalog.Strategy, blobNames []string) []catalog.Strategy {
+	type rb struct{ lua, path string }
+	var blobs []rb
+	for _, n := range blobNames {
+		if lua, path, ok := a.resolveBlob(n); ok {
+			blobs = append(blobs, rb{lua, path})
+		}
+	}
+	if len(blobs) == 0 {
+		return base
+	}
+	out := make([]catalog.Strategy, 0, len(base))
+	for _, s := range base {
+		if !reFakeBlobRef.MatchString(s.ArgLine) {
+			out = append(out, s) // blob-independent — test once
 			continue
 		}
-		path := filepath.Join(a.blobsDir(), n)
-		if _, err := os.Stat(path); err != nil {
-			path = filepath.Join(a.Cfg.SystemBlobsDir, n)
-			if _, err := os.Stat(path); err != nil {
-				continue
-			}
+		for _, b := range blobs {
+			v := s
+			v.ID = s.ID + "/" + b.lua
+			v.Name = "[" + b.lua + "] " + s.Name
+			v.ArgLine = "--blob=" + b.lua + ":@" + b.path + " " + reFakeBlobRef.ReplaceAllString(s.ArgLine, "${1}blob="+b.lua)
+			out = append(out, v)
 		}
-		name := strings.TrimSuffix(n, filepath.Ext(n))
-		out = append(out, "--blob="+name+":@"+path)
 	}
 	return out
 }

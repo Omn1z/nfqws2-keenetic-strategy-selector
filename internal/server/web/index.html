@@ -79,7 +79,9 @@
             <p id="listsEmpty" class="empty">Выберите список слева или создайте новый.</p>
             <div id="listEditor" class="hidden">
               <div class="card">
-                <div class="card-head"><h2>Список</h2></div>
+                <div class="card-head"><h2>Список</h2>
+                  <button id="deleteList" class="btn btn-mini btn-ghost-danger head-action">Удалить список</button>
+                </div>
                 <label class="field">Название<input id="listName" type="text" placeholder="Мой список"></label>
                 <div class="two">
                   <label class="field">Домены <span class="hint">по одному в строке</span>
@@ -89,11 +91,14 @@
                     <textarea id="listIPs" rows="7" placeholder="1.2.3.0/24"></textarea>
                   </label>
                 </div>
-                <label class="field">Тестовый URL <span class="hint">необязательно</span>
-                  <input id="listTestURL" type="text" placeholder="https://example.com/big.bin"></label>
+                <div id="listGeoRow" class="geo-row hidden">
+                  <label class="field field-grow">Добавить из GeoSite/GeoIP<select id="listGeoFile"></select></label>
+                  <label class="field field-grow">Категория<select id="listGeoCat"></select></label>
+                  <label class="field field-sm">Лимит<input id="listGeoLimit" type="number" min="0" value="50"></label>
+                  <button id="listGeoAdd" class="btn">Добавить в список</button>
+                </div>
                 <div class="actions">
                   <button id="saveList" class="btn btn-primary">Сохранить</button>
-                  <button id="deleteList" class="btn btn-ghost-danger">Удалить</button>
                 </div>
               </div>
 
@@ -101,10 +106,9 @@
                 <div class="card-head"><h2>Прогон стратегий</h2></div>
                 <div class="run-row">
                   <label class="field field-sm">Потоков<input id="runThreads" type="number" min="1" max="8" value="4"></label>
-                  <label class="switch"><input id="runIncludeIPs" type="checkbox"><span class="track"></span><span class="switch-label">Включать IP</span></label>
                   <label class="switch"><input id="runAuto" type="checkbox"><span class="track"></span><span class="switch-label">Автоподбор</span></label>
                 </div>
-                <div class="run-row">
+                <div class="run-row cols">
                   <div class="field field-grow">
                     <div class="cl-head"><span>Стратегии <span class="hint">пусто = все</span></span>
                       <button type="button" class="btn btn-mini cl-all" data-target="runStrategies">Выбрать все</button></div>
@@ -134,6 +138,7 @@
                 <div class="table-wrap">
                   <table id="resultsTable" class="data">
                     <thead><tr>
+                      <th data-sort="status">Статус</th>
                       <th data-sort="name">Стратегия</th>
                       <th data-sort="targets">Цели</th>
                       <th data-sort="latency">Задержка</th>
@@ -168,7 +173,6 @@
           <div class="run-row">
             <label class="field field-grow">Список<select id="bcList"></select></label>
             <label class="field field-sm">Потоков<input id="bcThreads" type="number" min="1" max="8" value="4"></label>
-            <label class="switch"><input id="bcIncludeIPs" type="checkbox"><span class="track"></span><span class="switch-label">Включать IP</span></label>
           </div>
           <div class="actions">
             <button id="startBC" class="btn btn-primary">▶ Проверить</button>

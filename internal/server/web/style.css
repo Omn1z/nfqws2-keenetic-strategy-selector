@@ -288,6 +288,12 @@ tr.fail td:first-child { box-shadow: inset 3px 0 0 var(--bad); }
 .cl-item .cl-sub { margin-left: auto; color: var(--muted); font-size: 11.5px; }
 .checklist.disabled { opacity: .5; pointer-events: none; }
 
+/* keep the two checklist columns top-aligned so the autoподбор hint doesn't push the blobs column down */
+.run-row.cols { align-items: flex-start; }
+.btn:disabled { opacity: .5; pointer-events: none; }
+.card-head .head-action { margin-left: auto; align-self: center; }
+.login-card .logo.big { margin: 0 auto 4px; }
+
 /* ---------- baseline info ---------- */
 .baseline {
   border: 1px solid var(--line); border-radius: 10px; background: var(--line-soft);

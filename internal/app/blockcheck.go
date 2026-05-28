@@ -15,9 +15,8 @@ import (
 
 // BlockCheckRequest starts a no-bypass reachability check of a list's targets.
 type BlockCheckRequest struct {
-	ListID     string `json:"list_id"`
-	Threads    int    `json:"threads"`
-	IncludeIPs bool   `json:"include_ips"`
+	ListID  string `json:"list_id"`
+	Threads int    `json:"threads"`
 }
 
 // StartBlockCheck launches an asynchronous reachability check. It shares the
@@ -28,9 +27,7 @@ func (a *App) StartBlockCheck(req BlockCheckRequest) (*BlockCheck, error) {
 		return nil, fmt.Errorf("list not found")
 	}
 	targets := append([]string{}, list.Domains...)
-	if req.IncludeIPs {
-		targets = append(targets, list.IPs...)
-	}
+	targets = append(targets, list.IPs...)
 	if len(targets) == 0 {
 		return nil, fmt.Errorf("list has no targets")
 	}

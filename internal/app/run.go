@@ -23,9 +23,8 @@ type RunRequest struct {
 	ListID      string   `json:"list_id"`
 	StrategyIDs []string `json:"strategy_ids"` // empty = all known strategies
 	Threads     int      `json:"threads"`
-	IncludeIPs  bool     `json:"include_ips"`
 	Auto        bool     `json:"auto"`  // automatic selection over the candidate catalog
-	Blobs       []string `json:"blobs"` // blob filenames loaded for every tested strategy
+	Blobs       []string `json:"blobs"` // each selected blob is tested as the fake payload (own pass)
 }
 
 func (a *App) loadRuns() {
@@ -99,9 +98,7 @@ func (a *App) StartRun(req RunRequest) (*Run, error) {
 		return nil, fmt.Errorf("list not found")
 	}
 	targets := append([]string{}, list.Domains...)
-	if req.IncludeIPs {
-		targets = append(targets, list.IPs...)
-	}
+	targets = append(targets, list.IPs...)
 	if len(targets) == 0 {
 		return nil, fmt.Errorf("list has no targets")
 	}
@@ -125,6 +122,8 @@ func (a *App) StartRun(req RunRequest) (*Run, error) {
 			}
 		}
 	}
+	// Expand across selected blobs: each blob is tested as the fake payload.
+	strategies = a.buildRunStrategies(strategies, req.Blobs)
 	if len(strategies) == 0 {
 		return nil, fmt.Errorf("no strategies selected")
 	}
@@ -165,11 +164,11 @@ func (a *App) StartRun(req RunRequest) (*Run, error) {
 	a.trimRunsLocked()
 	a.mu.Unlock()
 
-	go a.executeRun(ctx, run, list, strategies, threads, targets, a.blobArgs(req.Blobs))
+	go a.executeRun(ctx, run, list, strategies, threads, targets)
 	return run, nil
 }
 
-func (a *App) executeRun(ctx context.Context, run *Run, list *List, strategies []catalog.Strategy, threads int, targets []string, blobArgs []string) {
+func (a *App) executeRun(ctx context.Context, run *Run, list *List, strategies []catalog.Strategy, threads int, targets []string) {
 	defer func() {
 		a.mu.Lock()
 		a.active = nil
@@ -248,7 +247,7 @@ func (a *App) executeRun(ctx context.Context, run *Run, list *List, strategies [
 				if ctx.Err() != nil {
 					return
 				}
-				res := a.testStrategy(ctx, sb, pr, strategies[idx], testTargets, blobArgs)
+				res := a.testStrategy(ctx, sb, pr, strategies[idx], testTargets)
 				n := atomic.AddInt32(&done, 1)
 				// Append live so the UI fills the results table as each strategy completes.
 				a.mu.Lock()
@@ -337,9 +336,9 @@ func classifyProbe(host string, r probe.Result) TargetCheck {
 	return tc
 }
 
-func (a *App) testStrategy(ctx context.Context, sb *engine.Sandbox, pr *probe.Prober, s catalog.Strategy, targets []string, blobArgs []string) StrategyResult {
+func (a *App) testStrategy(ctx context.Context, sb *engine.Sandbox, pr *probe.Prober, s catalog.Strategy, targets []string) StrategyResult {
 	res := StrategyResult{StrategyID: s.ID, Name: s.Name, ArgLine: s.ArgLine, L7: s.L7, TargetsTotal: len(targets)}
-	if err := sb.StartNfqws(blobArgs, s.Args()); err != nil {
+	if err := sb.StartNfqws(nil, s.Args()); err != nil {
 		res.Error = firstLine(err.Error())
 		return res
 	}
