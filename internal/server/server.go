@@ -9,12 +9,14 @@ import (
 	"io/fs"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
 	"nfqws2strategy/internal/app"
 	"nfqws2strategy/internal/catalog"
 	"nfqws2strategy/internal/dns"
+	"nfqws2strategy/internal/logbuf"
 	"nfqws2strategy/internal/tgws"
 )
 
@@ -111,6 +113,11 @@ func (s *Server) routes() {
 	m.HandleFunc("GET /api/dashboard", s.getDashboard)
 	m.HandleFunc("GET /api/connections", s.getConnections)
 	m.HandleFunc("GET /api/devices", s.getDevices)
+	m.HandleFunc("POST /api/devices/{ip}/trace", s.startDeviceTrace)
+	m.HandleFunc("GET /api/trace/{id}", s.getTrace)
+
+	m.HandleFunc("GET /api/logs", s.getLogs)
+	m.HandleFunc("POST /api/logs/clear", s.clearLogs)
 
 	m.HandleFunc("GET /api/strategies", s.getStrategies)
 	m.HandleFunc("POST /api/strategies", s.saveStrategy)
@@ -223,6 +230,44 @@ func (s *Server) getDevices(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, v)
+}
+
+func (s *Server) startDeviceTrace(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Seconds int `json:"seconds"`
+	}
+	_ = readJSON(r, &in) // body optional; defaults to 30s
+	t, err := s.app.StartDeviceTrace(r.PathValue("ip"), in.Seconds)
+	if err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, t)
+}
+
+func (s *Server) getTrace(w http.ResponseWriter, r *http.Request) {
+	t, ok := s.app.GetTrace(r.PathValue("id"))
+	if !ok {
+		httpErr(w, 404, errNotFound)
+		return
+	}
+	writeJSON(w, 200, t)
+}
+
+// ---------- logs (in-memory ring, UI "Логи" tab) ----------
+
+func (s *Server) getLogs(w http.ResponseWriter, r *http.Request) {
+	module := r.URL.Query().Get("module")
+	limit := 0
+	if v := r.URL.Query().Get("limit"); v != "" {
+		limit, _ = strconv.Atoi(v)
+	}
+	writeJSON(w, 200, map[string]any{"entries": logbuf.Snapshot(module, limit), "modules": logbuf.Modules()})
+}
+
+func (s *Server) clearLogs(w http.ResponseWriter, r *http.Request) {
+	logbuf.Clear()
+	writeJSON(w, 200, map[string]string{"status": "ok"})
 }
 
 func (s *Server) getStrategies(w http.ResponseWriter, r *http.Request) {

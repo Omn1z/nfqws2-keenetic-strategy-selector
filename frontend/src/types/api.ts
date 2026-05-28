@@ -238,3 +238,43 @@ export interface Blobs {
 
 /** {list_id} for a saved list, or {targets} for an ad-hoc/geo set. */
 export type TargetSource = { list_id: string } | { targets: string[] };
+
+export interface LogEntry {
+  t: number; // unix millis
+  module: string;
+  level: string; // info | warn | error
+  msg: string;
+}
+
+export interface TraceEvent {
+  at_ms: number;
+  kind: string; // new | unreplied | replied | gone
+  proto: string;
+  dst: string;
+  note?: string;
+}
+
+export interface TraceConn {
+  proto: string;
+  dst: string;
+  state: string;
+  first_ms: number;
+  last_ms: number;
+  samples: number;
+  max_packets: number;
+  max_bytes: number;
+  unreplied: boolean;
+  gone: boolean;
+}
+
+export interface Trace {
+  id: string;
+  ip: string;
+  seconds: number;
+  status: string; // running | done | error
+  error?: string;
+  started_at: number;
+  elapsed_ms: number;
+  events: TraceEvent[];
+  conns: TraceConn[];
+}

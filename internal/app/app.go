@@ -47,6 +47,10 @@ type App struct {
 
 	dnsMu      sync.Mutex
 	dnsServers []dns.Server // configured DoH/DoT servers (DNS tab + run matrix)
+
+	traceMu    sync.Mutex
+	traces     map[string]*Trace // recent device network traces (id -> trace)
+	traceOrder []string
 }
 
 const (
@@ -59,7 +63,7 @@ func New(cfg *config.Config) (*App, error) {
 	if err != nil {
 		return nil, err
 	}
-	a := &App{Cfg: cfg, store: st, runs: map[string]*Run{}, sessions: auth.NewSessions(sessionTTL)}
+	a := &App{Cfg: cfg, store: st, runs: map[string]*Run{}, traces: map[string]*Trace{}, sessions: auth.NewSessions(sessionTTL)}
 	_ = a.store.Load(customStrategiesFile, &a.custom)
 	if err := os.MkdirAll(a.blobsDir(), 0o755); err != nil {
 		return nil, err

@@ -16,6 +16,7 @@ import (
 	"nfqws2strategy/internal/catalog"
 	"nfqws2strategy/internal/config"
 	"nfqws2strategy/internal/engine"
+	"nfqws2strategy/internal/logbuf"
 	"nfqws2strategy/internal/probe"
 	"nfqws2strategy/internal/server"
 )
@@ -121,6 +122,11 @@ func cmdServe(args []string) {
 			return
 		}
 	}
+
+	// Tee logs into the in-memory ring (UI "Логи" tab) while still writing to the
+	// -log file / stderr. SetFlags(0) since logbuf prepends its own timestamp.
+	log.SetFlags(0)
+	log.SetOutput(logbuf.Init(os.Stderr))
 
 	a, err := app.New(cfg)
 	if err != nil {

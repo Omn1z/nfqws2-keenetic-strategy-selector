@@ -10,6 +10,7 @@ import Lists from "@/features/lists/Lists";
 import Geo from "@/features/geo/Geo";
 import Dns from "@/features/dns/Dns";
 import Tgws from "@/features/tgws/Tgws";
+import Logs from "@/features/logs/Logs";
 
 const I = (children: ReactNode) => (
   <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" strokeWidth={2} strokeLinecap="round" strokeLinejoin="round">
@@ -35,6 +36,7 @@ export const TABS: Record<string, Tab> = {
   geo: { label: "GeoSite/GeoIP", Component: Geo, icon: I(<><circle cx="12" cy="12" r="9" /><path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18" /></>) },
   dns: { label: "DNS", Component: Dns, icon: I(<path d="M4 7h16M4 12h16M4 17h16" />) },
   tgws: { label: "TG WS Proxy", Component: Tgws, icon: I(<path d="M22 3 2 11l6 2 2 6 3-4 5 4z" />) },
+  logs: { label: "Логи", Component: Logs, icon: I(<><rect x="4" y="3" width="16" height="18" rx="2" /><path d="M8 8h8M8 12h8M8 16h5" /></>) },
 };
 
 export const NAV_GROUPS: { title: string; tabs: string[] }[] = [
@@ -42,6 +44,7 @@ export const NAV_GROUPS: { title: string; tabs: string[] }[] = [
   { title: "Подбор", tabs: ["runs", "blockcheck", "strategies", "blobs"] },
   { title: "Списки и данные", tabs: ["lists", "geo", "dns"] },
   { title: "Сервисы", tabs: ["tgws"] },
+  { title: "Управление", tabs: ["logs"] },
 ];
 
 export const TAB_KEYS = Object.keys(TABS);
