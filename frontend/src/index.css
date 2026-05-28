@@ -1,0 +1,56 @@
+@import "tailwindcss";
+
+/* Manual dark mode driven by <html data-theme>, set pre-paint in index.html and
+   toggled by useTheme(). */
+@custom-variant dark (&:where([data-theme="dark"], [data-theme="dark"] *));
+
+/* Semantic design tokens (Keenetic palette). Light by default; the values flip
+   under [data-theme="dark"], so every Tailwind `*-<token>` utility adapts. */
+:root {
+  --c-bg: #eef2f7; --c-panel: #ffffff; --c-ink: #25313f; --c-ink-soft: #4a5868; --c-muted: #8a97a8;
+  --c-line: #e4e9f0; --c-line-soft: #eef2f7; --c-accent: #1f8ceb; --c-accent-d: #1670c4; --c-accent-w: #eaf4fe;
+  --c-ok: #25b06b; --c-ok-bg: #e6f7ee; --c-bad: #e0544b; --c-bad-bg: #fdebea; --c-warn: #f0a020; --c-warn-bg: #fdf2dd;
+  --c-input: #ffffff; --c-track: #cfd8e3;
+  color-scheme: light;
+}
+[data-theme="dark"] {
+  --c-bg: #0f151d; --c-panel: #1a232f; --c-ink: #e7edf5; --c-ink-soft: #aeb9c7; --c-muted: #7c899a;
+  --c-line: #2a3645; --c-line-soft: #222d3a; --c-accent: #3a9bf0; --c-accent-d: #2f80d8; --c-accent-w: #14304a;
+  --c-ok: #34c07a; --c-ok-bg: #142c22; --c-bad: #ef6a60; --c-bad-bg: #3a201e; --c-warn: #f0a836; --c-warn-bg: #2e2410;
+  --c-input: #131b25; --c-track: #3a4756;
+  color-scheme: dark;
+}
+
+@theme inline {
+  --color-bg: var(--c-bg);
+  --color-panel: var(--c-panel);
+  --color-ink: var(--c-ink);
+  --color-ink-soft: var(--c-ink-soft);
+  --color-muted: var(--c-muted);
+  --color-line: var(--c-line);
+  --color-line-soft: var(--c-line-soft);
+  --color-accent: var(--c-accent);
+  --color-accent-d: var(--c-accent-d);
+  --color-accent-w: var(--c-accent-w);
+  --color-ok: var(--c-ok);
+  --color-ok-bg: var(--c-ok-bg);
+  --color-bad: var(--c-bad);
+  --color-bad-bg: var(--c-bad-bg);
+  --color-warn: var(--c-warn);
+  --color-warn-bg: var(--c-warn-bg);
+  --color-input: var(--c-input);
+  --color-track: var(--c-track);
+  --font-mono: ui-monospace, Consolas, monospace;
+}
+
+html, body, #root { height: 100%; }
+body {
+  margin: 0; background: var(--c-bg); color: var(--c-ink); overflow: hidden;
+  font-family: -apple-system, "Segoe UI", Roboto, system-ui, sans-serif; -webkit-font-smoothing: antialiased;
+}
+
+/* Clamp long nfqws2 arg strings to 3 lines (full text in the title tooltip). */
+.args-clamp {
+  display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3; line-clamp: 3; overflow: hidden;
+  overflow-wrap: anywhere;
+}
