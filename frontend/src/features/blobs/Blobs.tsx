@@ -4,6 +4,7 @@ import { cn } from "@/lib/cn";
 import { usePoll } from "@/lib/hooks";
 import { useStore } from "@/providers/StoreProvider";
 import { toast } from "@/components/ui/Toast";
+import { confirmDialog } from "@/components/ui/Confirm";
 import { Card } from "@/components/ui/Card";
 import { Button } from "@/components/ui/Button";
 import { Modal } from "@/components/ui/Modal";
@@ -156,12 +157,12 @@ export default function Blobs() {
     catch (e) { toast((e as Error).message, "err"); }
   };
   const purge = async (name: string) => {
-    if (!confirm(`Удалить «${name}» навсегда? Это действие необратимо.`)) return;
+    if (!(await confirmDialog({ title: `Удалить «${name}» навсегда?`, body: "Это действие необратимо.", confirmLabel: "Удалить навсегда", danger: true }))) return;
     try { await api("DELETE", `/api/blobs/trash/${encodeURIComponent(name)}`); toast("Удалено навсегда", "ok"); await reloadBlobs(); }
     catch (e) { toast((e as Error).message, "err"); }
   };
   const emptyTrash = async () => {
-    if (!confirm(`Очистить корзину (${blobs.trash.length})? Это действие необратимо.`)) return;
+    if (!(await confirmDialog({ title: `Очистить корзину (${blobs.trash.length})?`, body: "Это действие необратимо.", confirmLabel: "Очистить", danger: true }))) return;
     try { await api("POST", "/api/blobs/trash/empty"); toast("Корзина очищена", "ok"); await reloadBlobs(); }
     catch (e) { toast((e as Error).message, "err"); }
   };
@@ -205,9 +206,9 @@ export default function Blobs() {
     catch (e) { toast((e as Error).message, "err"); }
   };
 
-  const cb = "h-4 w-4 accent-[var(--c-accent)]";
+  const cb = "h-4 w-4 rounded-[4px] accent-[var(--c-accent)] outline-none focus-visible:ring-2 focus-visible:ring-ring/40";
   const seg = (m: "capture" | "generate", label: string) => (
-    <button onClick={() => setMode(m)} className={cn("rounded-md px-3 py-1.5 text-[13px] font-semibold transition", mode === m ? "bg-accent text-white" : "text-ink-soft hover:bg-line-soft")}>{label}</button>
+    <button type="button" onClick={() => setMode(m)} className={cn("rounded-md px-3 py-1.5 text-[13px] font-semibold outline-none transition focus-visible:ring-2 focus-visible:ring-ring/40", mode === m ? "bg-accent text-white" : "text-ink-soft hover:bg-line-soft")}>{label}</button>
   );
 
   return (
@@ -288,12 +289,12 @@ export default function Blobs() {
       >
         <TableWrap>
           <table className={tableCls}>
-            <thead><tr><th className={cn(thBase, "w-8")}><input type="checkbox" className={cb} checked={allShownSelected} onChange={toggleAll} /></th><th className={thBase}>Имя</th><th className={thBase}>Тип</th><th className={cn(thBase, "text-right")} /></tr></thead>
+            <thead><tr><th className={cn(thBase, "w-8")}><input type="checkbox" aria-label="Выбрать все" className={cb} checked={allShownSelected} onChange={toggleAll} /></th><th className={thBase}>Имя</th><th className={thBase}>Тип</th><th className={cn(thBase, "text-right")} /></tr></thead>
             <tbody>
               {shown.length === 0 && <EmptyRow colSpan={4}>{all.length ? "Ничего не найдено." : "Нет блобов."}</EmptyRow>}
               {pageSlice(shown, blobPage, blobPageSize).map((b) => (
                 <tr key={b.name} className="hover:bg-line-soft">
-                  <td className={tdCls}><input type="checkbox" className={cb} checked={sel.has(b.name)} onChange={() => toggle(b.name)} /></td>
+                  <td className={cn(tdCls, "align-middle")}><input type="checkbox" aria-label={`Выбрать ${b.name}`} className={cb} checked={sel.has(b.name)} onChange={() => toggle(b.name)} /></td>
                   <td className={cn(tdCls, "font-mono")}>{b.name}</td>
                   <td className={tdCls}>{b.custom ? "свой" : "системный"}</td>
                   <td className={cn(tdCls, "text-right")}>

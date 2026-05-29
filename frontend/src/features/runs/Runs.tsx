@@ -113,7 +113,7 @@ export default function Runs() {
             <SourceSelector ref={srcRef} lists={lists} geo={geo} initialText={initialText} />
             <div className="mb-1.5 flex flex-wrap items-end gap-4">
               <Field label="Потоков" className="w-28 shrink-0"><Input type="number" min={1} max={8} value={threads} onChange={(e) => setThreads(e.target.value)} /></Field>
-              <div className="mb-3"><div className="mb-1.5 text-[13px] font-medium text-ink-soft">Автоподбор</div><Switch checked={auto} onChange={setAuto} /></div>
+              <div className="flex h-[38px] items-center"><Switch checked={auto} onChange={setAuto} label="Автоподбор" /></div>
             </div>
             <div className="flex flex-wrap items-start gap-4">
               <Checklist title="Стратегии" hint="пусто = все" items={stratItems} value={stratSel} onChange={setStratSel} disabled={auto} />
@@ -191,9 +191,11 @@ export default function Runs() {
                   <td className={cn(tdCls, "tabular-nums")}>{r.avg_ttfb_ms ? `${r.avg_ttfb_ms} мс` : "—"}</td>
                   <td className={cn(tdCls, "tabular-nums")}>{r.avg_speed_bps ? `${kb(r.avg_speed_bps)} КБ/с` : "—"}</td>
                   <td className={cn(tdCls, "tabular-nums")}>{r.coefficient ? Math.round(r.coefficient) : "—"}</td>
-                  <td className={cn(tdCls, "flex flex-wrap gap-1.5")}>
-                    {r.success && <Button mini onClick={() => applyStrategyToConfig(r.args)}>Применить</Button>}
-                    <Button mini title="Экспорт (ZIP)" onClick={() => exportStrategy(r.name || r.strategy_id, r.l7 || "", r.args).catch((e) => toast((e as Error).message, "err"))}>⤓</Button>
+                  <td className={tdCls}>
+                    <div className="flex flex-wrap gap-1.5">
+                      {r.success && <Button mini onClick={() => applyStrategyToConfig(r.args)}>Применить</Button>}
+                      <Button mini title="Экспорт (ZIP)" onClick={() => exportStrategy(r.name || r.strategy_id, r.l7 || "", r.args).catch((e) => toast((e as Error).message, "err"))}>⤓</Button>
+                    </div>
                   </td>
                 </tr>
               ))}

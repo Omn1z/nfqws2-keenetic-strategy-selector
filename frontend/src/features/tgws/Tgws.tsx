@@ -4,6 +4,7 @@ import { api } from "@/lib/api";
 import { cn } from "@/lib/cn";
 import { usePoll } from "@/lib/hooks";
 import { toast } from "@/components/ui/Toast";
+import { confirmDialog } from "@/components/ui/Confirm";
 import { Card } from "@/components/ui/Card";
 import { Button } from "@/components/ui/Button";
 import { Badge } from "@/components/ui/Badge";
@@ -56,7 +57,7 @@ const StatRow = ({ l, v }: { l: string; v: ReactNode }) => (
   <tr><td className={cn(tdCls, "text-ink-soft")}>{l}</td><td className={cn(tdCls, "tabular-nums")}>{v}</td></tr>
 );
 const ToggleField = ({ label, checked, onChange }: { label: string; checked: boolean; onChange: (v: boolean) => void }) => (
-  <div className="mb-3"><div className="mb-1.5 text-[13px] font-medium text-ink-soft">{label}</div><Switch checked={checked} onChange={onChange} /></div>
+  <div className="flex h-[38px] items-center"><Switch checked={checked} onChange={onChange} label={label} /></div>
 );
 
 export default function Tgws() {
@@ -76,7 +77,7 @@ export default function Tgws() {
   const set = <K extends keyof Form>(k: K, v: Form[K]) => setForm((f) => (f ? { ...f, [k]: v } : f));
   const toggle = async (on: boolean) => { try { apply(await api<TgwsStatus>("POST", on ? "/api/tgws/start" : "/api/tgws/stop", {})); toast(on ? "Прокси запущен" : "Прокси остановлен", "ok"); } catch (e) { toast((e as Error).message, "err"); } };
   const save = async () => { if (!form) return; try { apply(await api<TgwsStatus>("POST", "/api/tgws/config", collect(form))); toast("Настройки сохранены", "ok"); } catch (e) { toast((e as Error).message, "err"); } };
-  const newSecret = async () => { if (!confirm("Сгенерировать новый секрет? Старые tg:// ссылки перестанут работать.")) return; try { await api("POST", "/api/tgws/secret", {}); apply(await api<TgwsStatus>("GET", "/api/tgws")); toast("Новый секрет сгенерирован", "ok"); } catch (e) { toast((e as Error).message, "err"); } };
+  const newSecret = async () => { if (!(await confirmDialog({ title: "Сгенерировать новый секрет?", body: "Старые tg:// ссылки перестанут работать.", confirmLabel: "Сгенерировать" }))) return; try { await api("POST", "/api/tgws/secret", {}); apply(await api<TgwsStatus>("GET", "/api/tgws")); toast("Новый секрет сгенерирован", "ok"); } catch (e) { toast((e as Error).message, "err"); } };
   const copy = async () => { const v = live?.link; if (!v) return; try { await navigator.clipboard.writeText(v); toast("Ссылка скопирована", "ok"); } catch { toast("Скопируйте вручную", "err"); } };
 
   if (!form || !live) return <Card><span className="text-xs text-muted">Загрузка…</span></Card>;

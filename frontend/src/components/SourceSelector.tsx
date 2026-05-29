@@ -55,7 +55,7 @@ export function SourceSelector({ lists, geo, initialText, ref }: Props) {
     <button
       type="button"
       onClick={() => setMode(m)}
-      className={cn("border-r border-line px-3.5 py-1.5 text-[13px] transition last:border-r-0", mode === m ? "bg-accent text-white" : "bg-panel text-ink-soft hover:bg-line-soft")}
+      className={cn("border-r border-line px-3.5 py-1.5 text-[13px] outline-none transition last:border-r-0 focus-visible:relative focus-visible:ring-2 focus-visible:ring-ring/40", mode === m ? "bg-accent text-white" : "bg-panel text-ink-soft hover:bg-line-soft")}
     >
       {label}
     </button>

@@ -33,6 +33,8 @@ export function Toaster() {
   return (
     <div
       key={t.id}
+      role="status"
+      aria-live="polite"
       className={cn(
         "fixed bottom-4 left-4 right-4 z-[60] rounded-xl px-4 py-3 text-sm text-white shadow-2xl sm:bottom-5 sm:left-auto sm:right-5 sm:max-w-sm",
         t.kind ? KIND[t.kind] : "bg-slate-800",

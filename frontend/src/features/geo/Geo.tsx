@@ -2,6 +2,7 @@ import { useState } from "react";
 import { api, uploadForm } from "@/lib/api";
 import { useStore } from "@/providers/StoreProvider";
 import { toast } from "@/components/ui/Toast";
+import { confirmDialog } from "@/components/ui/Confirm";
 import { Card } from "@/components/ui/Card";
 import { Button } from "@/components/ui/Button";
 import { Badge } from "@/components/ui/Badge";
@@ -17,7 +18,7 @@ function GeoFileCard({ file, lists, onChanged }: { file: GeoFile; lists: List[];
   const [newName, setNewName] = useState("");
 
   const del = async () => {
-    if (!confirm(`Удалить geo-файл «${file.name}»?`)) return;
+    if (!(await confirmDialog({ title: `Удалить geo-файл «${file.name}»?`, confirmLabel: "Удалить", danger: true }))) return;
     try { await api("DELETE", `/api/geo/${encodeURIComponent(file.name)}`); onChanged(); } catch (e) { toast((e as Error).message, "err"); }
   };
   const imp = async () => {

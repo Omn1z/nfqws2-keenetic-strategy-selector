@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import { api, setUnauthorizedHandler } from "@/lib/api";
 import { StoreProvider } from "@/providers/StoreProvider";
 import { Toaster } from "@/components/ui/Toast";
+import { ConfirmHost } from "@/components/ui/Confirm";
 import { Spinner } from "@/components/ui/Spinner";
 import { Shell } from "@/components/layout/Shell";
 import { Login } from "@/components/Login";
@@ -27,11 +28,12 @@ export default function App() {
   }, []);
 
   if (phase === "checking") return <div className="grid h-screen place-items-center"><Spinner /></div>;
-  if (phase === "login") return (<><Login onSuccess={() => setPhase("ready")} /><Toaster /></>);
+  if (phase === "login") return (<><Login onSuccess={() => setPhase("ready")} /><Toaster /><ConfirmHost /></>);
   return (
     <StoreProvider>
       <Shell authEnabled={authEnabled} />
       <Toaster />
+      <ConfirmHost />
     </StoreProvider>
   );
 }

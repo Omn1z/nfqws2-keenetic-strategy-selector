@@ -4,6 +4,7 @@ import { api, exportStrategy, uploadForm } from "@/lib/api";
 import { cn } from "@/lib/cn";
 import { useStore } from "@/providers/StoreProvider";
 import { toast } from "@/components/ui/Toast";
+import { confirmDialog } from "@/components/ui/Confirm";
 import { Card } from "@/components/ui/Card";
 import { Button } from "@/components/ui/Button";
 import { Field, Input, Textarea } from "@/components/ui/form";
@@ -38,7 +39,7 @@ export default function Strategies() {
     } catch (e) { toast((e as Error).message, "err"); }
   };
   const del = async (id: string) => {
-    if (!confirm("Удалить стратегию?")) return;
+    if (!(await confirmDialog({ title: "Удалить стратегию?", confirmLabel: "Удалить", danger: true }))) return;
     try { await api("DELETE", `/api/strategies/${id}`); await reloadStrategies(); } catch (e) { toast((e as Error).message, "err"); }
   };
   const onImport = async (e: ChangeEvent<HTMLInputElement>) => {
@@ -68,14 +69,16 @@ export default function Strategies() {
                     <td className={tdCls}>{s.l7}</td>
                     <td className={tdCls}><Args>{s.args}</Args></td>
                     <td className={tdCls}>{s.source}</td>
-                    <td className={cn(tdCls, "flex flex-wrap gap-1.5")}>
-                      <Button mini title="Экспорт (ZIP)" onClick={() => exportStrategy(s.name || s.id, s.l7 || "", s.args).catch((e) => toast((e as Error).message, "err"))}>⤓</Button>
-                      {custom && (
-                        <>
-                          <Button mini onClick={() => setForm({ id: s.id, name: s.name || "", l7: s.l7 || "tls", args: s.args || "" })}>Изм.</Button>
-                          <Button mini variant="danger" onClick={() => del(s.id)}>×</Button>
-                        </>
-                      )}
+                    <td className={tdCls}>
+                      <div className="flex flex-wrap gap-1.5">
+                        <Button mini title="Экспорт (ZIP)" onClick={() => exportStrategy(s.name || s.id, s.l7 || "", s.args).catch((e) => toast((e as Error).message, "err"))}>⤓</Button>
+                        {custom && (
+                          <>
+                            <Button mini onClick={() => setForm({ id: s.id, name: s.name || "", l7: s.l7 || "tls", args: s.args || "" })}>Изм.</Button>
+                            <Button mini variant="danger" title="Удалить" aria-label="Удалить стратегию" onClick={() => del(s.id)}>×</Button>
+                          </>
+                        )}
+                      </div>
                     </td>
                   </tr>
                 );

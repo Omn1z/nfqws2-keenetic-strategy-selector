@@ -6,6 +6,7 @@ import { useStore } from "@/providers/StoreProvider";
 import { useTheme } from "@/lib/theme";
 import type { ThemeMode } from "@/lib/theme";
 import { toast } from "@/components/ui/Toast";
+import { confirmDialog } from "@/components/ui/Confirm";
 import { Spinner } from "@/components/ui/Spinner";
 
 interface UpdateInfo {
@@ -43,7 +44,7 @@ export function TopBar({ authEnabled, onMenu }: { authEnabled: boolean; onMenu: 
   useEffect(() => { void check(false); }, []);
 
   const doUpdate = async () => {
-    if (!confirm(`Обновить nfqws2-strategy до ${latest}?\nСервис будет перезапущен.`)) return;
+    if (!(await confirmDialog({ title: `Обновить до ${latest}?`, body: "Сервис будет перезапущен.", confirmLabel: "Обновить" }))) return;
     const target = latest;
     try { await api("POST", "/api/update"); } catch (e) { toast((e as Error).message, "err"); return; }
     setUpdating({ target, msg: "Скачиваем новую версию и перезапускаем сервис." });

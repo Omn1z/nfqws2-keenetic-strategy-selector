@@ -5,6 +5,7 @@ import { kb } from "@/lib/format";
 import { applyStrategyToConfig } from "@/lib/actions";
 import { useStore } from "@/providers/StoreProvider";
 import { toast } from "@/components/ui/Toast";
+import { confirmDialog } from "@/components/ui/Confirm";
 import { Card } from "@/components/ui/Card";
 import { Button } from "@/components/ui/Button";
 import { DnsBadge } from "@/components/ui/Badge";
@@ -38,7 +39,7 @@ export default function Lists() {
     } catch (e) { toast((e as Error).message, "err"); }
   };
   const del = async (id: string, name: string) => {
-    if (!confirm(`Удалить список «${name || "без имени"}»?`)) return;
+    if (!(await confirmDialog({ title: `Удалить список «${name || "без имени"}»?`, confirmLabel: "Удалить", danger: true }))) return;
     try { await api("DELETE", `/api/lists/${id}`); if (sel?.id === id) setSel(null); await reloadLists(); toast("Список удалён", "ok"); }
     catch (e) { toast((e as Error).message, "err"); }
   };
@@ -69,7 +70,7 @@ export default function Lists() {
                 <div className="font-semibold">{l.name || "(без имени)"}</div>
                 <div className="mt-0.5 text-xs text-muted">{l.domains?.length ?? 0} дом. · {l.ips?.length ?? 0} IP · {l.successful_strategies?.length ?? 0} рабочих</div>
               </div>
-              <button className="grid h-7 w-7 shrink-0 place-items-center rounded-md text-lg leading-none text-muted transition hover:bg-bad-bg hover:text-bad" onClick={() => del(l.id, l.name)}>×</button>
+              <button aria-label="Удалить список" title="Удалить" className="grid h-7 w-7 shrink-0 place-items-center rounded-md text-lg leading-none text-muted outline-none transition hover:bg-bad-bg hover:text-bad focus-visible:ring-2 focus-visible:ring-ring/40" onClick={() => del(l.id, l.name)}>×</button>
             </li>
           ))}
         </ul>
@@ -113,9 +114,11 @@ export default function Lists() {
                         <td className={cn(tdCls, "tabular-nums")}>{s.avg_ttfb_ms} мс</td>
                         <td className={cn(tdCls, "tabular-nums")}>{kb(s.avg_speed_bps)} КБ/с</td>
                         <td className={cn(tdCls, "tabular-nums")}>{Math.round(s.coefficient)}</td>
-                        <td className={cn(tdCls, "flex flex-wrap gap-1.5")}>
-                          <Button mini onClick={() => applyStrategyToConfig(s.args)}>Применить</Button>
-                          <Button mini title="Экспорт (ZIP)" onClick={() => exportStrategy(s.name || s.strategy_id, "", s.args).catch((e) => toast((e as Error).message, "err"))}>⤓</Button>
+                        <td className={tdCls}>
+                          <div className="flex flex-wrap gap-1.5">
+                            <Button mini onClick={() => applyStrategyToConfig(s.args)}>Применить</Button>
+                            <Button mini title="Экспорт (ZIP)" onClick={() => exportStrategy(s.name || s.strategy_id, "", s.args).catch((e) => toast((e as Error).message, "err"))}>⤓</Button>
+                          </div>
                         </td>
                       </tr>
                     ))}

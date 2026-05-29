@@ -5,6 +5,7 @@ import { usePoll } from "@/lib/hooks";
 import { fmtNum, human } from "@/lib/format";
 import { Card } from "@/components/ui/Card";
 import { Badge } from "@/components/ui/Badge";
+import { Skeleton } from "@/components/ui/Skeleton";
 import { Sparkline } from "@/components/ui/Chart";
 import type { Dashboard as DashboardData } from "@/types/api";
 
@@ -21,6 +22,10 @@ const Big = ({ value, sub }: { value: ReactNode; sub: string }) => (
     <span className="mt-0.5 block text-xs font-medium text-muted">{sub}</span>
   </div>
 );
+
+// One row of 4 equal-width, equal-height cards (1 / 2 / 4 columns; never orphans).
+const GRID = "grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4";
+const CARD = "mb-0 h-full"; // cancel the Card stacking margin + stretch to row height
 
 type Rate = { rx: number; tx: number };
 interface Sample {
@@ -73,29 +78,46 @@ export default function Dashboard() {
     }
   }, 2500);
 
-  if (!d) return <Card><span className="text-xs text-muted">Загрузка…</span></Card>;
+  // First paint: skeleton in the exact 4-card grid shape, so nothing jumps on load.
+  if (!d)
+    return (
+      <div className={GRID}>
+        {Array.from({ length: 4 }).map((_, i) => (
+          <Card key={i} className={CARD}>
+            <Skeleton className="mb-3 h-4 w-28" />
+            <Skeleton className="mb-2.5 h-8 w-24" />
+            <Skeleton className="mb-1.5 h-3 w-full" />
+            <Skeleton className="h-3 w-2/3" />
+          </Card>
+        ))}
+      </div>
+    );
+
   const { connections: cc, traffic: tr } = d.tgws.stats;
   const bp = d.conns.by_proto ?? {};
   const q = d.queues?.find((x) => x.queue === d.main_queue);
   const last = hist[hist.length - 1];
+  const wan = d.wan ?? [];
+  const wan0 = wan[0];
+  const wan0r = wan0 ? rates[wan0.iface] : undefined;
 
   return (
     <>
-      <div className="grid grid-cols-[repeat(auto-fit,minmax(252px,1fr))] items-start gap-4">
-        <Card title="TG WS Proxy">
+      <div className={GRID}>
+        <Card title="TG WS Proxy" className={CARD}>
           <Row l="Статус"><Badge kind={d.tgws.running ? "ok" : "bad"}>{d.tgws.running ? "работает" : "остановлен"}</Badge></Row>
           <Row l="Активные / всего">{cc.active} / {cc.total}</Row>
           <Row l="WS / TCP / CF">{cc.ws} / {cc.tcp_fallback} / {cc.cfproxy}</Row>
           <Row l="Трафик ↑ / ↓">{tr.human_up || "0 Б"} / {tr.human_down || "0 Б"}</Row>
         </Card>
 
-        <Card title="Активные соединения" sub="conntrack">
+        <Card title="Активные соединения" sub="conntrack" className={CARD}>
           <Big value={fmtNum(d.conns.total)} sub={`из ${fmtNum(d.conntrack.max)} макс.`} />
           <Row l="TCP / UDP / ICMP">{bp.tcp ?? 0} / {bp.udp ?? 0} / {bp.icmp ?? 0}</Row>
           <Row l="Не отвечают"><span className={d.conns.failing ? "text-bad" : ""}>{d.conns.failing}</span></Row>
         </Card>
 
-        <Card title="Пакеты DPI" sub="nfqws2">
+        <Card title="Пакеты DPI" sub="nfqws2" className={CARD}>
           {q ? (
             <>
               <Big value={fmtNum(q.id_seq)} sub={`пакетов · очередь ${d.main_queue}`} />
@@ -107,17 +129,20 @@ export default function Dashboard() {
           )}
         </Card>
 
-        <Card title="WAN" sub="интерфейс">
-          {(d.wan ?? []).length ? (
-            (d.wan ?? []).map((f) => {
-              const r = rates[f.iface];
-              return (
-                <div key={f.iface}>
-                  <Row l={`${f.iface} всего ↓ / ↑`}>{human(f.rx_bytes)} / {human(f.tx_bytes)}</Row>
-                  <Row l="скорость ↓ / ↑">{r ? `${human(r.rx)}/с / ${human(r.tx)}/с` : "…"}</Row>
-                </div>
-              );
-            })
+        <Card title="WAN" sub="интерфейс" className={CARD}>
+          {wan.length ? (
+            <>
+              <Big value={wan0r ? `${human(wan0r.rx)}/с` : "…"} sub={`${wan0.iface} ↓ сейчас`} />
+              {wan.map((f) => {
+                const r = rates[f.iface];
+                return (
+                  <div key={f.iface}>
+                    <Row l={`${f.iface} всего ↓ / ↑`}>{human(f.rx_bytes)} / {human(f.tx_bytes)}</Row>
+                    <Row l={`${f.iface} ↑ сейчас`}>{r ? `${human(r.tx)}/с` : "…"}</Row>
+                  </div>
+                );
+              })}
+            </>
           ) : (
             <p className="text-xs text-muted">Нет данных по WAN-интерфейсу.</p>
           )}

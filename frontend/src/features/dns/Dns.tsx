@@ -2,6 +2,7 @@ import { useState } from "react";
 import { api } from "@/lib/api";
 import { useStore } from "@/providers/StoreProvider";
 import { toast } from "@/components/ui/Toast";
+import { confirmDialog } from "@/components/ui/Confirm";
 import { Card } from "@/components/ui/Card";
 import { Button } from "@/components/ui/Button";
 import { DnsBadge } from "@/components/ui/Badge";
@@ -21,12 +22,12 @@ export default function Dns() {
     catch (e) { toast((e as Error).message, "err"); }
   };
   const del = async (id: string, nm: string) => {
-    if (!confirm(`Удалить DNS «${nm || id}»?`)) return;
+    if (!(await confirmDialog({ title: `Удалить DNS «${nm || id}»?`, confirmLabel: "Удалить", danger: true }))) return;
     try { await api("DELETE", `/api/dns/${encodeURIComponent(id)}`); await reloadDns(); toast("DNS удалён", "ok"); }
     catch (e) { toast((e as Error).message, "err"); }
   };
   const reset = async () => {
-    if (!confirm("Сбросить список DNS к стандартным? Добавленные вами записи будут удалены.")) return;
+    if (!(await confirmDialog({ title: "Сбросить список DNS к стандартным?", body: "Добавленные вами записи будут удалены.", confirmLabel: "Сбросить", danger: true }))) return;
     try { await api("POST", "/api/dns/reset"); await reloadDns(); toast("Список DNS сброшен", "ok"); }
     catch (e) { toast((e as Error).message, "err"); }
   };
