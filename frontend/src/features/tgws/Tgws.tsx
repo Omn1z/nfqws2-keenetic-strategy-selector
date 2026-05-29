@@ -87,9 +87,9 @@ export default function Tgws() {
     <>
       <Card title="Telegram MTProto → WebSocket прокси" head={<Badge kind={live.running ? "ok" : "bad"}>{live.running ? "работает" : "остановлен"}</Badge>}>
         <p className="mb-3 text-xs text-muted">Прокси для Telegram прямо на роутере: клиенты в LAN ходят через <code>&lt;роутер&gt;:порт</code>, трафик идёт к Telegram по WSS с запасными путями.</p>
-        <div className="flex flex-wrap items-end gap-4">
+        <div className="flex flex-wrap items-center gap-4">
           <ToggleField label="Прокси включён" checked={live.config.enabled} onChange={toggle} />
-          <span className="mb-4 text-xs text-muted">{live.running ? `слушает порт ${form.port}` : live.config.enabled ? "не удалось запустить" : ""}</span>
+          <span className="text-xs text-muted">{live.running ? `слушает порт ${form.port}` : live.config.enabled ? "не удалось запустить" : ""}</span>
         </div>
       </Card>
 

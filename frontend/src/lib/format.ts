@@ -9,7 +9,7 @@ export const human = (b?: number): string => {
     n /= 1024;
     i++;
   }
-  return `${i === 0 ? n : n.toFixed(n < 10 ? 1 : 0)} ${u[i]}`;
+  return `${i === 0 ? Math.round(n) : n.toFixed(n < 10 ? 1 : 0)} ${u[i]}`;
 };
 
 export const kb = (bps?: number): string => (Number(bps) / 1024).toFixed(0);
