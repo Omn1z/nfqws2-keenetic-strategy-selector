@@ -59,8 +59,8 @@ export default function Lists() {
   const saved = (sel?.successful_strategies ?? []).filter((s) => !sq || `${s.name} ${s.args} ${s.dns ?? ""}`.toLowerCase().includes(sq));
 
   return (
-    <div className="flex items-start gap-5 max-[860px]:flex-col">
-      <aside className="w-[270px] shrink-0 max-[860px]:w-full">
+    <div className="flex flex-col gap-5 lg:flex-row lg:items-start">
+      <aside className="w-full shrink-0 lg:w-[270px]">
         <Button variant="primary" className="mb-3 w-full" onClick={newList}>+ Новый список</Button>
         <ul className="m-0 list-none p-0">
           {lists.map((l) => (
@@ -100,7 +100,7 @@ export default function Lists() {
               <div className="mt-2 flex gap-2.5"><Button variant="primary" onClick={save}>Сохранить</Button></div>
             </Card>
 
-            <Card title="Рабочие стратегии списка" sub="по скорости" head={<Input value={stratQ} onChange={(e) => { setStratQ(e.target.value); setPage(1); }} placeholder="Поиск по стратегии / args / DNS" className="h-8 w-56 py-1" />}>
+            <Card title="Рабочие стратегии списка" sub="по скорости" head={<Input value={stratQ} onChange={(e) => { setStratQ(e.target.value); setPage(1); }} placeholder="Поиск по стратегии / args / DNS" className="h-8 w-full py-1 sm:w-56" />}>
               <TableWrap scrollable>
                 <table className={tableCls}>
                   <thead><tr><th className={thBase}>Стратегия</th><th className={thBase}>DNS</th><th className={thBase}>Задержка</th><th className={thBase}>Скорость</th><th className={thBase}>Коэф.</th><th className={thBase} /></tr></thead>

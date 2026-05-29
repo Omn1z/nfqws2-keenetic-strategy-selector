@@ -36,7 +36,7 @@ function CandidateRow({ c, index, onSave }: { c: ClientHelloCandidate; index: nu
         <span className={cn("text-xs font-bold", c.valid ? "text-ok" : "text-bad")} title={c.detail}>{c.valid ? "✓" : "✗"}</span>
         <span className="font-mono text-[13px] font-semibold">{c.sni || "(без SNI)"}</span>
         <span className="text-xs text-muted">→ {c.dst_ip}:{c.dst_port} · {c.size} Б</span>
-        <Input className="ml-auto w-56" value={name} onChange={(e) => setName(e.target.value)} />
+        <Input className="w-full sm:ml-auto sm:w-56" value={name} onChange={(e) => setName(e.target.value)} />
         <Button mini onClick={() => onSave(index, name)}>Сохранить</Button>
       </div>
       <div className={cn("mt-0.5 text-[11px]", c.valid ? "text-muted" : "text-bad")}>{c.detail}</div>

@@ -12,6 +12,29 @@
   --c-ok: #25b06b; --c-ok-bg: #e6f7ee; --c-bad: #e0544b; --c-bad-bg: #fdebea; --c-warn: #f0a020; --c-warn-bg: #fdf2dd;
   --c-input: #ffffff; --c-track: #cfd8e3;
   color-scheme: light;
+
+  /* shadcn / Base-UI token bridge → Keenetic palette. Values reference --c-* so
+     they auto-flip under [data-theme="dark"] with no duplicate dark block.
+     NOTE: `accent`, `muted`, `input` already exist as project color utilities,
+     so shadcn's hover-`accent`/`muted` backgrounds and input border are expressed
+     with project utilities inside components instead of being aliased here. */
+  --background: var(--c-bg);
+  --foreground: var(--c-ink);
+  --card: var(--c-panel);
+  --card-foreground: var(--c-ink);
+  --popover: var(--c-panel);
+  --popover-foreground: var(--c-ink);
+  --primary: var(--c-accent);
+  --primary-foreground: #ffffff;
+  --secondary: var(--c-line-soft);
+  --secondary-foreground: var(--c-ink);
+  --muted-foreground: var(--c-muted);
+  --accent-foreground: var(--c-ink);
+  --destructive: var(--c-bad);
+  --destructive-foreground: #ffffff;
+  --border: var(--c-line);
+  --ring: var(--c-accent);
+  --radius: 0.625rem;
 }
 [data-theme="dark"] {
   --c-bg: #0f151d; --c-panel: #1a232f; --c-ink: #e7edf5; --c-ink-soft: #aeb9c7; --c-muted: #7c899a;
@@ -41,6 +64,29 @@
   --color-input: var(--c-input);
   --color-track: var(--c-track);
   --font-mono: ui-monospace, Consolas, monospace;
+
+  /* shadcn token utilities: bg-primary, text-foreground, bg-card, border-border,
+     ring-ring, rounded-lg/md/sm, … `accent`/`muted`/`input` deliberately omitted
+     so the existing project utilities of those names keep their meaning. */
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-ring: var(--ring);
+  --radius-lg: var(--radius);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-sm: calc(var(--radius) - 4px);
 }
 
 html, body, #root { height: 100%; }

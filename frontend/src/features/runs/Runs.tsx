@@ -107,7 +107,7 @@ export default function Runs() {
 
   return (
     <>
-      <div className="flex items-start gap-4 max-[980px]:flex-col">
+      <div className="flex flex-col gap-4 lg:flex-row lg:items-start">
         <div className="min-w-0 flex-1">
           <Card title="Прогон стратегий" sub="подбор рабочих стратегий обхода">
             <SourceSelector ref={srcRef} lists={lists} geo={geo} initialText={initialText} />
@@ -137,7 +137,7 @@ export default function Runs() {
           </Card>
         </div>
         {run && (
-          <div className="w-[360px] shrink-0 max-[980px]:w-full">
+          <div className="w-full shrink-0 lg:w-[360px]">
             <Card title="Лог прогона" sub="ошибки и ход подбора">
               <RunLog results={results} status={run.status} done={run.done} total={run.total} />
             </Card>
@@ -150,7 +150,7 @@ export default function Runs() {
         sub="клик по заголовку — сортировка"
         head={
           <div className="flex flex-wrap items-center gap-2">
-            <Input value={query} onChange={(e) => { setQuery(e.target.value); setPage(1); }} placeholder="Поиск по стратегии / args / DNS" className="h-8 w-56 py-1" />
+            <Input value={query} onChange={(e) => { setQuery(e.target.value); setPage(1); }} placeholder="Поиск по стратегии / args / DNS" className="h-8 w-full py-1 sm:w-56" />
             <Select value={filterMode} onChange={(e) => { setFilterMode(e.target.value); setPage(1); }} className="w-auto">
               <option value="all">Все</option>
               <option value="one">≥1 цель пройдена</option>

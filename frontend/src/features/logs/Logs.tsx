@@ -43,7 +43,7 @@ export default function Logs() {
       title="Логи"
       sub="последние записи по модулям сервиса"
       head={
-        <div className="flex items-center gap-2.5">
+        <div className="flex flex-wrap items-center gap-2.5">
           <Select value={module} onChange={(e) => setModule(e.target.value)} className="w-auto">
             <option value="all">все модули</option>
             {modules.map((m) => <option key={m} value={m}>{m}</option>)}

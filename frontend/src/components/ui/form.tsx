@@ -1,8 +1,9 @@
 import type { InputHTMLAttributes, ReactNode, SelectHTMLAttributes, TextareaHTMLAttributes } from "react";
 import { cn } from "@/lib/cn";
 
+// Shared field shell. Token-based (border/bg/ring) so it adapts to the theme.
 export const fieldCls =
-  "w-full rounded-lg border border-line bg-input px-3 py-2 text-[13.5px] text-ink outline-none transition focus:border-accent focus:ring-2 focus:ring-accent-w";
+  "w-full rounded-lg border border-line bg-input px-3 py-2 text-[13.5px] text-ink outline-none transition placeholder:text-muted focus:border-accent focus:ring-2 focus:ring-accent-w disabled:cursor-not-allowed disabled:opacity-50";
 
 export function Field({ label, hint, className, children }: { label?: ReactNode; hint?: ReactNode; className?: string; children: ReactNode }) {
   return (

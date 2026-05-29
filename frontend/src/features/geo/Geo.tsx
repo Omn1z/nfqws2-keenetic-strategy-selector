@@ -69,7 +69,7 @@ export default function Geo() {
     <>
       <Card title="GeoSite / GeoIP">
         <p className="mb-3 text-xs text-muted">Загрузите <code>geosite.dat</code> / <code>geoip.dat</code> (формат v2ray) или текстовый список (домен/IP в строке). Затем импортируйте категорию в тестовый список.</p>
-        <div className="flex items-stretch gap-3.5">
+        <div className="flex flex-col gap-3.5 sm:flex-row sm:items-stretch">
           <Field label="Тип" className="w-32 shrink-0"><Select value={kind} onChange={(e) => setKind(e.target.value)}><option value="geosite">geosite.dat</option><option value="geoip">geoip.dat</option><option value="text">текст</option></Select></Field>
           <div className="flex-1">
             <Dropzone onFiles={upload}>

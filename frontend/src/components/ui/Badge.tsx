@@ -1,21 +1,23 @@
 import type { ReactNode } from "react";
+import { cva } from "class-variance-authority";
 import { cn } from "@/lib/cn";
 
 export type BadgeKind = "ok" | "bad" | "warn" | "neutral";
 
-const KIND: Record<BadgeKind, string> = {
-  ok: "bg-ok-bg text-ok",
-  bad: "bg-bad-bg text-bad",
-  warn: "bg-warn-bg text-warn",
-  neutral: "bg-line-soft text-ink-soft",
-};
+const badgeVariants = cva("inline-block whitespace-nowrap rounded-full px-2.5 py-0.5 text-[11px] font-semibold", {
+  variants: {
+    kind: {
+      ok: "bg-ok-bg text-ok",
+      bad: "bg-bad-bg text-bad",
+      warn: "bg-warn-bg text-warn",
+      neutral: "bg-line-soft text-ink-soft",
+    },
+  },
+  defaultVariants: { kind: "neutral" },
+});
 
-export function Badge({ kind = "neutral", className, children }: { kind?: BadgeKind; className?: string; children: ReactNode }) {
-  return (
-    <span className={cn("inline-block whitespace-nowrap rounded-full px-2.5 py-0.5 text-[11px] font-semibold", KIND[kind], className)}>
-      {children}
-    </span>
-  );
+export function Badge({ kind, className, children }: { kind?: BadgeKind; className?: string; children: ReactNode }) {
+  return <span data-slot="badge" className={cn(badgeVariants({ kind }), className)}>{children}</span>;
 }
 
 const VERDICT: Record<string, [string, BadgeKind]> = {

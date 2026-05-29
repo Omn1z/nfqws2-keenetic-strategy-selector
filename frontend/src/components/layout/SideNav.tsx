@@ -1,9 +1,15 @@
 import { cn } from "@/lib/cn";
 import { NAV_GROUPS, TABS } from "@/config/nav";
 
-export function SideNav({ active, onSelect }: { active: string; onSelect: (t: string) => void }) {
+export function SideNav({ active, onSelect, open }: { active: string; onSelect: (t: string) => void; open: boolean }) {
   return (
-    <nav className="w-[232px] shrink-0 overflow-y-auto border-r border-line bg-panel px-3 py-3.5">
+    <nav
+      className={cn(
+        // Mobile: off-canvas drawer below the 58px TopBar. md+: static rail.
+        "fixed bottom-0 left-0 top-[58px] z-40 w-[232px] shrink-0 overflow-y-auto border-r border-border bg-card px-3 py-3.5 transition-transform md:static md:top-auto md:translate-x-0 md:shadow-none",
+        open ? "translate-x-0 shadow-2xl" : "-translate-x-full",
+      )}
+    >
       {NAV_GROUPS.map((g) => (
         <div key={g.title} className="mb-3">
           <div className="px-3 pb-1 pt-1.5 text-[10.5px] font-bold uppercase tracking-[0.08em] text-muted">{g.title}</div>
@@ -13,6 +19,7 @@ export function SideNav({ active, onSelect }: { active: string; onSelect: (t: st
               <a
                 key={k}
                 href={"/" + k}
+                aria-current={on ? "page" : undefined}
                 onClick={(e) => {
                   if (e.metaKey || e.ctrlKey || e.shiftKey || e.button !== 0) return; // let the browser open a new tab
                   e.preventDefault();

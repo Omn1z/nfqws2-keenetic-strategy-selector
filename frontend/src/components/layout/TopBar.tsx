@@ -22,7 +22,7 @@ const THEME_ICON: Record<ThemeMode, ReactNode> = {
 };
 const iconBtn = "grid h-7 w-7 place-items-center rounded-lg text-ink-soft transition hover:bg-line-soft hover:text-accent";
 
-export function TopBar({ authEnabled }: { authEnabled: boolean }) {
+export function TopBar({ authEnabled, onMenu }: { authEnabled: boolean; onMenu: () => void }) {
   const { config } = useStore();
   const [mode, cycle] = useTheme();
   const [latest, setLatest] = useState("");
@@ -60,18 +60,21 @@ export function TopBar({ authEnabled }: { authEnabled: boolean }) {
   const logout = async () => { try { await api("POST", "/api/auth/logout"); } catch { /* ignore */ } location.reload(); };
 
   return (
-    <header className="relative z-20 flex h-[58px] shrink-0 items-center justify-between border-b border-line bg-panel px-5 shadow-sm">
-      <div className="flex items-center gap-2.5 text-base">
+    <header className="relative z-20 flex h-[58px] shrink-0 items-center justify-between border-b border-border bg-card px-3 shadow-sm sm:px-5">
+      <div className="flex items-center gap-2 text-base sm:gap-2.5">
+        <button className={cn(iconBtn, "md:hidden")} title="Меню" aria-label="Открыть меню" onClick={onMenu}>
+          <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 6h18M3 12h18M3 18h18" /></svg>
+        </button>
         <span className="grid h-[30px] w-[30px] place-items-center rounded-[9px] bg-gradient-to-br from-[#36a3ff] to-accent-d text-white shadow">
           <svg viewBox="0 0 24 24" width="20" height="20"><path d="M13 2 4 14h6l-1 8 9-12h-6z" fill="currentColor" /></svg>
         </span>
         <span>NFQWS2 <b className="font-bold text-accent">Strategy</b></span>
       </div>
-      <div className="flex items-center gap-3.5">
-        {config?.wan_ifaces && <span className="text-xs text-muted">iface {config.wan_ifaces.join(",")}</span>}
+      <div className="flex items-center gap-2 sm:gap-3.5">
+        {config?.wan_ifaces && <span className="hidden text-xs text-muted sm:inline">iface {config.wan_ifaces.join(",")}</span>}
         <button className={iconBtn} title="Тема" onClick={cycle}>{THEME_ICON[mode]}</button>
         <div className="flex items-center gap-2 rounded-full bg-line-soft py-1 pl-3 pr-2">
-          <span className="text-xs text-muted">версия</span>
+          <span className="hidden text-xs text-muted sm:inline">версия</span>
           <span className="font-semibold tabular-nums">{version}</span>
           <button className={cn(iconBtn, checking && "animate-spin")} title="Проверить обновления" onClick={() => check(true)}>
             <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36M21 3v6h-6" /></svg>
