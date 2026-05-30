@@ -127,6 +127,12 @@ func (a *App) AWG2Deploy() (awg.DeployResult, error) {
 		logbuf.Append("awg2", lvl, msg)
 	})
 	a.awgSave() // persist DeployedAt / pinned host key / WAN iface
+	if res.OK {
+		// populate live status right away so the card doesn't show «нет связи»
+		sctx, scancel := context.WithTimeout(context.Background(), 25*time.Second)
+		_, _ = a.awg.Status(sctx)
+		scancel()
+	}
 	if err != nil {
 		logbuf.Append("awg2", "error", "деплой: "+err.Error())
 	}

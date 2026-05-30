@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { api } from "@/lib/api";
 import { cn } from "@/lib/cn";
 import { usePoll } from "@/lib/hooks";
@@ -27,6 +27,18 @@ export default function AWG2() {
       /* keep last */
     }
   }, 2500);
+
+  // Periodically refresh live server status (SSH `awg show`) while the tab is open,
+  // plus once right after mount — otherwise `status` stays null and the card reads
+  // «нет связи» even when the server is up.
+  const stRef = useRef<Awg2Status | null>(st);
+  stRef.current = st;
+  useEffect(() => {
+    const tick = () => { if (stRef.current?.deployed) void api("POST", "/api/awg2/status/refresh", {}).catch(() => {}); };
+    tick();
+    const id = window.setInterval(tick, 15000);
+    return () => window.clearInterval(id);
+  }, []);
 
   const reload = async () => {
     try {
