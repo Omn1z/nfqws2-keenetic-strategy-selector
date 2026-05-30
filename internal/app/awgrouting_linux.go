@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"os/exec"
+	"strconv"
 	"strings"
 	"time"
 
@@ -20,8 +21,12 @@ import (
 // whole thing down if the panel doesn't commit in time.
 
 const (
-	awgTable    = "998"           // dedicated routing table for tunneled traffic
-	awgMark     = "0x40000"       // distinctive fwmark bit (clear of nfqws2's marks)
+	awgTable = "998" // dedicated routing table for tunneled traffic
+	// fwmark bit 28. MUST be clear of (a) Keenetic's own policy-routing marks,
+	// which are 0x0FFFFxxx (bits 0–27) — an earlier 0x40000 (bit 18) collided with
+	// them and our higher-priority ip rule hijacked ALL of Keenetic's policy traffic
+	// → full outage — and (b) nfqws2's marks 0x40000000/0x20000000 (bits 30/29).
+	awgMark     = "0x10000000"
 	awgMarkRule = awgMark + "/" + awgMark
 	awgChain    = "AWG2_MARK"
 	awgSetInc   = "awg2_inc"
@@ -51,6 +56,40 @@ func awgDefaultRoute() (gw, dev string) {
 		}
 	}
 	return
+}
+
+// awgMarkCollision returns a non-empty fwmark string if some EXISTING ip rule
+// uses a fwmark whose bits overlap ours (0x10000000) — which would let our
+// higher-priority rule hijack that traffic, or the router's policy routing grab
+// ours. The router's own marks (e.g. Keenetic's 0x0FFFFxxx) must not overlap.
+func awgMarkCollision() string {
+	out, _ := awgRun("ip rule")
+	const ourBit = 0x10000000
+	for _, ln := range strings.Split(out, "\n") {
+		i := strings.Index(ln, "fwmark ")
+		if i < 0 {
+			continue
+		}
+		fields := strings.Fields(ln[i+len("fwmark "):])
+		if len(fields) == 0 {
+			continue
+		}
+		mark := fields[0]
+		if j := strings.IndexByte(mark, '/'); j >= 0 {
+			mark = mark[:j]
+		}
+		v, err := strconv.ParseUint(strings.TrimPrefix(strings.TrimPrefix(mark, "0x"), "0X"), 16, 64)
+		if err != nil {
+			continue
+		}
+		if v == ourBit {
+			continue // our own rule from a prior run
+		}
+		if v&ourBit != 0 {
+			return mark
+		}
+	}
+	return ""
 }
 
 func hostOf(endpoint string) string {
@@ -102,6 +141,9 @@ func (a *App) awgApplyRoutingOS() error {
 	}
 	if cs := a.awgClientStatusOS(); cs == nil || !cs.IfacePresent {
 		return fmt.Errorf("туннель awg0 не поднят — сначала «Поднять туннель»")
+	}
+	if other := awgMarkCollision(); other != "" {
+		return fmt.Errorf("на роутере уже есть ip rule с пересекающейся fwmark (%s) — применение отменено во избежание конфликта с policy-routing роутера", other)
 	}
 	endpointIP := resolveHostIP(hostOf(cfg.Endpoint))
 	gw, wandev := awgDefaultRoute()
