@@ -27,25 +27,27 @@ type App struct {
 	Cfg   *config.Config
 	store *store.Store
 
-	mu         sync.Mutex
-	custom     []catalog.Strategy // custom strategies
-	sniDomains []string           // SNI domains to iterate in runs (Strategies tab)
-	runs     map[string]*Run    // in-memory runs (id -> run)
-	runOrder []string           // run ids, newest last
-	active         *Run      // currently running, if any
-	cancel         func()    // cancel for the active run
-	addWorker      func(int) // raises the active run's worker count (add threads live)
-	pendingThreads int       // a thread target requested before the worker pool was up (auto baseline phase)
+	mu             sync.Mutex
+	custom         []catalog.Strategy // custom strategies
+	sniDomains     []string           // SNI domains to iterate in runs (Strategies tab)
+	runs           map[string]*Run    // in-memory runs (id -> run)
+	runOrder       []string           // run ids, newest last
+	active         *Run               // currently running, if any
+	cancel         func()             // cancel for the active run
+	addWorker      func(int)          // raises the active run's worker count (add threads live)
+	pendingThreads int                // a thread target requested before the worker pool was up (auto baseline phase)
 
 	activeBC *BlockCheck // currently running block check, if any
 	cancelBC func()      // cancel for the active block check
 	lastBC   *BlockCheck // most recently finished block check (for the final poll)
 
-	sessions        *auth.Sessions
-	authEnabled     bool
-	loggingDisabled bool
+	sessions         *auth.Sessions
+	authEnabled      bool
+	loggingDisabled  bool
+	httpLogsDisabled bool // suppress the per-request HTTP access log line
 
-	tgws *tgws.Manager // Telegram MTProto->WS proxy (separate tab)
+	tgws   *tgws.Manager       // Telegram MTProto->WS proxy (Telegram tab)
+	socks5 *tgws.Socks5Manager // Telegram SOCKS5 proxy, TGLock-adapted (Telegram tab)
 
 	dnsMu      sync.Mutex
 	dnsServers []dns.Server // configured DoH/DoT servers (DNS tab + run matrix)
@@ -83,6 +85,7 @@ func New(cfg *config.Config) (*App, error) {
 	a.initAuth()
 	a.loadRuns()
 	a.initTGWS()
+	a.initSocks5()
 	a.initDNS()
 	// Repair any sandbox state leaked by a previous unclean exit (stale STRAT_*
 	// iptables chains / orphaned test nfqws2 children). Without this a killed run
@@ -110,6 +113,7 @@ func (a *App) Shutdown() {
 	time.Sleep(300 * time.Millisecond)
 	engine.CleanupSandboxes(a.Cfg, maxThreads)
 	a.StopTGWS()
+	a.StopSocks5()
 }
 
 func (a *App) blobsDir() string { return a.store.Path("blobs") }

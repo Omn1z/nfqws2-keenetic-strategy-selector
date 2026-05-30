@@ -6,7 +6,11 @@ import "nfqws2strategy/internal/netmon"
 // the DPI engine's NFQUEUE stats, and WAN byte counters (the UI derives a rate
 // by diffing successive samples).
 type DashboardView struct {
-	TGWS TGWSStatus `json:"tgws"`
+	TGWS   TGWSStatus   `json:"tgws"`
+	Socks5 Socks5Status `json:"socks5"`
+
+	// Nfqws2Running is true when the DPI engine's NFQUEUE (MainQueue) is bound.
+	Nfqws2Running bool `json:"nfqws2_running"`
 
 	Conntrack struct {
 		Count int `json:"count"`
@@ -30,6 +34,7 @@ type DashboardView struct {
 func (a *App) Dashboard(host string) DashboardView {
 	var d DashboardView
 	d.TGWS = a.TGWSStatusFor(host)
+	d.Socks5 = a.Socks5StatusFor(host)
 	d.MainQueue = a.Cfg.MainQueue
 	d.Conns.ByProto = map[string]int{}
 
@@ -48,6 +53,12 @@ func (a *App) Dashboard(host string) DashboardView {
 	}
 	if qs, err := netmon.Queues(); err == nil {
 		d.Queues = qs
+		for _, q := range qs {
+			if q.Queue == a.Cfg.MainQueue {
+				d.Nfqws2Running = true
+				break
+			}
+		}
 	}
 	if ifs, err := netmon.Ifaces(); err == nil {
 		want := make(map[string]bool, len(a.Cfg.WANIfaces))

@@ -14,8 +14,9 @@ const (
 )
 
 type settings struct {
-	AuthEnabled     bool `json:"auth_enabled"`
-	LoggingDisabled bool `json:"logging_disabled"`
+	AuthEnabled      bool `json:"auth_enabled"`
+	LoggingDisabled  bool `json:"logging_disabled"`
+	HTTPLogsDisabled bool `json:"http_logs_disabled"`
 }
 
 // initAuth loads system settings (auth default enabled, logging default on).
@@ -30,12 +31,13 @@ func (a *App) initAuth() {
 	}
 	a.authEnabled = s.AuthEnabled
 	a.loggingDisabled = s.LoggingDisabled
+	a.httpLogsDisabled = s.HTTPLogsDisabled
 	logbuf.SetEnabled(!s.LoggingDisabled)
 }
 
 // saveSettings persists the current toggles (call with a.mu held).
 func (a *App) saveSettings() error {
-	return a.store.Save(settingsFile, settings{AuthEnabled: a.authEnabled, LoggingDisabled: a.loggingDisabled})
+	return a.store.Save(settingsFile, settings{AuthEnabled: a.authEnabled, LoggingDisabled: a.loggingDisabled, HTTPLogsDisabled: a.httpLogsDisabled})
 }
 
 func (a *App) AuthEnabled() bool {
@@ -69,6 +71,22 @@ func (a *App) SetLoggingEnabled(enabled bool) error {
 	defer a.mu.Unlock()
 	a.loggingDisabled = !enabled
 	logbuf.SetEnabled(enabled)
+	return a.saveSettings()
+}
+
+// HTTPLogsEnabled reports whether the per-request HTTP access log is on.
+func (a *App) HTTPLogsEnabled() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return !a.httpLogsDisabled
+}
+
+// SetHTTPLogsEnabled toggles the HTTP access log (the noisy "GET /api/… 14ms"
+// lines) without affecting other module logs, and persists it.
+func (a *App) SetHTTPLogsEnabled(enabled bool) error {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.httpLogsDisabled = !enabled
 	return a.saveSettings()
 }
 

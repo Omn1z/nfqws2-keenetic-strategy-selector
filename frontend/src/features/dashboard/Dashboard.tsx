@@ -9,6 +9,7 @@ import { Skeleton } from "@/components/ui/Skeleton";
 import { Button } from "@/components/ui/Button";
 import { Modal } from "@/components/ui/Modal";
 import { toast } from "@/components/ui/Toast";
+import { confirmDialog } from "@/components/ui/Confirm";
 import { Sparkline } from "@/components/ui/Chart";
 import type { Dashboard as DashboardData } from "@/types/api";
 
@@ -26,8 +27,8 @@ const Big = ({ value, sub }: { value: ReactNode; sub: string }) => (
   </div>
 );
 
-// One row of 4 equal-width, equal-height cards (1 / 2 / 4 columns; never orphans).
-const GRID = "grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4";
+// Service-status cards in a 3-up row; metric cards in their own 3-up row.
+const GRID3 = "grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3";
 const CARD = "mb-0 h-full"; // cancel the Card stacking margin + stretch to row height
 
 type Rate = { rx: number; tx: number };
@@ -47,8 +48,12 @@ interface ServiceResult {
 
 const RESTART_SERVICES = [
   { id: "nfqws2", label: "NFQWS2 (обход DPI)" },
-  { id: "tgws", label: "TG WS Proxy" },
+  { id: "tgws", label: "TG WS Proxy (MTProto)" },
+  { id: "socks5", label: "Telegram SOCKS5" },
 ];
+
+const svcToast = (r: ServiceResult) =>
+  toast(`${r.name}: ${r.ok ? "ок" : "ошибка"}${r.detail ? " — " + r.detail.split("\n").filter(Boolean).slice(-1)[0] : ""}`, r.ok ? "ok" : "err");
 
 // Restart selected on-router services (works around the upstream nfqws2 init's
 // pgrep-collision that orphans nfqws2 on reboot). Never reboots the router.
@@ -62,7 +67,7 @@ function RestartButton() {
     setBusy(true);
     try {
       const d = await api<{ results: ServiceResult[] }>("POST", "/api/services/restart", { services: sel });
-      for (const r of d.results) toast(`${r.name}: ${r.ok ? "перезапущен" : "ошибка"}${r.detail ? " — " + r.detail.split("\n")[0] : ""}`, r.ok ? "ok" : "err");
+      for (const r of d.results) svcToast(r);
       setOpen(false);
     } catch (e) {
       toast((e as Error).message, "err");
@@ -96,6 +101,36 @@ function RestartButton() {
         </Modal>
       )}
     </>
+  );
+}
+
+// NFQWS2 service controls: status + Start / Stop / Reload / Restart. Stop and
+// Restart interrupt DPI bypass, so they confirm first; Reload is a SIGHUP (safe).
+function Nfqws2Card({ running, queue }: { running: boolean; queue: number }) {
+  const [busy, setBusy] = useState("");
+  const run = async (key: string, fn: () => Promise<void>, confirm?: { title: string; body?: string; danger?: boolean }) => {
+    if (confirm && !(await confirmDialog({ title: confirm.title, body: confirm.body, confirmLabel: "Да", danger: confirm.danger }))) return;
+    setBusy(key);
+    try { await fn(); } catch (e) { toast((e as Error).message, "err"); } finally { setBusy(""); }
+  };
+  const start = () => run("start", async () => svcToast(await api<ServiceResult>("POST", "/api/nfqws2/start", {})));
+  const stop = () => run("stop", async () => svcToast(await api<ServiceResult>("POST", "/api/nfqws2/stop", {})), { title: "Остановить NFQWS2?", body: "Обход DPI перестанет работать до следующего запуска.", danger: true });
+  const reload = () => run("reload", async () => { await api("POST", "/api/nfqws2/reload", {}); toast("nfqws2: конфиг перечитан (reload)", "ok"); });
+  const restart = () => run("restart", async () => { const d = await api<{ results: ServiceResult[] }>("POST", "/api/services/restart", { services: ["nfqws2"] }); if (d.results?.[0]) svcToast(d.results[0]); }, { title: "Перезапустить NFQWS2?", body: "Обход DPI прервётся на ~2 секунды." });
+  const B = ({ k, label, variant, onClick }: { k: string; label: string; variant?: "primary" | "danger"; onClick: () => void }) => (
+    <Button mini variant={variant} disabled={!!busy} onClick={onClick}>{busy === k ? "…" : label}</Button>
+  );
+  return (
+    <Card title="NFQWS2" sub="движок DPI" head={<Badge kind={running ? "ok" : "bad"}>{running ? "работает" : "остановлен"}</Badge>} className={CARD}>
+      <p className="mb-2.5 text-[13px] text-ink-soft">Очередь {queue}: <b>{running ? "активна" : "не активна"}</b></p>
+      <div className="flex flex-wrap gap-2">
+        <B k="start" label="Старт" variant="primary" onClick={start} />
+        <B k="stop" label="Стоп" variant="danger" onClick={stop} />
+        <B k="reload" label="Reload" onClick={reload} />
+        <B k="restart" label="Перезапуск" onClick={restart} />
+      </div>
+      <p className="mt-2 text-xs text-muted">Reload перечитывает списки без обрыва очереди; Стоп/Перезапуск прерывают обход.</p>
+    </Card>
   );
 }
 
@@ -141,13 +176,13 @@ export default function Dashboard() {
     }
   }, 2500);
 
-  // First paint: skeleton in the exact 4-card grid shape, so nothing jumps on load.
+  // First paint: skeleton in a 3-card grid so nothing jumps on load.
   if (!d)
     return (
       <>
         <div className="mb-4 flex justify-end"><RestartButton /></div>
-        <div className={GRID}>
-          {Array.from({ length: 4 }).map((_, i) => (
+        <div className={GRID3}>
+          {Array.from({ length: 3 }).map((_, i) => (
             <Card key={i} className={CARD}>
               <Skeleton className="mb-3 h-4 w-28" />
               <Skeleton className="mb-2.5 h-8 w-24" />
@@ -160,6 +195,7 @@ export default function Dashboard() {
     );
 
   const { connections: cc, traffic: tr } = d.tgws.stats;
+  const sc = d.socks5.stats.connections, str = d.socks5.stats.traffic;
   const bp = d.conns.by_proto ?? {};
   const q = d.queues?.find((x) => x.queue === d.main_queue);
   const last = hist[hist.length - 1];
@@ -170,29 +206,43 @@ export default function Dashboard() {
   return (
     <>
       <div className="mb-4 flex justify-end"><RestartButton /></div>
-      <div className={GRID}>
-        <Card title="TG WS Proxy" className={CARD}>
+
+      {/* Сервисы — статусы и управление */}
+      <div className={`${GRID3} mb-4`}>
+        <Card title="TG WS Proxy" sub="MTProto" className={CARD}>
           <Row l="Статус"><Badge kind={d.tgws.running ? "ok" : "bad"}>{d.tgws.running ? "работает" : "остановлен"}</Badge></Row>
           <Row l="Активные / всего">{cc.active} / {cc.total}</Row>
           <Row l="WS / TCP / CF">{cc.ws} / {cc.tcp_fallback} / {cc.cfproxy}</Row>
           <Row l="Трафик ↑ / ↓">{tr.human_up || "0 Б"} / {tr.human_down || "0 Б"}</Row>
         </Card>
 
+        <Card title="SOCKS5" sub="Telegram" className={CARD}>
+          <Row l="Статус"><Badge kind={d.socks5.running ? "ok" : "bad"}>{d.socks5.running ? "работает" : "остановлен"}</Badge></Row>
+          <Row l="Активные / всего">{sc.active} / {sc.total}</Row>
+          <Row l="Telegram / прямые">{sc.telegram} / {sc.direct}</Row>
+          <Row l="Трафик ↑ / ↓">{str.human_up || "0 Б"} / {str.human_down || "0 Б"}</Row>
+        </Card>
+
+        <Nfqws2Card running={d.nfqws2_running} queue={d.main_queue} />
+      </div>
+
+      {/* Метрики */}
+      <div className={GRID3}>
         <Card title="Активные соединения" sub="conntrack" className={CARD}>
           <Big value={fmtNum(d.conns.total)} sub={`из ${fmtNum(d.conntrack.max)} макс.`} />
           <Row l="TCP / UDP / ICMP">{bp.tcp ?? 0} / {bp.udp ?? 0} / {bp.icmp ?? 0}</Row>
           <Row l="Не отвечают"><span className={d.conns.failing ? "text-bad" : ""}>{d.conns.failing}</span></Row>
         </Card>
 
-        <Card title="Пакеты DPI" sub="nfqws2" className={CARD}>
+        <Card title="Пакеты DPI" sub={`nfqws2 · очередь ${d.main_queue}`} className={CARD}>
           {q ? (
             <>
-              <Big value={fmtNum(q.id_seq)} sub={`пакетов · очередь ${d.main_queue}`} />
+              <Big value={fmtNum(q.id_seq)} sub="пакетов обработано" />
               <Row l="В очереди сейчас">{fmtNum(q.queued)}</Row>
               <Row l="Отброшено (ядро / польз.)"><span className={q.queue_drop || q.user_drop ? "text-bad" : ""}>{fmtNum(q.queue_drop)} / {fmtNum(q.user_drop)}</span></Row>
             </>
           ) : (
-            <p className="text-xs text-muted">Очередь {d.main_queue} не активна — сервис nfqws2 не запущен?</p>
+            <p className="text-xs text-muted">Очередь {d.main_queue} не активна — nfqws2 не запущен?</p>
           )}
         </Card>
 

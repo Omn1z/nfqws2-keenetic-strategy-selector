@@ -29,6 +29,8 @@ func (a *App) RestartServices(names []string) []ServiceResult {
 			out = append(out, a.restartNfqws2())
 		case "tgws":
 			out = append(out, a.restartTGWS())
+		case "socks5":
+			out = append(out, a.restartSocks5())
 		default:
 			out = append(out, ServiceResult{Name: n, OK: false, Detail: "неизвестный сервис"})
 		}
@@ -63,6 +65,51 @@ func (a *App) restartNfqws2() ServiceResult {
 		return ServiceResult{Name: "nfqws2", OK: false, Detail: fmt.Sprintf("%s (%v)", detail, err)}
 	}
 	logbuf.Append("system", "info", "restart nfqws2: ок")
+	return ServiceResult{Name: "nfqws2", OK: true, Detail: detail}
+}
+
+func (a *App) restartSocks5() ServiceResult {
+	if a.socks5 == nil {
+		return ServiceResult{Name: "socks5", OK: false, Detail: "менеджер не инициализирован"}
+	}
+	if !a.socks5.Config().Enabled {
+		return ServiceResult{Name: "socks5", OK: false, Detail: "прокси выключен — нечего перезапускать"}
+	}
+	logbuf.Append("system", "info", "restart socks5…")
+	if err := a.socks5.Restart(); err != nil {
+		logbuf.Append("system", "error", "restart socks5: "+err.Error())
+		return ServiceResult{Name: "socks5", OK: false, Detail: err.Error()}
+	}
+	return ServiceResult{Name: "socks5", OK: true, Detail: "перезапущен"}
+}
+
+// Nfqws2Start ensures the live nfqws2 engine is running: it first reaps any
+// orphaned nfqws2 (the upstream S51 pgrep-collision can leave one holding the
+// queue) then starts. Nfqws2Stop stops and reaps. These back the dashboard
+// NFQWS2 Start/Stop controls; the router is never rebooted.
+func (a *App) Nfqws2Start() ServiceResult {
+	init := a.Cfg.Nfqws2Init
+	script := "killall nfqws2 2>/dev/null\nkillall nfqws2-keenetic 2>/dev/null\nsleep 1\n" + init + " start 2>&1"
+	return a.nfqws2Ctl("start", script)
+}
+
+func (a *App) Nfqws2Stop() ServiceResult {
+	init := a.Cfg.Nfqws2Init
+	script := init + " stop 2>&1 || true\nkillall nfqws2 2>/dev/null\nkillall nfqws2-keenetic 2>/dev/null\necho 'nfqws2 stopped'"
+	return a.nfqws2Ctl("stop", script)
+}
+
+func (a *App) nfqws2Ctl(action, script string) ServiceResult {
+	logbuf.Append("system", "info", "nfqws2 "+action+"…")
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	b, err := exec.CommandContext(ctx, "sh", "-c", script).CombinedOutput()
+	detail := lastLines(strings.TrimSpace(string(b)), 6)
+	if err != nil {
+		logbuf.Append("system", "error", "nfqws2 "+action+": "+err.Error())
+		return ServiceResult{Name: "nfqws2", OK: false, Detail: fmt.Sprintf("%s (%v)", detail, err)}
+	}
+	logbuf.Append("system", "info", "nfqws2 "+action+": ок")
 	return ServiceResult{Name: "nfqws2", OK: true, Detail: detail}
 }
 

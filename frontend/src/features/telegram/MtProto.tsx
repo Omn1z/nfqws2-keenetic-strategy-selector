@@ -60,7 +60,7 @@ const ToggleField = ({ label, checked, onChange }: { label: string; checked: boo
   <div className="flex h-[38px] items-center"><Switch checked={checked} onChange={onChange} label={label} /></div>
 );
 
-export default function Tgws() {
+export default function MtProto() {
   const [form, setForm] = useState<Form | null>(null);
   const [live, setLive] = useState<TgwsStatus | null>(null);
   const loaded = useRef(false);

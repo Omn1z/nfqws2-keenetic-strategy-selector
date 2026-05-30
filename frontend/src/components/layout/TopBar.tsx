@@ -1,13 +1,11 @@
 import { useEffect, useState } from "react";
-import type { ReactNode } from "react";
 import { api } from "@/lib/api";
 import { cn } from "@/lib/cn";
 import { useStore } from "@/providers/StoreProvider";
-import { useTheme } from "@/lib/theme";
-import type { ThemeMode } from "@/lib/theme";
 import { toast } from "@/components/ui/Toast";
-import { confirmDialog } from "@/components/ui/Confirm";
 import { Spinner } from "@/components/ui/Spinner";
+import { Modal } from "@/components/ui/Modal";
+import { Button } from "@/components/ui/Button";
 import type { Nfqws2Version } from "@/types/api";
 
 interface UpdateInfo {
@@ -17,21 +15,24 @@ interface UpdateInfo {
   error?: string;
 }
 
-const THEME_ICON: Record<ThemeMode, ReactNode> = {
-  auto: <svg viewBox="0 0 24 24" width="16" height="16"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" strokeWidth="2" /><path d="M12 3a9 9 0 0 0 0 18z" fill="currentColor" /></svg>,
-  light: <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><circle cx="12" cy="12" r="4.3" /><path d="M12 1.6v3M12 19.4v3M4.2 4.2l2.1 2.1M17.7 17.7l2.1 2.1M1.6 12h3M19.4 12h3M4.2 19.8l2.1-2.1M17.7 6.3l2.1-2.1" /></svg>,
-  dark: <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="2" strokeLinejoin="round"><path d="M21 12.8A9 9 0 1 1 11.2 3 7 7 0 0 0 21 12.8z" /></svg>,
-};
+interface Pending {
+  id: "app" | "nfqws2";
+  label: string;
+  from: string;
+  to: string;
+}
+
 const iconBtn = "grid h-7 w-7 place-items-center rounded-lg text-ink-soft transition hover:bg-line-soft hover:text-accent";
 
 export function TopBar({ authEnabled, onMenu }: { authEnabled: boolean; onMenu: () => void }) {
   const { config } = useStore();
-  const [mode, cycle] = useTheme();
   const [latest, setLatest] = useState("");
   const [checking, setChecking] = useState(false);
   const [updating, setUpdating] = useState<{ target: string; msg: string } | null>(null);
   const [n2s, setN2s] = useState<Nfqws2Version | null>(null);
   const [n2sUpdating, setN2sUpdating] = useState<{ target: string; msg: string } | null>(null);
+  const [updOpen, setUpdOpen] = useState(false);
+  const [updSel, setUpdSel] = useState<string[]>([]);
   const version = config?.version ?? "…";
 
   const check = async (manual: boolean) => {
@@ -39,37 +40,25 @@ export function TopBar({ authEnabled, onMenu }: { authEnabled: boolean; onMenu: 
     try {
       const u = await api<UpdateInfo>("GET", "/api/update/check");
       if (u.error) { if (manual) toast("Проверка: " + u.error, "err"); }
-      else if (u.available) { setLatest(u.latest); if (manual) toast("Доступна версия " + u.latest, "ok"); }
-      else { setLatest(""); if (manual) toast("Установлена последняя версия", "ok"); }
+      else if (u.available) { setLatest(u.latest); if (manual) toast("Доступно обновление панели: " + u.latest, "ok"); }
+      else { setLatest(""); }
     } catch (e) { if (manual) toast((e as Error).message, "err"); }
     finally { setTimeout(() => setChecking(false), 400); }
   };
-  useEffect(() => { void check(false); }, []);
-
-  // nfqws2 engine version (fast) then the GitHub update check (background).
-  useEffect(() => {
-    void (async () => {
-      try { setN2s(await api<Nfqws2Version>("GET", "/api/nfqws2/version")); } catch { /* ignore */ }
-      try { setN2s(await api<Nfqws2Version>("GET", "/api/nfqws2/update/check")); } catch { /* keep version-only */ }
-    })();
-  }, []);
-
-  const doN2sUpdate = async () => {
-    const target = n2s?.latest;
-    if (!target) return;
-    if (!(await confirmDialog({ title: `Обновить nfqws2 до ${target}?`, body: "Пакет nfqws2-keenetic обновится через opkg, движок кратко перезапустится. Роутер НЕ перезагружается.", confirmLabel: "Обновить" }))) return;
-    setN2sUpdating({ target, msg: "Выполняется opkg upgrade (может занять до минуты)…" });
-    try {
-      const r = await api<{ ok: boolean; output: string; error?: string }>("POST", "/api/nfqws2/update");
-      if (!r.ok) { setN2sUpdating(null); toast("Обновление nfqws2: " + (r.error || "ошибка"), "err"); return; }
-    } catch (e) { setN2sUpdating(null); toast((e as Error).message, "err"); return; }
-    setN2sUpdating(null);
-    toast("nfqws2 обновлён до " + target, "ok");
-    try { setN2s(await api<Nfqws2Version>("GET", "/api/nfqws2/update/check")); } catch { /* ignore */ }
+  const checkN2s = async () => {
+    try { setN2s(await api<Nfqws2Version>("GET", "/api/nfqws2/version")); } catch { /* ignore */ }
+    try { setN2s(await api<Nfqws2Version>("GET", "/api/nfqws2/update/check")); } catch { /* keep version-only */ }
   };
+  useEffect(() => { void check(false); void checkN2s(); }, []);
+  const recheck = async () => { await check(true); await checkN2s(); };
 
-  const doUpdate = async () => {
-    if (!(await confirmDialog({ title: `Обновить до ${latest}?`, body: "Сервис будет перезапущен.", confirmLabel: "Обновить" }))) return;
+  // Every component with a pending update, unified into one button + modal.
+  const pending: Pending[] = [];
+  if (latest) pending.push({ id: "app", label: "Панель управления", from: version, to: latest });
+  if (n2s?.available && n2s.latest) pending.push({ id: "nfqws2", label: "Движок NFQWS2", from: n2s.package, to: n2s.latest });
+
+  // Update flows (no confirm — the modal is the confirmation).
+  const appUpdateFlow = async () => {
     const target = latest;
     try { await api("POST", "/api/update"); } catch (e) { toast((e as Error).message, "err"); return; }
     setUpdating({ target, msg: "Скачиваем новую версию и перезапускаем сервис." });
@@ -81,6 +70,23 @@ export function TopBar({ authEnabled, onMenu }: { authEnabled: boolean; onMenu: 
       } catch { /* server restarting */ }
     }
     setUpdating({ target, msg: "Перезапуск занимает дольше обычного. Обновите страницу вручную." });
+  };
+  const n2sUpdateFlow = async () => {
+    const target = n2s?.latest;
+    if (!target) return;
+    setN2sUpdating({ target, msg: "Выполняется opkg upgrade (может занять до минуты)…" });
+    try {
+      const r = await api<{ ok: boolean; output: string; error?: string }>("POST", "/api/nfqws2/update");
+      if (!r.ok) { setN2sUpdating(null); toast("Обновление nfqws2: " + (r.error || "ошибка"), "err"); return; }
+    } catch (e) { setN2sUpdating(null); toast((e as Error).message, "err"); return; }
+    setN2sUpdating(null);
+    toast("nfqws2 обновлён до " + target, "ok");
+    await checkN2s();
+  };
+  const runUpdates = async (ids: string[]) => {
+    setUpdOpen(false);
+    if (ids.includes("nfqws2")) await n2sUpdateFlow(); // first — doesn't restart our panel
+    if (ids.includes("app")) await appUpdateFlow();    // last — restarts the panel + reloads the page
   };
 
   const logout = async () => { try { await api("POST", "/api/auth/logout"); } catch { /* ignore */ } location.reload(); };
@@ -97,43 +103,66 @@ export function TopBar({ authEnabled, onMenu }: { authEnabled: boolean; onMenu: 
         <span className="truncate">NFQWS2<b className="hidden font-bold text-accent sm:inline"> Strategy</b></span>
       </div>
       <div className="flex items-center gap-2 sm:gap-3.5">
-        {config?.wan_ifaces && <span className="hidden text-xs text-muted sm:inline">iface {config.wan_ifaces.join(",")}</span>}
-        <button className={iconBtn} title="Тема" onClick={cycle}>{THEME_ICON[mode]}</button>
-        {n2s?.package && (
-          <div className="flex items-center gap-2 rounded-full bg-line-soft py-1 pl-3 pr-2" title={n2s.engine ? `движок ${n2s.engine}` : undefined}>
-            <span className="hidden text-xs text-muted sm:inline">nfqws2</span>
-            <span className="font-semibold tabular-nums">{n2s.package}</span>
-            {n2s.available && n2s.latest && (
-              <button onClick={doN2sUpdate} title={`Обновить движок до ${n2s.latest}`} className="animate-pulse rounded-full bg-gradient-to-br from-[#ffb33e] to-warn px-2.5 py-1.5 text-xs font-semibold text-white shadow">
-                → {n2s.latest}
-              </button>
-            )}
-          </div>
-        )}
+        {config?.wan_ifaces && <span className="hidden text-xs text-muted lg:inline">iface {config.wan_ifaces.join(",")}</span>}
         <div className="flex items-center gap-2 rounded-full bg-line-soft py-1 pl-3 pr-2">
           <span className="hidden text-xs text-muted sm:inline">версия</span>
           <span className="font-semibold tabular-nums">{version}</span>
-          <button className={cn("hidden h-7 w-7 place-items-center rounded-lg text-ink-soft transition hover:bg-line-soft hover:text-accent sm:grid", checking && "animate-spin")} title="Проверить обновления" onClick={() => check(true)}>
+          <button className={cn("hidden h-7 w-7 place-items-center rounded-lg text-ink-soft transition hover:bg-line-soft hover:text-accent sm:grid", checking && "animate-spin")} title="Проверить обновления" onClick={recheck}>
             <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36M21 3v6h-6" /></svg>
           </button>
-          {latest && (
-            <button onClick={doUpdate} title={`Обновить до ${latest}`} className="shrink-0 animate-pulse rounded-full bg-gradient-to-br from-[#ffb33e] to-warn px-2.5 py-1.5 text-xs font-semibold text-white shadow sm:px-3">
-              <span className="sm:hidden">↑{latest}</span>
-              <span className="hidden sm:inline">Обновить до {latest}</span>
-            </button>
-          )}
         </div>
+
+        {pending.length > 0 && (
+          <button
+            onClick={() => { setUpdSel(pending.map((p) => p.id)); setUpdOpen(true); }}
+            title="Доступны обновления"
+            className="shrink-0 animate-pulse rounded-full bg-gradient-to-br from-[#ffb33e] to-warn px-2.5 py-1.5 text-xs font-semibold text-white shadow sm:px-3"
+          >
+            <span className="sm:hidden">↑{pending.length}</span>
+            <span className="hidden sm:inline">Обновления · {pending.length}</span>
+          </button>
+        )}
+
         {authEnabled && (
           <button className={iconBtn} title="Выход" onClick={logout}>
             <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9" /></svg>
           </button>
         )}
       </div>
+
+      {updOpen && (
+        <Modal
+          title="Доступны обновления"
+          onClose={() => setUpdOpen(false)}
+          actions={
+            <>
+              <Button variant="ghost" onClick={() => setUpdOpen(false)}>Отмена</Button>
+              <Button variant="primary" disabled={!updSel.length} onClick={() => runUpdates(updSel)}>Обновить выбранные</Button>
+            </>
+          }
+        >
+          <p className="mb-3 text-muted">Отметьте, что обновить. Роутер не перезагружается.</p>
+          <div className="flex flex-col gap-2.5">
+            {pending.map((p) => (
+              <label key={p.id} className="flex cursor-pointer items-center gap-2.5 text-[13.5px]">
+                <input
+                  type="checkbox"
+                  className="h-4 w-4 rounded-[4px] accent-[var(--c-accent)] outline-none focus-visible:ring-2 focus-visible:ring-ring/40"
+                  checked={updSel.includes(p.id)}
+                  onChange={() => setUpdSel((s) => (s.includes(p.id) ? s.filter((x) => x !== p.id) : [...s, p.id]))}
+                />
+                <span>{p.label}: <span className="text-muted tabular-nums">{p.from}</span> → <b className="tabular-nums text-accent-d">{p.to}</b></span>
+              </label>
+            ))}
+          </div>
+        </Modal>
+      )}
+
       {updating && (
         <div className="fixed inset-0 z-[60] grid place-items-center bg-[rgba(20,30,45,.55)] backdrop-blur-sm">
           <div className="w-[340px] rounded-2xl border border-line bg-panel p-9 text-center shadow-2xl">
             <Spinner className="mx-auto" />
-            <h3 className="mb-2 mt-4 text-lg font-semibold">Обновление до {updating.target}</h3>
+            <h3 className="mb-2 mt-4 text-lg font-semibold">Обновление панели до {updating.target}</h3>
             <p className="text-xs text-muted">{updating.msg}</p>
           </div>
         </div>

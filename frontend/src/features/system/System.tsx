@@ -27,7 +27,7 @@ export default function System() {
   }, []);
   useEffect(() => { void load(); }, [load]);
 
-  const apply = async (patch: Partial<Pick<SystemSettings, "auth_enabled" | "logging_enabled">>, ok: string) => {
+  const apply = async (patch: Partial<Pick<SystemSettings, "auth_enabled" | "logging_enabled" | "http_logs_enabled">>, ok: string) => {
     try { setS(await api<SystemSettings>("POST", "/api/system/settings", patch)); toast(ok, "ok"); }
     catch (e) { toast((e as Error).message, "err"); }
   };
@@ -50,6 +50,9 @@ export default function System() {
         </Row>
         <Row title="Логирование" desc="Запись логов сервиса (вкладка «Логи» и файл). Выключение останавливает сбор.">
           <Switch checked={s.logging_enabled} onChange={(on) => apply({ logging_enabled: on }, on ? "Логирование включено" : "Логирование выключено")} />
+        </Row>
+        <Row title="HTTP-логи запросов" desc="Строки «GET /api/… 14ms» в логах. Выключение убирает их шум, остальные логи остаются.">
+          <Switch checked={s.http_logs_enabled} onChange={(on) => apply({ http_logs_enabled: on }, on ? "HTTP-логи включены" : "HTTP-логи выключены")} />
         </Row>
       </Card>
 

@@ -35,7 +35,7 @@ func New(a *app.App) *Server {
 	return s
 }
 
-func (s *Server) Handler() http.Handler { return logging(s.authGate(s.mux)) }
+func (s *Server) Handler() http.Handler { return s.logging(s.authGate(s.mux)) }
 
 const sessionCookie = "n2s_sess"
 
@@ -120,16 +120,18 @@ func (s *Server) restartServices(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) getSystemSettings(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{
-		"auth_enabled":    s.app.AuthEnabled(),
-		"auth_forced_off": s.app.AuthForcedOff(),
-		"logging_enabled": s.app.LoggingEnabled(),
+		"auth_enabled":      s.app.AuthEnabled(),
+		"auth_forced_off":   s.app.AuthForcedOff(),
+		"logging_enabled":   s.app.LoggingEnabled(),
+		"http_logs_enabled": s.app.HTTPLogsEnabled(),
 	})
 }
 
 func (s *Server) setSystemSettings(w http.ResponseWriter, r *http.Request) {
 	var in struct {
-		AuthEnabled    *bool `json:"auth_enabled"`
-		LoggingEnabled *bool `json:"logging_enabled"`
+		AuthEnabled     *bool `json:"auth_enabled"`
+		LoggingEnabled  *bool `json:"logging_enabled"`
+		HTTPLogsEnabled *bool `json:"http_logs_enabled"`
 	}
 	if err := readJSON(r, &in); err != nil {
 		httpErr(w, 400, err)
@@ -143,6 +145,12 @@ func (s *Server) setSystemSettings(w http.ResponseWriter, r *http.Request) {
 	}
 	if in.LoggingEnabled != nil {
 		if err := s.app.SetLoggingEnabled(*in.LoggingEnabled); err != nil {
+			httpErr(w, 500, err)
+			return
+		}
+	}
+	if in.HTTPLogsEnabled != nil {
+		if err := s.app.SetHTTPLogsEnabled(*in.HTTPLogsEnabled); err != nil {
 			httpErr(w, 500, err)
 			return
 		}
@@ -219,6 +227,11 @@ func (s *Server) routes() {
 	m.HandleFunc("POST /api/tgws/stop", s.tgwsStop)
 	m.HandleFunc("POST /api/tgws/secret", s.tgwsSecret)
 
+	m.HandleFunc("GET /api/socks5", s.socks5Status)
+	m.HandleFunc("POST /api/socks5/config", s.socks5Config)
+	m.HandleFunc("POST /api/socks5/start", s.socks5Start)
+	m.HandleFunc("POST /api/socks5/stop", s.socks5Stop)
+
 	m.HandleFunc("POST /api/apply", s.applyStrategy)
 
 	m.HandleFunc("GET /api/update/check", s.checkUpdate)
@@ -240,6 +253,8 @@ func (s *Server) routes() {
 	m.HandleFunc("GET /api/nfqws2/update/check", s.nfqws2CheckUpdate)
 	m.HandleFunc("POST /api/nfqws2/update", s.nfqws2Update)
 	m.HandleFunc("POST /api/nfqws2/reload", s.nfqws2Reload)
+	m.HandleFunc("POST /api/nfqws2/start", s.nfqws2StartSvc)
+	m.HandleFunc("POST /api/nfqws2/stop", s.nfqws2StopSvc)
 	m.HandleFunc("GET /api/nfqws2/files", s.nfqws2Files)
 	m.HandleFunc("GET /api/nfqws2/file", s.nfqws2GetFile)
 	m.HandleFunc("POST /api/nfqws2/file", s.nfqws2SaveFile)
@@ -1107,6 +1122,49 @@ func (s *Server) tgwsSecret(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]string{"secret": secret})
 }
 
+// ---------- SOCKS5 Telegram proxy (TGLock-adapted) ----------
+
+func (s *Server) socks5Status(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, 200, s.app.Socks5StatusFor(hostFromHeader(r.Host)))
+}
+
+func (s *Server) socks5Config(w http.ResponseWriter, r *http.Request) {
+	var in tgws.Socks5Config
+	if err := readJSON(r, &in); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	if err := s.app.Socks5SetConfig(&in); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, s.app.Socks5StatusFor(hostFromHeader(r.Host)))
+}
+
+func (s *Server) socks5Start(w http.ResponseWriter, r *http.Request) {
+	if err := s.app.Socks5Start(); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, s.app.Socks5StatusFor(hostFromHeader(r.Host)))
+}
+
+func (s *Server) socks5Stop(w http.ResponseWriter, r *http.Request) {
+	if err := s.app.Socks5Stop(); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, s.app.Socks5StatusFor(hostFromHeader(r.Host)))
+}
+
+func (s *Server) nfqws2StartSvc(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, 200, s.app.Nfqws2Start())
+}
+
+func (s *Server) nfqws2StopSvc(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, 200, s.app.Nfqws2Stop())
+}
+
 // hostFromHeader strips the port from a Host header so the tg:// link points at
 // whatever address the user reached the UI on.
 func hostFromHeader(host string) string {
@@ -1161,7 +1219,9 @@ func (s *Server) doUpdate(w http.ResponseWriter, r *http.Request) {
 
 // ---------- helpers ----------
 
-type apiError struct{ Error string `json:"error"` }
+type apiError struct {
+	Error string `json:"error"`
+}
 
 var errNotFound = &simpleErr{"not found"}
 
@@ -1184,11 +1244,11 @@ func readJSON(r *http.Request, v any) error {
 	return json.NewDecoder(io.LimitReader(r.Body, 8<<20)).Decode(v)
 }
 
-func logging(next http.Handler) http.Handler {
+func (s *Server) logging(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		next.ServeHTTP(w, r)
-		if r.URL.Path != "/" && len(r.URL.Path) >= 4 && r.URL.Path[:4] == "/api" {
+		if s.app.HTTPLogsEnabled() && r.URL.Path != "/" && len(r.URL.Path) >= 4 && r.URL.Path[:4] == "/api" {
 			log.Printf("%s %s %s", r.Method, r.URL.Path, time.Since(start).Round(time.Millisecond))
 		}
 	})

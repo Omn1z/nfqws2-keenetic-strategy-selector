@@ -202,8 +202,34 @@ export interface TgwsStatus {
   link: string;
 }
 
+export interface Socks5Config {
+  enabled: boolean;
+  port: number;
+  user: string;
+  pass: string;
+  buffer_size: number;
+  dc_redirects: Record<string, string>;
+  link_host: string;
+}
+
+export interface Socks5Snapshot {
+  connections: { total: number; active: number; telegram: number; direct: number; bad: number };
+  traffic: { bytes_up: number; bytes_down: number; human_up: string; human_down: string };
+  last_dc: number;
+  started_at: number;
+}
+
+export interface Socks5Status {
+  running: boolean;
+  config: Socks5Config;
+  stats: Socks5Snapshot;
+  link: string;
+}
+
 export interface Dashboard {
   tgws: TgwsStatus;
+  socks5: Socks5Status;
+  nfqws2_running: boolean;
   conntrack: { count: number; max: number };
   conns: { total: number; failing: number; by_proto: Record<string, number> };
   queues: QueueStat[];
@@ -251,6 +277,7 @@ export interface SystemSettings {
   auth_enabled: boolean;
   auth_forced_off: boolean;
   logging_enabled: boolean;
+  http_logs_enabled: boolean;
 }
 
 export interface BlobCapture {
