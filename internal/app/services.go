@@ -40,14 +40,15 @@ func (a *App) RestartServices(names []string) []ServiceResult {
 
 // restartNfqws2 robustly restarts the main nfqws2 service.
 //
-// Why not a plain `S51nfqws2 restart`: the upstream init's is_running() uses
-// `pgrep -nf /opt/usr/bin/nfqws2`, which also matches OUR
-// /opt/usr/bin/nfqws2-strategy process (substring) and picks it as the newest —
-// so the init mis-detects nfqws2 as "not running", skips the kill on stop, and
-// orphans nfqws2 holding NFQUEUE 300, so a fresh start can't bind the queue
-// (this is the post-reboot "nfqws2 не поднимается" symptom). We therefore mirror
-// the proven manual recovery: stop (drops the firewall), `killall nfqws2`
-// (matches by exact process name — never this nfqws2-strategy), then start fresh.
+// Background: the upstream init's is_running() uses `pgrep -nf /opt/usr/bin/nfqws2`,
+// which substring-matched OUR old binary path /opt/usr/bin/nfqws2-strategy and, when
+// our PID was the newest, made the init mis-detect nfqws2 as "not running" — it then
+// skipped the kill on stop and orphaned nfqws2 holding NFQUEUE 300 (the post-reboot
+// "nfqws2 не поднимается" + nfqws-keenetic-web "stopped" symptoms). v0.10.2 renamed our
+// binary to /opt/usr/bin/n2s to remove that collision at the source. We still mirror the
+// proven manual recovery here as defense-in-depth (a not-yet-migrated install, or any
+// other stale nfqws2): stop (drops the firewall), `killall nfqws2` (exact process-name
+// match — never this binary), then start fresh.
 func (a *App) restartNfqws2() ServiceResult {
 	init := a.Cfg.Nfqws2Init
 	script := init + " stop 2>&1 || true\n" +

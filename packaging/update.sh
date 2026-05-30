@@ -9,7 +9,8 @@ set -e
 REPO="Omn1z/nfqws2-keenetic-strategy-selector"
 # -----------------------------------------
 
-BIN=/opt/usr/bin/nfqws2-strategy
+BIN=/opt/usr/bin/n2s
+OLD_BIN=/opt/usr/bin/nfqws2-strategy   # pre-v0.10.2 name (S51 pgrep collision); removed on migration
 INIT=/opt/etc/init.d/S52nfqws2-strategy
 
 say() { echo "[nfqws2-strategy] $*"; }
@@ -34,7 +35,7 @@ is_running() {
   [ -n "$_pid" ] || return 1
   kill -0 "$_pid" 2>/dev/null || return 1
   case "$(cat "/proc/$_pid/cmdline" 2>/dev/null)" in
-    *nfqws2-strategy*) return 0 ;;
+    */n2s*) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -89,7 +90,7 @@ fetch() {
   else die "need curl or wget"; fi
 }
 
-say "current: $("$BIN" version 2>/dev/null || echo '?')"
+say "current: $("$BIN" version 2>/dev/null || "$OLD_BIN" version 2>/dev/null || echo '?')"
 say "downloading $URL"
 fetch "$URL" "$BIN.new" || die "download failed"
 chmod +x "$BIN.new"
@@ -98,7 +99,10 @@ PORT="$(sed -n 's/^PORT=//p' "$INIT" 2>/dev/null | head -1)"
 [ -n "$PORT" ] || PORT=8090
 "$INIT" stop 2>/dev/null || true
 mv "$BIN.new" "$BIN"
-write_init   # refresh the init (stale-pidfile fix), preserving PORT
+write_init   # refresh the init (new binary path + stale-pidfile fix), preserving PORT
+# migrate away from the pre-v0.10.2 binary name so S51's `pgrep -nf /opt/usr/bin/nfqws2`
+# stops matching us (the cause of nfqws-keenetic-web showing nfqws2 as "stopped").
+if [ "$OLD_BIN" != "$BIN" ] && [ -e "$OLD_BIN" ]; then rm -f "$OLD_BIN" && say "removed old binary $OLD_BIN"; fi
 "$INIT" start || die "service failed to start"
 say "updated to: $("$BIN" version 2>/dev/null || echo '?')"
 say "Done."

@@ -9,7 +9,12 @@ REPO="Omn1z/nfqws2-keenetic-strategy-selector"
 PORT="${N2S_PORT:-8090}"
 
 BIN_DIR=/opt/usr/bin
-BIN="$BIN_DIR/nfqws2-strategy"
+# Binary is named "n2s" (NOT nfqws2-strategy) on purpose: the upstream nfqws2
+# init's is_running() does `pgrep -nf /opt/usr/bin/nfqws2`, which substring-matches
+# anything starting with that path. The old name made nfqws-keenetic-web / S51
+# mis-detect the live nfqws2 as stopped (and broke boot start). See CHANGELOG v0.10.2.
+BIN="$BIN_DIR/n2s"
+OLD_BIN="$BIN_DIR/nfqws2-strategy"   # pre-v0.10.2 name, removed on migration
 INIT=/opt/etc/init.d/S52nfqws2-strategy
 DATA=/opt/etc/nfqws2-strategy
 
@@ -53,6 +58,8 @@ chmod +x "$BIN.new"
 # --- stop old, install new ---
 [ -x "$INIT" ] && "$INIT" stop 2>/dev/null || true
 mv "$BIN.new" "$BIN"
+# migrate away from the pre-v0.10.2 binary name (avoids the S51 pgrep collision)
+[ -e "$OLD_BIN" ] && rm -f "$OLD_BIN" && say "removed old binary $OLD_BIN"
 
 # --- write init script ---
 cat > "$INIT" <<EOF
@@ -74,7 +81,7 @@ is_running() {
   [ -n "$_pid" ] || return 1
   kill -0 "$_pid" 2>/dev/null || return 1
   case "$(cat "/proc/$_pid/cmdline" 2>/dev/null)" in
-    *nfqws2-strategy*) return 0 ;;
+    */n2s*) return 0 ;;
     *) return 1 ;;
   esac
 }
