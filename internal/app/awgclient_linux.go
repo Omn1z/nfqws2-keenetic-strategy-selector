@@ -81,6 +81,13 @@ func (a *App) awgInstallEngineOS() (string, error) {
 	if err := extractEngine(data, awgEngineDir); err != nil {
 		return "", err
 	}
+	// split-routing needs ipset — install it alongside the engine if it's absent
+	if _, e1 := os.Stat("/opt/sbin/ipset"); e1 != nil {
+		if _, e2 := os.Stat("/opt/bin/ipset"); e2 != nil {
+			logbuf.Append("awg2", "info", "установка ipset (нужен для маршрутизации)…")
+			_, _ = exec.Command("sh", "-c", opkgBin()+" update >/dev/null 2>&1; "+opkgBin()+" install ipset 2>&1").CombinedOutput()
+		}
+	}
 	logbuf.Append("awg2", "info", "движок установлен в "+awgEngineDir)
 	return "движок установлен: " + asset, nil
 }

@@ -35,6 +35,15 @@ func (a *App) initAWG() {
 	}
 	cfg.Normalize()
 	a.awg = awg.NewManager(cfg)
+	// Bring the local client tunnel up on boot if the user enabled it (best-effort;
+	// routing is NOT auto-applied — that stays an explicit, dead-man's-switched step).
+	if cfg.Client.Enabled {
+		go func() {
+			if err := a.awgClientUpOS(); err != nil {
+				log.Printf("awg: client autostart: %v", err)
+			}
+		}()
+	}
 }
 
 func (a *App) awgSave() {
