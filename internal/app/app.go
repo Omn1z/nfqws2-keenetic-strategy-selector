@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"nfqws2strategy/internal/auth"
+	"nfqws2strategy/internal/awg"
 	"nfqws2strategy/internal/catalog"
 	"nfqws2strategy/internal/config"
 	"nfqws2strategy/internal/dns"
@@ -48,6 +49,8 @@ type App struct {
 
 	tgws   *tgws.Manager       // Telegram MTProto->WS proxy (Telegram tab)
 	socks5 *tgws.Socks5Manager // Telegram SOCKS5 proxy, TGLock-adapted (Telegram tab)
+	awg      *awg.Manager      // AmneziaWG 2.0 server/client manager (AWG2 tab)
+	awgRoute awgRouteState     // AWG2 split-routing runtime (dead-man's switch)
 
 	dnsMu      sync.Mutex
 	dnsServers []dns.Server // configured DoH/DoT servers (DNS tab + run matrix)
@@ -86,11 +89,13 @@ func New(cfg *config.Config) (*App, error) {
 	a.loadRuns()
 	a.initTGWS()
 	a.initSocks5()
+	a.initAWG()
 	a.initDNS()
 	// Repair any sandbox state leaked by a previous unclean exit (stale STRAT_*
 	// iptables chains / orphaned test nfqws2 children). Without this a killed run
 	// leaves an exclude-connmark rule that makes the MAIN nfqws2 skip connections.
 	engine.CleanupSandboxes(cfg, maxThreads)
+	a.awgRepairRouting() // remove any leaked AWG2 routing state from an unclean exit
 	return a, nil
 }
 
@@ -114,6 +119,8 @@ func (a *App) Shutdown() {
 	engine.CleanupSandboxes(a.Cfg, maxThreads)
 	a.StopTGWS()
 	a.StopSocks5()
+	a.StopAWG()
+	a.awgTeardownRouting()
 }
 
 func (a *App) blobsDir() string { return a.store.Path("blobs") }

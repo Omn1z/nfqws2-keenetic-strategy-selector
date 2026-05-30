@@ -226,6 +226,81 @@ export interface Socks5Status {
   link: string;
 }
 
+// ---- AWG2 (AmneziaWG 2.0). Secret fields (password/key_pem/key_pass/private_key/psk)
+// are write-only: sent on save, never returned by the API. ----
+export interface AwgObfuscation {
+  jc: number; jmin: number; jmax: number;
+  s1: number; s2: number; s3: number; s4: number;
+  h1: string; h2: string; h3: string; h4: string;
+  i1: string; i2: string; i3: string; i4: string; i5: string;
+}
+export interface AwgCredentials {
+  host: string; port: number; user: string; auth_kind: string;
+  password?: string; key_pem?: string; key_pass?: string; known_key: string;
+}
+export interface AwgPeer {
+  id: string; name: string; public_key: string;
+  private_key?: string; psk?: string;
+  address: string; allowed_ips: string; keepalive: number;
+  is_router: boolean; has_private: boolean; created_at: number;
+}
+export interface AwgZone { name: string; domains: string[]; ips: string[]; enabled: boolean }
+export interface AwgRoutingConfig {
+  mode: string; zones: AwgZone[]; mtu: number; killswitch: boolean; domain_source: string;
+}
+export interface AwgClientConfig { enabled: boolean; peer_id: string }
+export interface AwgServerConfig {
+  enabled: boolean;
+  conn: AwgCredentials;
+  install: string;
+  private_key?: string;
+  public_key: string;
+  listen_port: number;
+  address: string;
+  subnet: string;
+  mtu: number;
+  dns: string;
+  wan_iface: string;
+  endpoint: string;
+  obf: AwgObfuscation;
+  peers: AwgPeer[];
+  client: AwgClientConfig;
+  routing: AwgRoutingConfig;
+  interface: string;
+  deployed_at: number;
+}
+export interface AwgStep { name: string; ok: boolean; detail: string }
+export interface AwgDeployResult {
+  ok: boolean; method: string; wan_iface: string; listening: boolean; handshake: boolean;
+  steps: AwgStep[]; error?: string;
+}
+export interface AwgPeerStatus {
+  id: string; name: string; public_key: string; endpoint: string;
+  latest_handshake: number; rx_bytes: number; tx_bytes: number; online: boolean;
+}
+export interface AwgStatus {
+  reachable: boolean; up: boolean; listen_port: number; peers: AwgPeerStatus[]; error?: string;
+}
+export interface AwgEngineInfo {
+  installed: boolean; awg_version: string; arch: string; supported: boolean; tun_ok: boolean; error?: string;
+}
+export interface AwgClientStatus {
+  running: boolean; iface_present: boolean; last_handshake: number; rx_bytes: number; tx_bytes: number;
+  endpoint: string; address: string; mtu: number; connected: boolean; error?: string;
+}
+export interface Awg2Status {
+  config: AwgServerConfig; // redacted (no secrets)
+  has_password: boolean;
+  has_key: boolean;
+  has_server_key: boolean;
+  deployed: boolean;
+  last_deploy: AwgDeployResult | null;
+  status: AwgStatus | null;
+  endpoint: string;
+  engine: AwgEngineInfo;
+  client: AwgClientStatus | null;
+}
+
 export interface Dashboard {
   tgws: TgwsStatus;
   socks5: Socks5Status;

@@ -27,3 +27,28 @@ jobs:
         with:
           files: dist/nfqws2-strategy-linux-*
           generate_release_notes: true
+
+  # Build OUR OWN AmneziaWG 2.0 engine (amneziawg-go + amneziawg-tools `awg`),
+  # statically linked against musl, as additional release assets the AWG2 tab
+  # installs onto the router on demand.
+  build-engine:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+      - name: Build AmneziaWG engine (go + tools)
+        run: sh scripts/build-engine.sh
+      - name: Upload engine artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: awg-engine
+          path: dist/awg-engine-linux-*
+          if-no-files-found: error
+      - name: Publish engine assets
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/awg-engine-linux-*
+          generate_release_notes: false

@@ -40,6 +40,29 @@ func (s *Store) Save(rel string, v any) error {
 	return s.saveLocked(rel, v)
 }
 
+// SaveSecret marshals v as indented JSON and writes it atomically with 0600
+// permissions (for files holding credentials / private keys, e.g. awg.json).
+func (s *Store) SaveSecret(rel string, v any) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	full := filepath.Join(s.dir, rel)
+	if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+		return err
+	}
+	b, err := json.MarshalIndent(v, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp := full + ".tmp"
+	if err := os.WriteFile(tmp, b, 0o600); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, full); err != nil {
+		return err
+	}
+	return os.Chmod(full, 0o600)
+}
+
 func (s *Store) saveLocked(rel string, v any) error {
 	full := filepath.Join(s.dir, rel)
 	if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {

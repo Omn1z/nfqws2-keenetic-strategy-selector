@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"nfqws2strategy/internal/app"
+	"nfqws2strategy/internal/awg"
 	"nfqws2strategy/internal/catalog"
 	"nfqws2strategy/internal/dns"
 	"nfqws2strategy/internal/logbuf"
@@ -231,6 +232,21 @@ func (s *Server) routes() {
 	m.HandleFunc("POST /api/socks5/config", s.socks5Config)
 	m.HandleFunc("POST /api/socks5/start", s.socks5Start)
 	m.HandleFunc("POST /api/socks5/stop", s.socks5Stop)
+
+	m.HandleFunc("GET /api/awg2", s.awg2Status)
+	m.HandleFunc("POST /api/awg2/config", s.awg2Config)
+	m.HandleFunc("POST /api/awg2/deploy", s.awg2Deploy)
+	m.HandleFunc("POST /api/awg2/status/refresh", s.awg2RefreshStatus)
+	m.HandleFunc("POST /api/awg2/peers", s.awg2AddPeer)
+	m.HandleFunc("DELETE /api/awg2/peers/{id}", s.awg2RemovePeer)
+	m.HandleFunc("GET /api/awg2/peers/{id}/config", s.awg2PeerConfig)
+	m.HandleFunc("POST /api/awg2/install", s.awg2Install)
+	m.HandleFunc("POST /api/awg2/client/up", s.awg2ClientUp)
+	m.HandleFunc("POST /api/awg2/client/down", s.awg2ClientDown)
+	m.HandleFunc("POST /api/awg2/routing/config", s.awg2RoutingConfig)
+	m.HandleFunc("POST /api/awg2/routing/apply", s.awg2RoutingApply)
+	m.HandleFunc("POST /api/awg2/routing/commit", s.awg2RoutingCommit)
+	m.HandleFunc("POST /api/awg2/routing/teardown", s.awg2RoutingTeardown)
 
 	m.HandleFunc("POST /api/apply", s.applyStrategy)
 
@@ -1155,6 +1171,138 @@ func (s *Server) socks5Stop(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, s.app.Socks5StatusFor(hostFromHeader(r.Host)))
+}
+
+// ---------- AWG2 (AmneziaWG 2.0) ----------
+
+func (s *Server) awg2Status(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, 200, s.app.AWG2StatusView())
+}
+
+func (s *Server) awg2Config(w http.ResponseWriter, r *http.Request) {
+	var in awg.ServerConfig
+	if err := readJSON(r, &in); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	if err := s.app.AWG2SetConfig(&in); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, s.app.AWG2StatusView())
+}
+
+func (s *Server) awg2Deploy(w http.ResponseWriter, r *http.Request) {
+	res, err := s.app.AWG2Deploy()
+	if err != nil {
+		writeJSON(w, 200, map[string]any{"ok": false, "result": res, "error": err.Error()})
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": res.OK, "result": res})
+}
+
+func (s *Server) awg2RefreshStatus(w http.ResponseWriter, r *http.Request) {
+	st, err := s.app.AWG2RefreshStatus()
+	if err != nil {
+		writeJSON(w, 200, map[string]any{"ok": false, "status": st, "error": err.Error()})
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": true, "status": st})
+}
+
+func (s *Server) awg2AddPeer(w http.ResponseWriter, r *http.Request) {
+	var in awg.Peer
+	if err := readJSON(r, &in); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	p, err := s.app.AWG2AddPeer(in)
+	if err != nil {
+		writeJSON(w, 200, map[string]any{"ok": false, "peer": p, "error": err.Error()})
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": true, "peer": p})
+}
+
+func (s *Server) awg2RemovePeer(w http.ResponseWriter, r *http.Request) {
+	if err := s.app.AWG2RemovePeer(r.PathValue("id")); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, map[string]string{"status": "ok"})
+}
+
+func (s *Server) awg2PeerConfig(w http.ResponseWriter, r *http.Request) {
+	text, name, err := s.app.AWG2ClientConfig(r.PathValue("id"))
+	if err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Header().Set("Content-Disposition", `attachment; filename="`+safeDispoName(name)+`"`)
+	_, _ = w.Write([]byte(text))
+}
+
+func (s *Server) awg2Install(w http.ResponseWriter, r *http.Request) {
+	out, err := s.app.AWG2InstallEngine()
+	if err != nil {
+		writeJSON(w, 200, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": true, "detail": out})
+}
+
+func (s *Server) awg2ClientUp(w http.ResponseWriter, r *http.Request) {
+	if err := s.app.AWG2ClientUp(); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, s.app.AWG2StatusView())
+}
+
+func (s *Server) awg2ClientDown(w http.ResponseWriter, r *http.Request) {
+	if err := s.app.AWG2ClientDown(); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, s.app.AWG2StatusView())
+}
+
+func (s *Server) awg2RoutingConfig(w http.ResponseWriter, r *http.Request) {
+	var in awg.RoutingConfig
+	if err := readJSON(r, &in); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	if err := s.app.AWG2SetRouting(in); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, s.app.AWG2StatusView())
+}
+
+func (s *Server) awg2RoutingApply(w http.ResponseWriter, r *http.Request) {
+	if err := s.app.AWG2ApplyRouting(); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, s.app.AWG2StatusView())
+}
+
+func (s *Server) awg2RoutingCommit(w http.ResponseWriter, r *http.Request) {
+	if err := s.app.AWG2CommitRouting(); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, map[string]string{"status": "committed"})
+}
+
+func (s *Server) awg2RoutingTeardown(w http.ResponseWriter, r *http.Request) {
+	if err := s.app.AWG2TeardownRouting(); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, s.app.AWG2StatusView())
 }
 
 func (s *Server) nfqws2StartSvc(w http.ResponseWriter, r *http.Request) {
