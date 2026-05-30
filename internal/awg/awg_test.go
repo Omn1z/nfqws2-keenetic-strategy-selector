@@ -95,3 +95,30 @@ func TestValidHeaderAndCPS(t *testing.T) {
 		t.Error("expected invalid-tag CPS error")
 	}
 }
+
+func TestRenderUAPISet(t *testing.T) {
+	c := Default()
+	c.PublicKey = "RB78swIIfUFo/YfDnFJk32oggQFd8c5uJXodSj86xxs="
+	c.Conn.Host = "vpn.example.com"
+	c.Normalize()
+	if err := RandomizeObf(&c.Obf); err != nil {
+		t.Fatal(err)
+	}
+	p := Peer{Name: "router", PrivateKey: "kBAoKn010lyD1EfH/HTuCwLjpcweg7v70BzZ4ynfb1s=", PSK: "mJpNnaSR9h4gCHB7e4v4DNdGBZrV07pSgMzMU5VNCvI=", Address: "10.13.13.2/32", AllowedIPs: "0.0.0.0/0, ::/0", Keepalive: 25}
+	out, err := RenderUAPISet(c, p, "1.2.3.4", 51820)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"set=1", "private_key=", "public_key=", "endpoint=1.2.3.4:51820", "jc=", "h1=", "replace_peers=true", "allowed_ip=0.0.0.0/0", "persistent_keepalive_interval=25"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("UAPI set missing %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "kBAoKn010") {
+		t.Error("private key must be hex-encoded in UAPI, not base64")
+	}
+	st := ParseUAPIGet("public_key=abcd\nendpoint=1.2.3.4:51820\nlast_handshake_time_sec=1700000000\nrx_bytes=123\ntx_bytes=456\nerrno=0\n")
+	if st.LastHandshake != 1700000000 || st.RxBytes != 123 || st.TxBytes != 456 || st.Endpoint != "1.2.3.4:51820" {
+		t.Errorf("ParseUAPIGet wrong: %+v", st)
+	}
+}
