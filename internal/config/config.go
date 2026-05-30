@@ -25,6 +25,10 @@ type Config struct {
 	InitScript string `json:"init_script"`  // OUR service control script (S52, restart after update)
 	Nfqws2Init string `json:"nfqws2_init"`  // upstream nfqws2 service init (S51, for the restart button)
 
+	// nfqws2 engine package (for the NFQWS2 tab's version display + opkg update).
+	Nfqws2Repo string `json:"nfqws2_repo"` // GitHub owner/name of the engine package
+	Nfqws2Pkg  string `json:"nfqws2_pkg"`  // opkg package name of the engine
+
 	// Worker sandbox parameters.
 	FirstQueue     int `json:"first_queue"`
 	PortBase       int `json:"port_base"`
@@ -50,6 +54,8 @@ func Default() *Config {
 		MainQueue:      300,
 		InitScript:     "/opt/etc/init.d/S52nfqws2-strategy",
 		Nfqws2Init:     "/opt/etc/init.d/S51nfqws2",
+		Nfqws2Repo:     "nfqws/nfqws2-keenetic",
+		Nfqws2Pkg:      "nfqws2-keenetic",
 	}
 }
 

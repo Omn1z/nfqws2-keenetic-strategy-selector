@@ -334,3 +334,23 @@ export interface InstallResult {
   output: string;
   error?: string;
 }
+
+// NFQWS2 engine file management + version.
+export type Nfqws2Kind = "conf" | "list" | "lua";
+
+export interface Nfqws2File {
+  name: string;
+  kind: Nfqws2Kind;
+  size: number;
+  gz: boolean;
+  protected: boolean;
+}
+
+export interface Nfqws2Version {
+  package: string;
+  engine: string;
+  latest: string;
+  available: boolean;
+  url: string;
+  error?: string;
+}

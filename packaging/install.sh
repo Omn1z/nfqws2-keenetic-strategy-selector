@@ -63,9 +63,24 @@ LOGFILE=/opt/var/log/nfqws2-strategy.log
 PORT=$PORT
 EOF
 cat >> "$INIT" <<'EOF'
-is_running() { [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null; }
+# PIDFILE lives on persistent /opt (ubifs), so it survives a reboot. A plain
+# `kill -0` would false-positive if the stale PID was reused by another boot-time
+# process — and then start() would skip launching us. So verify the PID is really
+# OUR binary via /proc/<pid>/cmdline (the shell truncates the NUL-separated cmdline
+# at argv[0], i.e. the binary path).
+is_running() {
+  [ -f "$PIDFILE" ] || return 1
+  _pid="$(cat "$PIDFILE" 2>/dev/null)"
+  [ -n "$_pid" ] || return 1
+  kill -0 "$_pid" 2>/dev/null || return 1
+  case "$(cat "/proc/$_pid/cmdline" 2>/dev/null)" in
+    *nfqws2-strategy*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
 start() {
   if is_running; then echo "nfqws2-strategy already running"; return 0; fi
+  rm -f "$PIDFILE"   # drop any stale pidfile (survives reboots on persistent /opt)
   "$BIN" serve -d -l ":$PORT" -log "$LOGFILE" -pid "$PIDFILE"
   sleep 1
   if is_running; then echo "nfqws2-strategy started on :$PORT"; else echo "start failed; see $LOGFILE"; return 1; fi

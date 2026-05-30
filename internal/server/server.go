@@ -235,6 +235,19 @@ func (s *Server) routes() {
 	m.HandleFunc("POST /api/geo/import", s.importGeo)
 	m.HandleFunc("POST /api/geo/resolve", s.resolveGeo)
 
+	// NFQWS2 engine: file management (conf/list/lua) + version/update/reload.
+	m.HandleFunc("GET /api/nfqws2/version", s.nfqws2Version)
+	m.HandleFunc("GET /api/nfqws2/update/check", s.nfqws2CheckUpdate)
+	m.HandleFunc("POST /api/nfqws2/update", s.nfqws2Update)
+	m.HandleFunc("POST /api/nfqws2/reload", s.nfqws2Reload)
+	m.HandleFunc("GET /api/nfqws2/files", s.nfqws2Files)
+	m.HandleFunc("GET /api/nfqws2/file", s.nfqws2GetFile)
+	m.HandleFunc("POST /api/nfqws2/file", s.nfqws2SaveFile)
+	m.HandleFunc("POST /api/nfqws2/file/create", s.nfqws2CreateFile)
+	m.HandleFunc("POST /api/nfqws2/file/upload", s.nfqws2UploadFile)
+	m.HandleFunc("DELETE /api/nfqws2/file", s.nfqws2DeleteFile)
+	m.HandleFunc("GET /api/nfqws2/file/download", s.nfqws2DownloadFile)
+
 	// Single-file React app: any non-/api path serves the inlined index.html, so
 	// History-API routes (/lists, /runs, …) deep-link and refresh cleanly. /api/*
 	// patterns are more specific and take precedence.
@@ -782,6 +795,153 @@ func (s *Server) resolveGeo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, map[string]any{"targets": targets})
+}
+
+// ---------- NFQWS2 engine file management + version/update/reload ----------
+
+func (s *Server) nfqws2Version(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, 200, s.app.Nfqws2Version())
+}
+
+func (s *Server) nfqws2CheckUpdate(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, 200, s.app.Nfqws2CheckUpdate())
+}
+
+func (s *Server) nfqws2Update(w http.ResponseWriter, r *http.Request) {
+	out, err := s.app.Nfqws2Update()
+	if err != nil {
+		writeJSON(w, 200, map[string]any{"ok": false, "output": out, "error": err.Error()})
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": true, "output": out})
+}
+
+func (s *Server) nfqws2Reload(w http.ResponseWriter, r *http.Request) {
+	if err := s.app.Nfqws2Reload(); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, map[string]string{"status": "reloaded"})
+}
+
+func (s *Server) nfqws2Files(w http.ResponseWriter, r *http.Request) {
+	files, err := s.app.ListNfqws2Files(r.URL.Query().Get("kind"))
+	if err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"files": files})
+}
+
+func (s *Server) nfqws2GetFile(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	kind, name := q.Get("kind"), q.Get("name")
+	content, err := s.app.ReadNfqws2File(kind, name)
+	if err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"kind": kind, "name": name, "content": content})
+}
+
+func (s *Server) nfqws2SaveFile(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Kind    string `json:"kind"`
+		Name    string `json:"name"`
+		Content string `json:"content"`
+	}
+	if err := readJSON(r, &in); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	if err := s.app.SaveNfqws2File(in.Kind, in.Name, in.Content); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, map[string]string{"status": "saved"})
+}
+
+func (s *Server) nfqws2CreateFile(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Kind string `json:"kind"`
+		Name string `json:"name"`
+	}
+	if err := readJSON(r, &in); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	if err := s.app.CreateNfqws2File(in.Kind, in.Name); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, map[string]string{"status": "created"})
+}
+
+func (s *Server) nfqws2UploadFile(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseMultipartForm(16 << 20); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	kind := r.FormValue("kind")
+	f, hdr, err := r.FormFile("file")
+	if err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	defer f.Close()
+	data, err := io.ReadAll(io.LimitReader(f, 16<<20))
+	if err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	if err := s.app.SaveNfqws2Upload(kind, hdr.Filename, data); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, map[string]string{"name": hdr.Filename, "kind": kind})
+}
+
+func (s *Server) nfqws2DeleteFile(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	if err := s.app.DeleteNfqws2File(q.Get("kind"), q.Get("name")); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, map[string]string{"status": "ok"})
+}
+
+func (s *Server) nfqws2DownloadFile(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	data, name, err := s.app.Nfqws2FileBytes(q.Get("kind"), q.Get("name"))
+	if err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Content-Disposition", `attachment; filename="`+safeDispoName(name)+`"`)
+	_, _ = w.Write(data)
+}
+
+// safeDispoName sanitizes a filename for a Content-Disposition header while
+// PRESERVING dots — unlike safeFile, which maps "." to "_" (mangling user.list).
+func safeDispoName(s string) string {
+	var b strings.Builder
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_', r == '.':
+			b.WriteRune(r)
+		default:
+			b.WriteByte('_')
+		}
+	}
+	out := b.String()
+	if out == "" {
+		out = "file"
+	}
+	if len(out) > 80 {
+		out = out[:80]
+	}
+	return out
 }
 
 func (s *Server) startRun(w http.ResponseWriter, r *http.Request) {

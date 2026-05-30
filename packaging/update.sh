@@ -1,6 +1,8 @@
 #!/bin/sh
 # nfqws2-strategy updater: fetch the latest release binary and restart the
-# service. Lists/results/blobs and the init script are preserved.
+# service. Lists/results/blobs are preserved; the init script is refreshed so
+# existing installs pick up init fixes (e.g. the stale-pidfile-after-reboot
+# hardening in is_running()).
 set -e
 
 # ----- keep in sync with install.sh -----
@@ -12,6 +14,57 @@ INIT=/opt/etc/init.d/S52nfqws2-strategy
 
 say() { echo "[nfqws2-strategy] $*"; }
 die() { echo "[nfqws2-strategy] ERROR: $*" >&2; exit 1; }
+
+# write_init regenerates the service init script. KEEP IN SYNC with install.sh.
+# Needs $BIN, $INIT, $PORT set.
+write_init() {
+  cat > "$INIT" <<EOF
+#!/bin/sh
+BIN=$BIN
+PIDFILE=/opt/var/run/nfqws2-strategy.pid
+LOGFILE=/opt/var/log/nfqws2-strategy.log
+PORT=$PORT
+EOF
+  cat >> "$INIT" <<'EOF'
+# PIDFILE lives on persistent /opt (ubifs) and survives reboots — so verify the
+# saved PID is really OUR binary (not a reused PID) before treating it as running.
+is_running() {
+  [ -f "$PIDFILE" ] || return 1
+  _pid="$(cat "$PIDFILE" 2>/dev/null)"
+  [ -n "$_pid" ] || return 1
+  kill -0 "$_pid" 2>/dev/null || return 1
+  case "$(cat "/proc/$_pid/cmdline" 2>/dev/null)" in
+    *nfqws2-strategy*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+start() {
+  if is_running; then echo "nfqws2-strategy already running"; return 0; fi
+  rm -f "$PIDFILE"
+  "$BIN" serve -d -l ":$PORT" -log "$LOGFILE" -pid "$PIDFILE"
+  sleep 1
+  if is_running; then echo "nfqws2-strategy started on :$PORT"; else echo "start failed; see $LOGFILE"; return 1; fi
+}
+stop() {
+  if is_running; then
+    PID="$(cat "$PIDFILE")"
+    kill "$PID" 2>/dev/null
+    i=0
+    while kill -0 "$PID" 2>/dev/null && [ "$i" -lt 8 ]; do sleep 1; i=$((i+1)); done
+    kill -9 "$PID" 2>/dev/null
+  fi
+  rm -f "$PIDFILE"; echo "nfqws2-strategy stopped"
+}
+case "$1" in
+  start) start ;;
+  stop) stop ;;
+  restart) stop; start ;;
+  status) is_running && echo running || echo stopped ;;
+  *) echo "usage: $0 {start|stop|restart|status}" ;;
+esac
+EOF
+  chmod +x "$INIT"
+}
 
 [ "$(id -u)" = "0" ] || die "run as root"
 [ -x "$INIT" ] || die "not installed (run install.sh first)"
@@ -41,8 +94,11 @@ say "downloading $URL"
 fetch "$URL" "$BIN.new" || die "download failed"
 chmod +x "$BIN.new"
 
+PORT="$(sed -n 's/^PORT=//p' "$INIT" 2>/dev/null | head -1)"
+[ -n "$PORT" ] || PORT=8090
 "$INIT" stop 2>/dev/null || true
 mv "$BIN.new" "$BIN"
+write_init   # refresh the init (stale-pidfile fix), preserving PORT
 "$INIT" start || die "service failed to start"
 say "updated to: $("$BIN" version 2>/dev/null || echo '?')"
 say "Done."
