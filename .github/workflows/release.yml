@@ -27,6 +27,7 @@ jobs:
         with:
           files: dist/nfqws2-strategy-linux-*
           generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}
 
   # Build OUR OWN AmneziaWG 2.0 engine (amneziawg-go + amneziawg-tools `awg`),
   # statically linked against musl, as additional release assets the AWG2 tab
@@ -52,3 +53,4 @@ jobs:
         with:
           files: dist/awg-engine-linux-*
           generate_release_notes: false
+          prerelease: ${{ contains(github.ref_name, '-') }}
