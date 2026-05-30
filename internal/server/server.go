@@ -107,6 +107,17 @@ func (s *Server) authConfig(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]bool{"enabled": in.Enabled})
 }
 
+func (s *Server) restartServices(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Services []string `json:"services"`
+	}
+	if err := readJSON(r, &in); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"results": s.app.RestartServices(in.Services)})
+}
+
 func (s *Server) getSystemSettings(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{
 		"auth_enabled":    s.app.AuthEnabled(),
@@ -157,6 +168,7 @@ func (s *Server) routes() {
 	m.HandleFunc("POST /api/system/install", s.installPackage)
 	m.HandleFunc("GET /api/system/settings", s.getSystemSettings)
 	m.HandleFunc("POST /api/system/settings", s.setSystemSettings)
+	m.HandleFunc("POST /api/services/restart", s.restartServices)
 
 	m.HandleFunc("GET /api/logs", s.getLogs)
 	m.HandleFunc("POST /api/logs/clear", s.clearLogs)

@@ -22,7 +22,8 @@ type Config struct {
 	// Self-update.
 	Version    string `json:"version"`
 	Repo       string `json:"repo"`        // owner/name on GitHub
-	InitScript string `json:"init_script"` // service control script used to restart after update
+	InitScript string `json:"init_script"`  // OUR service control script (S52, restart after update)
+	Nfqws2Init string `json:"nfqws2_init"`  // upstream nfqws2 service init (S51, for the restart button)
 
 	// Worker sandbox parameters.
 	FirstQueue     int `json:"first_queue"`
@@ -48,6 +49,7 @@ func Default() *Config {
 		PortsPerWorker: 200,
 		MainQueue:      300,
 		InitScript:     "/opt/etc/init.d/S52nfqws2-strategy",
+		Nfqws2Init:     "/opt/etc/init.d/S51nfqws2",
 	}
 }
 
