@@ -70,14 +70,14 @@ func (a *App) restartNfqws2() ServiceResult {
 }
 
 func (a *App) restartSocks5() ServiceResult {
-	if a.socks5 == nil {
+	if a.proxy.Socks5() == nil {
 		return ServiceResult{Name: "socks5", OK: false, Detail: "менеджер не инициализирован"}
 	}
-	if !a.socks5.Config().Enabled {
+	if !a.proxy.Socks5().Config().Enabled {
 		return ServiceResult{Name: "socks5", OK: false, Detail: "прокси выключен — нечего перезапускать"}
 	}
 	logbuf.Append("system", "info", "restart socks5…")
-	if err := a.socks5.Restart(); err != nil {
+	if err := a.proxy.Socks5().Restart(); err != nil {
 		logbuf.Append("system", "error", "restart socks5: "+err.Error())
 		return ServiceResult{Name: "socks5", OK: false, Detail: err.Error()}
 	}
@@ -115,14 +115,14 @@ func (a *App) nfqws2Ctl(action, script string) ServiceResult {
 }
 
 func (a *App) restartTGWS() ServiceResult {
-	if a.tgws == nil {
+	if a.proxy.TGWS() == nil {
 		return ServiceResult{Name: "tgws", OK: false, Detail: "менеджер не инициализирован"}
 	}
-	if !a.tgws.Config().Enabled {
+	if !a.proxy.TGWS().Config().Enabled {
 		return ServiceResult{Name: "tgws", OK: false, Detail: "прокси выключен — нечего перезапускать"}
 	}
 	logbuf.Append("system", "info", "restart tgws…")
-	if err := a.tgws.Restart(); err != nil {
+	if err := a.proxy.TGWS().Restart(); err != nil {
 		logbuf.Append("system", "error", "restart tgws: "+err.Error())
 		return ServiceResult{Name: "tgws", OK: false, Detail: err.Error()}
 	}

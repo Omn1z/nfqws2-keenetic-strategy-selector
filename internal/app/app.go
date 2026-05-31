@@ -16,9 +16,9 @@ import (
 
 	"nfqws2strategy/internal/services/awg"
 	"nfqws2strategy/internal/services/nfqws2"
+	"nfqws2strategy/internal/services/proxy"
 	"nfqws2strategy/internal/services/strategy/core/catalog"
 	"nfqws2strategy/internal/services/strategy/core/engine"
-	"nfqws2strategy/internal/services/tgws"
 	"nfqws2strategy/internal/tools/auth"
 	"nfqws2strategy/internal/tools/config"
 	"nfqws2strategy/internal/tools/dns"
@@ -48,11 +48,10 @@ type App struct {
 	loggingDisabled  bool
 	httpLogsDisabled bool // suppress the per-request HTTP access log line
 
-	tgws     *tgws.Manager       // Telegram MTProto->WS proxy (Telegram tab)
-	socks5   *tgws.Socks5Manager // Telegram SOCKS5 proxy, TGLock-adapted (Telegram tab)
-	nfqws2   *nfqws2.Manager     // nfqws2 engine file/version/update/reload (nfqws2 tab)
-	awg      *awg.Manager        // AmneziaWG 2.0 server/client manager (AWG2 tab)
-	awgRoute awgRouteState       // AWG2 split-routing runtime (dead-man's switch)
+	proxy    *proxy.Service  // Telegram proxies: MTProto->WS + SOCKS5 (Telegram tab)
+	nfqws2   *nfqws2.Manager // nfqws2 engine file/version/update/reload (nfqws2 tab)
+	awg      *awg.Manager    // AmneziaWG 2.0 server/client manager (AWG2 tab)
+	awgRoute awgRouteState   // AWG2 split-routing runtime (dead-man's switch)
 
 	dnsMu      sync.Mutex
 	dnsServers []dns.Server // configured DoH/DoT servers (DNS tab + run matrix)
@@ -90,8 +89,7 @@ func New(cfg *config.Config) (*App, error) {
 	}
 	a.initAuth()
 	a.loadRuns()
-	a.initTGWS()
-	a.initSocks5()
+	a.proxy = proxy.New(st)
 	a.initAWG() // creates a.awg; may autostart the tunnel + (after a delay) re-apply committed routing
 	a.initDNS()
 	// Repair any sandbox state leaked by a previous unclean exit (stale STRAT_*
