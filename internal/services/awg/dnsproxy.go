@@ -17,7 +17,7 @@ import (
 type DNSProxy struct {
 	addr     string
 	upstream string
-	onMatch  func(ip string)
+	onMatch  func(name, ip string)
 	matchers atomic.Pointer[[]DomainMatcher]
 
 	mu      sync.Mutex
@@ -34,9 +34,10 @@ type DNSProxy struct {
 const recentCap = 4096
 
 // NewDNSProxy creates a proxy listening on addr (e.g. 127.0.0.1:5354) that
-// forwards to upstream (e.g. 127.0.0.1:53). onMatch is called with each matched
-// A/AAAA IP (it must be safe for concurrent use).
-func NewDNSProxy(addr, upstream string, onMatch func(string)) *DNSProxy {
+// forwards to upstream (e.g. 127.0.0.1:53). onMatch is called with the matched
+// query name + each matched A/AAAA IP (safe for concurrent use); the caller routes
+// the IP to the right ipset by which zone the name matched.
+func NewDNSProxy(addr, upstream string, onMatch func(name, ip string)) *DNSProxy {
 	p := &DNSProxy{addr: addr, upstream: upstream, onMatch: onMatch}
 	var empty []DomainMatcher
 	p.matchers.Store(&empty)
@@ -66,7 +67,7 @@ func (p *DNSProxy) SetMatchers(ms []DomainMatcher) {
 		for name, ips := range snapshot {
 			if MatchAny(ms, name) {
 				for _, ip := range ips {
-					p.onMatch(ip)
+					p.onMatch(name, ip)
 				}
 			}
 		}
@@ -263,7 +264,7 @@ func (p *DNSProxy) inspect(query, resp []byte) {
 	}
 	for _, ip := range ips {
 		if p.onMatch != nil {
-			p.onMatch(ip)
+			p.onMatch(name, ip)
 		}
 	}
 }

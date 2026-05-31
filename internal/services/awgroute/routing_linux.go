@@ -99,11 +99,11 @@ func (svc *Service) awgApplyRoutingOS() error {
 	// 4) domain-mask DNS proxy (optional, domain_source=="dnsproxy"). Start it
 	// BEFORE the hook so the hook's DNS REDIRECT is only installed once the proxy
 	// is actually listening (never blackhole LAN DNS).
-	dnsOn := svc.awgEnsureDNSProxy(&cfg, awgTargetSet(r.Mode))
+	dnsOn := svc.awgEnsureDNSProxy(&cfg)
 	// 5) firewall hook (marking chain + FORWARD/NAT/MSS [+ DNS REDIRECT]) — a Keenetic
 	// ndm netfilter.d hook so it survives the firewall rebuilds that flush foreign
 	// iptables chains; awgWriteHook also applies it immediately.
-	if err := awgWriteHook(r.Mode, endpointIP, r.MTU, dnsOn); err != nil {
+	if err := awgWriteHook(awgEffectiveMode(r), endpointIP, r.MTU, dnsOn); err != nil {
 		return fmt.Errorf("firewall-хук: %w", err)
 	}
 	// 6) disable Keenetic's NAT accelerators — their fast-path silently drops our
@@ -144,8 +144,10 @@ func (svc *Service) awgRefreshRoutingOS() error {
 	// set + its on-disk snapshot, then rebuild the explicit IP/CIDR entries; the DNS
 	// proxy re-learns the (new) masks on the next query.
 	if r.DomainSource == "dnsproxy" {
-		_, _ = awgRun("ipset flush " + awgTargetSet(r.Mode))
-		_ = os.Remove(awgSetDir + "/" + awgTargetSet(r.Mode) + ".ipset")
+		_, _ = awgRun("ipset flush " + awgSetInc)
+		_, _ = awgRun("ipset flush " + awgSetExc)
+		_ = os.Remove(awgSetDir + "/" + awgSetInc + ".ipset")
+		_ = os.Remove(awgSetDir + "/" + awgSetExc + ".ipset")
 	}
 	if err := svc.awgBuildSets(&cfg); err != nil {
 		return err
@@ -154,8 +156,8 @@ func (svc *Service) awgRefreshRoutingOS() error {
 	_, _ = awgRun("ip rule del fwmark " + awgMarkRule + " table " + awgTable + " 2>/dev/null")
 	_, _ = awgRun("ip rule add fwmark " + awgMarkRule + " table " + awgTable + " 2>/dev/null")
 	awgApplyKillswitch(r.Killswitch)
-	dnsOn := svc.awgEnsureDNSProxy(&cfg, awgTargetSet(r.Mode))
-	if err := awgWriteHook(r.Mode, endpointIP, r.MTU, dnsOn); err != nil {
+	dnsOn := svc.awgEnsureDNSProxy(&cfg)
+	if err := awgWriteHook(awgEffectiveMode(r), endpointIP, r.MTU, dnsOn); err != nil {
 		return fmt.Errorf("firewall-хук: %w", err)
 	}
 	awgSetAccel(false)
@@ -206,7 +208,7 @@ func (svc *Service) awgStartRefresh() {
 				// re-assert the firewall hook: rewrite the file if Keenetic/anything
 				// removed it, otherwise just re-run it (fast, idempotent).
 				if _, err := os.Stat(awgHookPath); err != nil {
-					_ = awgWriteHook(c.Routing.Mode, resolveHostIP(hostOf(c.Endpoint)), c.Routing.MTU, svc.awgEnsureDNSProxy(&c, awgTargetSet(c.Routing.Mode)))
+					_ = awgWriteHook(awgEffectiveMode(c.Routing), resolveHostIP(hostOf(c.Endpoint)), c.Routing.MTU, svc.awgEnsureDNSProxy(&c))
 				} else {
 					_, _ = awgRun("sh " + awgHookPath)
 				}

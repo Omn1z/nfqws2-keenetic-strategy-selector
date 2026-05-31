@@ -107,8 +107,15 @@ func awgFirewallHook(mode, endpointIP string, mtu int, dnsRedirect bool) string 
 	if endpointIP != "" {
 		s.WriteString("iptables -t mangle -A " + awgChain + " -d " + endpointIP + "/32 -j RETURN\n")
 	}
+	// mode here is the EFFECTIVE direction derived from the per-zone settings
+	// (awgEffectiveMode): "include" = whitelist (only include-zones tunnel),
+	// "exclude" = blacklist (everything except exclude-zones), "full" = everything,
+	// "" = zones-on-but-empty → nothing marked (all direct).
 	switch mode {
 	case "include":
+		// exclude-zones bypass FIRST (carve-out: they win over an overlapping include
+		// CIDR), then include-zones go through the tunnel.
+		s.WriteString("iptables -t mangle -A " + awgChain + " -m set --match-set " + awgSetExc + " dst -j RETURN\n")
 		s.WriteString("iptables -t mangle -A " + awgChain + " -m set --match-set " + awgSetInc + " dst -j MARK --set-xmark " + awgMarkRule + "\n")
 	case "exclude":
 		s.WriteString("iptables -t mangle -A " + awgChain + " -m set ! --match-set " + awgSetExc + " dst -j MARK --set-xmark " + awgMarkRule + "\n")

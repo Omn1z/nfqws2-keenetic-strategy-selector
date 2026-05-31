@@ -53,7 +53,7 @@ func TestAAAABlock(t *testing.T) {
 func TestRecentRematch(t *testing.T) {
 	var mu sync.Mutex
 	var got []string
-	p := NewDNSProxy("127.0.0.1:0", "127.0.0.1:0", func(ip string) {
+	p := NewDNSProxy("127.0.0.1:0", "127.0.0.1:0", func(_, ip string) {
 		mu.Lock()
 		got = append(got, ip)
 		mu.Unlock()
@@ -120,7 +120,7 @@ func TestDNSProxyE2E(t *testing.T) {
 
 	var mu sync.Mutex
 	var got []string
-	p := NewDNSProxy("127.0.0.1:0", up.LocalAddr().String(), func(ip string) {
+	p := NewDNSProxy("127.0.0.1:0", up.LocalAddr().String(), func(_, ip string) {
 		mu.Lock()
 		got = append(got, ip)
 		mu.Unlock()

@@ -96,9 +96,12 @@ type ClientConfig struct {
 	PeerID  string `json:"peer_id"` // which Peer represents this router
 }
 
-// Zone is a named group of domains/IPs for split routing.
+// Zone is a named group of domains/IPs for split routing. Each zone carries its
+// own direction: Mode "include" routes its members THROUGH the tunnel, "exclude"
+// keeps them DIRECT (bypass) — exclude wins on overlap (carve-out).
 type Zone struct {
 	Name    string   `json:"name"`
+	Mode    string   `json:"mode"` // "include" (→ tunnel) | "exclude" (→ direct/bypass)
 	Domains []string `json:"domains"`
 	IPs     []string `json:"ips"`
 	Enabled bool     `json:"enabled"`
@@ -106,7 +109,7 @@ type Zone struct {
 
 // RoutingConfig controls the local-router split routing (Part C).
 type RoutingConfig struct {
-	Mode         string `json:"mode"` // "off"|"full"|"include"|"exclude"
+	Mode         string `json:"mode"` // "off"|"zones" (direction is per-zone)|"full" (route everything)
 	Zones        []Zone `json:"zones"`
 	MTU          int    `json:"mtu"` // awg0 client MTU
 	Killswitch   bool   `json:"killswitch"`
@@ -201,6 +204,21 @@ func (c *ServerConfig) Normalize() {
 		if c.Routing.Zones[i].IPs == nil {
 			c.Routing.Zones[i].IPs = []string{}
 		}
+		// Per-zone include/exclude: a zone with no explicit mode inherits the OLD
+		// global routing mode (pre-migration), defaulting to include.
+		if c.Routing.Zones[i].Mode != "include" && c.Routing.Zones[i].Mode != "exclude" {
+			if c.Routing.Mode == "exclude" {
+				c.Routing.Zones[i].Mode = "exclude"
+			} else {
+				c.Routing.Zones[i].Mode = "include"
+			}
+		}
+	}
+	// The global include/exclude is gone — direction is per-zone now; an old global
+	// include/exclude collapses to "zones" (the per-zone derivation). Migrate AFTER
+	// the zone loop so zones inherit the old global value first.
+	if c.Routing.Mode == "include" || c.Routing.Mode == "exclude" {
+		c.Routing.Mode = "zones"
 	}
 }
 
@@ -261,7 +279,7 @@ func (c *ServerConfig) Validate() []string {
 		seenAddr[addr] = true
 	}
 	switch c.Routing.Mode {
-	case "off", "full", "include", "exclude":
+	case "off", "full", "zones", "include", "exclude": // include/exclude accepted for back-compat (Normalize migrates → "zones")
 	default:
 		errs = append(errs, "неизвестный режим маршрутизации")
 	}

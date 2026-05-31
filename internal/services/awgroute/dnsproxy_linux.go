@@ -12,7 +12,9 @@ import (
 // entry it adds the IPs to the routing ipset. Started/refreshed/stopped together
 // with split-routing when domain_source=="dnsproxy".
 
-// awgZoneMatchers compiles domain matchers from all enabled zones' domain lists.
+// awgZoneMatchers compiles domain matchers from ALL enabled zones (any direction).
+// The proxy fires onMatch for a name matching any zone; the callback then routes
+// the IP to the include or exclude set by which zone matched.
 func awgZoneMatchers(cfg *awg.ServerConfig) []awg.DomainMatcher {
 	var entries []string
 	for _, z := range cfg.Routing.Zones {
@@ -24,13 +26,33 @@ func awgZoneMatchers(cfg *awg.ServerConfig) []awg.DomainMatcher {
 	return ms
 }
 
+// awgZoneMatchersByMode compiles matchers for the enabled zones of one direction
+// ("include" or "exclude"), so a matched mask's IPs land in the right set.
+func awgZoneMatchersByMode(cfg *awg.ServerConfig, mode string) []awg.DomainMatcher {
+	var entries []string
+	for _, z := range cfg.Routing.Zones {
+		if !z.Enabled {
+			continue
+		}
+		zm := "include"
+		if z.Mode == "exclude" {
+			zm = "exclude"
+		}
+		if zm == mode {
+			entries = append(entries, z.Domains...)
+		}
+	}
+	ms, _ := awg.CompileMatchers(entries)
+	return ms
+}
+
 // awgEnsureDNSProxy starts/updates the domain-mask DNS proxy when
 // domain_source=="dnsproxy" with at least one matcher, otherwise stops it. It
 // returns true when the proxy is (now) running, so the firewall hook installs
 // the LAN :53 REDIRECT only while the proxy is actually up (never blackhole DNS).
-func (svc *Service) awgEnsureDNSProxy(cfg *awg.ServerConfig, targetSet string) bool {
+func (svc *Service) awgEnsureDNSProxy(cfg *awg.ServerConfig) bool {
 	ms := awgZoneMatchers(cfg)
-	want := cfg.Routing.Mode != "off" && cfg.Routing.DomainSource == "dnsproxy" && len(ms) > 0
+	want := cfg.Routing.Mode != "off" && cfg.Routing.Mode != "full" && cfg.Routing.DomainSource == "dnsproxy" && len(ms) > 0
 	svc.route.mu.Lock()
 	p := svc.route.dnsProxy
 	svc.route.mu.Unlock()
@@ -40,15 +62,26 @@ func (svc *Service) awgEnsureDNSProxy(cfg *awg.ServerConfig, targetSet string) b
 		}
 		return false
 	}
+	// Publish the per-direction matchers the onMatch callback routes by (lock-free,
+	// so it never contends with a routing op holding route.mu). Refreshed every call.
+	inc := awgZoneMatchersByMode(cfg, "include")
+	exc := awgZoneMatchersByMode(cfg, "exclude")
+	svc.route.incMatchers.Store(&inc)
+	svc.route.excMatchers.Store(&exc)
 	if p != nil {
 		p.SetMatchers(ms) // refresh on zone change
 		return true
 	}
-	np := awg.NewDNSProxy(awgDNSAddr, awgDNSUpstream, func(ip string) {
-		// Add every matched answer IP (idempotent -exist). No dedup cache on purpose:
-		// a zone edit flushes the set, and the next DNS query must re-learn cleanly.
-		// The target set is read live so a mode switch routes new hits correctly.
-		_, _ = awgRun("ipset add " + awgTargetSet(svc.awg.Config().Routing.Mode) + " " + ip + " -exist")
+	np := awg.NewDNSProxy(awgDNSAddr, awgDNSUpstream, func(name, ip string) {
+		// Route the matched IP to the exclude set when the name matched an exclude
+		// zone (exclude wins on overlap), else the include set. Matchers are read live
+		// so a zone edit takes effect without recreating the proxy. Idempotent -exist;
+		// a zone edit flushes the sets so the next query re-learns cleanly.
+		set := awgSetInc
+		if e := svc.route.excMatchers.Load(); e != nil && awg.MatchAny(*e, name) {
+			set = awgSetExc
+		}
+		_, _ = awgRun("ipset add " + set + " " + ip + " -exist")
 	})
 	svc.awgLoadRecent(np) // restore domains seen in a previous run (before matching)
 	np.SetMatchers(ms)    // re-evaluates the loaded cache → re-adds matching domains
@@ -59,7 +92,7 @@ func (svc *Service) awgEnsureDNSProxy(cfg *awg.ServerConfig, targetSet string) b
 	svc.route.mu.Lock()
 	svc.route.dnsProxy = np
 	svc.route.mu.Unlock()
-	logbuf.Append("awg2", "info", "DNS-прокси запущен: перехват :53 → домены/поддомены/маски идут в туннель")
+	logbuf.Append("awg2", "info", "DNS-прокси запущен: перехват :53 → маски доменов идут в нужный набор (include/exclude)")
 	return true
 }
 

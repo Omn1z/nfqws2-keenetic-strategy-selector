@@ -6,6 +6,7 @@ package awgroute
 
 import (
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"nfqws2strategy/internal/services/awg"
@@ -68,6 +69,10 @@ type awgRouteState struct {
 	stopRefresh chan struct{}
 	active      bool
 	dnsProxy    *awg.DNSProxy
+	// Per-direction domain matchers for the DNS proxy's onMatch callback (lock-free
+	// reads so a DNS answer never blocks on a routing op holding mu). Linux-only use.
+	incMatchers atomic.Pointer[[]awg.DomainMatcher]
+	excMatchers atomic.Pointer[[]awg.DomainMatcher]
 }
 
 func (svc *Service) AWG2ApplyRouting() error { return svc.awgApplyRoutingOS() }

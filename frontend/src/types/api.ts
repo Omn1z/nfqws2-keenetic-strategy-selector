@@ -244,7 +244,7 @@ export interface AwgPeer {
   address: string; allowed_ips: string; keepalive: number;
   is_router: boolean; has_private: boolean; created_at: number;
 }
-export interface AwgZone { name: string; domains: string[]; ips: string[]; enabled: boolean }
+export interface AwgZone { name: string; mode: string; domains: string[]; ips: string[]; enabled: boolean }
 export interface AwgRoutingConfig {
   mode: string; zones: AwgZone[]; mtu: number; killswitch: boolean; domain_source: string;
   active?: boolean;

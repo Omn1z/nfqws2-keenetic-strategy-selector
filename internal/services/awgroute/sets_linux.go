@@ -20,12 +20,44 @@ const (
 	awgRecentFile = awgSetDir + "/awg2_recent.json"
 )
 
-// awgTargetSet is the ipset the active mode populates.
-func awgTargetSet(mode string) string {
-	if mode == "exclude" {
-		return awgSetExc
+// awgEffectiveMode collapses the per-zone directions + global mode into the chain
+// shape the firewall hook renders:
+//
+//	"full"    → mark everything (route all traffic)
+//	"include" → whitelist: only include-zones tunnel; exclude-zones carve out
+//	"exclude" → blacklist: everything tunnels except exclude-zones
+//	""        → "zones" but no enabled zones with entries → nothing marked (all direct)
+//	"off"     → routing disabled
+//
+// Rule: if ANY enabled include-zone has entries → whitelist (the user is selecting
+// what goes through VPN). If there are only exclude-zones → blacklist (everything
+// via VPN except them).
+func awgEffectiveMode(r awg.RoutingConfig) string {
+	switch r.Mode {
+	case "off":
+		return "off"
+	case "full":
+		return "full"
 	}
-	return awgSetInc
+	hasInc, hasExc := false, false
+	for _, z := range r.Zones {
+		if !z.Enabled || (len(z.Domains) == 0 && len(z.IPs) == 0) {
+			continue
+		}
+		if z.Mode == "exclude" {
+			hasExc = true
+		} else {
+			hasInc = true
+		}
+	}
+	switch {
+	case hasInc:
+		return "include"
+	case hasExc:
+		return "exclude"
+	default:
+		return ""
+	}
 }
 
 // isMaskEntry reports whether a zone domain entry is a glob/regex mask (which the
@@ -38,18 +70,29 @@ func isMaskEntry(s string) bool {
 func (svc *Service) awgBuildSets(cfg *awg.ServerConfig) error {
 	_, _ = awgRun("ipset create " + awgSetInc + " hash:net family inet -exist")
 	_, _ = awgRun("ipset create " + awgSetExc + " hash:net family inet -exist")
-	target := awgSetInc
-	if cfg.Routing.Mode == "exclude" {
-		target = awgSetExc
-	}
-	// In dnsproxy mode the proxy adds matched IPs dynamically — don't flush them.
+	// In dnsproxy mode the proxy adds matched mask IPs dynamically — don't flush them
+	// here (the refresh path flushes explicitly when zones change).
 	if cfg.Routing.DomainSource != "dnsproxy" {
-		_, _ = awgRun("ipset flush " + target)
+		_, _ = awgRun("ipset flush " + awgSetInc)
+		_, _ = awgRun("ipset flush " + awgSetExc)
 	}
-	n := 0
+	nInc, nExc := 0, 0
 	for _, z := range cfg.Routing.Zones {
 		if !z.Enabled {
 			continue
+		}
+		// Each zone feeds its OWN set by its direction: include → awg2_inc (tunnel),
+		// exclude → awg2_exc (bypass).
+		target := awgSetInc
+		if z.Mode == "exclude" {
+			target = awgSetExc
+		}
+		bump := func() {
+			if z.Mode == "exclude" {
+				nExc++
+			} else {
+				nInc++
+			}
 		}
 		for _, ip := range z.IPs {
 			ip = strings.TrimSpace(ip)
@@ -57,7 +100,7 @@ func (svc *Service) awgBuildSets(cfg *awg.ServerConfig) error {
 				continue
 			}
 			if _, err := awgRun("ipset add " + target + " " + ip + " -exist"); err == nil {
-				n++
+				bump()
 			}
 		}
 		for _, d := range z.Domains {
@@ -65,17 +108,17 @@ func (svc *Service) awgBuildSets(cfg *awg.ServerConfig) error {
 			// a hostname — trying to (net.LookupHost on a bogus name) blocks on slow
 			// DNS timeouts and would hang «Сохранить и применить». The DNS proxy is
 			// what matches masks, so skip them here; only PLAIN domains get a direct
-			// server-side resolve (which makes them tunnel immediately).
+			// server-side resolve (which makes them tunnel/bypass immediately).
 			if isMaskEntry(d) {
 				continue
 			}
 			for _, ip := range resolveDomain(d) {
 				_, _ = awgRun("ipset add " + target + " " + ip + "/32 -exist")
-				n++
+				bump()
 			}
 		}
 	}
-	logbuf.Append("awg2", "info", fmt.Sprintf("ipset %s: %d записей", target, n))
+	logbuf.Append("awg2", "info", fmt.Sprintf("ipset: include=%d, exclude=%d записей", nInc, nExc))
 	return nil
 }
 

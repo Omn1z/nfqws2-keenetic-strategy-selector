@@ -115,20 +115,21 @@ export default function RoutingPane({ st, reload }: { st: Awg2Status; reload: ()
   const teardown = () => post("/api/awg2/routing/teardown", {}, "Маршрутизация снята", stopCountdown);
 
   const setZone = (i: number, patch: Partial<AwgZone>) => setR((p) => ({ ...p, zones: p.zones.map((z, j) => (j === i ? { ...z, ...patch } : z)) }));
-  const addZone = () => setR((p) => ({ ...p, zones: [...(p.zones || []), { name: "новая зона", domains: [], ips: [], enabled: true }] }));
+  const addZone = () => setR((p) => ({ ...p, zones: [...(p.zones || []), { name: "новая зона", mode: "include", domains: [], ips: [], enabled: true }] }));
   const delZone = (i: number) => setR((p) => ({ ...p, zones: p.zones.filter((_, j) => j !== i) }));
 
-  // Include/Exclude picker shown right in the Зоны card. Binds the SAME r.mode the
-  // Сплит-маршрутизация card's «Режим» Select does (one field) — they stay in sync;
-  // off/full still live in that master Select.
-  const modeSeg = (m: "include" | "exclude", label: string, hint: string) => (
+  // Per-zone Include/Exclude picker: each zone routes its own members THROUGH the
+  // tunnel (include) or DIRECT/bypass (exclude). The base for everything else is
+  // derived on the backend: any include-zone → whitelist (only includes via VPN,
+  // excludes carve out); only exclude-zones → blacklist (everything via VPN except).
+  const zoneSeg = (i: number, z: AwgZone, m: "include" | "exclude", label: string, hint: string) => (
     <button
       type="button"
       title={hint}
-      onClick={() => setR((p) => ({ ...p, mode: m }))}
+      onClick={() => setZone(i, { mode: m })}
       className={cn(
-        "border-r border-line px-3.5 py-1.5 text-[13px] outline-none transition last:border-r-0 focus-visible:relative focus-visible:ring-2 focus-visible:ring-ring/40",
-        r.mode === m ? "bg-accent text-white" : "bg-panel text-ink-soft hover:bg-line-soft",
+        "border-r border-line px-2.5 py-1 text-xs outline-none transition last:border-r-0 focus-visible:relative focus-visible:ring-2 focus-visible:ring-ring/40",
+        (z.mode || "include") === m ? "bg-accent text-white" : "bg-panel text-ink-soft hover:bg-line-soft",
       )}
     >
       {label}
@@ -173,10 +174,9 @@ export default function RoutingPane({ st, reload }: { st: Awg2Status; reload: ()
       <Card title="Сплит-маршрутизация" sub="как делить трафик между туннелем и прямым выходом">
         <div className="flex flex-wrap gap-4">
           <Field label="Режим" className="min-w-[280px] flex-1">
-            <Select value={r.mode} onChange={(e) => setR({ ...r, mode: e.target.value })}>
+            <Select value={r.mode === "include" || r.mode === "exclude" ? "zones" : r.mode} onChange={(e) => setR({ ...r, mode: e.target.value })}>
               <option value="off">Выключено</option>
-              <option value="exclude">Всё через VPN, кроме зон (напр. .ru — мимо)</option>
-              <option value="include">Только зоны — через VPN</option>
+              <option value="zones">По зонам (Включить/Исключить на каждой зоне)</option>
               <option value="full">Весь трафик — через VPN</option>
             </Select>
           </Field>
@@ -209,26 +209,18 @@ export default function RoutingPane({ st, reload }: { st: Awg2Status; reload: ()
       </Card>
 
       <Card title="Зоны" sub="что заводить в туннель — домены, маски и IP в одном списке" head={<Button mini onClick={addZone}>Добавить зону</Button>}>
-        <div className="mb-2.5 flex flex-wrap items-center gap-x-3 gap-y-2">
-          <span className="text-xs font-medium text-ink-soft">Режим списка зон:</span>
-          <div className="inline-flex overflow-hidden rounded-lg border border-line">
-            {modeSeg("include", "Включить", "Через туннель идут только перечисленные зоны")}
-            {modeSeg("exclude", "Исключить", "Через туннель идёт весь трафик, кроме зон")}
-          </div>
-          {r.mode === "include" && <span className="text-[11px] text-muted">через VPN идут <b>только</b> эти зоны (whitelist)</span>}
-          {r.mode === "exclude" && <span className="text-[11px] text-muted">через VPN идёт <b>всё, кроме</b> этих зон (напр. <b>.ru</b> — мимо)</span>}
-          {(r.mode === "off" || r.mode === "full") && (
-            <span className="text-[11px] text-warn">сейчас «{r.mode === "off" ? "выключено" : "весь трафик через VPN"}» — выберите режим, чтобы зоны заработали</span>
-          )}
-        </div>
-        <p className="mb-2 text-[11px] text-muted">В один список можно вписывать вперемешку: домены/маски, IPv4 и подсети (напр. <b>104.18.0.0/16</b>). IPv6-адреса принимаются, но пока в туннель не маршрутизируются (туннель IPv4); для доменов IPv6 и так форсируется на IPv4 без утечки.</p>
+        <p className="mb-2 text-[11px] text-muted"><b>Включить</b> — зона идёт через VPN; <b>Исключить</b> — мимо VPN (напрямую). Есть хоть одна «Включить» → через туннель идут только include-зоны (exclude вырезаются); только «Исключить» → через туннель идёт всё, кроме них. В список можно вписывать вперемешку: домены/маски, IPv4 и подсети (напр. <b>104.18.0.0/16</b>); IPv6 принимается, но в туннель пока не маршрутизируется.</p>
         {(r.zones || []).length === 0 ? (
           <p className="text-xs text-muted">Зон нет. Добавьте зону и впишите домены (напр. youtube.com), маски (ip*) и/или IP/подсети — всё в одном списке.</p>
         ) : (
           (r.zones || []).map((z, i) => (
             <div key={i} className="mb-3 rounded-lg border border-line p-2.5">
               <div className="mb-2 flex flex-wrap items-center gap-3">
-                <Input className="w-48" value={z.name} onChange={(e) => setZone(i, { name: e.target.value })} />
+                <Input className="w-44" value={z.name} onChange={(e) => setZone(i, { name: e.target.value })} />
+                <div className="inline-flex overflow-hidden rounded-md border border-line" role="group" aria-label="Режим зоны">
+                  {zoneSeg(i, z, "include", "Включить", "Зона идёт через VPN (туннель)")}
+                  {zoneSeg(i, z, "exclude", "Исключить", "Зона идёт мимо VPN (напрямую)")}
+                </div>
                 <Switch checked={z.enabled} onChange={(v) => setZone(i, { enabled: v })} label="вкл" />
                 <Button mini onClick={() => delZone(i)}>Удалить</Button>
               </div>
