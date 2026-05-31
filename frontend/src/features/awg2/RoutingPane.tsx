@@ -148,7 +148,8 @@ export default function RoutingPane({ st, reload }: { st: Awg2Status; reload: ()
           {r.mode === "off"
             ? <Button variant="primary" onClick={teardown} disabled={busy}>Снять маршрутизацию</Button>
             : <Button variant="primary" onClick={applyRouting} disabled={busy || !cl?.running}>Применить</Button>}
-          {countdown > 0 && <span className="text-xs font-medium text-warn">Авто-откат через {countdown}с — <button type="button" className="underline" onClick={commit}>подтвердить</button></span>}
+          {countdown > 0 && <Button variant="primary" onClick={commit} disabled={busy}>✓ Подтвердить ({countdown}с)</Button>}
+          {countdown > 0 && <span className="text-xs font-medium text-warn">← нажмите, иначе авто-откат</span>}
           {!cl?.running && r.mode !== "off" && <span className="text-xs text-muted">сначала поднимите туннель</span>}
         </div>
         <p className="mt-2 text-[11px] text-muted">Локальная сеть, приватные адреса и адрес сервера VPN всегда идут в обход туннеля. Применение защищено авто-откатом: если панель станет недоступна — маршрутизация откатится сама.</p>
