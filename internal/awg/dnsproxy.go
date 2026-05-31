@@ -103,6 +103,10 @@ func (p *DNSProxy) serveUDP(uc *net.UDPConn) {
 }
 
 func (p *DNSProxy) handleUDP(uc *net.UDPConn, client *net.UDPAddr, query []byte) {
+	if blk, ok := p.maybeBlockAAAA(query); ok {
+		_, _ = uc.WriteToUDP(blk, client)
+		return
+	}
 	resp, err := p.forwardUDP(query)
 	if err != nil || len(resp) == 0 {
 		return
@@ -148,6 +152,10 @@ func (p *DNSProxy) handleTCP(conn net.Conn) {
 	if err != nil {
 		return
 	}
+	if blk, ok := p.maybeBlockAAAA(query); ok {
+		_ = writeTCPMsg(conn, blk)
+		return
+	}
 	up, err := net.DialTimeout("tcp", p.upstream, 4*time.Second)
 	if err != nil {
 		return
@@ -183,7 +191,55 @@ func (p *DNSProxy) inspect(query, resp []byte) {
 	}
 }
 
+// maybeBlockAAAA: if the query is an AAAA (IPv6) lookup for a MATCHED name,
+// return a synthesized empty NOERROR response (blocked=true) so the client falls
+// back to the A record — the tunnel/ipset are IPv4-only, and handing back a real
+// AAAA would let an IPv6-capable device bypass the tunnel. Returns (nil,false)
+// otherwise (relay normally).
+func (p *DNSProxy) maybeBlockAAAA(query []byte) ([]byte, bool) {
+	name, qtype, ok := questionInfo(query)
+	if !ok || qtype != 28 { // 28 = AAAA
+		return nil, false
+	}
+	ms := p.matchers.Load()
+	if ms == nil || !MatchAny(*ms, name) {
+		return nil, false
+	}
+	return emptyNoErrorResponse(query), true
+}
+
+// emptyNoErrorResponse turns a query into a NOERROR response with no answers
+// (echoing the question), so the client sees "no AAAA record".
+func emptyNoErrorResponse(query []byte) []byte {
+	if len(query) < 12 {
+		return query
+	}
+	resp := make([]byte, len(query))
+	copy(resp, query)
+	resp[2] |= 0x80                          // QR=1 (response), keep RD/opcode
+	resp[3] = 0x80                           // RA=1, Z=0, RCODE=0 (NOERROR)
+	resp[6], resp[7] = 0, 0                   // ANCOUNT=0
+	resp[8], resp[9] = 0, 0                   // NSCOUNT=0
+	resp[10], resp[11] = 0, 0                 // ARCOUNT=0
+	return resp
+}
+
 // ---- DNS wire parsing (read-only, bounds-checked) ----
+
+// questionInfo returns the first question's name (lowercased) and its qtype.
+func questionInfo(msg []byte) (string, uint16, bool) {
+	if len(msg) < 12 {
+		return "", 0, false
+	}
+	if qd := int(msg[4])<<8 | int(msg[5]); qd < 1 {
+		return "", 0, false
+	}
+	name, next, ok := readName(msg, 12)
+	if !ok || next+2 > len(msg) {
+		return "", 0, false
+	}
+	return name, uint16(msg[next])<<8 | uint16(msg[next+1]), true
+}
 
 // questionName returns the first question's name (dotted, lowercased) from a DNS
 // message.

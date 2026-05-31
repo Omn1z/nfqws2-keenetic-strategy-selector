@@ -17,10 +17,37 @@ func encName(name string) []byte {
 	return append(b, 0)
 }
 
-func tQuery(name string) []byte {
+func tQueryType(name string, qtype byte) []byte {
 	b := []byte{0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0}
 	b = append(b, encName(name)...)
-	return append(b, 0, 1, 0, 1) // QTYPE=A, QCLASS=IN
+	return append(b, 0, qtype, 0, 1) // QTYPE, QCLASS=IN
+}
+
+func tQuery(name string) []byte { return tQueryType(name, 1) } // A
+
+func TestAAAABlock(t *testing.T) {
+	ms, _ := CompileMatchers([]string{"main.com"})
+	p := NewDNSProxy("127.0.0.1:0", "127.0.0.1:0", nil)
+	p.SetMatchers(ms)
+	// AAAA for a matched name → blocked (empty NOERROR response)
+	resp, ok := p.maybeBlockAAAA(tQueryType("a.main.com", 28))
+	if !ok {
+		t.Fatal("AAAA for a matched name should be blocked")
+	}
+	if resp[2]&0x80 == 0 {
+		t.Error("blocked response should have QR=1")
+	}
+	if an := int(resp[6])<<8 | int(resp[7]); an != 0 {
+		t.Errorf("blocked response ANCOUNT=%d, want 0", an)
+	}
+	// AAAA for a non-matched name → not blocked
+	if _, ok := p.maybeBlockAAAA(tQueryType("other.com", 28)); ok {
+		t.Error("AAAA for a non-matched name should not be blocked")
+	}
+	// A for a matched name → not blocked (must be forwarded so we learn its IP)
+	if _, ok := p.maybeBlockAAAA(tQueryType("a.main.com", 1)); ok {
+		t.Error("A query should never be blocked")
+	}
 }
 
 func tResponse(name string, ips []string) []byte {

@@ -36,7 +36,8 @@ export default function RoutingPane({ st, reload }: { st: Awg2Status; reload: ()
   const [busy, setBusy] = useState(false);
   const [countdown, setCountdown] = useState(0);
   const timer = useRef<number | null>(null);
-  useEffect(() => () => { if (timer.current) window.clearInterval(timer.current); }, []);
+  const autoTimer = useRef<number | null>(null);
+  useEffect(() => () => { if (timer.current) window.clearInterval(timer.current); if (autoTimer.current) window.clearTimeout(autoTimer.current); }, []);
 
   const eng = st.engine;
   const cl = st.client;
@@ -66,22 +67,32 @@ export default function RoutingPane({ st, reload }: { st: Awg2Status; reload: ()
       return c - 1;
     }), 1000);
   };
-  const stopCountdown = () => { setCountdown(0); if (timer.current) window.clearInterval(timer.current); };
+  const stopCountdown = () => { setCountdown(0); if (timer.current) window.clearInterval(timer.current); if (autoTimer.current) { window.clearTimeout(autoTimer.current); autoTimer.current = null; } };
 
   const applyRouting = async () => {
     if (r.mode === "off") return teardown();
     if (!(await confirmDialog({
       title: "Применить маршрутизацию?",
-      body: `Режим «${r.mode}». Часть трафика пойдёт через VPN. Авто-откат ~90с: если не подтвердить (или панель потеряет связь) — всё откатится. Локальная сеть, приватные адреса и сам сервер VPN всегда в обход туннеля.`,
+      body: `Режим «${r.mode}». Часть трафика пойдёт через VPN. Подтверждение произойдёт автоматически через несколько секунд; если применение оборвёт связь с панелью — будет авто-откат. Локальная сеть, приватные адреса и сам сервер VPN всегда в обход туннеля.`,
       confirmLabel: "Применить",
     }))) return;
     setBusy(true);
     try {
       await api("POST", "/api/awg2/routing/config", cleanRouting(r));
       await api("POST", "/api/awg2/routing/apply", {});
-      toast("Применено — подтвердите в течение 90с", "ok");
+      toast("Применено — подтверждаю автоматически…", "ok");
       startCountdown();
       await reload();
+      // Auto-confirm shortly after: the panel is reached by LAN IP regardless of
+      // routing (LAN/private/self are always excluded from the tunnel), so a config
+      // change can't cut panel access. If it somehow did, this commit POST fails and
+      // the 90s dead-man's switch still rolls everything back.
+      if (autoTimer.current) window.clearTimeout(autoTimer.current);
+      autoTimer.current = window.setTimeout(() => {
+        void api("POST", "/api/awg2/routing/commit", {})
+          .then(() => { stopCountdown(); toast("Подтверждено", "ok"); void reload(); })
+          .catch(() => { /* unreachable → dead-man's switch rolls back */ });
+      }, 5000);
     } catch (e) { toast((e as Error).message, "err"); } finally { setBusy(false); }
   };
   const commit = () => post("/api/awg2/routing/commit", {}, "Подтверждено — авто-откат отменён", stopCountdown);
