@@ -168,7 +168,7 @@ func (a *App) awgClientUpOS() error {
 
 	mtu := cfg.Routing.MTU
 	if mtu == 0 {
-		mtu = 1376
+		mtu = 1280
 	}
 	// 1) start the userspace daemon (creates the iface + UAPI socket) + bring up
 	script := strings.Join([]string{

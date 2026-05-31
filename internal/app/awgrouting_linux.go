@@ -5,7 +5,9 @@ package app
 import (
 	"fmt"
 	"net"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -19,6 +21,14 @@ import (
 // endpoint are always excluded (RETURN) so the router and its management path
 // are never pulled into the tunnel; a server-side dead-man's-switch tears the
 // whole thing down if the panel doesn't commit in time.
+//
+// PERSISTENCE: Keenetic's ndm periodically rebuilds the firewall and FLUSHES all
+// foreign iptables chains — our marking chain + FORWARD/NAT/MSS rules vanish and
+// nothing gets marked, so split-routing silently stops. We therefore install the
+// iptables half as a Keenetic netfilter.d hook (re-run by ndm after every
+// rebuild, exactly like nfqws2's 100-nfqws2.sh) and also re-assert it from a
+// 60s watchdog. The ip rule / ip route table / ipset are NOT touched by Keenetic,
+// so they live directly in the kernel.
 
 const (
 	awgTable = "998" // dedicated routing table for tunneled traffic
@@ -31,17 +41,51 @@ const (
 	awgChain    = "AWG2_MARK"
 	awgSetInc   = "awg2_inc"
 	awgSetExc   = "awg2_exc"
+	// awgHookPath is the Keenetic ndm netfilter.d hook that re-installs our
+	// iptables state after each firewall rebuild. Prefixed 90- to run after
+	// Keenetic's own setup (and our nfqws2's 100- hook is independent).
+	awgHookPath = "/opt/etc/ndm/netfilter.d/90-awg2.sh"
 )
+
+// awgExcludes never enter the tunnel — loopback, private/LAN, CGNAT ranges. The
+// AWG endpoint is excluded separately (its IP is only known at apply time).
+var awgExcludes = []string{"127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10"}
+
+// awgAccelSysctls are Keenetic's NAT accelerators that cache a forwarded flow's
+// path and bypass per-packet netfilter. They CANNOT honor our fwmark→table→awg0
+// policy routing: the accelerated fast-path silently DROPS forwarded tunnel
+// segments, causing heavy TCP retransmits + exponential backoff (1→2→4→8s) — the
+// router's own traffic is fine but LAN devices crawl and Wi-Fi dies. We turn them
+// off while routing is active and back on at teardown. The hardware PPE for
+// normal LAN↔WAN traffic (net.hwnat.ppe_enabled) is left untouched.
+var awgAccelSysctls = []string{
+	"net.netfilter.nf_conntrack_fastnat",
+	"net.netfilter.nf_conntrack_fastroute",
+	"net.core.swnat",
+	"net.hwnat.extif_offload",
+}
+
+// awgSetAccel toggles Keenetic's NAT accelerators (off while tunnel routing is
+// active). Disabling also flushes already-accelerated flows so existing
+// connections re-evaluate the route.
+func awgSetAccel(on bool) {
+	v := "0"
+	if on {
+		v = "1"
+	}
+	for _, s := range awgAccelSysctls {
+		_, _ = awgRun("sysctl -w " + s + "=" + v + " 2>/dev/null")
+	}
+	if !on {
+		_, _ = awgRun("sysctl -w net.core.swnat_reset=1 2>/dev/null")
+	}
+}
 
 func awgRun(cmd string) (string, error) {
 	ctx, cancel := contextTimeout(15 * time.Second)
 	defer cancel()
 	out, err := exec.CommandContext(ctx, "sh", "-c", cmd).CombinedOutput()
 	return strings.TrimSpace(string(out)), err
-}
-
-func awgEnsureRule(table, chain, rule string) {
-	_, _ = awgRun("iptables -t " + table + " -C " + chain + " " + rule + " 2>/dev/null || iptables -t " + table + " -A " + chain + " " + rule)
 }
 
 func awgDefaultRoute() (gw, dev string) {
@@ -133,6 +177,80 @@ func resolveDomain(d string) []string {
 	return out
 }
 
+// awgFirewallHook renders the netfilter.d hook that (re)installs the AWG2 marking
+// chain + FORWARD/NAT/MSS rules. Every rule is -C-guarded (idempotent) and the
+// script self-disables when the tunnel is down, so Keenetic's ndm can run it at
+// any time and any number of times. It is also executed directly on apply and by
+// the watchdog. mtu is the awg0 MTU; TCP MSS is pinned to mtu-40 in BOTH
+// directions with an EXPLICIT value (not --clamp-mss-to-pmtu): on the return path
+// (-i awg0) the PMTU clamp resolves to the LAN MTU (1500), not the tunnel, so it
+// fails to shrink client→server segments and oversized uploads (large cookies,
+// speed-test POSTs) blackhole → pages "load then stall/RESET".
+func awgFirewallHook(mode, endpointIP string, mtu int) string {
+	if mtu <= 0 {
+		mtu = 1280
+	}
+	mss := strconv.Itoa(mtu - 40)
+	ap := func(table, chain, rule string) string {
+		b := "iptables -t " + table + " "
+		return b + "-C " + chain + " " + rule + " 2>/dev/null || " + b + "-A " + chain + " " + rule + "\n"
+	}
+	ins := func(table, chain, rule string) string {
+		b := "iptables -t " + table + " "
+		return b + "-C " + chain + " " + rule + " 2>/dev/null || " + b + "-I " + chain + " 1 " + rule + "\n"
+	}
+	var s strings.Builder
+	s.WriteString("#!/bin/sh\n")
+	s.WriteString("# AWG2 split-routing firewall hook — managed by nfqws2-strategy. DO NOT EDIT.\n")
+	s.WriteString("# Keenetic re-runs netfilter.d/* after every firewall rebuild (which flushes\n")
+	s.WriteString("# foreign iptables chains); this restores the AWG2 marking + FORWARD/NAT/MSS.\n")
+	s.WriteString("[ \"$type\" = \"ip6tables\" ] && exit 0\n")
+	s.WriteString("ip link show " + awgIface + " >/dev/null 2>&1 || exit 0\n")
+	s.WriteString("ipset create " + awgSetInc + " hash:net family inet -exist 2>/dev/null\n")
+	s.WriteString("ipset create " + awgSetExc + " hash:net family inet -exist 2>/dev/null\n")
+	s.WriteString("iptables -t mangle -N " + awgChain + " 2>/dev/null\n")
+	s.WriteString("iptables -t mangle -F " + awgChain + "\n")
+	for _, ex := range awgExcludes {
+		s.WriteString("iptables -t mangle -A " + awgChain + " -d " + ex + " -j RETURN\n")
+	}
+	if endpointIP != "" {
+		s.WriteString("iptables -t mangle -A " + awgChain + " -d " + endpointIP + "/32 -j RETURN\n")
+	}
+	switch mode {
+	case "include":
+		s.WriteString("iptables -t mangle -A " + awgChain + " -m set --match-set " + awgSetInc + " dst -j MARK --set-xmark " + awgMarkRule + "\n")
+	case "exclude":
+		s.WriteString("iptables -t mangle -A " + awgChain + " -m set ! --match-set " + awgSetExc + " dst -j MARK --set-xmark " + awgMarkRule + "\n")
+	case "full":
+		s.WriteString("iptables -t mangle -A " + awgChain + " -j MARK --set-xmark " + awgMarkRule + "\n")
+	}
+	s.WriteString(ap("mangle", "PREROUTING", "-j "+awgChain))
+	s.WriteString(ap("mangle", "OUTPUT", "-j "+awgChain))
+	// NAT for LAN clients + MSS clamp + allow forwarding LAN<->tunnel. Keenetic's
+	// FORWARD policy is DROP and doesn't know awg0, so the ACCEPTs go at the TOP.
+	s.WriteString(ap("nat", "POSTROUTING", "-o "+awgIface+" -j MASQUERADE"))
+	s.WriteString(ap("mangle", "FORWARD", "-o "+awgIface+" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "+mss))
+	s.WriteString(ap("mangle", "FORWARD", "-i "+awgIface+" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "+mss))
+	s.WriteString(ins("filter", "FORWARD", "-i "+awgIface+" -j ACCEPT"))
+	s.WriteString(ins("filter", "FORWARD", "-o "+awgIface+" -j ACCEPT"))
+	return s.String()
+}
+
+// awgWriteHook writes the netfilter.d hook for the given mode/endpoint and runs
+// it once immediately (applying the rules now, not just on the next ndm rebuild).
+func awgWriteHook(mode, endpointIP string, mtu int) error {
+	if err := os.MkdirAll(filepath.Dir(awgHookPath), 0o755); err != nil {
+		return err
+	}
+	if err := os.WriteFile(awgHookPath, []byte(awgFirewallHook(mode, endpointIP, mtu)), 0o755); err != nil {
+		return err
+	}
+	if out, err := awgRun("sh " + awgHookPath); err != nil {
+		logbuf.Append("awg2", "warn", "firewall-хук: "+lastLines(out, 2))
+	}
+	return nil
+}
+
 func (a *App) awgApplyRoutingOS() error {
 	cfg := a.awg.Config()
 	r := cfg.Routing
@@ -159,44 +277,26 @@ func (a *App) awgApplyRoutingOS() error {
 	if err := a.awgBuildSets(&cfg); err != nil {
 		return err
 	}
-	// 3) tunnel table + fwmark rule
+	// 3) tunnel table + fwmark rule (survive Keenetic reloads on their own)
 	_, _ = awgRun("ip route replace default dev " + awgIface + " table " + awgTable)
 	_, _ = awgRun("ip rule del fwmark " + awgMarkRule + " table " + awgTable + " 2>/dev/null")
 	if _, err := awgRun("ip rule add fwmark " + awgMarkRule + " table " + awgTable); err != nil {
 		return fmt.Errorf("ip rule: %w", err)
 	}
-	// 4) mangle marking chain (exclusions first, then the mode rule)
-	a.awgInstallChain(r.Mode, endpointIP)
-	// 5) NAT + MSS clamp out the tunnel
-	awgEnsureRule("nat", "POSTROUTING", "-o "+awgIface+" -j MASQUERADE")
-	awgEnsureRule("mangle", "FORWARD", "-o "+awgIface+" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu")
-	// 6) arm the dead-man's switch + start the domain refresher
+	// 4) firewall hook (marking chain + FORWARD/NAT/MSS) — installed as a Keenetic
+	// ndm netfilter.d hook so it survives the firewall rebuilds that flush foreign
+	// iptables chains; awgWriteHook also applies it immediately.
+	if err := awgWriteHook(r.Mode, endpointIP, r.MTU); err != nil {
+		return fmt.Errorf("firewall-хук: %w", err)
+	}
+	// 5) disable Keenetic's NAT accelerators — their fast-path silently drops our
+	// policy-routed tunnel segments (see awgSetAccel). Restored on teardown.
+	awgSetAccel(false)
+	// 6) arm the dead-man's switch + start the hook-watchdog / domain refresher
 	a.awgArmRollback(90 * time.Second)
 	a.awgStartRefresh()
 	logbuf.Append("awg2", "info", "маршрутизация применена (режим "+r.Mode+") — подтвердите в течение 90с, иначе авто-откат")
 	return nil
-}
-
-func (a *App) awgInstallChain(mode, endpointIP string) {
-	_, _ = awgRun("iptables -t mangle -N " + awgChain + " 2>/dev/null")
-	_, _ = awgRun("iptables -t mangle -F " + awgChain)
-	// mandatory exclusions — private/CGNAT/loopback and the AWG endpoint stay direct
-	for _, ex := range []string{"127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10"} {
-		_, _ = awgRun("iptables -t mangle -A " + awgChain + " -d " + ex + " -j RETURN")
-	}
-	if endpointIP != "" {
-		_, _ = awgRun("iptables -t mangle -A " + awgChain + " -d " + endpointIP + "/32 -j RETURN")
-	}
-	switch mode {
-	case "include":
-		_, _ = awgRun("iptables -t mangle -A " + awgChain + " -m set --match-set " + awgSetInc + " dst -j MARK --set-xmark " + awgMarkRule)
-	case "exclude":
-		_, _ = awgRun("iptables -t mangle -A " + awgChain + " -m set ! --match-set " + awgSetExc + " dst -j MARK --set-xmark " + awgMarkRule)
-	case "full":
-		_, _ = awgRun("iptables -t mangle -A " + awgChain + " -j MARK --set-xmark " + awgMarkRule)
-	}
-	awgEnsureRule("mangle", "PREROUTING", "-j "+awgChain)
-	awgEnsureRule("mangle", "OUTPUT", "-j "+awgChain)
 }
 
 func (a *App) awgBuildSets(cfg *awg.ServerConfig) error {
@@ -245,6 +345,11 @@ func (a *App) awgArmRollback(d time.Duration) {
 	})
 }
 
+// awgStartRefresh runs a 60s watchdog while routing is active: it re-asserts the
+// firewall hook (Keenetic may have flushed our chain between rebuilds, and not
+// every table rebuild is guaranteed to trigger netfilter.d) and, every ~15 min,
+// re-resolves the domain zones into the ipset. It stops when routing is torn down
+// (the dead-man's switch / teardown closes stopRefresh), so a rollback is final.
 func (a *App) awgStartRefresh() {
 	a.awgRoute.mu.Lock()
 	if a.awgRoute.stopRefresh != nil {
@@ -254,15 +359,28 @@ func (a *App) awgStartRefresh() {
 	a.awgRoute.stopRefresh = stop
 	a.awgRoute.mu.Unlock()
 	go func() {
-		t := time.NewTicker(15 * time.Minute)
+		t := time.NewTicker(60 * time.Second)
 		defer t.Stop()
+		ticks := 0
 		for {
 			select {
 			case <-stop:
 				return
 			case <-t.C:
 				c := a.awg.Config()
-				if c.Routing.Mode == "include" || c.Routing.Mode == "exclude" {
+				if c.Routing.Mode == "off" {
+					continue
+				}
+				// re-assert the firewall hook: rewrite the file if Keenetic/anything
+				// removed it, otherwise just re-run it (fast, idempotent).
+				if _, err := os.Stat(awgHookPath); err != nil {
+					_ = awgWriteHook(c.Routing.Mode, resolveHostIP(hostOf(c.Endpoint)), c.Routing.MTU)
+				} else {
+					_, _ = awgRun("sh " + awgHookPath)
+				}
+				awgSetAccel(false) // re-assert: Keenetic may re-enable accelerators on reconfig
+				ticks++
+				if ticks%15 == 0 && (c.Routing.Mode == "include" || c.Routing.Mode == "exclude") {
 					_ = a.awgBuildSets(&c)
 				}
 			}
@@ -297,6 +415,8 @@ func (a *App) awgTeardownRoutingOS() error {
 	a.awgRoute.active = false
 	a.awgRoute.mu.Unlock()
 
+	awgSetAccel(true)          // restore Keenetic's NAT accelerators (off only while routing active)
+	_ = os.Remove(awgHookPath) // stop Keenetic's ndm from re-adding our rules
 	_, _ = awgRun("iptables -t mangle -D PREROUTING -j " + awgChain + " 2>/dev/null")
 	_, _ = awgRun("iptables -t mangle -D OUTPUT -j " + awgChain + " 2>/dev/null")
 	_, _ = awgRun("iptables -t mangle -F " + awgChain + " 2>/dev/null")
@@ -304,7 +424,17 @@ func (a *App) awgTeardownRoutingOS() error {
 	_, _ = awgRun("ip rule del fwmark " + awgMarkRule + " table " + awgTable + " 2>/dev/null")
 	_, _ = awgRun("ip route flush table " + awgTable + " 2>/dev/null")
 	_, _ = awgRun("iptables -t nat -D POSTROUTING -o " + awgIface + " -j MASQUERADE 2>/dev/null")
-	_, _ = awgRun("iptables -t mangle -D FORWARD -o " + awgIface + " -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null")
+	mtu := a.awg.Config().Routing.MTU
+	if mtu <= 0 {
+		mtu = 1280
+	}
+	mss := strconv.Itoa(mtu - 40)
+	for _, dir := range []string{"-o", "-i"} {
+		_, _ = awgRun("iptables -t mangle -D FORWARD " + dir + " " + awgIface + " -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss " + mss + " 2>/dev/null")
+		_, _ = awgRun("iptables -t mangle -D FORWARD " + dir + " " + awgIface + " -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null")
+	}
+	_, _ = awgRun("iptables -D FORWARD -i " + awgIface + " -j ACCEPT 2>/dev/null")
+	_, _ = awgRun("iptables -D FORWARD -o " + awgIface + " -j ACCEPT 2>/dev/null")
 	_, _ = awgRun("ipset destroy " + awgSetInc + " 2>/dev/null")
 	_, _ = awgRun("ipset destroy " + awgSetExc + " 2>/dev/null")
 	logbuf.Append("awg2", "info", "маршрутизация снята")

@@ -36,9 +36,27 @@ type ClientStatus struct {
 // Public app methods (delegating to the OS impl) used by the server handlers.
 func (a *App) AWG2EngineInfo() EngineInfo        { return a.awgEngineInfoOS() }
 func (a *App) AWG2InstallEngine() (string, error) { return a.awgInstallEngineOS() }
-func (a *App) AWG2ClientUp() error                { return a.awgClientUpOS() }
-func (a *App) AWG2ClientDown() error              { return a.awgClientDownOS() }
 func (a *App) awgClientStatus() *ClientStatus     { return a.awgClientStatusOS() }
+
+// AWG2ClientUp brings up the local tunnel and persists Client.Enabled=true so it
+// autostarts after a panel restart.
+func (a *App) AWG2ClientUp() error {
+	if err := a.awgClientUpOS(); err != nil {
+		return err
+	}
+	a.awg.SetClientEnabled(true)
+	a.awgSave()
+	return nil
+}
+
+// AWG2ClientDown tears down split-routing first (the table points at awg0, which
+// is about to disappear), clears the autostart flag, then drops the tunnel.
+func (a *App) AWG2ClientDown() error {
+	a.awgTeardownRouting()
+	a.awg.SetClientEnabled(false)
+	a.awgSave()
+	return a.awgClientDownOS()
+}
 
 // awgRouteState holds the split-routing runtime (dead-man's-switch + refresher).
 type awgRouteState struct {

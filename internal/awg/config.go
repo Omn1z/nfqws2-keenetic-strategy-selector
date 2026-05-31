@@ -129,7 +129,7 @@ func Default() *ServerConfig {
 		Routing: RoutingConfig{
 			Mode:         "off",
 			Zones:        []Zone{},
-			MTU:          1376,
+			MTU:          1280, // AmneziaWG over a real internet path: safe MTU (avoids PMTU blackhole)
 			DomainSource: "resolve",
 		},
 	}
@@ -185,7 +185,7 @@ func (c *ServerConfig) Normalize() {
 		c.Routing.Mode = "off"
 	}
 	if c.Routing.MTU == 0 {
-		c.Routing.MTU = 1376
+		c.Routing.MTU = 1280
 	}
 	if c.Routing.DomainSource != "dnsmasq" {
 		c.Routing.DomainSource = "resolve"

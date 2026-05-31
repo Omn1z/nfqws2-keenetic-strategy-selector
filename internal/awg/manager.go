@@ -120,6 +120,14 @@ func (m *Manager) SetRouting(rc RoutingConfig) {
 	m.mu.Unlock()
 }
 
+// SetClientEnabled toggles the local-client autostart flag, persisted so the
+// router tunnel comes back up after a panel restart.
+func (m *Manager) SetClientEnabled(v bool) {
+	m.mu.Lock()
+	m.cfg.Client.Enabled = v
+	m.mu.Unlock()
+}
+
 // EnsureKeys generates the server keypair + randomized 2.0 obfuscation once.
 // Returns true if anything changed (so the caller persists before deploying).
 func (m *Manager) EnsureKeys() (bool, error) {
