@@ -3,25 +3,25 @@
 package app
 
 import (
-	"encoding/json"
 	"fmt"
-	"net"
 	"os"
-	"os/exec"
-	"path/filepath"
 	"strconv"
-	"strings"
 	"time"
 
-	"nfqws2strategy/internal/awg"
 	"nfqws2strategy/internal/logbuf"
 )
 
-// Split-routing: mark selected traffic (by ipset membership) with a fwmark and
-// policy-route it into the awg0 tunnel. SAFETY: private/LAN/self and the AWG
-// endpoint are always excluded (RETURN) so the router and its management path
-// are never pulled into the tunnel; a server-side dead-man's-switch tears the
+// Split-routing lifecycle: mark selected traffic (by ipset membership) with a
+// fwmark and policy-route it into the awg0 tunnel. SAFETY: private/LAN/self and
+// the AWG endpoint are always excluded (RETURN) so the router and its management
+// path are never pulled into the tunnel; a server-side dead-man's-switch tears the
 // whole thing down if the panel doesn't commit in time.
+//
+// The pieces live in sibling files (all package app, build tag linux):
+//   - awgfirewall_linux.go — the netfilter hook + NAT/MSS + accel + kill-switch
+//   - awgsets_linux.go      — ipset membership + ipset/recent persistence
+//   - awgdnsproxy_linux.go  — the domain-mask DNS proxy lifecycle
+//   - awgutil_linux.go      — awgRun, route/mark inspection, host resolution
 //
 // PERSISTENCE: Keenetic's ndm periodically rebuilds the firewall and FLUSHES all
 // foreign iptables chains — our marking chain + FORWARD/NAT/MSS rules vanish and
@@ -53,303 +53,6 @@ const (
 	awgDNSPort     = "5354"
 	awgDNSUpstream = "127.0.0.1:53" // Keenetic ndnproxy — the real LAN resolver
 )
-
-// awgExcludes never enter the tunnel — loopback, private/LAN, CGNAT ranges. The
-// AWG endpoint is excluded separately (its IP is only known at apply time).
-var awgExcludes = []string{"127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10"}
-
-// awgAccelSysctls are Keenetic's NAT accelerators that cache a forwarded flow's
-// path and bypass per-packet netfilter. They CANNOT honor our fwmark→table→awg0
-// policy routing: the accelerated fast-path silently DROPS forwarded tunnel
-// segments, causing heavy TCP retransmits + exponential backoff (1→2→4→8s) — the
-// router's own traffic is fine but LAN devices crawl and Wi-Fi dies. We turn them
-// off while routing is active and back on at teardown. The hardware PPE for
-// normal LAN↔WAN traffic (net.hwnat.ppe_enabled) is left untouched.
-var awgAccelSysctls = []string{
-	"net.netfilter.nf_conntrack_fastnat",
-	"net.netfilter.nf_conntrack_fastroute",
-	"net.core.swnat",
-	"net.hwnat.extif_offload",
-}
-
-// awgSetAccel toggles Keenetic's NAT accelerators (off while tunnel routing is
-// active). Disabling also flushes already-accelerated flows so existing
-// connections re-evaluate the route.
-func awgSetAccel(on bool) {
-	v := "0"
-	if on {
-		v = "1"
-	}
-	for _, s := range awgAccelSysctls {
-		_, _ = awgRun("sysctl -w " + s + "=" + v + " 2>/dev/null")
-	}
-	if !on {
-		_, _ = awgRun("sysctl -w net.core.swnat_reset=1 2>/dev/null")
-	}
-}
-
-func awgRun(cmd string) (string, error) {
-	ctx, cancel := contextTimeout(15 * time.Second)
-	defer cancel()
-	out, err := exec.CommandContext(ctx, "sh", "-c", cmd).CombinedOutput()
-	return strings.TrimSpace(string(out)), err
-}
-
-func awgDefaultRoute() (gw, dev string) {
-	out, _ := awgRun("ip route show default")
-	f := strings.Fields(out)
-	for i := 0; i+1 < len(f); i++ {
-		switch f[i] {
-		case "via":
-			gw = f[i+1]
-		case "dev":
-			dev = f[i+1]
-		}
-	}
-	return
-}
-
-// awgMarkCollision returns a non-empty fwmark string if some EXISTING ip rule
-// uses a fwmark whose bits overlap ours (0x10000000) — which would let our
-// higher-priority rule hijack that traffic, or the router's policy routing grab
-// ours. The router's own marks (e.g. Keenetic's 0x0FFFFxxx) must not overlap.
-func awgMarkCollision() string {
-	out, _ := awgRun("ip rule")
-	const ourBit = 0x10000000
-	for _, ln := range strings.Split(out, "\n") {
-		i := strings.Index(ln, "fwmark ")
-		if i < 0 {
-			continue
-		}
-		fields := strings.Fields(ln[i+len("fwmark "):])
-		if len(fields) == 0 {
-			continue
-		}
-		mark := fields[0]
-		if j := strings.IndexByte(mark, '/'); j >= 0 {
-			mark = mark[:j]
-		}
-		v, err := strconv.ParseUint(strings.TrimPrefix(strings.TrimPrefix(mark, "0x"), "0X"), 16, 64)
-		if err != nil {
-			continue
-		}
-		if v == ourBit {
-			continue // our own rule from a prior run
-		}
-		if v&ourBit != 0 {
-			return mark
-		}
-	}
-	return ""
-}
-
-func hostOf(endpoint string) string {
-	endpoint = strings.TrimSpace(endpoint)
-	if i := strings.LastIndex(endpoint, ":"); i > 0 {
-		return endpoint[:i]
-	}
-	return endpoint
-}
-
-func resolveHostIP(host string) string {
-	host = strings.TrimSpace(host)
-	if host == "" {
-		return ""
-	}
-	if net.ParseIP(host) != nil {
-		return host
-	}
-	for _, ip := range resolveDomain(host) {
-		return ip
-	}
-	return ""
-}
-
-// resolveDomain returns the IPv4 addresses for a domain (system resolver).
-func resolveDomain(d string) []string {
-	d = strings.TrimSpace(d)
-	if d == "" {
-		return nil
-	}
-	ips, err := net.LookupIP(d)
-	if err != nil {
-		return nil
-	}
-	var out []string
-	for _, ip := range ips {
-		if v4 := ip.To4(); v4 != nil {
-			out = append(out, v4.String())
-		}
-	}
-	return out
-}
-
-// awgZoneMatchers compiles domain matchers from all enabled zones' domain lists.
-func awgZoneMatchers(cfg *awg.ServerConfig) []awg.DomainMatcher {
-	var entries []string
-	for _, z := range cfg.Routing.Zones {
-		if z.Enabled {
-			entries = append(entries, z.Domains...)
-		}
-	}
-	ms, _ := awg.CompileMatchers(entries)
-	return ms
-}
-
-// awgTargetSet is the ipset the active mode populates.
-func awgTargetSet(mode string) string {
-	if mode == "exclude" {
-		return awgSetExc
-	}
-	return awgSetInc
-}
-
-// awgEnsureDNSProxy starts/updates the domain-mask DNS proxy when
-// domain_source=="dnsproxy" with at least one matcher, otherwise stops it. It
-// returns true when the proxy is (now) running, so the firewall hook installs
-// the LAN :53 REDIRECT only while the proxy is actually up (never blackhole DNS).
-func (a *App) awgEnsureDNSProxy(cfg *awg.ServerConfig, targetSet string) bool {
-	ms := awgZoneMatchers(cfg)
-	want := cfg.Routing.Mode != "off" && cfg.Routing.DomainSource == "dnsproxy" && len(ms) > 0
-	a.awgRoute.mu.Lock()
-	p := a.awgRoute.dnsProxy
-	a.awgRoute.mu.Unlock()
-	if !want {
-		if p != nil {
-			a.awgStopDNSProxy()
-		}
-		return false
-	}
-	if p != nil {
-		p.SetMatchers(ms) // refresh on zone change
-		return true
-	}
-	np := awg.NewDNSProxy(awgDNSAddr, awgDNSUpstream, func(ip string) {
-		// Add every matched answer IP (idempotent -exist). No dedup cache on purpose:
-		// a zone edit flushes the set, and the next DNS query must re-learn cleanly.
-		// The target set is read live so a mode switch routes new hits correctly.
-		_, _ = awgRun("ipset add " + awgTargetSet(a.awg.Config().Routing.Mode) + " " + ip + " -exist")
-	})
-	a.awgLoadRecent(np)  // restore domains seen in a previous run (before matching)
-	np.SetMatchers(ms)   // re-evaluates the loaded cache → re-adds matching domains
-	if err := np.Start(); err != nil {
-		logbuf.Append("awg2", "error", "DNS-прокси (маски доменов) не запустился: "+err.Error())
-		return false
-	}
-	a.awgRoute.mu.Lock()
-	a.awgRoute.dnsProxy = np
-	a.awgRoute.mu.Unlock()
-	logbuf.Append("awg2", "info", "DNS-прокси запущен: перехват :53 → домены/поддомены/маски идут в туннель")
-	return true
-}
-
-// awgStopDNSProxy stops the proxy and removes its LAN :53 REDIRECT rules so DNS
-// falls straight back to the router's resolver.
-func (a *App) awgStopDNSProxy() {
-	a.awgRoute.mu.Lock()
-	p := a.awgRoute.dnsProxy
-	a.awgRoute.dnsProxy = nil
-	a.awgRoute.mu.Unlock()
-	if p != nil {
-		p.Stop()
-	}
-	_, _ = awgRun("for br in $(ls /sys/class/net/ 2>/dev/null | grep '^br'); do " +
-		"iptables -t nat -D PREROUTING -i $br -p udp --dport 53 -j REDIRECT --to-ports " + awgDNSPort + " 2>/dev/null; " +
-		"iptables -t nat -D PREROUTING -i $br -p tcp --dport 53 -j REDIRECT --to-ports " + awgDNSPort + " 2>/dev/null; done")
-}
-
-// awgFirewallHook renders the netfilter.d hook that (re)installs the AWG2 marking
-// chain + FORWARD/NAT/MSS rules. Every rule is -C-guarded (idempotent) and the
-// script self-disables when the tunnel is down, so Keenetic's ndm can run it at
-// any time and any number of times. It is also executed directly on apply and by
-// the watchdog. mtu is the awg0 MTU; TCP MSS is pinned to mtu-40 in BOTH
-// directions with an EXPLICIT value (not --clamp-mss-to-pmtu): on the return path
-// (-i awg0) the PMTU clamp resolves to the LAN MTU (1500), not the tunnel, so it
-// fails to shrink client→server segments and oversized uploads (large cookies,
-// speed-test POSTs) blackhole → pages "load then stall/RESET".
-func awgFirewallHook(mode, endpointIP string, mtu int, dnsRedirect bool) string {
-	if mtu <= 0 {
-		mtu = 1280
-	}
-	mss := strconv.Itoa(mtu - 40)
-	dnsPortHex := "14EA" // 5354 in hex, for the /proc/net/udp listening check
-	if p, err := strconv.Atoi(awgDNSPort); err == nil {
-		dnsPortHex = fmt.Sprintf("%04X", p)
-	}
-	ap := func(table, chain, rule string) string {
-		b := "iptables -t " + table + " "
-		return b + "-C " + chain + " " + rule + " 2>/dev/null || " + b + "-A " + chain + " " + rule + "\n"
-	}
-	ins := func(table, chain, rule string) string {
-		b := "iptables -t " + table + " "
-		return b + "-C " + chain + " " + rule + " 2>/dev/null || " + b + "-I " + chain + " 1 " + rule + "\n"
-	}
-	var s strings.Builder
-	s.WriteString("#!/bin/sh\n")
-	s.WriteString("# AWG2 split-routing firewall hook — managed by nfqws2-strategy. DO NOT EDIT.\n")
-	s.WriteString("# Keenetic re-runs netfilter.d/* after every firewall rebuild (which flushes\n")
-	s.WriteString("# foreign iptables chains); this restores the AWG2 marking + FORWARD/NAT/MSS.\n")
-	s.WriteString("[ \"$type\" = \"ip6tables\" ] && exit 0\n")
-	s.WriteString("ip link show " + awgIface + " >/dev/null 2>&1 || exit 0\n")
-	s.WriteString("ipset create " + awgSetInc + " hash:net family inet -exist 2>/dev/null\n")
-	s.WriteString("ipset create " + awgSetExc + " hash:net family inet -exist 2>/dev/null\n")
-	s.WriteString("iptables -t mangle -N " + awgChain + " 2>/dev/null\n")
-	s.WriteString("iptables -t mangle -F " + awgChain + "\n")
-	for _, ex := range awgExcludes {
-		s.WriteString("iptables -t mangle -A " + awgChain + " -d " + ex + " -j RETURN\n")
-	}
-	if endpointIP != "" {
-		s.WriteString("iptables -t mangle -A " + awgChain + " -d " + endpointIP + "/32 -j RETURN\n")
-	}
-	switch mode {
-	case "include":
-		s.WriteString("iptables -t mangle -A " + awgChain + " -m set --match-set " + awgSetInc + " dst -j MARK --set-xmark " + awgMarkRule + "\n")
-	case "exclude":
-		s.WriteString("iptables -t mangle -A " + awgChain + " -m set ! --match-set " + awgSetExc + " dst -j MARK --set-xmark " + awgMarkRule + "\n")
-	case "full":
-		s.WriteString("iptables -t mangle -A " + awgChain + " -j MARK --set-xmark " + awgMarkRule + "\n")
-	}
-	s.WriteString(ap("mangle", "PREROUTING", "-j "+awgChain))
-	s.WriteString(ap("mangle", "OUTPUT", "-j "+awgChain))
-	// NAT for LAN clients + MSS clamp + allow forwarding LAN<->tunnel. Keenetic's
-	// FORWARD policy is DROP and doesn't know awg0, so the ACCEPTs go at the TOP.
-	s.WriteString(ap("nat", "POSTROUTING", "-o "+awgIface+" -j MASQUERADE"))
-	s.WriteString(ap("mangle", "FORWARD", "-o "+awgIface+" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "+mss))
-	s.WriteString(ap("mangle", "FORWARD", "-i "+awgIface+" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "+mss))
-	s.WriteString(ins("filter", "FORWARD", "-i "+awgIface+" -j ACCEPT"))
-	s.WriteString(ins("filter", "FORWARD", "-o "+awgIface+" -j ACCEPT"))
-	if dnsRedirect {
-		// Domain-mask DNS interception: redirect LAN :53 to the panel DNS proxy,
-		// but ONLY while the proxy is actually listening (so we never blackhole DNS
-		// if the proxy is down). Applies to every LAN bridge (br*).
-		// Check the proxy is listening via /proc/net/udp (hex port) rather than
-		// netstat — busybox netstat can be slow enough on a busy router to stall
-		// the hook (and the «Сохранить и применить» request that runs it).
-		s.WriteString("if grep -qi ':" + dnsPortHex + " ' /proc/net/udp 2>/dev/null; then\n")
-		s.WriteString("  for br in $(ls /sys/class/net/ 2>/dev/null | grep '^br'); do\n")
-		for _, proto := range []string{"udp", "tcp"} {
-			r := "-i $br -p " + proto + " --dport 53 -j REDIRECT --to-ports " + awgDNSPort
-			s.WriteString("    iptables -t nat -C PREROUTING " + r + " 2>/dev/null || iptables -t nat -A PREROUTING " + r + "\n")
-		}
-		s.WriteString("  done\nfi\n")
-	}
-	return s.String()
-}
-
-// awgWriteHook writes the netfilter.d hook for the given mode/endpoint and runs
-// it once immediately (applying the rules now, not just on the next ndm rebuild).
-func awgWriteHook(mode, endpointIP string, mtu int, dnsRedirect bool) error {
-	if err := os.MkdirAll(filepath.Dir(awgHookPath), 0o755); err != nil {
-		return err
-	}
-	if err := os.WriteFile(awgHookPath, []byte(awgFirewallHook(mode, endpointIP, mtu, dnsRedirect)), 0o755); err != nil {
-		return err
-	}
-	if out, err := awgRun("sh " + awgHookPath); err != nil {
-		logbuf.Append("awg2", "warn", "firewall-хук: "+lastLines(out, 2))
-	}
-	return nil
-}
 
 func (a *App) awgApplyRoutingOS() error {
 	cfg := a.awg.Config()
@@ -396,11 +99,7 @@ func (a *App) awgApplyRoutingOS() error {
 	// 4) domain-mask DNS proxy (optional, domain_source=="dnsproxy"). Start it
 	// BEFORE the hook so the hook's DNS REDIRECT is only installed once the proxy
 	// is actually listening (never blackhole LAN DNS).
-	target := awgSetInc
-	if r.Mode == "exclude" {
-		target = awgSetExc
-	}
-	dnsOn := a.awgEnsureDNSProxy(&cfg, target)
+	dnsOn := a.awgEnsureDNSProxy(&cfg, awgTargetSet(r.Mode))
 	// 5) firewall hook (marking chain + FORWARD/NAT/MSS [+ DNS REDIRECT]) — a Keenetic
 	// ndm netfilter.d hook so it survives the firewall rebuilds that flush foreign
 	// iptables chains; awgWriteHook also applies it immediately.
@@ -415,123 +114,6 @@ func (a *App) awgApplyRoutingOS() error {
 	a.awgStartRefresh()
 	logbuf.Append("awg2", "info", "маршрутизация применена (режим "+r.Mode+") — подтвердите в течение 90с, иначе авто-откат")
 	return nil
-}
-
-// isMaskEntry reports whether a zone domain entry is a glob/regex mask (which the
-// DNS proxy resolves on the fly) rather than a plain resolvable hostname.
-func isMaskEntry(s string) bool {
-	s = strings.ToLower(strings.TrimSpace(s))
-	return strings.ContainsAny(s, "*#") || strings.HasPrefix(s, "[re]")
-}
-
-func (a *App) awgBuildSets(cfg *awg.ServerConfig) error {
-	_, _ = awgRun("ipset create " + awgSetInc + " hash:net family inet -exist")
-	_, _ = awgRun("ipset create " + awgSetExc + " hash:net family inet -exist")
-	target := awgSetInc
-	if cfg.Routing.Mode == "exclude" {
-		target = awgSetExc
-	}
-	// In dnsproxy mode the proxy adds matched IPs dynamically — don't flush them.
-	if cfg.Routing.DomainSource != "dnsproxy" {
-		_, _ = awgRun("ipset flush " + target)
-	}
-	n := 0
-	for _, z := range cfg.Routing.Zones {
-		if !z.Enabled {
-			continue
-		}
-		for _, ip := range z.IPs {
-			ip = strings.TrimSpace(ip)
-			if ip == "" {
-				continue
-			}
-			if _, err := awgRun("ipset add " + target + " " + ip + " -exist"); err == nil {
-				n++
-			}
-		}
-		for _, d := range z.Domains {
-			// Mask/regex entries (e.g. "2ip.*", "*ip*", "[re]…") can't be resolved as
-			// a hostname — trying to (net.LookupHost on a bogus name) blocks on slow
-			// DNS timeouts and would hang «Сохранить и применить». The DNS proxy is
-			// what matches masks, so skip them here; only PLAIN domains get a direct
-			// server-side resolve (which makes them tunnel immediately).
-			if isMaskEntry(d) {
-				continue
-			}
-			for _, ip := range resolveDomain(d) {
-				_, _ = awgRun("ipset add " + target + " " + ip + "/32 -exist")
-				n++
-			}
-		}
-	}
-	logbuf.Append("awg2", "info", fmt.Sprintf("ipset %s: %d записей", target, n))
-	return nil
-}
-
-const awgSetDir = "/opt/etc/nfqws2-strategy"
-
-// awgSaveSets persists the ipset members so the IPs the DNS proxy learned for
-// masked domains survive a panel restart / reboot (otherwise those domains fall
-// out of the tunnel until each is queried again).
-func awgSaveSets() {
-	for _, s := range []string{awgSetInc, awgSetExc} {
-		_, _ = awgRun("ipset save " + s + " 2>/dev/null > " + awgSetDir + "/" + s + ".ipset 2>/dev/null")
-	}
-}
-
-// awgRestoreSets re-adds the persisted members into the (already-created) sets.
-func awgRestoreSets() {
-	for _, s := range []string{awgSetInc, awgSetExc} {
-		f := awgSetDir + "/" + s + ".ipset"
-		_, _ = awgRun("[ -f " + f + " ] && grep '^add ' " + f + " 2>/dev/null | while read _a st ip _r; do ipset add \"$st\" \"$ip\" -exist 2>/dev/null; done; true")
-	}
-}
-
-const awgRecentFile = awgSetDir + "/awg2_recent.json"
-
-// awgSaveRecent persists the DNS proxy's recently-seen name→IPs cache so that after
-// a panel restart / reboot the masks re-apply to every domain seen before, without
-// waiting for the device to look it up again (its DNS cache wouldn't re-query it).
-func (a *App) awgSaveRecent() {
-	a.awgRoute.mu.Lock()
-	p := a.awgRoute.dnsProxy
-	a.awgRoute.mu.Unlock()
-	if p == nil {
-		return
-	}
-	m := p.SnapshotRecent()
-	if len(m) == 0 {
-		return
-	}
-	if b, err := json.Marshal(m); err == nil {
-		_ = os.WriteFile(awgRecentFile, b, 0o644)
-	}
-}
-
-// awgLoadRecent restores the persisted name→IPs cache into a freshly-created proxy.
-func (a *App) awgLoadRecent(p *awg.DNSProxy) {
-	b, err := os.ReadFile(awgRecentFile)
-	if err != nil {
-		return
-	}
-	var m map[string][]string
-	if json.Unmarshal(b, &m) == nil && len(m) > 0 {
-		p.LoadRecent(m)
-	}
-}
-
-// awgApplyKillswitch toggles the "Эксклюзивный маршрут" blackhole in the tunnel
-// table. ON: a blackhole default (high metric) sits below the awg0 default — while
-// awg0 is up the tunnel route wins; the moment awg0 goes down (its route is auto-
-// removed) the blackhole catches the marked traffic and DROPS it, so listed sites
-// cannot leak to the direct WAN. OFF: no blackhole, so when awg0 is down the marked
-// traffic falls through ip-rule to the main table (a normal direct connection).
-func awgApplyKillswitch(on bool) {
-	if on {
-		_, _ = awgRun("ip route replace blackhole default table " + awgTable + " metric 1000")
-	} else {
-		_, _ = awgRun("ip route del blackhole default table " + awgTable + " metric 1000 2>/dev/null")
-	}
 }
 
 // awgRefreshRoutingOS re-applies the CURRENT (already-active) routing config to the
