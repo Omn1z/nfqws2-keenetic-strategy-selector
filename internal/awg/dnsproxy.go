@@ -27,7 +27,13 @@ type DNSProxy struct {
 	tcp     net.Listener
 	stop    chan struct{}
 	running bool
+
+	rmu    sync.Mutex
+	recent map[string][]string // recently-seen qname → answer IPs, for re-matching on a mask change
 }
+
+// recentCap bounds the recently-seen-name cache (reset wholesale on overflow).
+const recentCap = 4096
 
 // NewDNSProxy creates a proxy listening on addr (e.g. 127.0.0.1:5354) that
 // forwards to upstream (e.g. 127.0.0.1:53). onMatch is called with each matched
@@ -39,8 +45,75 @@ func NewDNSProxy(addr, upstream string, onMatch func(string)) *DNSProxy {
 	return p
 }
 
-// SetMatchers atomically swaps the active matcher set.
-func (p *DNSProxy) SetMatchers(ms []DomainMatcher) { p.matchers.Store(&ms) }
+// SetMatchers atomically swaps the active matcher set and re-checks recently-seen
+// names against the NEW matchers, calling onMatch for matches. This makes a mask
+// edit apply to domains the device already resolved (its DNS cache won't re-query
+// them for a while) — the same "immediate" behaviour an explicit domain gets from
+// server-side resolution. Runs async so it never blocks the apply path.
+func (p *DNSProxy) SetMatchers(ms []DomainMatcher) {
+	p.matchers.Store(&ms)
+	if p.onMatch == nil {
+		return
+	}
+	p.rmu.Lock()
+	snapshot := make(map[string][]string, len(p.recent))
+	for k, v := range p.recent {
+		snapshot[k] = v
+	}
+	p.rmu.Unlock()
+	if len(snapshot) == 0 {
+		return
+	}
+	go func() {
+		for name, ips := range snapshot {
+			if MatchAny(ms, name) {
+				for _, ip := range ips {
+					p.onMatch(ip)
+				}
+			}
+		}
+	}()
+}
+
+// remember stores a recently-seen name→IPs so a later mask change can pick it up
+// without waiting for the device to re-query.
+func (p *DNSProxy) remember(name string, ips []string) {
+	p.rmu.Lock()
+	if p.recent == nil || len(p.recent) >= recentCap {
+		p.recent = make(map[string][]string, 256)
+	}
+	p.recent[name] = ips
+	p.rmu.Unlock()
+}
+
+// SnapshotRecent returns a copy of the recently-seen name→IPs cache, so the caller
+// can persist it to disk and the masks survive a panel restart / reboot.
+func (p *DNSProxy) SnapshotRecent() map[string][]string {
+	p.rmu.Lock()
+	defer p.rmu.Unlock()
+	out := make(map[string][]string, len(p.recent))
+	for k, v := range p.recent {
+		out[k] = v
+	}
+	return out
+}
+
+// LoadRecent merges a persisted name→IPs cache into the recent set (called on
+// start, before SetMatchers, so a mask immediately re-applies to domains seen in a
+// previous run without waiting for the device to look them up again).
+func (p *DNSProxy) LoadRecent(m map[string][]string) {
+	p.rmu.Lock()
+	defer p.rmu.Unlock()
+	if p.recent == nil {
+		p.recent = make(map[string][]string, len(m)+16)
+	}
+	for k, v := range m {
+		if len(p.recent) >= recentCap {
+			break
+		}
+		p.recent[k] = v
+	}
+}
 
 // Start binds the UDP + TCP listeners and serves until Stop. Idempotent.
 func (p *DNSProxy) Start() error {
@@ -180,11 +253,17 @@ func (p *DNSProxy) inspect(query, resp []byte) {
 	if !ok || name == "" {
 		return
 	}
+	ips := answerIPs(resp)
+	// Remember EVERY resolved name (matched or not) so a future mask edit can apply
+	// to it without waiting for the device to look it up again.
+	if len(ips) > 0 {
+		p.remember(name, ips)
+	}
 	ms := p.matchers.Load()
 	if ms == nil || !MatchAny(*ms, name) {
 		return
 	}
-	for _, ip := range answerIPs(resp) {
+	for _, ip := range ips {
 		if p.onMatch != nil {
 			p.onMatch(ip)
 		}

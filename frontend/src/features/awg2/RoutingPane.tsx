@@ -9,14 +9,25 @@ import { Switch } from "@/components/ui/Switch";
 import { Field, Input, Select, Textarea } from "@/components/ui/form";
 import type { Awg2Status, AwgRoutingConfig, AwgZone } from "@/types/api";
 
+// One combined list per zone: domains/masks AND IPv4/IPv6/CIDR in the same box.
+// During editing everything lives in z.domains; on save we split IP/CIDR lines into
+// z.ips and keep the rest in z.domains (the backend routes ips via ipset and
+// domains/masks via the DNS proxy).
+const zoneLines = (z: AwgZone) => [...(z.domains || []), ...(z.ips || [])];
 const toLines = (a: string[]) => (a || []).join("\n");
 // Keep raw lines while editing (don't trim/drop blanks — that fights the cursor
 // and blocks pressing Enter). Clean (trim + drop empties) only when saving.
 const splitRaw = (s: string) => s.split("\n");
 const cleanArr = (a: string[]) => (a || []).map((x) => x.trim()).filter(Boolean);
+const isIPish = (s: string) =>
+  /^(\d{1,3}\.){3}\d{1,3}(\/\d{1,2})?$/.test(s) || // IPv4 / CIDR
+  (s.includes(":") && /^[0-9a-fA-F:.]+(\/\d{1,3})?$/.test(s)); // IPv6 / CIDR
 const cleanRouting = (rc: AwgRoutingConfig): AwgRoutingConfig => ({
   ...rc,
-  zones: (rc.zones || []).map((z) => ({ ...z, domains: cleanArr(z.domains), ips: cleanArr(z.ips) })),
+  zones: (rc.zones || []).map((z) => {
+    const all = cleanArr(zoneLines(z));
+    return { ...z, domains: all.filter((x) => !isIPish(x)), ips: all.filter(isIPish) };
+  }),
 });
 const human = (n: number) => {
   if (!n) return "0 B";
@@ -41,6 +52,10 @@ export default function RoutingPane({ st, reload }: { st: Awg2Status; reload: ()
 
   const eng = st.engine;
   const cl = st.client;
+  // Routing is "active" once committed; while active, saving zones/masks/killswitch
+  // applies to the live tunnel immediately (the backend refreshes membership without
+  // a dead-man's switch — it can't cut panel access).
+  const active = !!st.config.routing.active && r.mode !== "off";
 
   const post = async (path: string, body: unknown, ok: string, after?: () => void) => {
     setBusy(true);
@@ -149,26 +164,36 @@ export default function RoutingPane({ st, reload }: { st: Awg2Status; reload: ()
           </Field>
           <Field label="MTU туннеля" className="w-28 shrink-0"><Input type="number" min={1280} max={1420} value={String(r.mtu || 1376)} onChange={(e) => setR({ ...r, mtu: parseInt(e.target.value, 10) || 1376 })} /></Field>
         </div>
-        <div className="mt-1 flex items-center gap-4"><Switch checked={!!r.killswitch} onChange={(v) => setR({ ...r, killswitch: v })} label="Killswitch (резать туннельный трафик, если awg0 упал)" /></div>
+        <div className="mt-1 flex items-center gap-4"><Switch checked={!!r.killswitch} onChange={(v) => setR({ ...r, killswitch: v })} label="Эксклюзивный маршрут (kill-switch): если туннель недоступен — сайты из зон НЕ открываются" /></div>
+        <p className="mt-0.5 text-[11px] text-muted">Включено — трафик зон идёт только через туннель; упал туннель → соединения нет (без утечки в обычный канал). Выключено — при недоступном туннеле сайты зон открываются обычным прямым соединением.</p>
         <div className="mt-1 flex items-center gap-4"><Switch checked={r.domain_source === "dnsproxy"} onChange={(v) => setR({ ...r, domain_source: v ? "dnsproxy" : "resolve" })} label="Маски и поддомены доменов (перехват DNS)" /></div>
         {r.domain_source === "dnsproxy" && (
-          <p className="mt-1 text-[11px] text-muted">Панель прозрачно перехватывает DNS локальной сети и заводит в туннель IP по совпадению имени. Форматы записи домена: <b>domain.com</b> — домен и все поддомены; маски <b>*main.com</b>, <b>server*</b>, <b>test##.com</b> (<b>#</b> — один символ); регэксп <b>[re]^.*\.cdn\.net$</b>. Действует только пока маршрутизация активна; шифрованный DNS (DoH/DoT) на устройстве это обходит.</p>
+          <p className="mt-1 text-[11px] text-muted">Перехватывает DNS локальной сети и заводит в туннель IP по совпадению имени. Форматы строки: <b>youtube.com</b> — домен и все поддомены; <b>ip*</b> — всё, что начинается на «ip» (ipinfo.io, iphone.com) — точка НЕ нужна; <b>*ip*</b> — всё, что содержит «ip» (2ip.ru, ipinfo.io); <b>server*</b>, <b>test##.com</b> (<b>#</b> — один символ); регэксп <b>[re]^.*\.cdn\.net$</b>. ⚠️ <b>ip.*</b> (с точкой) совпадает только с «ip.что-то», НЕ с ipinfo.io — для «ipinfo» пишите <b>ip*</b> или <b>*ip*</b>. Маски действуют, только пока маршрутизация активна; шифрованный DNS (DoH/DoT) на устройстве это обходит.</p>
         )}
         <div className="mt-2 flex flex-wrap items-center gap-2.5">
-          <Button onClick={() => post("/api/awg2/routing/config", cleanRouting(r), "Маршрутизация сохранена")} disabled={busy}>Сохранить</Button>
-          {r.mode === "off"
-            ? <Button variant="primary" onClick={teardown} disabled={busy}>Снять маршрутизацию</Button>
-            : <Button variant="primary" onClick={applyRouting} disabled={busy || !cl?.running}>Применить</Button>}
+          {r.mode === "off" ? (
+            <Button variant="primary" onClick={teardown} disabled={busy}>Снять маршрутизацию</Button>
+          ) : active ? (
+            <Button variant="primary" onClick={() => post("/api/awg2/routing/config", cleanRouting(r), "Сохранено и применено к туннелю")} disabled={busy}>Сохранить и применить</Button>
+          ) : (
+            <>
+              <Button onClick={() => post("/api/awg2/routing/config", cleanRouting(r), "Маршрутизация сохранена")} disabled={busy}>Сохранить</Button>
+              <Button variant="primary" onClick={applyRouting} disabled={busy || !cl?.running}>Применить</Button>
+            </>
+          )}
           {countdown > 0 && <Button variant="primary" onClick={commit} disabled={busy}>✓ Подтвердить ({countdown}с)</Button>}
           {countdown > 0 && <span className="text-xs font-medium text-warn">← нажмите, иначе авто-откат</span>}
-          {!cl?.running && r.mode !== "off" && <span className="text-xs text-muted">сначала поднимите туннель</span>}
+          {!cl?.running && r.mode !== "off" && !active && <span className="text-xs text-muted">сначала поднимите туннель</span>}
         </div>
-        <p className="mt-2 text-[11px] text-muted">Локальная сеть, приватные адреса и адрес сервера VPN всегда идут в обход туннеля. Применение защищено авто-откатом: если панель станет недоступна — маршрутизация откатится сама.</p>
+        {active
+          ? <p className="mt-2 text-[11px] font-medium text-ok">● Маршрутизация активна — правки режима, зон, масок и kill-switch применяются к туннелю сразу при сохранении.</p>
+          : <p className="mt-2 text-[11px] text-muted">Локальная сеть, приватные адреса и адрес сервера VPN всегда идут в обход туннеля. Первое применение защищено авто-откатом: если панель станет недоступна — маршрутизация откатится сама.</p>}
       </Card>
 
-      <Card title="Зоны (домены / IP)" sub="наполнение для include/exclude" head={<Button mini onClick={addZone}>Добавить зону</Button>}>
+      <Card title="Зоны" sub="что заводить в туннель — домены, маски и IP в одном списке" head={<Button mini onClick={addZone}>Добавить зону</Button>}>
+        <p className="mb-2 text-[11px] text-muted">В один список можно вписывать вперемешку: домены/маски, IPv4 и подсети (напр. <b>104.18.0.0/16</b>). IPv6-адреса принимаются, но пока в туннель не маршрутизируются (туннель IPv4); для доменов IPv6 и так форсируется на IPv4 без утечки.</p>
         {(r.zones || []).length === 0 ? (
-          <p className="text-xs text-muted">Зон нет. Добавьте зону с доменами (напр. youtube.com) и/или IP/подсетями — они попадут в ipset выбранного режима.</p>
+          <p className="text-xs text-muted">Зон нет. Добавьте зону и впишите домены (напр. youtube.com), маски (ip*) и/или IP/подсети — всё в одном списке.</p>
         ) : (
           (r.zones || []).map((z, i) => (
             <div key={i} className="mb-3 rounded-lg border border-line p-2.5">
@@ -177,14 +202,13 @@ export default function RoutingPane({ st, reload }: { st: Awg2Status; reload: ()
                 <Switch checked={z.enabled} onChange={(v) => setZone(i, { enabled: v })} label="вкл" />
                 <Button mini onClick={() => delZone(i)}>Удалить</Button>
               </div>
-              <div className="flex flex-wrap gap-3">
-                <Field label="Домены (по строке)" className="min-w-[200px] flex-1"><Textarea rows={4} value={toLines(z.domains)} placeholder={"youtube.com\ngoogleapis.com"} onChange={(e) => setZone(i, { domains: splitRaw(e.target.value) })} /></Field>
-                <Field label="IP / подсети (по строке)" className="min-w-[160px] flex-1"><Textarea rows={4} value={toLines(z.ips)} placeholder={"1.2.3.4\n10.0.0.0/24"} onChange={(e) => setZone(i, { ips: splitRaw(e.target.value) })} /></Field>
-              </div>
+              <Field label="Домены, маски и IP — всё в одном списке (по строке)">
+                <Textarea rows={6} value={toLines(zoneLines(z))} placeholder={"youtube.com\n*ip*\n104.18.0.0/16\n2606:4700::/32"} onChange={(e) => setZone(i, { domains: splitRaw(e.target.value), ips: [] })} />
+              </Field>
             </div>
           ))
         )}
-        {(r.zones || []).length > 0 && <Button onClick={() => post("/api/awg2/routing/config", cleanRouting(r), "Сохранить зоны")} disabled={busy}>Сохранить зоны</Button>}
+        {(r.zones || []).length > 0 && <Button variant={active ? "primary" : undefined} onClick={() => post("/api/awg2/routing/config", cleanRouting(r), active ? "Зоны сохранены и применены к туннелю" : "Зоны сохранены")} disabled={busy}>{active ? "Сохранить и применить зоны" : "Сохранить зоны"}</Button>}
       </Card>
     </>
   );

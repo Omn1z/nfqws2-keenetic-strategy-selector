@@ -20,6 +20,7 @@ func (a *App) awgClientDownOS() error { return fmt.Errorf("туннель дос
 func (a *App) awgClientStatusOS() *ClientStatus { return nil }
 
 func (a *App) awgApplyRoutingOS() error    { return fmt.Errorf("маршрутизация доступна только на роутере") }
+func (a *App) awgRefreshRoutingOS() error  { return nil }
 func (a *App) awgCommitRoutingOS() error   { return fmt.Errorf("маршрутизация доступна только на роутере") }
 func (a *App) awgTeardownRoutingOS() error { return nil }
 func (a *App) awgRepairRoutingOS()         {}

@@ -3,6 +3,7 @@
 package app
 
 import (
+	"encoding/json"
 	"fmt"
 	"net"
 	"os"
@@ -10,7 +11,6 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"nfqws2strategy/internal/awg"
@@ -224,14 +224,14 @@ func (a *App) awgEnsureDNSProxy(cfg *awg.ServerConfig, targetSet string) bool {
 		p.SetMatchers(ms) // refresh on zone change
 		return true
 	}
-	seen := &sync.Map{}
 	np := awg.NewDNSProxy(awgDNSAddr, awgDNSUpstream, func(ip string) {
-		if _, dup := seen.LoadOrStore(ip, struct{}{}); dup {
-			return
-		}
-		_, _ = awgRun("ipset add " + targetSet + " " + ip + " -exist")
+		// Add every matched answer IP (idempotent -exist). No dedup cache on purpose:
+		// a zone edit flushes the set, and the next DNS query must re-learn cleanly.
+		// The target set is read live so a mode switch routes new hits correctly.
+		_, _ = awgRun("ipset add " + awgTargetSet(a.awg.Config().Routing.Mode) + " " + ip + " -exist")
 	})
-	np.SetMatchers(ms)
+	a.awgLoadRecent(np)  // restore domains seen in a previous run (before matching)
+	np.SetMatchers(ms)   // re-evaluates the loaded cache → re-adds matching domains
 	if err := np.Start(); err != nil {
 		logbuf.Append("awg2", "error", "DNS-прокси (маски доменов) не запустился: "+err.Error())
 		return false
@@ -272,6 +272,10 @@ func awgFirewallHook(mode, endpointIP string, mtu int, dnsRedirect bool) string 
 		mtu = 1280
 	}
 	mss := strconv.Itoa(mtu - 40)
+	dnsPortHex := "14EA" // 5354 in hex, for the /proc/net/udp listening check
+	if p, err := strconv.Atoi(awgDNSPort); err == nil {
+		dnsPortHex = fmt.Sprintf("%04X", p)
+	}
 	ap := func(table, chain, rule string) string {
 		b := "iptables -t " + table + " "
 		return b + "-C " + chain + " " + rule + " 2>/dev/null || " + b + "-A " + chain + " " + rule + "\n"
@@ -318,7 +322,10 @@ func awgFirewallHook(mode, endpointIP string, mtu int, dnsRedirect bool) string 
 		// Domain-mask DNS interception: redirect LAN :53 to the panel DNS proxy,
 		// but ONLY while the proxy is actually listening (so we never blackhole DNS
 		// if the proxy is down). Applies to every LAN bridge (br*).
-		s.WriteString("if netstat -lun 2>/dev/null | grep -q ':" + awgDNSPort + "'; then\n")
+		// Check the proxy is listening via /proc/net/udp (hex port) rather than
+		// netstat — busybox netstat can be slow enough on a busy router to stall
+		// the hook (and the «Сохранить и применить» request that runs it).
+		s.WriteString("if grep -qi ':" + dnsPortHex + " ' /proc/net/udp 2>/dev/null; then\n")
 		s.WriteString("  for br in $(ls /sys/class/net/ 2>/dev/null | grep '^br'); do\n")
 		for _, proto := range []string{"udp", "tcp"} {
 			r := "-i $br -p " + proto + " --dport 53 -j REDIRECT --to-ports " + awgDNSPort
@@ -370,12 +377,22 @@ func (a *App) awgApplyRoutingOS() error {
 	if err := a.awgBuildSets(&cfg); err != nil {
 		return err
 	}
+	// 2b) restore the IPs the DNS proxy learned for masked domains in a previous
+	// run so those domains stay in the tunnel across a panel restart / reboot
+	// (the kernel set is recreated empty on restart; without this, every masked
+	// domain falls out of the tunnel until the device happens to re-query it).
+	if r.DomainSource == "dnsproxy" {
+		awgRestoreSets()
+	}
 	// 3) tunnel table + fwmark rule (survive Keenetic reloads on their own)
 	_, _ = awgRun("ip route replace default dev " + awgIface + " table " + awgTable)
 	_, _ = awgRun("ip rule del fwmark " + awgMarkRule + " table " + awgTable + " 2>/dev/null")
 	if _, err := awgRun("ip rule add fwmark " + awgMarkRule + " table " + awgTable); err != nil {
 		return fmt.Errorf("ip rule: %w", err)
 	}
+	// 3b) killswitch (Эксклюзивный маршрут): a blackhole fallback in the tunnel table
+	// so marked traffic is DROPPED (not leaked to the direct WAN) when awg0 is down.
+	awgApplyKillswitch(r.Killswitch)
 	// 4) domain-mask DNS proxy (optional, domain_source=="dnsproxy"). Start it
 	// BEFORE the hook so the hook's DNS REDIRECT is only installed once the proxy
 	// is actually listening (never blackhole LAN DNS).
@@ -398,6 +415,13 @@ func (a *App) awgApplyRoutingOS() error {
 	a.awgStartRefresh()
 	logbuf.Append("awg2", "info", "маршрутизация применена (режим "+r.Mode+") — подтвердите в течение 90с, иначе авто-откат")
 	return nil
+}
+
+// isMaskEntry reports whether a zone domain entry is a glob/regex mask (which the
+// DNS proxy resolves on the fly) rather than a plain resolvable hostname.
+func isMaskEntry(s string) bool {
+	s = strings.ToLower(strings.TrimSpace(s))
+	return strings.ContainsAny(s, "*#") || strings.HasPrefix(s, "[re]")
 }
 
 func (a *App) awgBuildSets(cfg *awg.ServerConfig) error {
@@ -426,6 +450,14 @@ func (a *App) awgBuildSets(cfg *awg.ServerConfig) error {
 			}
 		}
 		for _, d := range z.Domains {
+			// Mask/regex entries (e.g. "2ip.*", "*ip*", "[re]…") can't be resolved as
+			// a hostname — trying to (net.LookupHost on a bogus name) blocks on slow
+			// DNS timeouts and would hang «Сохранить и применить». The DNS proxy is
+			// what matches masks, so skip them here; only PLAIN domains get a direct
+			// server-side resolve (which makes them tunnel immediately).
+			if isMaskEntry(d) {
+				continue
+			}
 			for _, ip := range resolveDomain(d) {
 				_, _ = awgRun("ipset add " + target + " " + ip + "/32 -exist")
 				n++
@@ -433,6 +465,120 @@ func (a *App) awgBuildSets(cfg *awg.ServerConfig) error {
 		}
 	}
 	logbuf.Append("awg2", "info", fmt.Sprintf("ipset %s: %d записей", target, n))
+	return nil
+}
+
+const awgSetDir = "/opt/etc/nfqws2-strategy"
+
+// awgSaveSets persists the ipset members so the IPs the DNS proxy learned for
+// masked domains survive a panel restart / reboot (otherwise those domains fall
+// out of the tunnel until each is queried again).
+func awgSaveSets() {
+	for _, s := range []string{awgSetInc, awgSetExc} {
+		_, _ = awgRun("ipset save " + s + " 2>/dev/null > " + awgSetDir + "/" + s + ".ipset 2>/dev/null")
+	}
+}
+
+// awgRestoreSets re-adds the persisted members into the (already-created) sets.
+func awgRestoreSets() {
+	for _, s := range []string{awgSetInc, awgSetExc} {
+		f := awgSetDir + "/" + s + ".ipset"
+		_, _ = awgRun("[ -f " + f + " ] && grep '^add ' " + f + " 2>/dev/null | while read _a st ip _r; do ipset add \"$st\" \"$ip\" -exist 2>/dev/null; done; true")
+	}
+}
+
+const awgRecentFile = awgSetDir + "/awg2_recent.json"
+
+// awgSaveRecent persists the DNS proxy's recently-seen name→IPs cache so that after
+// a panel restart / reboot the masks re-apply to every domain seen before, without
+// waiting for the device to look it up again (its DNS cache wouldn't re-query it).
+func (a *App) awgSaveRecent() {
+	a.awgRoute.mu.Lock()
+	p := a.awgRoute.dnsProxy
+	a.awgRoute.mu.Unlock()
+	if p == nil {
+		return
+	}
+	m := p.SnapshotRecent()
+	if len(m) == 0 {
+		return
+	}
+	if b, err := json.Marshal(m); err == nil {
+		_ = os.WriteFile(awgRecentFile, b, 0o644)
+	}
+}
+
+// awgLoadRecent restores the persisted name→IPs cache into a freshly-created proxy.
+func (a *App) awgLoadRecent(p *awg.DNSProxy) {
+	b, err := os.ReadFile(awgRecentFile)
+	if err != nil {
+		return
+	}
+	var m map[string][]string
+	if json.Unmarshal(b, &m) == nil && len(m) > 0 {
+		p.LoadRecent(m)
+	}
+}
+
+// awgApplyKillswitch toggles the "Эксклюзивный маршрут" blackhole in the tunnel
+// table. ON: a blackhole default (high metric) sits below the awg0 default — while
+// awg0 is up the tunnel route wins; the moment awg0 goes down (its route is auto-
+// removed) the blackhole catches the marked traffic and DROPS it, so listed sites
+// cannot leak to the direct WAN. OFF: no blackhole, so when awg0 is down the marked
+// traffic falls through ip-rule to the main table (a normal direct connection).
+func awgApplyKillswitch(on bool) {
+	if on {
+		_, _ = awgRun("ip route replace blackhole default table " + awgTable + " metric 1000")
+	} else {
+		_, _ = awgRun("ip route del blackhole default table " + awgTable + " metric 1000 2>/dev/null")
+	}
+}
+
+// awgRefreshRoutingOS re-applies the CURRENT (already-active) routing config to the
+// live tunnel after a zone/mask/mode/killswitch edit — rebuilding ipset membership,
+// refreshing the DNS-proxy matchers, re-writing the firewall hook and re-asserting
+// the killswitch — WITHOUT arming the dead-man's switch. This is safe because a
+// membership/matcher/mode change never affects panel reachability: LAN, private
+// ranges, the router itself and the VPN endpoint are always excluded from the
+// tunnel in every mode, so the panel stays reachable by its LAN IP throughout.
+func (a *App) awgRefreshRoutingOS() error {
+	cfg := a.awg.Config()
+	r := cfg.Routing
+	if r.Mode == "off" {
+		return a.awgTeardownRoutingOS()
+	}
+	if cs := a.awgClientStatusOS(); cs == nil || !cs.IfacePresent {
+		// Tunnel not up — nothing live to refresh; the config is already persisted
+		// and will be applied when the tunnel comes up / on the next «Применить».
+		logbuf.Append("awg2", "info", "зоны сохранены; туннель не поднят — применятся при поднятии")
+		return nil
+	}
+	endpointIP := resolveHostIP(hostOf(cfg.Endpoint))
+	if gw, wandev := awgDefaultRoute(); endpointIP != "" && gw != "" && wandev != "" {
+		_, _ = awgRun("ip route replace " + endpointIP + "/32 via " + gw + " dev " + wandev)
+	}
+	// A zone/mask edit must drop the IPs learned for the OLD masks — otherwise a
+	// removed domain stays tunneled ("старая зона не выгрузилась"). Flush the dynamic
+	// set + its on-disk snapshot, then rebuild the explicit IP/CIDR entries; the DNS
+	// proxy re-learns the (new) masks on the next query.
+	if r.DomainSource == "dnsproxy" {
+		_, _ = awgRun("ipset flush " + awgTargetSet(r.Mode))
+		_ = os.Remove(awgSetDir + "/" + awgTargetSet(r.Mode) + ".ipset")
+	}
+	if err := a.awgBuildSets(&cfg); err != nil {
+		return err
+	}
+	_, _ = awgRun("ip route replace default dev " + awgIface + " table " + awgTable)
+	_, _ = awgRun("ip rule del fwmark " + awgMarkRule + " table " + awgTable + " 2>/dev/null")
+	_, _ = awgRun("ip rule add fwmark " + awgMarkRule + " table " + awgTable + " 2>/dev/null")
+	awgApplyKillswitch(r.Killswitch)
+	dnsOn := a.awgEnsureDNSProxy(&cfg, awgTargetSet(r.Mode))
+	if err := awgWriteHook(r.Mode, endpointIP, r.MTU, dnsOn); err != nil {
+		return fmt.Errorf("firewall-хук: %w", err)
+	}
+	awgSetAccel(false)
+	a.awgStartRefresh() // ensure the watchdog is running (idempotent)
+	logbuf.Append("awg2", "info", "зоны применены к туннелю на лету (режим "+r.Mode+")")
 	return nil
 }
 
@@ -482,10 +628,19 @@ func (a *App) awgStartRefresh() {
 				} else {
 					_, _ = awgRun("sh " + awgHookPath)
 				}
+				// re-assert the tunnel default route + killswitch: if awg0 flapped, the
+				// kernel drops routes on its device, so re-add the table-998 default and
+				// keep the killswitch blackhole in the state the user chose.
+				_, _ = awgRun("ip route replace default dev " + awgIface + " table " + awgTable)
+				awgApplyKillswitch(c.Routing.Killswitch)
 				awgSetAccel(false) // re-assert: Keenetic may re-enable accelerators on reconfig
 				ticks++
 				if ticks%15 == 0 && (c.Routing.Mode == "include" || c.Routing.Mode == "exclude") {
 					_ = a.awgBuildSets(&c)
+				}
+				if ticks%5 == 0 && c.Routing.DomainSource == "dnsproxy" {
+					awgSaveSets()     // persist proxy-learned IPs so they survive a restart/reboot
+					a.awgSaveRecent() // persist seen domains so masks re-apply after a restart
 				}
 			}
 		}
@@ -494,15 +649,21 @@ func (a *App) awgStartRefresh() {
 
 func (a *App) awgCommitRoutingOS() error {
 	a.awgRoute.mu.Lock()
-	defer a.awgRoute.mu.Unlock()
 	if !a.awgRoute.active {
+		a.awgRoute.mu.Unlock()
 		return fmt.Errorf("маршрутизация не активна")
 	}
 	if a.awgRoute.rollback != nil {
 		a.awgRoute.rollback.Stop()
 		a.awgRoute.rollback = nil
 	}
+	a.awgRoute.mu.Unlock()
 	logbuf.Append("awg2", "info", "маршрутизация подтверждена (авто-откат отменён)")
+	// Persist OUTSIDE the lock: awgSaveRecent re-acquires a.awgRoute.mu, so calling it
+	// while still holding the lock self-deadlocks — which would pin the mutex forever
+	// and hang every subsequent routing operation (refresh/teardown/client-down).
+	awgSaveSets()     // snapshot the current set members (incl. proxy-learned IPs)
+	a.awgSaveRecent() // snapshot the seen-domains cache too
 	return nil
 }
 

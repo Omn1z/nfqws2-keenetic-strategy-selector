@@ -247,6 +247,7 @@ export interface AwgPeer {
 export interface AwgZone { name: string; domains: string[]; ips: string[]; enabled: boolean }
 export interface AwgRoutingConfig {
   mode: string; zones: AwgZone[]; mtu: number; killswitch: boolean; domain_source: string;
+  active?: boolean;
 }
 export interface AwgClientConfig { enabled: boolean; peer_id: string }
 export interface AwgServerConfig {

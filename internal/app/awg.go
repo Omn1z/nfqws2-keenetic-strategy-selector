@@ -180,9 +180,27 @@ func (a *App) AWG2ClientConfig(id string) (text, filename string, err error) {
 	return a.awg.ClientConfig(id)
 }
 
-// AWG2SetRouting persists the split-routing config (mode/zones/mtu/etc.).
+// AWG2SetRouting persists the split-routing config (mode/zones/mtu/etc.) and — when
+// routing is already active — applies the edit to the live tunnel immediately, so
+// editing zones/masks/killswitch in the UI "just works" without a separate
+// «Применить». No dead-man's switch is armed for a live refresh: membership/matcher/
+// mode changes never affect panel reachability (LAN/private/self/endpoint are always
+// excluded from the tunnel). Switching the mode to «off» tears routing down.
 func (a *App) AWG2SetRouting(rc awg.RoutingConfig) error {
 	a.awg.SetRouting(rc)
 	a.awgSave()
+	cfg := a.awg.Config()
+	if !cfg.Routing.Active {
+		return nil // not active yet — user activates with «Применить»
+	}
+	if cfg.Routing.Mode == "off" {
+		return a.AWG2TeardownRouting()
+	}
+	// Apply to the live tunnel in the BACKGROUND so the HTTP response (and the UI
+	// «Сохранить и применить» button) returns instantly and can NEVER freeze on a
+	// slow router command — awgRefreshRoutingOS runs several ipset/iptables/ip calls
+	// (each capped at 15s) and a transiently-slow one would otherwise hang the request.
+	// The config is already persisted above; the refresh re-asserts the live state.
+	go func() { _ = a.awgRefreshRoutingOS() }()
 	return nil
 }

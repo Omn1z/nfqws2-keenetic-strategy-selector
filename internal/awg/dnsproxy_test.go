@@ -50,6 +50,29 @@ func TestAAAABlock(t *testing.T) {
 	}
 }
 
+func TestRecentRematch(t *testing.T) {
+	var mu sync.Mutex
+	var got []string
+	p := NewDNSProxy("127.0.0.1:0", "127.0.0.1:0", func(ip string) {
+		mu.Lock()
+		got = append(got, ip)
+		mu.Unlock()
+	})
+	// The device resolved ipinfo.io while no mask matched it (remembered only).
+	p.remember("ipinfo.io", []string{"34.117.59.81"})
+	// Now the user adds a mask that DOES match it — the recent re-check must add the
+	// IP immediately, without the device looking it up again. Also asserts the
+	// "ip*.*" glob matches "ipinfo.io".
+	ms, _ := CompileMatchers([]string{"ip*.*"})
+	p.SetMatchers(ms)
+	time.Sleep(150 * time.Millisecond) // SetMatchers re-evaluates asynchronously
+	mu.Lock()
+	defer mu.Unlock()
+	if len(got) != 1 || got[0] != "34.117.59.81" {
+		t.Errorf("recent re-match got %v, want [34.117.59.81]", got)
+	}
+}
+
 func tResponse(name string, ips []string) []byte {
 	b := []byte{0x12, 0x34, 0x81, 0x80, 0x00, 0x01, byte(len(ips) >> 8), byte(len(ips)), 0, 0, 0, 0}
 	b = append(b, encName(name)...)
