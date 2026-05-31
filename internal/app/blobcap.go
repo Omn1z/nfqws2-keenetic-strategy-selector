@@ -13,6 +13,7 @@ import (
 
 	"nfqws2strategy/internal/tools/logbuf"
 	"nfqws2strategy/internal/tools/store"
+	"nfqws2strategy/internal/tools/tcpdump"
 	"nfqws2strategy/internal/tools/tlsblob"
 )
 
@@ -41,7 +42,7 @@ func (a *App) StartBlobCapture(ip string, seconds int) (*BlobCapture, error) {
 	if net.ParseIP(ip) == nil {
 		return nil, fmt.Errorf("неверный IP")
 	}
-	if tcpdumpPath() == "" {
+	if tcpdump.Path() == "" {
 		return nil, ErrNeedTcpdump
 	}
 	if seconds <= 0 || seconds > 120 {
@@ -52,7 +53,7 @@ func (a *App) StartBlobCapture(ip string, seconds int) (*BlobCapture, error) {
 		return nil, err
 	}
 	id := store.NewID()
-	c := &BlobCapture{ID: id, IP: ip, Iface: deviceIface(ip), Seconds: seconds, Status: "running", StartedAt: time.Now().Unix(), Candidates: []tlsblob.Candidate{}, file: filepath.Join(dir, "blobcap-"+id+".pcap")}
+	c := &BlobCapture{ID: id, IP: ip, Iface: tcpdump.DeviceIface(ip), Seconds: seconds, Status: "running", StartedAt: time.Now().Unix(), Candidates: []tlsblob.Candidate{}, file: filepath.Join(dir, "blobcap-"+id+".pcap")}
 	a.blobCapMu.Lock()
 	a.blobCaps[id] = c
 	a.blobCapOrder = append(a.blobCapOrder, id)
@@ -70,7 +71,7 @@ func (a *App) StartBlobCapture(ip string, seconds int) (*BlobCapture, error) {
 }
 
 func (a *App) runBlobCapture(c *BlobCapture) {
-	bin := tcpdumpPath()
+	bin := tcpdump.Path()
 	logbuf.Append("blobcap", "info", fmt.Sprintf("blobcap %s: захват ClientHello %s на %s, %dс", short(c.ID), c.IP, c.Iface, c.Seconds))
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(c.Seconds+3)*time.Second)
 	defer cancel()
@@ -171,4 +172,12 @@ func (a *App) GenerateBlob(sni string, alpn []string, minVer uint16, name string
 		return "", err
 	}
 	return a.SaveBlob(name, data)
+}
+
+// short truncates an id for log lines.
+func short(id string) string {
+	if len(id) > 6 {
+		return id[:6]
+	}
+	return id
 }

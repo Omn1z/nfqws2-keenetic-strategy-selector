@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"nfqws2strategy/internal/services/awg"
+	"nfqws2strategy/internal/services/monitor"
 	"nfqws2strategy/internal/services/nfqws2"
 	"nfqws2strategy/internal/services/proxy"
 	"nfqws2strategy/internal/services/strategy/core/catalog"
@@ -48,21 +49,14 @@ type App struct {
 	loggingDisabled  bool
 	httpLogsDisabled bool // suppress the per-request HTTP access log line
 
-	proxy    *proxy.Service  // Telegram proxies: MTProto->WS + SOCKS5 (Telegram tab)
-	nfqws2   *nfqws2.Manager // nfqws2 engine file/version/update/reload (nfqws2 tab)
-	awg      *awg.Manager    // AmneziaWG 2.0 server/client manager (AWG2 tab)
-	awgRoute awgRouteState   // AWG2 split-routing runtime (dead-man's switch)
+	proxy    *proxy.Service   // Telegram proxies: MTProto->WS + SOCKS5 (Telegram tab)
+	monitor  *monitor.Service // live network views: dashboard, conns, devices, traces, pcaps
+	nfqws2   *nfqws2.Manager  // nfqws2 engine file/version/update/reload (nfqws2 tab)
+	awg      *awg.Manager     // AmneziaWG 2.0 server/client manager (AWG2 tab)
+	awgRoute awgRouteState    // AWG2 split-routing runtime (dead-man's switch)
 
 	dnsMu      sync.Mutex
 	dnsServers []dns.Server // configured DoH/DoT servers (DNS tab + run matrix)
-
-	traceMu    sync.Mutex
-	traces     map[string]*Trace // recent device network traces (id -> trace)
-	traceOrder []string
-
-	pcapMu    sync.Mutex
-	pcaps     map[string]*Pcap // recent tcpdump captures (id -> pcap)
-	pcapOrder []string
 
 	blobCapMu    sync.Mutex
 	blobCaps     map[string]*BlobCapture // recent ClientHello captures (id -> capture)
@@ -80,7 +74,7 @@ func New(cfg *config.Config) (*App, error) {
 	if err != nil {
 		return nil, err
 	}
-	a := &App{Cfg: cfg, store: st, runs: map[string]*Run{}, traces: map[string]*Trace{}, pcaps: map[string]*Pcap{}, blobCaps: map[string]*BlobCapture{}, sessions: auth.NewSessions(sessionTTL)}
+	a := &App{Cfg: cfg, store: st, runs: map[string]*Run{}, blobCaps: map[string]*BlobCapture{}, sessions: auth.NewSessions(sessionTTL)}
 	a.nfqws2 = nfqws2.New(cfg)
 	_ = a.store.Load(customStrategiesFile, &a.custom)
 	_ = a.store.Load(sniDomainsFile, &a.sniDomains)
@@ -90,7 +84,8 @@ func New(cfg *config.Config) (*App, error) {
 	a.initAuth()
 	a.loadRuns()
 	a.proxy = proxy.New(st)
-	a.initAWG() // creates a.awg; may autostart the tunnel + (after a delay) re-apply committed routing
+	a.monitor = monitor.New(cfg, st, a.proxy) // dashboard reads the proxy status
+	a.initAWG()                               // creates a.awg; may autostart the tunnel + (after a delay) re-apply committed routing
 	a.initDNS()
 	// Repair any sandbox state leaked by a previous unclean exit (stale STRAT_*
 	// iptables chains / orphaned test nfqws2 children). Without this a killed run

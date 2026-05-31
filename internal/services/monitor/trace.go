@@ -1,4 +1,4 @@
-package app
+package monitor
 
 import (
 	"fmt"
@@ -62,7 +62,7 @@ func traceDst(c netmon.Conn) string {
 
 // StartDeviceTrace begins a conntrack-polling capture of one LAN device and
 // returns the initial snapshot. The capture runs in a goroutine; poll GetTrace.
-func (a *App) StartDeviceTrace(ip string, seconds int) (*Trace, error) {
+func (s *Service) StartDeviceTrace(ip string, seconds int) (*Trace, error) {
 	if net.ParseIP(ip) == nil {
 		return nil, fmt.Errorf("неверный IP")
 	}
@@ -70,28 +70,28 @@ func (a *App) StartDeviceTrace(ip string, seconds int) (*Trace, error) {
 		seconds = 30
 	}
 	t := &Trace{ID: store.NewID(), IP: ip, Seconds: seconds, Status: "running", StartedAt: time.Now().Unix(), Events: []TraceEvent{}, Conns: []TraceConn{}}
-	a.traceMu.Lock()
-	a.traces[t.ID] = t
-	a.traceOrder = append(a.traceOrder, t.ID)
-	for len(a.traceOrder) > maxStoredTraces {
-		delete(a.traces, a.traceOrder[0])
-		a.traceOrder = a.traceOrder[1:]
+	s.traceMu.Lock()
+	s.traces[t.ID] = t
+	s.traceOrder = append(s.traceOrder, t.ID)
+	for len(s.traceOrder) > maxStoredTraces {
+		delete(s.traces, s.traceOrder[0])
+		s.traceOrder = s.traceOrder[1:]
 	}
-	a.traceMu.Unlock()
-	go a.runTrace(t)
-	return a.snapshotTrace(t.ID), nil
+	s.traceMu.Unlock()
+	go s.runTrace(t)
+	return s.snapshotTrace(t.ID), nil
 }
 
 // GetTrace returns a serialization-safe copy of a trace.
-func (a *App) GetTrace(id string) (*Trace, bool) {
-	t := a.snapshotTrace(id)
+func (s *Service) GetTrace(id string) (*Trace, bool) {
+	t := s.snapshotTrace(id)
 	return t, t != nil
 }
 
-func (a *App) snapshotTrace(id string) *Trace {
-	a.traceMu.Lock()
-	defer a.traceMu.Unlock()
-	t, ok := a.traces[id]
+func (s *Service) snapshotTrace(id string) *Trace {
+	s.traceMu.Lock()
+	defer s.traceMu.Unlock()
+	t, ok := s.traces[id]
 	if !ok {
 		return nil
 	}
@@ -103,7 +103,7 @@ func (a *App) snapshotTrace(id string) *Trace {
 	return &cp
 }
 
-func (a *App) runTrace(t *Trace) {
+func (s *Service) runTrace(t *Trace) {
 	type cstate struct {
 		conn         TraceConn
 		present      bool
@@ -121,10 +121,10 @@ func (a *App) runTrace(t *Trace) {
 		elapsed := now.Sub(start).Milliseconds()
 		conns, err := netmon.Conntrack()
 		if err != nil {
-			a.traceMu.Lock()
+			s.traceMu.Lock()
 			t.Status = "error"
 			t.Error = err.Error()
-			a.traceMu.Unlock()
+			s.traceMu.Unlock()
 			logbuf.Append("trace", "error", "trace: conntrack: "+err.Error())
 			return
 		}
@@ -137,7 +137,7 @@ func (a *App) runTrace(t *Trace) {
 			cur[fmt.Sprintf("%s|%s|%d|%d", c.Proto, c.Dst.String(), c.DstPort, c.SrcPort)] = c
 		}
 
-		a.traceMu.Lock()
+		s.traceMu.Lock()
 		for _, st := range seen {
 			st.present = false
 		}
@@ -178,7 +178,7 @@ func (a *App) runTrace(t *Trace) {
 			}
 		}
 		t.ElapsedMs = elapsed
-		a.traceMu.Unlock()
+		s.traceMu.Unlock()
 
 		if now.After(deadline) {
 			break
@@ -186,7 +186,7 @@ func (a *App) runTrace(t *Trace) {
 		<-tick.C
 	}
 
-	a.traceMu.Lock()
+	s.traceMu.Lock()
 	t.Conns = t.Conns[:0]
 	for _, st := range seen {
 		t.Conns = append(t.Conns, st.conn)
@@ -199,10 +199,11 @@ func (a *App) runTrace(t *Trace) {
 			dropped++
 		}
 	}
-	a.traceMu.Unlock()
+	s.traceMu.Unlock()
 	logbuf.Append("trace", "info", fmt.Sprintf("trace %s: готово — %d соединений, %d с проблемами, %d событий", short(t.ID), len(seen), dropped, len(t.Events)))
 }
 
+// short truncates an id for log lines (shared with pcap.go in this package).
 func short(id string) string {
 	if len(id) > 6 {
 		return id[:6]
