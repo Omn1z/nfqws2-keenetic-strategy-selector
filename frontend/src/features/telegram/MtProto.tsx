@@ -11,6 +11,7 @@ import { Badge } from "@/components/ui/Badge";
 import { Switch } from "@/components/ui/Switch";
 import { Field, Input, Textarea } from "@/components/ui/form";
 import { tableCls, tdCls } from "@/components/ui/Table";
+import AwgFallback from "./AwgFallback";
 import type { TgwsConfig, TgwsStatus } from "@/types/api";
 
 interface Form {
@@ -92,6 +93,8 @@ export default function MtProto() {
           <span className="text-xs text-muted">{live.running ? `слушает порт ${form.port}` : live.config.enabled ? "не удалось запустить" : ""}</span>
         </div>
       </Card>
+
+      <AwgFallback />
 
       <Card title="Подключение Telegram" sub="ссылка содержит секрет">
         <Field label="tg:// ссылка"><div className="flex gap-2"><Input readOnly value={live.link} className="font-mono text-xs" /><Button onClick={copy}>Копировать</Button></div></Field>

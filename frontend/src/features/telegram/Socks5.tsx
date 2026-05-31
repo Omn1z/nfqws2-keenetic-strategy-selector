@@ -10,6 +10,7 @@ import { Badge } from "@/components/ui/Badge";
 import { Switch } from "@/components/ui/Switch";
 import { Field, Input } from "@/components/ui/form";
 import { tableCls, tdCls } from "@/components/ui/Table";
+import AwgFallback from "./AwgFallback";
 import type { Socks5Config, Socks5Status } from "@/types/api";
 
 interface Form {
@@ -63,6 +64,8 @@ export default function Socks5() {
           <span className="text-xs text-muted">{live.running ? `слушает порт ${form.port}` : live.config.enabled ? "не удалось запустить" : ""}</span>
         </div>
       </Card>
+
+      <AwgFallback />
 
       <Card title="Подключение Telegram" sub="ссылка добавляет прокси автоматически">
         <Field label="tg:// ссылка"><div className="flex gap-2"><Input readOnly value={live.link} className="font-mono text-xs" /><Button onClick={copy}>Копировать</Button></div></Field>

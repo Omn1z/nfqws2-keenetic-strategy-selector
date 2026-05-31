@@ -36,14 +36,24 @@ func (e *wsHandshakeError) isRedirect() bool {
 	return false
 }
 
+// wsIdleTimeout caps how long recv() waits for the next upstream frame. After the
+// WS handshake there is otherwise NO read deadline, so a silently-dead or stalled
+// upstream (a flaky relay, a half-open TCP) would wedge the bridge goroutine — and
+// the client's download — forever ("бесконечная загрузка"). On timeout recv()
+// errors, the bridge tears down and the Telegram client reconnects/retries.
+// Telegram keeps active WS links warm with sub-minute pings, so 180s of total
+// silence means the link is dead.
+const wsIdleTimeout = 180 * time.Second
+
 // rawWebSocket is a bare-bones RFC 6455 client: binary frames, masked
 // client->server, ping/pong handling, clean close. No fragmentation — the
 // upstream Telegram WS endpoint never fragments.
 type rawWebSocket struct {
-	conn   net.Conn
-	r      *bufio.Reader
-	wmu    sync.Mutex
-	closed bool
+	conn        net.Conn
+	r           *bufio.Reader
+	wmu         sync.Mutex
+	closed      bool
+	idleTimeout time.Duration // per-frame read deadline; 0 = none
 }
 
 func applyConnOptions(conn net.Conn, bufferSize int) {
@@ -102,7 +112,7 @@ func connectWS(ctx context.Context, host, sniDomain string, timeout time.Duratio
 	}
 	if statusCode == 101 {
 		_ = tconn.SetDeadline(time.Time{}) // clear the handshake deadline
-		return &rawWebSocket{conn: tconn, r: br}, nil
+		return &rawWebSocket{conn: tconn, r: br, idleTimeout: wsIdleTimeout}, nil
 	}
 	_ = tconn.Close()
 	return nil, &wsHandshakeError{statusCode: statusCode, statusLine: statusLine, location: headers["location"]}
@@ -167,6 +177,9 @@ func (ws *rawWebSocket) sendBatch(parts [][]byte) error {
 // Returns io.EOF when the peer closes.
 func (ws *rawWebSocket) recv() ([]byte, error) {
 	for !ws.closed {
+		if ws.idleTimeout > 0 {
+			_ = ws.conn.SetReadDeadline(time.Now().Add(ws.idleTimeout))
+		}
 		opcode, payload, err := ws.readFrame()
 		if err != nil {
 			return nil, err

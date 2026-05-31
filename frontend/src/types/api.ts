@@ -226,6 +226,11 @@ export interface Socks5Status {
   link: string;
 }
 
+// Shared "route the ISP-blocked Telegram DCs (1/3/5) via AWG2" selection for both
+// proxies. value: "off" | "auto" | "<server-id>".
+export interface AwgFallbackServer { id: string; label: string; connected: boolean }
+export interface AwgFallbackView { value: string; servers: AwgFallbackServer[] }
+
 // ---- AWG2 (AmneziaWG 2.0). Secret fields (password/key_pem/key_pass/private_key/psk)
 // are write-only: sent on save, never returned by the API. ----
 export interface AwgObfuscation {

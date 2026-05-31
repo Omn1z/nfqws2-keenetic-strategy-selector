@@ -7,6 +7,7 @@ import (
 	"log"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -24,6 +25,22 @@ type Manager struct {
 	pool   *wsPool
 	conns  *connSet
 	wg     sync.WaitGroup
+
+	// awgUp is an optional live probe injected by the host app: "is the AWG2
+	// tunnel up?" Read per connection (atomic, settable after Start) to route the
+	// otherwise-unreachable DCs (1/3/5) through the tunnel only while it is up.
+	awgUp atomic.Pointer[func() bool]
+}
+
+// SetAWGUp injects the live AWG2-tunnel-up probe (safe to call after Start; reads
+// are lock-free). A nil or unset probe means "tunnel down" (normal fallback).
+func (m *Manager) SetAWGUp(f func() bool) { m.awgUp.Store(&f) }
+
+func (m *Manager) awgAvailable() bool {
+	if p := m.awgUp.Load(); p != nil && *p != nil {
+		return (*p)()
+	}
+	return false
 }
 
 // NewManager creates a manager around an initial config (normalized in place).
@@ -106,6 +123,7 @@ func (m *Manager) Start() error {
 		fakeTLSDomain: cfg.FakeTLSDomain,
 		proxyProtocol: cfg.ProxyProtocol,
 		fallback:      fallbackConfig{cfproxyEnabled: cfg.CFProxy, cfproxyWorkerDomain: cfg.CFProxyWorkerDomain},
+		awgAvailable:  m.awgAvailable,
 	}
 	conns := newConnSet()
 	handler := newClientHandler(ctx, settings, pool, m.stats, bal)

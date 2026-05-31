@@ -22,6 +22,7 @@ import (
 
 	"nfqws2strategy/internal/services/awg"
 	"nfqws2strategy/internal/tools/logbuf"
+	"nfqws2strategy/internal/tools/tgfronts"
 )
 
 const (
@@ -200,10 +201,21 @@ func (svc *Service) awgClientUpOS() error {
 		return fmt.Errorf("UAPI set отклонён: %s", strings.TrimSpace(resp))
 	}
 	logbuf.Append("awg2", "info", "туннель awg0 поднят (конфиг применён по UAPI)")
+	// Route the ISP-blockable Telegram proxy fronts through the tunnel so the
+	// MTProto/SOCKS5 proxies can reach DC1/3/5 while awg0 is up. The proxies only
+	// dial these fronts when TunnelUp() is true, so the route and the dial are gated
+	// together. Harmless if the proxies are disabled (nothing else dials these IPs).
+	for _, ip := range tgfronts.IPs() {
+		_, _ = awgRun("ip route replace " + ip + "/32 dev " + awgIface)
+	}
 	return nil
 }
 
 func (svc *Service) awgClientDownOS() error {
+	// Drop the proxy-front routes first (they point at awg0, about to disappear).
+	for _, ip := range tgfronts.IPs() {
+		_, _ = awgRun("ip route del " + ip + "/32 dev " + awgIface + " 2>/dev/null")
+	}
 	script := strings.Join([]string{
 		"ip link set " + awgIface + " down 2>/dev/null || true",
 		"ip link del " + awgIface + " 2>/dev/null || true",

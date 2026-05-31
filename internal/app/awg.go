@@ -37,3 +37,16 @@ func (a *App) AWG2SetRouting(rc awg.RoutingConfig) error { return a.awgroute.AWG
 func (a *App) AWG2ApplyRouting() error                   { return a.awgroute.AWG2ApplyRouting() }
 func (a *App) AWG2CommitRouting() error                  { return a.awgroute.AWG2CommitRouting() }
 func (a *App) AWG2TeardownRouting() error                { return a.awgroute.AWG2TeardownRouting() }
+
+// ProxyAWGFallback is the shared "AWG2-as-fallback for the ISP-blocked Telegram DCs"
+// view: the current selection plus the AWG2 servers the proxies may route through.
+type ProxyAWGFallback struct {
+	Value   string                `json:"value"`   // "off" | "auto" | "<server-id>"
+	Servers []awgroute.ServerInfo `json:"servers"` // selectable AWG2 servers ([] not null)
+}
+
+func (a *App) ProxyAWGFallbackView() ProxyAWGFallback {
+	return ProxyAWGFallback{Value: a.proxy.AWGFallback(), Servers: a.awgroute.Servers()}
+}
+
+func (a *App) SetProxyAWGFallback(v string) { a.proxy.SetAWGFallback(v) }

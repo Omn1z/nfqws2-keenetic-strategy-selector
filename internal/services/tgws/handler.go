@@ -10,6 +10,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"nfqws2strategy/internal/tools/tgfronts"
 )
 
 const (
@@ -26,6 +28,7 @@ type handlerSettings struct {
 	fakeTLSDomain string
 	proxyProtocol bool
 	fallback      fallbackConfig
+	awgAvailable  func() bool // live "is the AWG2 tunnel up?" probe (may be nil)
 }
 
 // rwStream is the client-facing stream — either a raw buffered TCP conn or a
@@ -209,7 +212,16 @@ func (h *clientHandler) serveAuthenticated(parsed *clientHandshake, stream rwStr
 	relayInit := generateRelayHandshake(parsed.protoTag, parsed.dcIndex())
 	reenc := buildContext(parsed.prekeyIV, h.settings.secret, relayInit)
 
-	_, hasRoute := h.settings.dcRedirects[dc]
+	targetIP, hasRoute := h.settings.dcRedirects[dc]
+	// DCs without a user-configured redirect (DC1/3/5 have no unblocked direct
+	// front) can still reach their real front THROUGH the AWG2 tunnel — but only
+	// while the tunnel is actually up; otherwise fall through to the normal chain.
+	if !hasRoute {
+		if front, okFront := tgfronts.FrontForDC(dc); okFront && h.settings.awgAvailable != nil && h.settings.awgAvailable() {
+			targetIP, hasRoute = front, true
+			log.Printf("tgws: [%s] DC%d%s -> AWG2 front %s", label, dc, mediaTag, front)
+		}
+	}
 	if !hasRoute || h.cooldown.isBlacklisted(dcKey) {
 		reason := "no DC route"
 		if hasRoute {
@@ -223,7 +235,6 @@ func (h *clientHandler) serveAuthenticated(parsed *clientHandshake, stream rwStr
 		return
 	}
 
-	targetIP := h.settings.dcRedirects[dc]
 	domains := wsDomainsFor(dc, isMedia)
 	timeout := wsDefaultTimeout
 	if h.cooldown.remainingCooldown(dcKey) > 0 {

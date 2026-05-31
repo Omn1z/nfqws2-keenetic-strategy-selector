@@ -12,6 +12,8 @@ import (
 	"strconv"
 	"sync/atomic"
 	"time"
+
+	"nfqws2strategy/internal/tools/tgfronts"
 )
 
 // socks5 implements the client-facing front-end adapted from TGLock
@@ -24,10 +26,11 @@ import (
 const socks5HandshakeTimeout = 15 * time.Second
 
 type socks5Settings struct {
-	user        string
-	pass        string
-	bufferSize  int
-	dcRedirects map[int]string
+	user         string
+	pass         string
+	bufferSize   int
+	dcRedirects  map[int]string
+	awgAvailable func() bool // live "is the AWG2 tunnel up?" probe (may be nil)
 }
 
 type socks5Handler struct {
@@ -199,6 +202,8 @@ func (h *socks5Handler) tunnelWS(conn net.Conn, dc int, init []byte) {
 	host := socks5WebFrontIP
 	if ip := h.settings.dcRedirects[dc]; ip != "" {
 		host = ip // per-DC override
+	} else if front, ok := tgfronts.FrontForDC(dc); ok && h.settings.awgAvailable != nil && h.settings.awgAvailable() {
+		host = front // DC1/3/5 real front, reachable through the AWG2 tunnel while it is up
 	}
 	ws, err := connectWS(h.ctx, host, domain, wsDefaultTimeout, "/apiws", h.settings.bufferSize)
 	if err != nil && host != domain {

@@ -6,6 +6,7 @@ import (
 	"log"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -22,11 +23,25 @@ type Socks5Manager struct {
 	cancel context.CancelFunc
 	conns  *connSet
 	wg     sync.WaitGroup
+
+	// awgUp is an optional live "is the AWG2 tunnel up?" probe injected by the host
+	// app, read per connection to route DC1/3/5 via the tunnel only while it is up.
+	awgUp atomic.Pointer[func() bool]
 }
 
 func NewSocks5Manager(cfg *Socks5Config) *Socks5Manager {
 	cfg.Normalize()
 	return &Socks5Manager{cfg: cfg, stats: &Socks5Stats{}}
+}
+
+// SetAWGUp injects the live AWG2-tunnel-up probe (safe to call after Start).
+func (m *Socks5Manager) SetAWGUp(f func() bool) { m.awgUp.Store(&f) }
+
+func (m *Socks5Manager) awgAvailable() bool {
+	if p := m.awgUp.Load(); p != nil && *p != nil {
+		return (*p)()
+	}
+	return false
 }
 
 func (m *Socks5Manager) Running() bool {
@@ -80,10 +95,11 @@ func (m *Socks5Manager) Start() error {
 	cfg := m.cfg
 	ctx, cancel := context.WithCancel(context.Background())
 	settings := socks5Settings{
-		user:        cfg.User,
-		pass:        cfg.Pass,
-		bufferSize:  cfg.BufferSize,
-		dcRedirects: copyDC(cfg.DCRedirects),
+		user:         cfg.User,
+		pass:         cfg.Pass,
+		bufferSize:   cfg.BufferSize,
+		dcRedirects:  copyDC(cfg.DCRedirects),
+		awgAvailable: m.awgAvailable,
 	}
 	conns := newConnSet()
 	handler := newSocks5Handler(ctx, settings, m.stats)

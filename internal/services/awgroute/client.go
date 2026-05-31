@@ -5,6 +5,7 @@ package awgroute
 // OS-specific work lives in awgclient_{linux,other}.go.
 
 import (
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -73,6 +74,65 @@ type awgRouteState struct {
 	// reads so a DNS answer never blocks on a routing op holding mu). Linux-only use.
 	incMatchers atomic.Pointer[[]awg.DomainMatcher]
 	excMatchers atomic.Pointer[[]awg.DomainMatcher]
+
+	// Cached TunnelUp() result: the Telegram proxies call it per connection, so we
+	// avoid a UAPI round-trip more than ~once per 5s.
+	tunnelUpVal atomic.Bool
+	tunnelUpAt  atomic.Int64 // unix nanos of the last probe
+}
+
+// TunnelUp reports whether the local AWG2 client tunnel is enabled AND connected
+// (a handshake within ~180s). Used by the Telegram proxies to decide whether to
+// route the ISP-blocked DCs (1/3/5) through the tunnel. Cached ~5s so per-connection
+// callers don't hammer the UAPI socket. Always false on non-router (non-linux) OSes.
+func (svc *Service) TunnelUp() bool {
+	const ttl = int64(5 * time.Second)
+	now := time.Now().UnixNano()
+	if at := svc.route.tunnelUpAt.Load(); at != 0 && now-at < ttl {
+		return svc.route.tunnelUpVal.Load()
+	}
+	up := false
+	if svc.awg.Config().Client.Enabled {
+		if cs := svc.awgClientStatusOS(); cs != nil && cs.Connected {
+			up = true
+		}
+	}
+	svc.route.tunnelUpVal.Store(up)
+	svc.route.tunnelUpAt.Store(now)
+	return up
+}
+
+// ServerInfo describes one selectable AWG2 server for the Telegram-proxy fallback
+// select. The architecture currently has a single server (the awg0 tunnel); the
+// list has one entry when a server endpoint is configured, otherwise none.
+type ServerInfo struct {
+	ID        string `json:"id"`
+	Label     string `json:"label"`
+	Connected bool   `json:"connected"`
+}
+
+// Servers lists the AWG2 servers available as a Telegram-proxy fallback target
+// (non-nil so it marshals as [] not null).
+func (svc *Service) Servers() []ServerInfo {
+	cfg := svc.awg.Config()
+	if strings.TrimSpace(cfg.Endpoint) == "" {
+		return []ServerInfo{}
+	}
+	return []ServerInfo{{ID: "awg0", Label: cfg.Endpoint, Connected: svc.TunnelUp()}}
+}
+
+// FallbackUp reports whether the AWG2 fallback selected by sel is usable now (its
+// tunnel up+connected). sel: ""/"off" → false; "auto" → first available server up;
+// "<id>" → that specific server up. Currently a single server (awg0) backs both.
+func (svc *Service) FallbackUp(sel string) bool {
+	switch sel {
+	case "", "off":
+		return false
+	case "auto", "awg0":
+		return svc.TunnelUp()
+	default:
+		return false
+	}
 }
 
 func (svc *Service) AWG2ApplyRouting() error { return svc.awgApplyRoutingOS() }

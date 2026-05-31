@@ -8,6 +8,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"log"
+	"sync/atomic"
 
 	"nfqws2strategy/internal/services/tgws"
 	"nfqws2strategy/internal/tools/store"
@@ -16,6 +17,7 @@ import (
 const (
 	tgwsConfigFile   = "tgws.json"
 	socks5ConfigFile = "socks5.json"
+	sharedConfigFile = "tgproxy.json"
 )
 
 // TGWSStatus is the combined view the Telegram tab polls.
@@ -39,6 +41,13 @@ type Service struct {
 	store  *store.Store
 	tgws   *tgws.Manager
 	socks5 *tgws.Socks5Manager
+
+	// Shared AWG2-fallback selection for BOTH proxies: "off" → use the normal
+	// fallback (CF worker) for the ISP-blocked DCs (1/3/5); "auto" → the first
+	// available AWG2 server; "<id>" → that specific server (future multi-server).
+	// Resolved live via awgProbe injected from the AWG2 service.
+	awgFallback atomic.Pointer[string]
+	awgProbe    atomic.Pointer[func(string) bool]
 }
 
 // New loads the persisted configs (or defaults) and auto-starts each proxy that
@@ -46,6 +55,7 @@ type Service struct {
 // persists back (so a freshly generated secret is saved).
 func New(st *store.Store) *Service {
 	s := &Service{store: st}
+	s.initShared()
 	s.initTGWS()
 	s.initSocks5()
 	return s
@@ -54,6 +64,69 @@ func New(st *store.Store) *Service {
 // TGWS / Socks5 expose the underlying managers for service-control (restart).
 func (s *Service) TGWS() *tgws.Manager         { return s.tgws }
 func (s *Service) Socks5() *tgws.Socks5Manager { return s.socks5 }
+
+// ---- shared AWG2-fallback selection (applies to both proxies) ----
+
+type sharedConfig struct {
+	AWGFallback string `json:"awg_fallback"`
+}
+
+func (s *Service) initShared() {
+	var c sharedConfig
+	if err := s.store.Load(sharedConfigFile, &c); err != nil {
+		c.AWGFallback = "auto" // default preserves the v0.12.0 AWG2-fallback behavior
+	}
+	v := normalizeFallback(c.AWGFallback)
+	s.awgFallback.Store(&v)
+}
+
+func normalizeFallback(v string) string {
+	if v == "" {
+		return "auto"
+	}
+	return v
+}
+
+// AWGFallback returns the current shared AWG2-fallback selection.
+func (s *Service) AWGFallback() string {
+	if p := s.awgFallback.Load(); p != nil {
+		return *p
+	}
+	return "auto"
+}
+
+// SetAWGFallback updates and persists the shared selection. Takes effect
+// immediately — both proxies read it live per connection.
+func (s *Service) SetAWGFallback(v string) {
+	v = normalizeFallback(v)
+	s.awgFallback.Store(&v)
+	if err := s.store.Save(sharedConfigFile, &sharedConfig{AWGFallback: v}); err != nil {
+		log.Printf("proxy: save %s failed: %v", sharedConfigFile, err)
+	}
+}
+
+// awgUp resolves the shared selection against the injected probe (is the chosen
+// AWG2 server's tunnel usable?). Used by both proxies' blocked-DC routing gate.
+func (s *Service) awgUp() bool {
+	p := s.awgProbe.Load()
+	if p == nil || *p == nil {
+		return false
+	}
+	return (*p)(s.AWGFallback())
+}
+
+// SetAWGFallbackProbe injects the resolver "is AWG2 selection <sel> usable?" (from
+// the AWG2 service) and wires both proxies to gate the blocked DCs on the SHARED
+// fallback decision. Safe to call after the proxies auto-started (reads are live).
+func (s *Service) SetAWGFallbackProbe(probe func(string) bool) {
+	s.awgProbe.Store(&probe)
+	if s.tgws != nil {
+		s.tgws.SetAWGUp(s.awgUp)
+	}
+	if s.socks5 != nil {
+		s.socks5.SetAWGUp(s.awgUp)
+	}
+}
 
 // ---- MTProto WS proxy ----
 

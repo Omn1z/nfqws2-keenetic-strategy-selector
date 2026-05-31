@@ -233,6 +233,9 @@ func (s *Server) routes() {
 	m.HandleFunc("POST /api/socks5/start", s.socks5Start)
 	m.HandleFunc("POST /api/socks5/stop", s.socks5Stop)
 
+	m.HandleFunc("GET /api/proxy/awg-fallback", s.proxyAWGFallback)
+	m.HandleFunc("POST /api/proxy/awg-fallback", s.proxyAWGFallbackSet)
+
 	m.HandleFunc("GET /api/awg2", s.awg2Status)
 	m.HandleFunc("POST /api/awg2/config", s.awg2Config)
 	m.HandleFunc("POST /api/awg2/deploy", s.awg2Deploy)
@@ -1171,6 +1174,24 @@ func (s *Server) socks5Stop(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, s.app.Socks5StatusFor(hostFromHeader(r.Host)))
+}
+
+// proxyAWGFallback returns the shared AWG2-fallback selection for the blocked
+// Telegram DCs (1/3/5) + the AWG2 servers available to select.
+func (s *Server) proxyAWGFallback(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, 200, s.app.ProxyAWGFallbackView())
+}
+
+func (s *Server) proxyAWGFallbackSet(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Value string `json:"value"`
+	}
+	if err := readJSON(r, &in); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	s.app.SetProxyAWGFallback(in.Value)
+	writeJSON(w, 200, s.app.ProxyAWGFallbackView())
 }
 
 // ---------- AWG2 (AmneziaWG 2.0) ----------
