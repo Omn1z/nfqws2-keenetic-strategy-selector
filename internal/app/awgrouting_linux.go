@@ -8,7 +8,7 @@ import (
 	"strconv"
 	"time"
 
-	"nfqws2strategy/internal/logbuf"
+	"nfqws2strategy/internal/tools/logbuf"
 )
 
 // Split-routing lifecycle: mark selected traffic (by ipset membership) with a

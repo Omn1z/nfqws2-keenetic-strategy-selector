@@ -13,12 +13,12 @@ import (
 	"time"
 
 	"nfqws2strategy/internal/app"
-	"nfqws2strategy/internal/catalog"
-	"nfqws2strategy/internal/config"
-	"nfqws2strategy/internal/engine"
-	"nfqws2strategy/internal/logbuf"
-	"nfqws2strategy/internal/probe"
 	"nfqws2strategy/internal/server"
+	"nfqws2strategy/internal/services/strategy/core/catalog"
+	"nfqws2strategy/internal/services/strategy/core/engine"
+	"nfqws2strategy/internal/tools/config"
+	"nfqws2strategy/internal/tools/logbuf"
+	"nfqws2strategy/internal/tools/probe"
 )
 
 // version is set at build time via -ldflags "-X main.version=...".

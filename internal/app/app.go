@@ -14,15 +14,15 @@ import (
 	"sync"
 	"time"
 
-	"nfqws2strategy/internal/auth"
-	"nfqws2strategy/internal/awg"
-	"nfqws2strategy/internal/catalog"
-	"nfqws2strategy/internal/config"
-	"nfqws2strategy/internal/dns"
-	"nfqws2strategy/internal/engine"
-	"nfqws2strategy/internal/nfqws2ctl"
-	"nfqws2strategy/internal/store"
-	"nfqws2strategy/internal/tgws"
+	"nfqws2strategy/internal/services/awg"
+	"nfqws2strategy/internal/services/nfqws2"
+	"nfqws2strategy/internal/services/strategy/core/catalog"
+	"nfqws2strategy/internal/services/strategy/core/engine"
+	"nfqws2strategy/internal/services/tgws"
+	"nfqws2strategy/internal/tools/auth"
+	"nfqws2strategy/internal/tools/config"
+	"nfqws2strategy/internal/tools/dns"
+	"nfqws2strategy/internal/tools/store"
 )
 
 type App struct {
@@ -50,7 +50,7 @@ type App struct {
 
 	tgws     *tgws.Manager       // Telegram MTProto->WS proxy (Telegram tab)
 	socks5   *tgws.Socks5Manager // Telegram SOCKS5 proxy, TGLock-adapted (Telegram tab)
-	nfqws2   *nfqws2ctl.Manager  // nfqws2 engine file/version/update/reload (nfqws2 tab)
+	nfqws2   *nfqws2.Manager     // nfqws2 engine file/version/update/reload (nfqws2 tab)
 	awg      *awg.Manager        // AmneziaWG 2.0 server/client manager (AWG2 tab)
 	awgRoute awgRouteState       // AWG2 split-routing runtime (dead-man's switch)
 
@@ -82,7 +82,7 @@ func New(cfg *config.Config) (*App, error) {
 		return nil, err
 	}
 	a := &App{Cfg: cfg, store: st, runs: map[string]*Run{}, traces: map[string]*Trace{}, pcaps: map[string]*Pcap{}, blobCaps: map[string]*BlobCapture{}, sessions: auth.NewSessions(sessionTTL)}
-	a.nfqws2 = nfqws2ctl.New(cfg)
+	a.nfqws2 = nfqws2.New(cfg)
 	_ = a.store.Load(customStrategiesFile, &a.custom)
 	_ = a.store.Load(sniDomainsFile, &a.sniDomains)
 	if err := os.MkdirAll(a.blobsDir(), 0o755); err != nil {

@@ -1,6 +1,6 @@
 package engine
 
-import "nfqws2strategy/internal/config"
+import "nfqws2strategy/internal/tools/config"
 
 // CleanupSandboxes removes every test sandbox's leftover iptables chains (for
 // worker slots 0..maxWorker, which includes the baseline slot) and kills any

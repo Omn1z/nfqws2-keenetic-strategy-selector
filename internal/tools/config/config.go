@@ -22,8 +22,8 @@ type Config struct {
 	// Self-update.
 	Version    string `json:"version"`
 	Repo       string `json:"repo"`        // owner/name on GitHub
-	InitScript string `json:"init_script"`  // OUR service control script (S52, restart after update)
-	Nfqws2Init string `json:"nfqws2_init"`  // upstream nfqws2 service init (S51, for the restart button)
+	InitScript string `json:"init_script"` // OUR service control script (S52, restart after update)
+	Nfqws2Init string `json:"nfqws2_init"` // upstream nfqws2 service init (S51, for the restart button)
 
 	// nfqws2 engine package (for the NFQWS2 tab's version display + opkg update).
 	Nfqws2Repo string `json:"nfqws2_repo"` // GitHub owner/name of the engine package

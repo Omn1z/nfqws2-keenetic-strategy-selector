@@ -8,9 +8,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	"nfqws2strategy/internal/engine"
-	"nfqws2strategy/internal/probe"
-	"nfqws2strategy/internal/store"
+	"nfqws2strategy/internal/services/strategy/core/engine"
+	"nfqws2strategy/internal/tools/probe"
+	"nfqws2strategy/internal/tools/store"
 )
 
 // BlockCheckRequest starts a no-bypass reachability check. Targets come from a

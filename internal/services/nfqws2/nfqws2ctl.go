@@ -1,4 +1,4 @@
-// Package nfqws2ctl ports the file-management + version/update surface of the
+// Package nfqws2 ports the file-management + version/update surface of the
 // upstream nfqws-keenetic-web (the lighttpd+PHP UI on port 90) into our panel:
 // editing the live nfqws2 engine's config, Lua DPI scripts and domain/IP lists,
 // plus showing/updating the engine package version and reloading it (SIGHUP).
@@ -11,7 +11,7 @@
 // the directory. Names are reduced to a basename and validated against a
 // per-kind anchored regex (stem + allowed extension). No client-supplied value
 // can redirect the directory or escape it.
-package nfqws2ctl
+package nfqws2
 
 import (
 	"bytes"
@@ -30,8 +30,8 @@ import (
 	"strings"
 	"time"
 
-	"nfqws2strategy/internal/config"
-	"nfqws2strategy/internal/logbuf"
+	"nfqws2strategy/internal/tools/config"
+	"nfqws2strategy/internal/tools/logbuf"
 )
 
 // Manager owns the nfqws2 engine's on-disk files + package version/update/reload.

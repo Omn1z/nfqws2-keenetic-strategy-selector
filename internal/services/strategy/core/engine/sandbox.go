@@ -14,7 +14,7 @@ import (
 	"syscall"
 	"time"
 
-	"nfqws2strategy/internal/config"
+	"nfqws2strategy/internal/tools/config"
 )
 
 const (

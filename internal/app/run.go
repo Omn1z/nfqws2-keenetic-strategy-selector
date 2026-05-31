@@ -10,11 +10,11 @@ import (
 	"sync/atomic"
 	"time"
 
-	"nfqws2strategy/internal/catalog"
-	"nfqws2strategy/internal/dns"
-	"nfqws2strategy/internal/engine"
-	"nfqws2strategy/internal/probe"
-	"nfqws2strategy/internal/store"
+	"nfqws2strategy/internal/services/strategy/core/catalog"
+	"nfqws2strategy/internal/services/strategy/core/engine"
+	"nfqws2strategy/internal/tools/dns"
+	"nfqws2strategy/internal/tools/probe"
+	"nfqws2strategy/internal/tools/store"
 )
 
 const maxThreads = 8
@@ -24,7 +24,7 @@ const maxThreads = 8
 // pasted text); successful strategies are only persisted when a list is used.
 type RunRequest struct {
 	ListID      string   `json:"list_id"`
-	Targets     []string `json:"targets"` // ad-hoc targets when ListID is empty
+	Targets     []string `json:"targets"`      // ad-hoc targets when ListID is empty
 	StrategyIDs []string `json:"strategy_ids"` // empty = all known strategies
 	Threads     int      `json:"threads"`
 	Auto        bool     `json:"auto"`  // automatic selection over the candidate catalog

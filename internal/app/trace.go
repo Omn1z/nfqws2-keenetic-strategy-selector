@@ -7,13 +7,13 @@ import (
 	"strconv"
 	"time"
 
-	"nfqws2strategy/internal/logbuf"
-	"nfqws2strategy/internal/netmon"
-	"nfqws2strategy/internal/store"
+	"nfqws2strategy/internal/tools/logbuf"
+	"nfqws2strategy/internal/tools/netmon"
+	"nfqws2strategy/internal/tools/store"
 )
 
 const (
-	traceInterval = 500 * time.Millisecond
+	traceInterval   = 500 * time.Millisecond
 	maxStoredTraces = 10
 )
 
@@ -105,9 +105,9 @@ func (a *App) snapshotTrace(id string) *Trace {
 
 func (a *App) runTrace(t *Trace) {
 	type cstate struct {
-		conn          TraceConn
-		present       bool
-		wasUnreplied  bool
+		conn         TraceConn
+		present      bool
+		wasUnreplied bool
 	}
 	seen := map[string]*cstate{}
 	start := time.Now()

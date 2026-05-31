@@ -44,11 +44,14 @@ func GenerateClientHello(sni string, alpn []string, minVer uint16) ([]byte, erro
 // and returns EOF on read so tls.Client.Handshake stops after the first flight.
 type captureConn struct{ written []byte }
 
-func (c *captureConn) Write(p []byte) (int, error) { c.written = append(c.written, p...); return len(p), nil }
-func (c *captureConn) Read([]byte) (int, error)    { return 0, io.EOF }
-func (c *captureConn) Close() error                { return nil }
-func (c *captureConn) LocalAddr() net.Addr         { return emptyAddr{} }
-func (c *captureConn) RemoteAddr() net.Addr        { return emptyAddr{} }
+func (c *captureConn) Write(p []byte) (int, error) {
+	c.written = append(c.written, p...)
+	return len(p), nil
+}
+func (c *captureConn) Read([]byte) (int, error)         { return 0, io.EOF }
+func (c *captureConn) Close() error                     { return nil }
+func (c *captureConn) LocalAddr() net.Addr              { return emptyAddr{} }
+func (c *captureConn) RemoteAddr() net.Addr             { return emptyAddr{} }
 func (c *captureConn) SetDeadline(time.Time) error      { return nil }
 func (c *captureConn) SetReadDeadline(time.Time) error  { return nil }
 func (c *captureConn) SetWriteDeadline(time.Time) error { return nil }

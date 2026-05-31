@@ -1,15 +1,15 @@
 package app
 
-import "nfqws2strategy/internal/nfqws2ctl"
+import "nfqws2strategy/internal/services/nfqws2"
 
 // The nfqws2 engine's file management + version/update/reload now lives in
-// internal/nfqws2ctl. These type aliases + thin delegators keep the App method
+// internal/nfqws2. These type aliases + thin delegators keep the App method
 // surface that the HTTP handlers (internal/server) call unchanged. (Start/Stop
 // live in services.go — they're service-control, a separate concern.)
 
 type (
-	Nfqws2File        = nfqws2ctl.File
-	Nfqws2VersionInfo = nfqws2ctl.VersionInfo
+	Nfqws2File        = nfqws2.File
+	Nfqws2VersionInfo = nfqws2.VersionInfo
 )
 
 func (a *App) ListNfqws2Files(kind string) ([]Nfqws2File, error) { return a.nfqws2.List(kind) }

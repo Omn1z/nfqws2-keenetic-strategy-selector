@@ -239,8 +239,8 @@ func parseSNI(rec []byte) string {
 	if len(rec) < 43 || rec[5] != 0x01 {
 		return ""
 	}
-	body := rec[5+4:] // skip record header (5) + handshake header (4)
-	p := 34           // client_version(2) + random(32)
+	body := rec[5+4:]           // skip record header (5) + handshake header (4)
+	p := 34                     // client_version(2) + random(32)
 	rd1 := func() (int, bool) { // length-prefixed-by-1-byte field: skip it
 		if p >= len(body) {
 			return 0, false

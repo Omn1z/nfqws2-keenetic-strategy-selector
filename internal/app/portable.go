@@ -11,7 +11,7 @@ import (
 	"regexp"
 	"strings"
 
-	"nfqws2strategy/internal/catalog"
+	"nfqws2strategy/internal/services/strategy/core/catalog"
 )
 
 const maxBlobBytes = 8 << 20

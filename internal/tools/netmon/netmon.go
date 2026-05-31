@@ -34,13 +34,13 @@ type Conn struct {
 	State string `json:"state"` // tcp only (ESTABLISHED, SYN_SENT, ...); "" otherwise
 	TTL   int    `json:"ttl"`   // seconds until this entry expires
 
-	Src     netip.Addr `json:"src"`   // original src = LAN initiator
-	Dst     netip.Addr `json:"dst"`   // original dst = destination dialed
-	SrcPort int        `json:"sport"`
-	DstPort int        `json:"dport"`
-	Packets int64      `json:"packets"` // original direction (may be stale under offload)
-	Bytes   int64      `json:"bytes"`
-	ReplyBytes int64   `json:"reply_bytes"`
+	Src        netip.Addr `json:"src"` // original src = LAN initiator
+	Dst        netip.Addr `json:"dst"` // original dst = destination dialed
+	SrcPort    int        `json:"sport"`
+	DstPort    int        `json:"dport"`
+	Packets    int64      `json:"packets"` // original direction (may be stale under offload)
+	Bytes      int64      `json:"bytes"`
+	ReplyBytes int64      `json:"reply_bytes"`
 
 	Assured   bool   `json:"assured"`
 	Unreplied bool   `json:"unreplied"`
@@ -101,5 +101,5 @@ type Device struct {
 	FailingDsts []string `json:"failing_dsts"`
 }
 
-func atoi(s string) int       { n, _ := strconv.Atoi(s); return n }
-func atoi64(s string) int64   { n, _ := strconv.ParseInt(s, 10, 64); return n }
+func atoi(s string) int     { n, _ := strconv.Atoi(s); return n }
+func atoi64(s string) int64 { n, _ := strconv.ParseInt(s, 10, 64); return n }

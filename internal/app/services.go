@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	"nfqws2strategy/internal/logbuf"
+	"nfqws2strategy/internal/tools/logbuf"
 )
 
 // ServiceResult is the outcome of restarting one service (Dashboard restart button).

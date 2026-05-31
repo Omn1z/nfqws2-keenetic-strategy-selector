@@ -5,7 +5,7 @@ import (
 	"encoding/hex"
 	"log"
 
-	"nfqws2strategy/internal/tgws"
+	"nfqws2strategy/internal/services/tgws"
 )
 
 const tgwsConfigFile = "tgws.json"

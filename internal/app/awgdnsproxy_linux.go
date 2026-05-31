@@ -3,8 +3,8 @@
 package app
 
 import (
-	"nfqws2strategy/internal/awg"
-	"nfqws2strategy/internal/logbuf"
+	"nfqws2strategy/internal/services/awg"
+	"nfqws2strategy/internal/tools/logbuf"
 )
 
 // Lifecycle of the domain-mask DNS proxy: it transparently intercepts LAN :53

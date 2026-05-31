@@ -1,6 +1,6 @@
 package app
 
-import "nfqws2strategy/internal/probe"
+import "nfqws2strategy/internal/tools/probe"
 
 // List is a user-defined set of test targets plus strategies known to work.
 type List struct {
@@ -35,7 +35,7 @@ type Run struct {
 	ListID     string           `json:"list_id"`
 	ListName   string           `json:"list_name"`
 	Threads    int              `json:"threads"`
-	Auto       bool             `json:"auto"` // automatic strategy selection over the candidate catalog
+	Auto       bool             `json:"auto"`   // automatic strategy selection over the candidate catalog
 	Status     string           `json:"status"` // running | done | cancelled | error
 	Error      string           `json:"error,omitempty"`
 	Total      int              `json:"total"` // strategies to test

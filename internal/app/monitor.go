@@ -1,6 +1,6 @@
 package app
 
-import "nfqws2strategy/internal/netmon"
+import "nfqws2strategy/internal/tools/netmon"
 
 // DashboardView is the home-page snapshot: TG WS proxy status, conntrack totals,
 // the DPI engine's NFQUEUE stats, and WAN byte counters (the UI derives a rate

@@ -9,7 +9,7 @@ import (
 	"strconv"
 	"strings"
 
-	"nfqws2strategy/internal/logbuf"
+	"nfqws2strategy/internal/tools/logbuf"
 )
 
 // The netfilter / iptables half of split-routing: the marking chain + FORWARD/NAT/

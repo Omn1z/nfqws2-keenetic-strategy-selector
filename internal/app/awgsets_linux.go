@@ -8,8 +8,8 @@ import (
 	"os"
 	"strings"
 
-	"nfqws2strategy/internal/awg"
-	"nfqws2strategy/internal/logbuf"
+	"nfqws2strategy/internal/services/awg"
+	"nfqws2strategy/internal/tools/logbuf"
 )
 
 // ipset membership for split-routing + on-disk persistence so the learned IPs and

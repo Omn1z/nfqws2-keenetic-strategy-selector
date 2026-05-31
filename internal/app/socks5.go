@@ -3,7 +3,7 @@ package app
 import (
 	"log"
 
-	"nfqws2strategy/internal/tgws"
+	"nfqws2strategy/internal/services/tgws"
 )
 
 const socks5ConfigFile = "socks5.json"

@@ -8,8 +8,8 @@ import (
 )
 
 var (
-	errShort  = errors.New("dns: short message")
-	errNoA    = errors.New("dns: no A record")
+	errShort   = errors.New("dns: short message")
+	errNoA     = errors.New("dns: no A record")
 	errBadName = errors.New("dns: bad name")
 )
 

@@ -27,7 +27,7 @@ func TestDomainMatcher(t *testing.T) {
 		{"server*", "server1.example.net", true},
 		{"server*", "myserver", false},
 		{"test##.com", "test12.com", true},
-		{"test##.com", "test1.com", false},  // # = exactly one char (only 1 here)
+		{"test##.com", "test1.com", false},   // # = exactly one char (only 1 here)
 		{"test##.com", "test123.com", false}, // 3 chars
 		{"domain*.*", "domain12.com", true},
 		{"domain*.*", "domain3124214.net", true},

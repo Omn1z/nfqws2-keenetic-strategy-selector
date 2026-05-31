@@ -15,12 +15,20 @@ func (a *App) awgEngineInfoOS() EngineInfo {
 func (a *App) awgInstallEngineOS() (string, error) {
 	return "", fmt.Errorf("установка движка доступна только на роутере")
 }
-func (a *App) awgClientUpOS() error   { return fmt.Errorf("туннель доступен только на роутере") }
-func (a *App) awgClientDownOS() error { return fmt.Errorf("туннель доступен только на роутере") }
+func (a *App) awgClientUpOS() error {
+	return fmt.Errorf("туннель доступен только на роутере")
+}
+func (a *App) awgClientDownOS() error {
+	return fmt.Errorf("туннель доступен только на роутере")
+}
 func (a *App) awgClientStatusOS() *ClientStatus { return nil }
 
-func (a *App) awgApplyRoutingOS() error    { return fmt.Errorf("маршрутизация доступна только на роутере") }
-func (a *App) awgRefreshRoutingOS() error  { return nil }
-func (a *App) awgCommitRoutingOS() error   { return fmt.Errorf("маршрутизация доступна только на роутере") }
+func (a *App) awgApplyRoutingOS() error {
+	return fmt.Errorf("маршрутизация доступна только на роутере")
+}
+func (a *App) awgRefreshRoutingOS() error { return nil }
+func (a *App) awgCommitRoutingOS() error {
+	return fmt.Errorf("маршрутизация доступна только на роутере")
+}
 func (a *App) awgTeardownRoutingOS() error { return nil }
 func (a *App) awgRepairRoutingOS()         {}

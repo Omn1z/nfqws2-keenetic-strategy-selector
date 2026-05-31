@@ -15,11 +15,11 @@ import (
 	"time"
 
 	"nfqws2strategy/internal/app"
-	"nfqws2strategy/internal/awg"
-	"nfqws2strategy/internal/catalog"
-	"nfqws2strategy/internal/dns"
-	"nfqws2strategy/internal/logbuf"
-	"nfqws2strategy/internal/tgws"
+	"nfqws2strategy/internal/services/awg"
+	"nfqws2strategy/internal/services/strategy/core/catalog"
+	"nfqws2strategy/internal/services/tgws"
+	"nfqws2strategy/internal/tools/dns"
+	"nfqws2strategy/internal/tools/logbuf"
 )
 
 //go:embed all:web

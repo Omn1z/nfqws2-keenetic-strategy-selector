@@ -18,16 +18,16 @@ var ccsFrame = []byte{0x14, 0x03, 0x03, 0x00, 0x01, 0x01}
 // session_id echo and the x25519 pubkey are filled in per connection.
 var serverHelloTemplate = func() []byte {
 	var b []byte
-	b = append(b, 0x16, 0x03, 0x03, 0x00, 0x7a) // record header (len 122)
-	b = append(b, 0x02, 0x00, 0x00, 0x76)       // ServerHello, len 118
-	b = append(b, 0x03, 0x03)                    // legacy_version
-	b = append(b, make([]byte, 32)...)           // server_random  (offset 11)
-	b = append(b, 0x20)                          // session_id len = 32
-	b = append(b, make([]byte, 32)...)           // session_id echo (offset 44)
-	b = append(b, 0x13, 0x01, 0x00)              // cipher 0x1301 + compression
-	b = append(b, 0x00, 0x2e)                    // extensions length 46
+	b = append(b, 0x16, 0x03, 0x03, 0x00, 0x7a)                   // record header (len 122)
+	b = append(b, 0x02, 0x00, 0x00, 0x76)                         // ServerHello, len 118
+	b = append(b, 0x03, 0x03)                                     // legacy_version
+	b = append(b, make([]byte, 32)...)                            // server_random  (offset 11)
+	b = append(b, 0x20)                                           // session_id len = 32
+	b = append(b, make([]byte, 32)...)                            // session_id echo (offset 44)
+	b = append(b, 0x13, 0x01, 0x00)                               // cipher 0x1301 + compression
+	b = append(b, 0x00, 0x2e)                                     // extensions length 46
 	b = append(b, 0x00, 0x33, 0x00, 0x24, 0x00, 0x1d, 0x00, 0x20) // key_share
-	b = append(b, make([]byte, 32)...)           // x25519 pubkey  (offset 89)
+	b = append(b, make([]byte, 32)...)                            // x25519 pubkey  (offset 89)
 	b = append(b, 0x00, 0x2b, 0x00, 0x02, 0x03, 0x04)             // supported_versions: TLS 1.3
 	return b
 }()

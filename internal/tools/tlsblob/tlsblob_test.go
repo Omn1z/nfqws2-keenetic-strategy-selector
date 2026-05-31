@@ -85,9 +85,9 @@ func TestParsePcapReassembleTwoSegments(t *testing.T) {
 func TestParsePcapDedupAndIgnore(t *testing.T) {
 	ch, _ := GenerateClientHello("dup.example.com", nil, 0)
 	frames := [][]byte{
-		ethIPv4TCP("10.0.0.1", "2.2.2.2", 5, 443, 1, []byte("GET / HTTP/1.1\r\n")),      // not a hello
-		ethIPv4TCP("10.0.0.1", "8.8.8.8", 40000, 443, 100, ch),                          // hello #1
-		ethIPv4TCP("10.0.0.2", "9.9.9.9", 40001, 443, 200, ch),                          // same SNI → deduped
+		ethIPv4TCP("10.0.0.1", "2.2.2.2", 5, 443, 1, []byte("GET / HTTP/1.1\r\n")), // not a hello
+		ethIPv4TCP("10.0.0.1", "8.8.8.8", 40000, 443, 100, ch),                     // hello #1
+		ethIPv4TCP("10.0.0.2", "9.9.9.9", 40001, 443, 200, ch),                     // same SNI → deduped
 	}
 	cands, err := ParsePcapClientHellos(buildPcap(dltEthernet, frames))
 	if err != nil {

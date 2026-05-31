@@ -10,13 +10,13 @@ import (
 // format is auto-detected from the entry text:
 //
 //   - "[re] <regexp>"      → Go regular expression over the full lowercased name
-//                            (e.g. "[re]^.*\\.googlevideo\\.com$").
+//     (e.g. "[re]^.*\\.googlevideo\\.com$").
 //   - contains '*' or '#'  → glob: '*' = any run of characters (incl. none),
-//                            '#' = exactly one character. The pattern is anchored
-//                            to the whole name (e.g. "*main.com", "server*",
-//                            "test##.com" → test + 2 chars + ".com").
+//     '#' = exactly one character. The pattern is anchored
+//     to the whole name (e.g. "*main.com", "server*",
+//     "test##.com" → test + 2 chars + ".com").
 //   - plain "domain.com"   → the domain itself AND every subdomain
-//                            (domain.com and *.domain.com).
+//     (domain.com and *.domain.com).
 //
 // Matching is case-insensitive and ignores a trailing dot on the queried name.
 type DomainMatcher struct {

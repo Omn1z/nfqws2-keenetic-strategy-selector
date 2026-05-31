@@ -8,7 +8,7 @@ import (
 	"sync"
 	"time"
 
-	"nfqws2strategy/internal/awg"
+	"nfqws2strategy/internal/services/awg"
 )
 
 // EngineInfo reports the installed userspace AmneziaWG engine on the router.
@@ -36,7 +36,7 @@ type ClientStatus struct {
 }
 
 // Public app methods (delegating to the OS impl) used by the server handlers.
-func (a *App) AWG2EngineInfo() EngineInfo        { return a.awgEngineInfoOS() }
+func (a *App) AWG2EngineInfo() EngineInfo         { return a.awgEngineInfoOS() }
 func (a *App) AWG2InstallEngine() (string, error) { return a.awgInstallEngineOS() }
 func (a *App) awgClientStatus() *ClientStatus     { return a.awgClientStatusOS() }
 

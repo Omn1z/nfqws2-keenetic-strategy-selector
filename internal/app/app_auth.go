@@ -4,8 +4,8 @@ import (
 	"os"
 	"time"
 
-	"nfqws2strategy/internal/auth"
-	"nfqws2strategy/internal/logbuf"
+	"nfqws2strategy/internal/tools/auth"
+	"nfqws2strategy/internal/tools/logbuf"
 )
 
 const (

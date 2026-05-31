@@ -1,6 +1,6 @@
 //go:build linux
 
-package nfqws2ctl
+package nfqws2
 
 import (
 	"fmt"

@@ -1,8 +1,8 @@
 package app
 
 import (
-	"nfqws2strategy/internal/dns"
-	"nfqws2strategy/internal/store"
+	"nfqws2strategy/internal/tools/dns"
+	"nfqws2strategy/internal/tools/store"
 )
 
 const dnsConfigFile = "dns.json"

@@ -6,8 +6,8 @@ import (
 	"strings"
 	"time"
 
-	"nfqws2strategy/internal/awg"
-	"nfqws2strategy/internal/logbuf"
+	"nfqws2strategy/internal/services/awg"
+	"nfqws2strategy/internal/tools/logbuf"
 )
 
 const awgConfigFile = "awg.json"
