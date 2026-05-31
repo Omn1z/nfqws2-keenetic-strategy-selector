@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { api } from "@/lib/api";
+import { cn } from "@/lib/cn";
 import { toast } from "@/components/ui/Toast";
 import { confirmDialog } from "@/components/ui/Confirm";
 import { Card } from "@/components/ui/Card";
@@ -117,6 +118,23 @@ export default function RoutingPane({ st, reload }: { st: Awg2Status; reload: ()
   const addZone = () => setR((p) => ({ ...p, zones: [...(p.zones || []), { name: "новая зона", domains: [], ips: [], enabled: true }] }));
   const delZone = (i: number) => setR((p) => ({ ...p, zones: p.zones.filter((_, j) => j !== i) }));
 
+  // Include/Exclude picker shown right in the Зоны card. Binds the SAME r.mode the
+  // Сплит-маршрутизация card's «Режим» Select does (one field) — they stay in sync;
+  // off/full still live in that master Select.
+  const modeSeg = (m: "include" | "exclude", label: string, hint: string) => (
+    <button
+      type="button"
+      title={hint}
+      onClick={() => setR((p) => ({ ...p, mode: m }))}
+      className={cn(
+        "border-r border-line px-3.5 py-1.5 text-[13px] outline-none transition last:border-r-0 focus-visible:relative focus-visible:ring-2 focus-visible:ring-ring/40",
+        r.mode === m ? "bg-accent text-white" : "bg-panel text-ink-soft hover:bg-line-soft",
+      )}
+    >
+      {label}
+    </button>
+  );
+
   return (
     <>
       <Card
@@ -191,6 +209,18 @@ export default function RoutingPane({ st, reload }: { st: Awg2Status; reload: ()
       </Card>
 
       <Card title="Зоны" sub="что заводить в туннель — домены, маски и IP в одном списке" head={<Button mini onClick={addZone}>Добавить зону</Button>}>
+        <div className="mb-2.5 flex flex-wrap items-center gap-x-3 gap-y-2">
+          <span className="text-xs font-medium text-ink-soft">Режим списка зон:</span>
+          <div className="inline-flex overflow-hidden rounded-lg border border-line">
+            {modeSeg("include", "Включить", "Через туннель идут только перечисленные зоны")}
+            {modeSeg("exclude", "Исключить", "Через туннель идёт весь трафик, кроме зон")}
+          </div>
+          {r.mode === "include" && <span className="text-[11px] text-muted">через VPN идут <b>только</b> эти зоны (whitelist)</span>}
+          {r.mode === "exclude" && <span className="text-[11px] text-muted">через VPN идёт <b>всё, кроме</b> этих зон (напр. <b>.ru</b> — мимо)</span>}
+          {(r.mode === "off" || r.mode === "full") && (
+            <span className="text-[11px] text-warn">сейчас «{r.mode === "off" ? "выключено" : "весь трафик через VPN"}» — выберите режим, чтобы зоны заработали</span>
+          )}
+        </div>
         <p className="mb-2 text-[11px] text-muted">В один список можно вписывать вперемешку: домены/маски, IPv4 и подсети (напр. <b>104.18.0.0/16</b>). IPv6-адреса принимаются, но пока в туннель не маршрутизируются (туннель IPv4); для доменов IPv6 и так форсируется на IPv4 без утечки.</p>
         {(r.zones || []).length === 0 ? (
           <p className="text-xs text-muted">Зон нет. Добавьте зону и впишите домены (напр. youtube.com), маски (ip*) и/или IP/подсети — всё в одном списке.</p>
