@@ -34,12 +34,12 @@ func (a *App) ExportBlobsZip(w io.Writer, names []string) error {
 	if len(names) == 0 {
 		blobNames, _ := a.store.ListFiles("blobs")
 		for _, n := range blobNames {
-			add(n, filepath.Join(a.blobsDir(), n))
+			add(n, filepath.Join(a.blobs.Dir(), n))
 		}
 	} else {
 		for _, n := range names {
 			base := filepath.Base(n)
-			if _, path, ok := a.resolveBlob(base); ok {
+			if _, path, ok := a.blobs.ResolveBlob(base); ok {
 				add(base, path)
 			}
 		}
@@ -62,7 +62,7 @@ func (a *App) ImportBlobsZip(data []byte) (int, error) {
 		if err != nil {
 			continue
 		}
-		if _, err := a.SaveBlob(filepath.Base(f.Name), b); err == nil {
+		if _, err := a.blobs.SaveBlob(filepath.Base(f.Name), b); err == nil {
 			count++
 		}
 	}
@@ -117,7 +117,7 @@ func (a *App) ImportStrategyZip(data []byte) (catalog.Strategy, error) {
 			_ = json.Unmarshal(b, &meta)
 			continue
 		}
-		_, _ = a.SaveBlob(filepath.Base(f.Name), b)
+		_, _ = a.blobs.SaveBlob(filepath.Base(f.Name), b)
 	}
 	if strings.TrimSpace(meta.Args) == "" {
 		return catalog.Strategy{}, fmt.Errorf("strategy.json missing or empty")
@@ -127,7 +127,7 @@ func (a *App) ImportStrategyZip(data []byte) (catalog.Strategy, error) {
 		sub := reBlobPath.FindStringSubmatch(m)
 		blobName, path := sub[1], sub[2]
 		if !strings.ContainsAny(path, "/\\") {
-			path = filepath.Join(a.blobsDir(), filepath.Base(path))
+			path = filepath.Join(a.blobs.Dir(), filepath.Base(path))
 		}
 		return "--blob=" + blobName + ":@" + path
 	})

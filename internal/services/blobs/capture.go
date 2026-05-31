@@ -1,4 +1,4 @@
-package app
+package blobs
 
 import (
 	"context"
@@ -21,7 +21,7 @@ const maxStoredBlobCaps = 5
 
 // BlobCapture is a short tcpdump capture of a device's TLS traffic, parsed into
 // the ClientHello(s) it sent — candidates the user can save as a fake-payload
-// blob. Reuses the v0.8.0 tcpdump plumbing (tcpdumpPath / ErrNeedTcpdump).
+// blob. Reuses the shared tcpdump plumbing (tcpdump.Path / tcpdump.ErrNeedInstall).
 type BlobCapture struct {
 	ID         string              `json:"id"`
 	IP         string              `json:"ip"`
@@ -36,14 +36,14 @@ type BlobCapture struct {
 }
 
 // StartBlobCapture sniffs a device's TLS (:443) traffic for `seconds` and
-// extracts every ClientHello it sends. Returns ErrNeedTcpdump when tcpdump is
-// missing so the UI can offer to install it (same flow as pcap capture).
-func (a *App) StartBlobCapture(ip string, seconds int) (*BlobCapture, error) {
+// extracts every ClientHello it sends. Returns tcpdump.ErrNeedInstall when
+// tcpdump is missing so the UI can offer to install it (same flow as pcap capture).
+func (s *Service) StartBlobCapture(ip string, seconds int) (*BlobCapture, error) {
 	if net.ParseIP(ip) == nil {
 		return nil, fmt.Errorf("неверный IP")
 	}
 	if tcpdump.Path() == "" {
-		return nil, ErrNeedTcpdump
+		return nil, tcpdump.ErrNeedInstall
 	}
 	if seconds <= 0 || seconds > 120 {
 		seconds = 20
@@ -54,23 +54,23 @@ func (a *App) StartBlobCapture(ip string, seconds int) (*BlobCapture, error) {
 	}
 	id := store.NewID()
 	c := &BlobCapture{ID: id, IP: ip, Iface: tcpdump.DeviceIface(ip), Seconds: seconds, Status: "running", StartedAt: time.Now().Unix(), Candidates: []tlsblob.Candidate{}, file: filepath.Join(dir, "blobcap-"+id+".pcap")}
-	a.blobCapMu.Lock()
-	a.blobCaps[id] = c
-	a.blobCapOrder = append(a.blobCapOrder, id)
-	for len(a.blobCapOrder) > maxStoredBlobCaps {
-		old := a.blobCapOrder[0]
-		if oc := a.blobCaps[old]; oc != nil {
+	s.capMu.Lock()
+	s.caps[id] = c
+	s.capOrder = append(s.capOrder, id)
+	for len(s.capOrder) > maxStoredBlobCaps {
+		old := s.capOrder[0]
+		if oc := s.caps[old]; oc != nil {
 			_ = os.Remove(oc.file)
 		}
-		delete(a.blobCaps, old)
-		a.blobCapOrder = a.blobCapOrder[1:]
+		delete(s.caps, old)
+		s.capOrder = s.capOrder[1:]
 	}
-	a.blobCapMu.Unlock()
-	go a.runBlobCapture(c)
-	return a.snapshotBlobCap(id), nil
+	s.capMu.Unlock()
+	go s.runBlobCapture(c)
+	return s.snapshotBlobCap(id), nil
 }
 
-func (a *App) runBlobCapture(c *BlobCapture) {
+func (s *Service) runBlobCapture(c *BlobCapture) {
 	bin := tcpdump.Path()
 	logbuf.Append("blobcap", "info", fmt.Sprintf("blobcap %s: захват ClientHello %s на %s, %dс", short(c.ID), c.IP, c.Iface, c.Seconds))
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(c.Seconds+3)*time.Second)
@@ -87,7 +87,7 @@ func (a *App) runBlobCapture(c *BlobCapture) {
 	// device in the window) — that's a clean "0 caught", not an error.
 	data, _ := os.ReadFile(c.file)
 	if len(data) < 24 {
-		a.setBlobCap(func() {
+		s.setBlobCap(func() {
 			c.Candidates = []tlsblob.Candidate{}
 			c.ElapsedMs = time.Since(start).Milliseconds()
 			c.Status = "done"
@@ -97,10 +97,10 @@ func (a *App) runBlobCapture(c *BlobCapture) {
 	}
 	cands, perr := tlsblob.ParsePcapClientHellos(data)
 	if perr != nil {
-		a.setBlobCap(func() { c.Status = "error"; c.Error = perr.Error() })
+		s.setBlobCap(func() { c.Status = "error"; c.Error = perr.Error() })
 		return
 	}
-	a.setBlobCap(func() {
+	s.setBlobCap(func() {
 		c.Candidates = cands
 		c.ElapsedMs = time.Since(start).Milliseconds()
 		c.Status = "done"
@@ -108,21 +108,21 @@ func (a *App) runBlobCapture(c *BlobCapture) {
 	logbuf.Append("blobcap", "info", fmt.Sprintf("blobcap %s: готово — %d ClientHello", short(c.ID), len(cands)))
 }
 
-func (a *App) setBlobCap(mut func()) {
-	a.blobCapMu.Lock()
+func (s *Service) setBlobCap(mut func()) {
+	s.capMu.Lock()
 	mut()
-	a.blobCapMu.Unlock()
+	s.capMu.Unlock()
 }
 
-func (a *App) GetBlobCapture(id string) (*BlobCapture, bool) {
-	c := a.snapshotBlobCap(id)
+func (s *Service) GetBlobCapture(id string) (*BlobCapture, bool) {
+	c := s.snapshotBlobCap(id)
 	return c, c != nil
 }
 
-func (a *App) snapshotBlobCap(id string) *BlobCapture {
-	a.blobCapMu.Lock()
-	defer a.blobCapMu.Unlock()
-	c, ok := a.blobCaps[id]
+func (s *Service) snapshotBlobCap(id string) *BlobCapture {
+	s.capMu.Lock()
+	defer s.capMu.Unlock()
+	c, ok := s.caps[id]
 	if !ok {
 		return nil
 	}
@@ -134,25 +134,25 @@ func (a *App) snapshotBlobCap(id string) *BlobCapture {
 }
 
 // SaveCapturedBlob stores the chosen captured ClientHello as a custom blob.
-func (a *App) SaveCapturedBlob(id string, index int, name string) (string, error) {
-	a.blobCapMu.Lock()
-	c, ok := a.blobCaps[id]
+func (s *Service) SaveCapturedBlob(id string, index int, name string) (string, error) {
+	s.capMu.Lock()
+	c, ok := s.caps[id]
 	if !ok || index < 0 || index >= len(c.Candidates) {
-		a.blobCapMu.Unlock()
+		s.capMu.Unlock()
 		return "", fmt.Errorf("ClientHello не найден")
 	}
 	data := append([]byte(nil), c.Candidates[index].Bytes...)
-	a.blobCapMu.Unlock()
+	s.capMu.Unlock()
 	if len(data) == 0 {
 		return "", fmt.Errorf("пустой ClientHello")
 	}
-	return a.SaveBlob(name, data)
+	return s.SaveBlob(name, data)
 }
 
 // ValidateBlob reads a blob (custom or system) and reports whether it is a
 // structurally valid TLS ClientHello usable as a fake payload.
-func (a *App) ValidateBlob(name string) (bool, string, error) {
-	_, path, ok := a.resolveBlob(name)
+func (s *Service) ValidateBlob(name string) (bool, string, error) {
+	_, path, ok := s.ResolveBlob(name)
 	if !ok {
 		return false, "", fmt.Errorf("блоб не найден")
 	}
@@ -166,12 +166,12 @@ func (a *App) ValidateBlob(name string) (bool, string, error) {
 
 // GenerateBlob builds a TLS ClientHello for the chosen domain and saves it as a
 // custom blob. alpn/minVer are optional knobs (see tlsblob.GenerateClientHello).
-func (a *App) GenerateBlob(sni string, alpn []string, minVer uint16, name string) (string, error) {
+func (s *Service) GenerateBlob(sni string, alpn []string, minVer uint16, name string) (string, error) {
 	data, err := tlsblob.GenerateClientHello(sni, alpn, minVer)
 	if err != nil {
 		return "", err
 	}
-	return a.SaveBlob(name, data)
+	return s.SaveBlob(name, data)
 }
 
 // short truncates an id for log lines.

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"nfqws2strategy/internal/services/awg"
+	"nfqws2strategy/internal/services/blobs"
 	"nfqws2strategy/internal/services/monitor"
 	"nfqws2strategy/internal/services/nfqws2"
 	"nfqws2strategy/internal/services/proxy"
@@ -54,13 +55,10 @@ type App struct {
 	nfqws2   *nfqws2.Manager  // nfqws2 engine file/version/update/reload (nfqws2 tab)
 	awg      *awg.Manager     // AmneziaWG 2.0 server/client manager (AWG2 tab)
 	awgRoute awgRouteState    // AWG2 split-routing runtime (dead-man's switch)
+	blobs    *blobs.Service   // fake-payload blob store + ClientHello capture (Blobs tab)
 
 	dnsMu      sync.Mutex
 	dnsServers []dns.Server // configured DoH/DoT servers (DNS tab + run matrix)
-
-	blobCapMu    sync.Mutex
-	blobCaps     map[string]*BlobCapture // recent ClientHello captures (id -> capture)
-	blobCapOrder []string
 }
 
 const (
@@ -74,13 +72,13 @@ func New(cfg *config.Config) (*App, error) {
 	if err != nil {
 		return nil, err
 	}
-	a := &App{Cfg: cfg, store: st, runs: map[string]*Run{}, blobCaps: map[string]*BlobCapture{}, sessions: auth.NewSessions(sessionTTL)}
+	a := &App{Cfg: cfg, store: st, runs: map[string]*Run{}, sessions: auth.NewSessions(sessionTTL)}
 	a.nfqws2 = nfqws2.New(cfg)
-	_ = a.store.Load(customStrategiesFile, &a.custom)
-	_ = a.store.Load(sniDomainsFile, &a.sniDomains)
-	if err := os.MkdirAll(a.blobsDir(), 0o755); err != nil {
+	if a.blobs, err = blobs.New(cfg, st); err != nil {
 		return nil, err
 	}
+	_ = a.store.Load(customStrategiesFile, &a.custom)
+	_ = a.store.Load(sniDomainsFile, &a.sniDomains)
 	a.initAuth()
 	a.loadRuns()
 	a.proxy = proxy.New(st)
@@ -120,8 +118,6 @@ func (a *App) Shutdown() {
 	a.StopAWG()
 	a.awgTeardownRouting()
 }
-
-func (a *App) blobsDir() string { return a.store.Path("blobs") }
 
 // opkgBin returns the Entware opkg path (used by the AWG2 engine install).
 func opkgBin() string {
@@ -243,56 +239,7 @@ func (a *App) DeleteCustomStrategy(id string) error {
 	return a.store.Save(customStrategiesFile, a.custom)
 }
 
-// ---------- Blobs ----------
-
-// Blobs lists available blob names: system blobs plus user-uploaded ones.
-func (a *App) Blobs() (system []string, custom []string) {
-	if entries, err := os.ReadDir(a.Cfg.SystemBlobsDir); err == nil {
-		for _, e := range entries {
-			if !e.IsDir() {
-				system = append(system, e.Name())
-			}
-		}
-	}
-	if names, err := a.store.ListFiles("blobs"); err == nil {
-		custom = names
-	}
-	sort.Strings(system)
-	sort.Strings(custom)
-	return
-}
-
-// resolveBlob maps a selected blob filename to its lua name and absolute path,
-// preferring a custom upload over a system blob of the same name. The lua name is
-// the filename without extension.
-func (a *App) resolveBlob(name string) (luaName, path string, ok bool) {
-	name = filepath.Base(name)
-	if name == "" || name == "." {
-		return "", "", false
-	}
-	path = filepath.Join(a.blobsDir(), name)
-	if _, err := os.Stat(path); err != nil {
-		path = filepath.Join(a.Cfg.SystemBlobsDir, name)
-		if _, err := os.Stat(path); err != nil {
-			return "", "", false
-		}
-	}
-	return luaIdent(strings.TrimSuffix(name, filepath.Ext(name))), path, true
-}
-
-// reNonIdent matches characters not allowed in an nfqws2 blob (Lua) identifier.
-var reNonIdent = regexp.MustCompile(`[^A-Za-z0-9_]`)
-
-// luaIdent turns a blob filename stem into a valid nfqws2 --blob=NAME identifier.
-// Captured/generated blobs are named after the SNI (e.g. clienthello_edge.microsoft.com),
-// and nfqws2 rejects dots/dashes as a "bad identifier", so they're folded to '_'.
-func luaIdent(s string) string {
-	s = reNonIdent.ReplaceAllString(s, "_")
-	if s == "" || (s[0] >= '0' && s[0] <= '9') {
-		s = "b_" + s
-	}
-	return s
-}
+// ---------- Runs: SNI + blob expansion ----------
 
 // reFakeBlobRef matches a fake-payload blob reference inside a desync directive
 // (e.g. ":blob=tls_clienthello"), but not the "--blob=" definition flag.
@@ -352,7 +299,7 @@ func (a *App) buildRunStrategies(base []catalog.Strategy, blobNames []string) []
 	type rb struct{ lua, path string }
 	var blobs []rb
 	for _, n := range blobNames {
-		if lua, path, ok := a.resolveBlob(n); ok {
+		if lua, path, ok := a.blobs.ResolveBlob(n); ok {
 			blobs = append(blobs, rb{lua, path})
 		}
 	}
@@ -377,30 +324,6 @@ func (a *App) buildRunStrategies(base []catalog.Strategy, blobNames []string) []
 		out = append(out, s) // default payload, tested last
 	}
 	return out
-}
-
-// SaveBlob stores an uploaded blob and returns the absolute path to reference
-// it in a strategy via --blob=name:@<path>.
-func (a *App) SaveBlob(name string, data []byte) (string, error) {
-	name, err := sanitizeBlobName(name)
-	if err != nil {
-		return "", err
-	}
-	if err := a.store.WriteBytes(filepath.Join("blobs", name), data); err != nil {
-		return "", err
-	}
-	return filepath.Join(a.blobsDir(), name), nil
-}
-
-// DeleteBlob soft-deletes a custom (user-uploaded) blob by moving it to the
-// recycle bin (TrashedBlobs / RestoreBlob / PurgeBlob). System blobs live
-// outside the data dir and are never touched.
-func (a *App) DeleteBlob(name string) error {
-	name, err := sanitizeBlobName(name)
-	if err != nil {
-		return err
-	}
-	return a.trashBlob(name)
 }
 
 // ---------- Apply strategy to live config ----------
