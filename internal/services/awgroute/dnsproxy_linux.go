@@ -1,6 +1,6 @@
 //go:build linux
 
-package app
+package awgroute
 
 import (
 	"nfqws2strategy/internal/services/awg"
@@ -28,15 +28,15 @@ func awgZoneMatchers(cfg *awg.ServerConfig) []awg.DomainMatcher {
 // domain_source=="dnsproxy" with at least one matcher, otherwise stops it. It
 // returns true when the proxy is (now) running, so the firewall hook installs
 // the LAN :53 REDIRECT only while the proxy is actually up (never blackhole DNS).
-func (a *App) awgEnsureDNSProxy(cfg *awg.ServerConfig, targetSet string) bool {
+func (svc *Service) awgEnsureDNSProxy(cfg *awg.ServerConfig, targetSet string) bool {
 	ms := awgZoneMatchers(cfg)
 	want := cfg.Routing.Mode != "off" && cfg.Routing.DomainSource == "dnsproxy" && len(ms) > 0
-	a.awgRoute.mu.Lock()
-	p := a.awgRoute.dnsProxy
-	a.awgRoute.mu.Unlock()
+	svc.route.mu.Lock()
+	p := svc.route.dnsProxy
+	svc.route.mu.Unlock()
 	if !want {
 		if p != nil {
-			a.awgStopDNSProxy()
+			svc.awgStopDNSProxy()
 		}
 		return false
 	}
@@ -48,28 +48,28 @@ func (a *App) awgEnsureDNSProxy(cfg *awg.ServerConfig, targetSet string) bool {
 		// Add every matched answer IP (idempotent -exist). No dedup cache on purpose:
 		// a zone edit flushes the set, and the next DNS query must re-learn cleanly.
 		// The target set is read live so a mode switch routes new hits correctly.
-		_, _ = awgRun("ipset add " + awgTargetSet(a.awg.Config().Routing.Mode) + " " + ip + " -exist")
+		_, _ = awgRun("ipset add " + awgTargetSet(svc.awg.Config().Routing.Mode) + " " + ip + " -exist")
 	})
-	a.awgLoadRecent(np) // restore domains seen in a previous run (before matching)
-	np.SetMatchers(ms)  // re-evaluates the loaded cache → re-adds matching domains
+	svc.awgLoadRecent(np) // restore domains seen in a previous run (before matching)
+	np.SetMatchers(ms)    // re-evaluates the loaded cache → re-adds matching domains
 	if err := np.Start(); err != nil {
 		logbuf.Append("awg2", "error", "DNS-прокси (маски доменов) не запустился: "+err.Error())
 		return false
 	}
-	a.awgRoute.mu.Lock()
-	a.awgRoute.dnsProxy = np
-	a.awgRoute.mu.Unlock()
+	svc.route.mu.Lock()
+	svc.route.dnsProxy = np
+	svc.route.mu.Unlock()
 	logbuf.Append("awg2", "info", "DNS-прокси запущен: перехват :53 → домены/поддомены/маски идут в туннель")
 	return true
 }
 
 // awgStopDNSProxy stops the proxy and removes its LAN :53 REDIRECT rules so DNS
 // falls straight back to the router's resolver.
-func (a *App) awgStopDNSProxy() {
-	a.awgRoute.mu.Lock()
-	p := a.awgRoute.dnsProxy
-	a.awgRoute.dnsProxy = nil
-	a.awgRoute.mu.Unlock()
+func (svc *Service) awgStopDNSProxy() {
+	svc.route.mu.Lock()
+	p := svc.route.dnsProxy
+	svc.route.dnsProxy = nil
+	svc.route.mu.Unlock()
 	if p != nil {
 		p.Stop()
 	}

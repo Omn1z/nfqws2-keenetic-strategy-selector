@@ -1,6 +1,6 @@
 //go:build linux
 
-package app
+package awgroute
 
 import (
 	"archive/tar"
@@ -42,7 +42,7 @@ func awgArchSupported(a string) bool {
 
 func awgGoBin() string { return filepath.Join(awgEngineDir, "amneziawg-go") }
 
-func (a *App) awgEngineInfoOS() EngineInfo {
+func (svc *Service) awgEngineInfoOS() EngineInfo {
 	info := EngineInfo{Arch: runtime.GOARCH, Supported: awgArchSupported(runtime.GOARCH)}
 	if _, err := os.Stat("/dev/net/tun"); err == nil {
 		info.TunOK = true
@@ -53,19 +53,19 @@ func (a *App) awgEngineInfoOS() EngineInfo {
 	return info
 }
 
-func (a *App) awgInstallEngineOS() (string, error) {
+func (svc *Service) awgInstallEngineOS() (string, error) {
 	arch := runtime.GOARCH
 	if !awgArchSupported(arch) {
 		return "", fmt.Errorf("нет сборки движка AWG2 для архитектуры %s", arch)
 	}
-	if a.Cfg.Repo == "" {
+	if svc.cfg.Repo == "" {
 		return "", fmt.Errorf("repo релизов не настроен")
 	}
 	if _, err := os.Stat("/dev/net/tun"); err != nil {
 		_ = exec.Command("sh", "-c", "modprobe tun 2>/dev/null; [ -e /dev/net/tun ] || { mkdir -p /dev/net; mknod /dev/net/tun c 10 200; }").Run()
 	}
 	asset := "awg-engine-linux-" + arch + ".tar.gz"
-	base := "https://github.com/" + a.Cfg.Repo + "/releases/latest/download/"
+	base := "https://github.com/" + svc.cfg.Repo + "/releases/latest/download/"
 	logbuf.Append("awg2", "info", "скачивание движка "+asset+"…")
 	data, err := httpGetBytes(base+asset, 90*time.Second)
 	if err != nil {
@@ -138,20 +138,20 @@ func extractEngine(data []byte, dir string) error {
 	return nil
 }
 
-func (a *App) awgClientUpOS() error {
-	if info := a.awgEngineInfoOS(); !info.Installed {
+func (svc *Service) awgClientUpOS() error {
+	if info := svc.awgEngineInfoOS(); !info.Installed {
 		return fmt.Errorf("движок AWG2 не установлен — нажмите «Установить движок»")
 	} else if !info.TunOK {
 		return fmt.Errorf("нет /dev/net/tun — TUN недоступен на этом роутере")
 	}
-	p, ok := a.awg.RouterPeer()
+	p, ok := svc.awg.RouterPeer()
 	if !ok {
 		return fmt.Errorf("сначала добавьте этот роутер как пир (вкладка «Клиенты», отметка «роутер»)")
 	}
 	if strings.TrimSpace(p.PrivateKey) == "" {
 		return fmt.Errorf("у роутер-пира нет приватного ключа — добавьте пир заново")
 	}
-	cfg := a.awg.Config()
+	cfg := svc.awg.Config()
 	endpointIP := resolveHostIP(hostOf(cfg.Endpoint))
 	port := portOf(cfg.Endpoint)
 	if endpointIP == "" || port == 0 {
@@ -203,7 +203,7 @@ func (a *App) awgClientUpOS() error {
 	return nil
 }
 
-func (a *App) awgClientDownOS() error {
+func (svc *Service) awgClientDownOS() error {
 	script := strings.Join([]string{
 		"ip link set " + awgIface + " down 2>/dev/null || true",
 		"ip link del " + awgIface + " 2>/dev/null || true",
@@ -218,7 +218,7 @@ func (a *App) awgClientDownOS() error {
 	return nil
 }
 
-func (a *App) awgClientStatusOS() *ClientStatus {
+func (svc *Service) awgClientStatusOS() *ClientStatus {
 	st := &ClientStatus{}
 	if exec.Command("ip", "link", "show", awgIface).Run() == nil {
 		st.IfacePresent = true

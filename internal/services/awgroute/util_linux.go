@@ -1,6 +1,6 @@
 //go:build linux
 
-package app
+package awgroute
 
 import (
 	"net"

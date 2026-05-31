@@ -14,7 +14,7 @@ import (
 	"sync"
 	"time"
 
-	"nfqws2strategy/internal/services/awg"
+	"nfqws2strategy/internal/services/awgroute"
 	"nfqws2strategy/internal/services/blobs"
 	"nfqws2strategy/internal/services/monitor"
 	"nfqws2strategy/internal/services/nfqws2"
@@ -50,12 +50,11 @@ type App struct {
 	loggingDisabled  bool
 	httpLogsDisabled bool // suppress the per-request HTTP access log line
 
-	proxy    *proxy.Service   // Telegram proxies: MTProto->WS + SOCKS5 (Telegram tab)
-	monitor  *monitor.Service // live network views: dashboard, conns, devices, traces, pcaps
-	nfqws2   *nfqws2.Manager  // nfqws2 engine file/version/update/reload (nfqws2 tab)
-	awg      *awg.Manager     // AmneziaWG 2.0 server/client manager (AWG2 tab)
-	awgRoute awgRouteState    // AWG2 split-routing runtime (dead-man's switch)
-	blobs    *blobs.Service   // fake-payload blob store + ClientHello capture (Blobs tab)
+	proxy    *proxy.Service    // Telegram proxies: MTProto->WS + SOCKS5 (Telegram tab)
+	monitor  *monitor.Service  // live network views: dashboard, conns, devices, traces, pcaps
+	nfqws2   *nfqws2.Manager   // nfqws2 engine file/version/update/reload (nfqws2 tab)
+	awgroute *awgroute.Service // AWG2 server + router client/split-routing (AWG2 tab)
+	blobs    *blobs.Service    // fake-payload blob store + ClientHello capture (Blobs tab)
 
 	dnsMu      sync.Mutex
 	dnsServers []dns.Server // configured DoH/DoT servers (DNS tab + run matrix)
@@ -83,15 +82,15 @@ func New(cfg *config.Config) (*App, error) {
 	a.loadRuns()
 	a.proxy = proxy.New(st)
 	a.monitor = monitor.New(cfg, st, a.proxy) // dashboard reads the proxy status
-	a.initAWG()                               // creates a.awg; may autostart the tunnel + (after a delay) re-apply committed routing
+	a.awgroute = awgroute.New(cfg, st)        // creates the manager; may autostart the tunnel + re-apply committed routing
 	a.initDNS()
 	// Repair any sandbox state leaked by a previous unclean exit (stale STRAT_*
 	// iptables chains / orphaned test nfqws2 children). Without this a killed run
 	// leaves an exclude-connmark rule that makes the MAIN nfqws2 skip connections.
 	engine.CleanupSandboxes(cfg, maxThreads)
-	// Clear any leaked AWG2 routing state from an unclean exit. Runs AFTER initAWG
-	// (needs a.awg) but BEFORE the autostart goroutine's delayed routing re-apply.
-	a.awgRepairRouting()
+	// Clear any leaked AWG2 routing state from an unclean exit. Runs AFTER the
+	// manager exists but BEFORE the autostart goroutine's delayed routing re-apply.
+	a.awgroute.RepairRouting()
 	return a, nil
 }
 
@@ -115,16 +114,8 @@ func (a *App) Shutdown() {
 	engine.CleanupSandboxes(a.Cfg, maxThreads)
 	a.StopTGWS()
 	a.StopSocks5()
-	a.StopAWG()
-	a.awgTeardownRouting()
-}
-
-// opkgBin returns the Entware opkg path (used by the AWG2 engine install).
-func opkgBin() string {
-	if _, err := os.Stat("/opt/bin/opkg"); err == nil {
-		return "/opt/bin/opkg"
-	}
-	return "opkg"
+	a.awgroute.StopAWG()
+	a.awgroute.TeardownRouting()
 }
 
 // ---------- Lists ----------

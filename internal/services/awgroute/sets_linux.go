@@ -1,6 +1,6 @@
 //go:build linux
 
-package app
+package awgroute
 
 import (
 	"encoding/json"
@@ -35,7 +35,7 @@ func isMaskEntry(s string) bool {
 	return strings.ContainsAny(s, "*#") || strings.HasPrefix(s, "[re]")
 }
 
-func (a *App) awgBuildSets(cfg *awg.ServerConfig) error {
+func (svc *Service) awgBuildSets(cfg *awg.ServerConfig) error {
 	_, _ = awgRun("ipset create " + awgSetInc + " hash:net family inet -exist")
 	_, _ = awgRun("ipset create " + awgSetExc + " hash:net family inet -exist")
 	target := awgSetInc
@@ -99,10 +99,10 @@ func awgRestoreSets() {
 // awgSaveRecent persists the DNS proxy's recently-seen name→IPs cache so that after
 // a panel restart / reboot the masks re-apply to every domain seen before, without
 // waiting for the device to look it up again (its DNS cache wouldn't re-query it).
-func (a *App) awgSaveRecent() {
-	a.awgRoute.mu.Lock()
-	p := a.awgRoute.dnsProxy
-	a.awgRoute.mu.Unlock()
+func (svc *Service) awgSaveRecent() {
+	svc.route.mu.Lock()
+	p := svc.route.dnsProxy
+	svc.route.mu.Unlock()
 	if p == nil {
 		return
 	}
@@ -116,7 +116,7 @@ func (a *App) awgSaveRecent() {
 }
 
 // awgLoadRecent restores the persisted name→IPs cache into a freshly-created proxy.
-func (a *App) awgLoadRecent(p *awg.DNSProxy) {
+func (svc *Service) awgLoadRecent(p *awg.DNSProxy) {
 	b, err := os.ReadFile(awgRecentFile)
 	if err != nil {
 		return
