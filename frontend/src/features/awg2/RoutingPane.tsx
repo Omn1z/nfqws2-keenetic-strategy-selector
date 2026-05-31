@@ -10,7 +10,14 @@ import { Field, Input, Select, Textarea } from "@/components/ui/form";
 import type { Awg2Status, AwgRoutingConfig, AwgZone } from "@/types/api";
 
 const toLines = (a: string[]) => (a || []).join("\n");
-const fromLines = (s: string) => s.split("\n").map((x) => x.trim()).filter(Boolean);
+// Keep raw lines while editing (don't trim/drop blanks — that fights the cursor
+// and blocks pressing Enter). Clean (trim + drop empties) only when saving.
+const splitRaw = (s: string) => s.split("\n");
+const cleanArr = (a: string[]) => (a || []).map((x) => x.trim()).filter(Boolean);
+const cleanRouting = (rc: AwgRoutingConfig): AwgRoutingConfig => ({
+  ...rc,
+  zones: (rc.zones || []).map((z) => ({ ...z, domains: cleanArr(z.domains), ips: cleanArr(z.ips) })),
+});
 const human = (n: number) => {
   if (!n) return "0 B";
   const u = ["B", "KB", "MB", "GB", "TB"];
@@ -70,7 +77,7 @@ export default function RoutingPane({ st, reload }: { st: Awg2Status; reload: ()
     }))) return;
     setBusy(true);
     try {
-      await api("POST", "/api/awg2/routing/config", r);
+      await api("POST", "/api/awg2/routing/config", cleanRouting(r));
       await api("POST", "/api/awg2/routing/apply", {});
       toast("Применено — подтвердите в течение 90с", "ok");
       startCountdown();
@@ -133,7 +140,7 @@ export default function RoutingPane({ st, reload }: { st: Awg2Status; reload: ()
         </div>
         <div className="mt-1 flex items-center gap-4"><Switch checked={!!r.killswitch} onChange={(v) => setR({ ...r, killswitch: v })} label="Killswitch (резать туннельный трафик, если awg0 упал)" /></div>
         <div className="mt-2 flex flex-wrap items-center gap-2.5">
-          <Button onClick={() => post("/api/awg2/routing/config", r, "Маршрутизация сохранена")} disabled={busy}>Сохранить</Button>
+          <Button onClick={() => post("/api/awg2/routing/config", cleanRouting(r), "Маршрутизация сохранена")} disabled={busy}>Сохранить</Button>
           {r.mode === "off"
             ? <Button variant="primary" onClick={teardown} disabled={busy}>Снять маршрутизацию</Button>
             : <Button variant="primary" onClick={applyRouting} disabled={busy || !cl?.running}>Применить</Button>}
@@ -155,13 +162,13 @@ export default function RoutingPane({ st, reload }: { st: Awg2Status; reload: ()
                 <Button mini onClick={() => delZone(i)}>Удалить</Button>
               </div>
               <div className="flex flex-wrap gap-3">
-                <Field label="Домены (по строке)" className="min-w-[200px] flex-1"><Textarea rows={3} value={toLines(z.domains)} placeholder={"youtube.com\ngoogleapis.com"} onChange={(e) => setZone(i, { domains: fromLines(e.target.value) })} /></Field>
-                <Field label="IP / подсети (по строке)" className="min-w-[160px] flex-1"><Textarea rows={3} value={toLines(z.ips)} placeholder={"1.2.3.4\n10.0.0.0/24"} onChange={(e) => setZone(i, { ips: fromLines(e.target.value) })} /></Field>
+                <Field label="Домены (по строке)" className="min-w-[200px] flex-1"><Textarea rows={4} value={toLines(z.domains)} placeholder={"youtube.com\ngoogleapis.com"} onChange={(e) => setZone(i, { domains: splitRaw(e.target.value) })} /></Field>
+                <Field label="IP / подсети (по строке)" className="min-w-[160px] flex-1"><Textarea rows={4} value={toLines(z.ips)} placeholder={"1.2.3.4\n10.0.0.0/24"} onChange={(e) => setZone(i, { ips: splitRaw(e.target.value) })} /></Field>
               </div>
             </div>
           ))
         )}
-        {(r.zones || []).length > 0 && <Button onClick={() => post("/api/awg2/routing/config", r, "Зоны сохранены")} disabled={busy}>Сохранить зоны</Button>}
+        {(r.zones || []).length > 0 && <Button onClick={() => post("/api/awg2/routing/config", cleanRouting(r), "Сохранить зоны")} disabled={busy}>Сохранить зоны</Button>}
       </Card>
     </>
   );

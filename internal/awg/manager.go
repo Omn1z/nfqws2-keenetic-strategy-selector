@@ -128,6 +128,14 @@ func (m *Manager) SetClientEnabled(v bool) {
 	m.mu.Unlock()
 }
 
+// SetRoutingActive marks split-routing as committed/active, persisted so the
+// panel re-applies it automatically after a restart/reboot.
+func (m *Manager) SetRoutingActive(v bool) {
+	m.mu.Lock()
+	m.cfg.Routing.Active = v
+	m.mu.Unlock()
+}
+
 // EnsureKeys generates the server keypair + randomized 2.0 obfuscation once.
 // Returns true if anything changed (so the caller persists before deploying).
 func (m *Manager) EnsureKeys() (bool, error) {

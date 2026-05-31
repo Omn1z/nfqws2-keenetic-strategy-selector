@@ -35,12 +35,26 @@ func (a *App) initAWG() {
 	}
 	cfg.Normalize()
 	a.awg = awg.NewManager(cfg)
-	// Bring the local client tunnel up on boot if the user enabled it (best-effort;
-	// routing is NOT auto-applied — that stays an explicit, dead-man's-switched step).
+	// Bring the local client tunnel up on boot if the user enabled it (best-effort).
 	if cfg.Client.Enabled {
 		go func() {
 			if err := a.awgClientUpOS(); err != nil {
 				log.Printf("awg: client autostart: %v", err)
+				return
+			}
+			// Re-apply split-routing if it was committed before (persist across
+			// reboot/panel restart). It was user-confirmed previously, so we apply
+			// AND commit: the apply still arms the ~90s dead-man's switch, the
+			// commit disarms it, so a misapply still auto-rolls-back.
+			c := a.awg.Config()
+			if c.Routing.Active && c.Routing.Mode != "off" {
+				time.Sleep(4 * time.Second) // let the handshake settle + startup repair finish
+				if err := a.awgApplyRoutingOS(); err != nil {
+					log.Printf("awg: routing auto-apply: %v", err)
+				} else {
+					_ = a.awgCommitRoutingOS()
+					logbuf.Append("awg2", "info", "маршрутизация восстановлена после перезапуска")
+				}
 			}
 		}()
 	}

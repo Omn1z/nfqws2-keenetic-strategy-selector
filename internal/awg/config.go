@@ -111,6 +111,7 @@ type RoutingConfig struct {
 	MTU          int    `json:"mtu"` // awg0 client MTU
 	Killswitch   bool   `json:"killswitch"`
 	DomainSource string `json:"domain_source"` // "resolve"|"dnsmasq"
+	Active       bool   `json:"active"`        // committed → re-apply on boot (set on commit, cleared on explicit teardown)
 }
 
 // Default returns a disabled, ready-to-fill server config with AWG 2.0 defaults.

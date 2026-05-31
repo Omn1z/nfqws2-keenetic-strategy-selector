@@ -66,8 +66,29 @@ type awgRouteState struct {
 	active      bool
 }
 
-func (a *App) AWG2ApplyRouting() error    { return a.awgApplyRoutingOS() }
-func (a *App) AWG2CommitRouting() error   { return a.awgCommitRoutingOS() }
-func (a *App) AWG2TeardownRouting() error { return a.awgTeardownRoutingOS() }
-func (a *App) awgRepairRouting()          { a.awgRepairRoutingOS() }
-func (a *App) awgTeardownRouting()        { _ = a.awgTeardownRoutingOS() }
+func (a *App) AWG2ApplyRouting() error { return a.awgApplyRoutingOS() }
+
+// AWG2CommitRouting disarms the dead-man's switch and marks routing committed so
+// it auto-applies after a restart/reboot.
+func (a *App) AWG2CommitRouting() error {
+	if err := a.awgCommitRoutingOS(); err != nil {
+		return err
+	}
+	a.awg.SetRoutingActive(true)
+	a.awgSave()
+	return nil
+}
+
+// AWG2TeardownRouting is the explicit "снять маршрутизацию" action — it clears
+// the committed flag so routing does NOT come back on the next boot.
+func (a *App) AWG2TeardownRouting() error {
+	a.awg.SetRoutingActive(false)
+	a.awgSave()
+	return a.awgTeardownRoutingOS()
+}
+
+func (a *App) awgRepairRouting() { a.awgRepairRoutingOS() }
+
+// awgTeardownRouting is the internal teardown (e.g. on client-down/shutdown). It
+// does NOT clear the committed flag, so routing restores when the tunnel returns.
+func (a *App) awgTeardownRouting() { _ = a.awgTeardownRoutingOS() }

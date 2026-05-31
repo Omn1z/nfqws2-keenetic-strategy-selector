@@ -89,13 +89,15 @@ func New(cfg *config.Config) (*App, error) {
 	a.loadRuns()
 	a.initTGWS()
 	a.initSocks5()
-	a.initAWG()
+	a.initAWG() // creates a.awg; may autostart the tunnel + (after a delay) re-apply committed routing
 	a.initDNS()
 	// Repair any sandbox state leaked by a previous unclean exit (stale STRAT_*
 	// iptables chains / orphaned test nfqws2 children). Without this a killed run
 	// leaves an exclude-connmark rule that makes the MAIN nfqws2 skip connections.
 	engine.CleanupSandboxes(cfg, maxThreads)
-	a.awgRepairRouting() // remove any leaked AWG2 routing state from an unclean exit
+	// Clear any leaked AWG2 routing state from an unclean exit. Runs AFTER initAWG
+	// (needs a.awg) but BEFORE the autostart goroutine's delayed routing re-apply.
+	a.awgRepairRouting()
 	return a, nil
 }
 

@@ -7,6 +7,7 @@ import { Card } from "@/components/ui/Card";
 import { Button } from "@/components/ui/Button";
 import { Badge } from "@/components/ui/Badge";
 import { Modal } from "@/components/ui/Modal";
+import { Switch } from "@/components/ui/Switch";
 import { Field, Input, Select } from "@/components/ui/form";
 import { tableCls, tdCls } from "@/components/ui/Table";
 import type { Awg2Status, AwgPeer, AwgPeerStatus } from "@/types/api";
@@ -32,6 +33,7 @@ export default function ClientsPane({ st, reload }: { st: Awg2Status; reload: ()
   const [adding, setAdding] = useState(false);
   const [name, setName] = useState("");
   const [tunnel, setTunnel] = useState("full");
+  const [isRouter, setIsRouter] = useState(false);
   const [busy, setBusy] = useState(false);
   const [show, setShow] = useState<{ name: string; text: string } | null>(null);
 
@@ -42,10 +44,10 @@ export default function ClientsPane({ st, reload }: { st: Awg2Status; reload: ()
   const add = async () => {
     setBusy(true);
     try {
-      const body = { name: name.trim(), allowed_ips: tunnel === "full" ? "0.0.0.0/0, ::/0" : st.config.subnet || "10.13.13.0/24" };
+      const body = { name: name.trim(), is_router: isRouter, allowed_ips: tunnel === "full" ? "0.0.0.0/0, ::/0" : st.config.subnet || "10.13.13.0/24" };
       const d = await api<{ ok: boolean; peer: AwgPeer; error?: string }>("POST", "/api/awg2/peers", body);
       if (!d.ok) toast(d.error || "Не удалось добавить пир", "err");
-      else { toast("Пир добавлен", "ok"); setAdding(false); setName(""); }
+      else { toast("Пир добавлен", "ok"); setAdding(false); setName(""); setIsRouter(false); }
       await reload();
     } catch (e) {
       toast((e as Error).message, "err");
@@ -133,7 +135,8 @@ export default function ClientsPane({ st, reload }: { st: Awg2Status; reload: ()
         >
           <Field label="Имя пира"><Input value={name} placeholder="напр. keenetic" onChange={(e) => setName(e.target.value)} /></Field>
           <Field label="Маршрутизация клиента" className="mt-3"><Select value={tunnel} onChange={(e) => setTunnel(e.target.value)}><option value="full">Весь трафик через VPN (0.0.0.0/0)</option><option value="split">Только подсеть туннеля</option></Select></Field>
-          <p className="mt-2 text-[11px] text-muted">Для пира сгенерируются пара ключей и PSK. Конфиг скачивается после добавления.</p>
+          <div className="mt-3"><Switch checked={isRouter} onChange={setIsRouter} label="Это наш роутер (Keenetic) — пир для туннеля awg0" /></div>
+          <p className="mt-2 text-[11px] text-muted">Отметьте «роутер», чтобы именно этот пир использовался кнопкой «Поднять туннель» во вкладке «Маршрутизация». Для пира сгенерируются пара ключей и PSK; конфиг скачивается после добавления.</p>
         </Modal>
       )}
 
