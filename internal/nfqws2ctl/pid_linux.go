@@ -1,6 +1,6 @@
 //go:build linux
 
-package app
+package nfqws2ctl
 
 import (
 	"fmt"
@@ -9,11 +9,11 @@ import (
 	"syscall"
 )
 
-// verifyNfqws2Pid confirms the pid belongs to the real nfqws2 engine and NOT our
-// own nfqws2-strategy process. The upstream S51 init's is_running() uses
+// verifyPid confirms the pid belongs to the real nfqws2 engine and NOT our own
+// nfqws2-strategy process. The upstream S51 init's is_running() uses
 // `pgrep -nf /opt/usr/bin/nfqws2`, which substring-matches nfqws2-strategy — so
 // we verify argv[0]'s basename is EXACTLY "nfqws2" before sending any signal.
-func verifyNfqws2Pid(pid int) error {
+func verifyPid(pid int) error {
 	b, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
 	if err != nil {
 		return fmt.Errorf("nfqws2 (pid %d) не запущен", pid)
@@ -29,7 +29,7 @@ func verifyNfqws2Pid(pid int) error {
 	return nil
 }
 
-func sighupNfqws2(pid int) error {
+func sighup(pid int) error {
 	if err := syscall.Kill(pid, syscall.SIGHUP); err != nil {
 		return fmt.Errorf("не удалось отправить SIGHUP процессу %d: %w", pid, err)
 	}

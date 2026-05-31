@@ -20,6 +20,7 @@ import (
 	"nfqws2strategy/internal/config"
 	"nfqws2strategy/internal/dns"
 	"nfqws2strategy/internal/engine"
+	"nfqws2strategy/internal/nfqws2ctl"
 	"nfqws2strategy/internal/store"
 	"nfqws2strategy/internal/tgws"
 )
@@ -47,10 +48,11 @@ type App struct {
 	loggingDisabled  bool
 	httpLogsDisabled bool // suppress the per-request HTTP access log line
 
-	tgws   *tgws.Manager       // Telegram MTProto->WS proxy (Telegram tab)
-	socks5 *tgws.Socks5Manager // Telegram SOCKS5 proxy, TGLock-adapted (Telegram tab)
-	awg      *awg.Manager      // AmneziaWG 2.0 server/client manager (AWG2 tab)
-	awgRoute awgRouteState     // AWG2 split-routing runtime (dead-man's switch)
+	tgws     *tgws.Manager       // Telegram MTProto->WS proxy (Telegram tab)
+	socks5   *tgws.Socks5Manager // Telegram SOCKS5 proxy, TGLock-adapted (Telegram tab)
+	nfqws2   *nfqws2ctl.Manager  // nfqws2 engine file/version/update/reload (nfqws2 tab)
+	awg      *awg.Manager        // AmneziaWG 2.0 server/client manager (AWG2 tab)
+	awgRoute awgRouteState       // AWG2 split-routing runtime (dead-man's switch)
 
 	dnsMu      sync.Mutex
 	dnsServers []dns.Server // configured DoH/DoT servers (DNS tab + run matrix)
@@ -80,6 +82,7 @@ func New(cfg *config.Config) (*App, error) {
 		return nil, err
 	}
 	a := &App{Cfg: cfg, store: st, runs: map[string]*Run{}, traces: map[string]*Trace{}, pcaps: map[string]*Pcap{}, blobCaps: map[string]*BlobCapture{}, sessions: auth.NewSessions(sessionTTL)}
+	a.nfqws2 = nfqws2ctl.New(cfg)
 	_ = a.store.Load(customStrategiesFile, &a.custom)
 	_ = a.store.Load(sniDomainsFile, &a.sniDomains)
 	if err := os.MkdirAll(a.blobsDir(), 0o755); err != nil {
@@ -126,6 +129,14 @@ func (a *App) Shutdown() {
 }
 
 func (a *App) blobsDir() string { return a.store.Path("blobs") }
+
+// opkgBin returns the Entware opkg path (used by the AWG2 engine install).
+func opkgBin() string {
+	if _, err := os.Stat("/opt/bin/opkg"); err == nil {
+		return "/opt/bin/opkg"
+	}
+	return "opkg"
+}
 
 // ---------- Lists ----------
 
