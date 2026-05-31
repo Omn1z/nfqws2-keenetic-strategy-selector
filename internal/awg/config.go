@@ -110,7 +110,7 @@ type RoutingConfig struct {
 	Zones        []Zone `json:"zones"`
 	MTU          int    `json:"mtu"` // awg0 client MTU
 	Killswitch   bool   `json:"killswitch"`
-	DomainSource string `json:"domain_source"` // "resolve"|"dnsmasq"
+	DomainSource string `json:"domain_source"` // "resolve"|"dnsproxy"
 	Active       bool   `json:"active"`        // committed → re-apply on boot (set on commit, cleared on explicit teardown)
 }
 
@@ -188,7 +188,7 @@ func (c *ServerConfig) Normalize() {
 	if c.Routing.MTU == 0 {
 		c.Routing.MTU = 1280
 	}
-	if c.Routing.DomainSource != "dnsmasq" {
+	if c.Routing.DomainSource != "dnsproxy" {
 		c.Routing.DomainSource = "resolve"
 	}
 	if c.Routing.Zones == nil {
@@ -265,7 +265,7 @@ func (c *ServerConfig) Validate() []string {
 	default:
 		errs = append(errs, "неизвестный режим маршрутизации")
 	}
-	if c.Routing.DomainSource != "resolve" && c.Routing.DomainSource != "dnsmasq" {
+	if c.Routing.DomainSource != "resolve" && c.Routing.DomainSource != "dnsproxy" {
 		errs = append(errs, "неизвестный источник доменов для маршрутизации")
 	}
 	return errs

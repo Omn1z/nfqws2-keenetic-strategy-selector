@@ -7,6 +7,8 @@ package app
 import (
 	"sync"
 	"time"
+
+	"nfqws2strategy/internal/awg"
 )
 
 // EngineInfo reports the installed userspace AmneziaWG engine on the router.
@@ -58,12 +60,14 @@ func (a *App) AWG2ClientDown() error {
 	return a.awgClientDownOS()
 }
 
-// awgRouteState holds the split-routing runtime (dead-man's-switch + refresher).
+// awgRouteState holds the split-routing runtime (dead-man's-switch + refresher
+// + the optional domain-mask DNS proxy).
 type awgRouteState struct {
 	mu          sync.Mutex
 	rollback    *time.Timer
 	stopRefresh chan struct{}
 	active      bool
+	dnsProxy    *awg.DNSProxy
 }
 
 func (a *App) AWG2ApplyRouting() error { return a.awgApplyRoutingOS() }

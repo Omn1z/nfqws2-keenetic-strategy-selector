@@ -115,6 +115,7 @@ func (m *Manager) SetConfig(in *ServerConfig) error {
 // server settings, so it can be edited before the server is even configured).
 func (m *Manager) SetRouting(rc RoutingConfig) {
 	m.mu.Lock()
+	rc.Active = m.cfg.Routing.Active // managed by commit/teardown, not the form — preserve it
 	m.cfg.Routing = rc
 	m.cfg.Normalize()
 	m.mu.Unlock()

@@ -139,6 +139,10 @@ export default function RoutingPane({ st, reload }: { st: Awg2Status; reload: ()
           <Field label="MTU туннеля" className="w-28 shrink-0"><Input type="number" min={1280} max={1420} value={String(r.mtu || 1376)} onChange={(e) => setR({ ...r, mtu: parseInt(e.target.value, 10) || 1376 })} /></Field>
         </div>
         <div className="mt-1 flex items-center gap-4"><Switch checked={!!r.killswitch} onChange={(v) => setR({ ...r, killswitch: v })} label="Killswitch (резать туннельный трафик, если awg0 упал)" /></div>
+        <div className="mt-1 flex items-center gap-4"><Switch checked={r.domain_source === "dnsproxy"} onChange={(v) => setR({ ...r, domain_source: v ? "dnsproxy" : "resolve" })} label="Маски и поддомены доменов (перехват DNS)" /></div>
+        {r.domain_source === "dnsproxy" && (
+          <p className="mt-1 text-[11px] text-muted">Панель прозрачно перехватывает DNS локальной сети и заводит в туннель IP по совпадению имени. Форматы записи домена: <b>domain.com</b> — домен и все поддомены; маски <b>*main.com</b>, <b>server*</b>, <b>test##.com</b> (<b>#</b> — один символ); регэксп <b>[re]^.*\.cdn\.net$</b>. Действует только пока маршрутизация активна; шифрованный DNS (DoH/DoT) на устройстве это обходит.</p>
+        )}
         <div className="mt-2 flex flex-wrap items-center gap-2.5">
           <Button onClick={() => post("/api/awg2/routing/config", cleanRouting(r), "Маршрутизация сохранена")} disabled={busy}>Сохранить</Button>
           {r.mode === "off"
