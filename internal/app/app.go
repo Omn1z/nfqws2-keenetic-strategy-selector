@@ -81,8 +81,8 @@ func New(cfg *config.Config) (*App, error) {
 	a.initAuth()
 	a.loadRuns()
 	a.proxy = proxy.New(st)
-	a.monitor = monitor.New(cfg, st, a.proxy) // dashboard reads the proxy status
-	a.awgroute = awgroute.New(cfg, st)               // creates the manager; may autostart the tunnel + re-apply committed routing
+	a.awgroute = awgroute.New(cfg, st)                    // creates the manager; may autostart the tunnel + re-apply committed routing
+	a.monitor = monitor.New(cfg, st, a.proxy, a.awgroute) // dashboard reads the proxy + AWG2 tunnel status
 	a.proxy.SetAWGFallbackProbe(a.awgroute.FallbackUp) // Telegram proxies route ISP-blocked DC1/3/5 via the selected AWG2 server while it is up
 	a.initDNS()
 	// Repair any sandbox state leaked by a previous unclean exit (stale STRAT_*

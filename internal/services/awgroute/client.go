@@ -37,6 +37,71 @@ type ClientStatus struct {
 	Error         string `json:"error,omitempty"`
 }
 
+// AWGConn is one AWG2 tunnel's live state, shaped for the dashboard (state +
+// transfer + stats). Modelled as a list (DashboardConns) so multiple AWG2 servers
+// render uniformly later; today there is the single router client tunnel awg0.
+type AWGConn struct {
+	ID            string `json:"id"`
+	Label         string `json:"label"`
+	Endpoint      string `json:"endpoint"`
+	State         string `json:"state"` // "connected" | "stale" | "down" | "off"
+	Connected     bool   `json:"connected"`
+	Running       bool   `json:"running"`
+	LastHandshake int64  `json:"last_handshake"`
+	RxBytes       int64  `json:"rx_bytes"`
+	TxBytes       int64  `json:"tx_bytes"`
+	MTU           int    `json:"mtu"`
+	Address       string `json:"address"`
+}
+
+// DashboardConns returns the AWG2 tunnel(s) for the dashboard. Empty (non-nil) when
+// no server is configured and nothing is running, so the dashboard hides the card.
+func (svc *Service) DashboardConns() []AWGConn {
+	out := []AWGConn{}
+	cfg := svc.awg.Config()
+	endpoint := strings.TrimSpace(cfg.Endpoint)
+	cs := svc.awgClientStatus() // nil off-router
+	if endpoint == "" && (cs == nil || !cs.Running) {
+		return out
+	}
+	label := endpoint
+	if i := strings.LastIndex(label, ":"); i > 0 {
+		label = label[:i]
+	}
+	id := cfg.Interface
+	if id == "" {
+		id = "awg0"
+	}
+	c := AWGConn{ID: id, Label: label, Endpoint: endpoint, State: "off"}
+	if cs != nil {
+		c.Connected, c.Running = cs.Connected, cs.Running
+		c.LastHandshake, c.RxBytes, c.TxBytes = cs.LastHandshake, cs.RxBytes, cs.TxBytes
+		c.MTU, c.Address = cs.MTU, cs.Address
+		switch {
+		case cs.Connected:
+			c.State = "connected"
+		case cs.Running:
+			c.State = "stale" // iface up but the handshake is old (>~180s)
+		default:
+			c.State = "down"
+		}
+	}
+	// The live UAPI status doesn't report MTU/address (set via `ip`, not UAPI) — fall
+	// back to the configured tunnel MTU and the router peer's tunnel address.
+	if c.MTU == 0 {
+		c.MTU = cfg.Routing.MTU
+	}
+	if c.Address == "" {
+		for _, p := range cfg.Peers {
+			if p.IsRouter {
+				c.Address = p.Address
+				break
+			}
+		}
+	}
+	return append(out, c)
+}
+
 // Public app methods (delegating to the OS impl) used by the server handlers.
 func (svc *Service) AWG2EngineInfo() EngineInfo         { return svc.awgEngineInfoOS() }
 func (svc *Service) AWG2InstallEngine() (string, error) { return svc.awgInstallEngineOS() }

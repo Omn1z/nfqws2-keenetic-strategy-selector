@@ -31,6 +31,19 @@ const Big = ({ value, sub }: { value: ReactNode; sub: string }) => (
 const GRID3 = "grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3";
 const CARD = "mb-0 h-full"; // cancel the Card stacking margin + stretch to row height
 
+// "N с/мин/ч назад" from a unix-seconds timestamp (AWG handshake age).
+const agoRu = (t: number) => {
+  const s = Math.max(0, Math.floor(Date.now() / 1000) - t);
+  return s < 60 ? `${s} с назад` : s < 3600 ? `${Math.floor(s / 60)} мин назад` : `${Math.floor(s / 3600)} ч назад`;
+};
+// AWG2 connection state → badge kind + label.
+const AWG_STATE: Record<string, { k: "ok" | "warn" | "bad" | "neutral"; l: string }> = {
+  connected: { k: "ok", l: "подключён" },
+  stale: { k: "warn", l: "хендшейк устарел" },
+  down: { k: "bad", l: "не в сети" },
+  off: { k: "neutral", l: "выключен" },
+};
+
 type Rate = { rx: number; tx: number };
 interface Sample {
   conns: number;
@@ -137,8 +150,10 @@ function Nfqws2Card({ running, queue }: { running: boolean; queue: number }) {
 export default function Dashboard() {
   const [d, setD] = useState<DashboardData | null>(null);
   const [rates, setRates] = useState<Record<string, Rate>>({});
+  const [awgRates, setAwgRates] = useState<Record<string, Rate>>({});
   const [hist, setHist] = useState<Sample[]>([]);
   const wanPrev = useRef<Record<string, Rate & { t: number }>>({});
+  const awgPrev = useRef<Record<string, Rate & { t: number }>>({});
   const qPrev = useRef<{ seq: number; t: number } | null>(null);
 
   usePoll(async () => {
@@ -165,6 +180,17 @@ export default function Dashboard() {
         if (p && now > p.t) pps = Math.max(0, (q.id_seq - p.seq) / ((now - p.t) / 1000));
         qPrev.current = { seq: q.id_seq, t: now };
       }
+      // AWG2 tunnel rates — same diff-over-time as WAN, keyed by connection id.
+      const nextAwg: Record<string, Rate> = {};
+      for (const c of data.awg ?? []) {
+        const p = awgPrev.current[c.id];
+        if (p && now > p.t) {
+          const dt = (now - p.t) / 1000;
+          nextAwg[c.id] = { rx: Math.max(0, (c.rx_bytes - p.rx) / dt), tx: Math.max(0, (c.tx_bytes - p.tx) / dt) };
+        }
+        awgPrev.current[c.id] = { rx: c.rx_bytes, tx: c.tx_bytes, t: now };
+      }
+      setAwgRates(nextAwg);
       setRates(nextRates);
       setD(data);
       // Push a history sample only once a baseline exists (first poll seeds prev).
@@ -225,6 +251,24 @@ export default function Dashboard() {
 
         <Nfqws2Card running={d.nfqws2_running} queue={d.main_queue} />
       </div>
+
+      {/* VPN-туннели AWG2 — по каждому соединению: состояние, трафик, статистика */}
+      {(d.awg?.length ?? 0) > 0 && (
+        <div className={`${GRID3} mb-4`}>
+          {d.awg.map((c) => {
+            const r = awgRates[c.id];
+            const st = AWG_STATE[c.state] ?? AWG_STATE.off;
+            return (
+              <Card key={c.id} title={`AWG2 · ${c.label || c.id}`} sub={c.endpoint || "VPN-туннель"} head={<Badge kind={st.k}>{st.l}</Badge>} className={CARD}>
+                <Row l="Хендшейк">{c.last_handshake ? agoRu(c.last_handshake) : "—"}</Row>
+                <Row l="Трафик ↓ / ↑">{human(c.rx_bytes)} / {human(c.tx_bytes)}</Row>
+                <Row l="Сейчас ↓ / ↑">{r ? `${human(r.rx)}/с / ${human(r.tx)}/с` : "…"}</Row>
+                <Row l="MTU / адрес">{c.mtu || "—"} / {c.address || "—"}</Row>
+              </Card>
+            );
+          })}
+        </div>
+      )}
 
       {/* Метрики */}
       <div className={GRID3}>

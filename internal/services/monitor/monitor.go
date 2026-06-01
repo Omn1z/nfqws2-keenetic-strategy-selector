@@ -8,6 +8,7 @@ package monitor
 import (
 	"sync"
 
+	"nfqws2strategy/internal/services/awgroute"
 	"nfqws2strategy/internal/services/proxy"
 	"nfqws2strategy/internal/tools/config"
 	"nfqws2strategy/internal/tools/netmon"
@@ -18,7 +19,8 @@ import (
 type Service struct {
 	cfg   *config.Config
 	store *store.Store
-	proxy *proxy.Service // the dashboard surfaces the two Telegram proxies' status
+	proxy *proxy.Service     // the dashboard surfaces the two Telegram proxies' status
+	awg   *awgroute.Service  // …and the AWG2 VPN tunnel(s)
 
 	traceMu    sync.Mutex
 	traces     map[string]*Trace
@@ -30,12 +32,13 @@ type Service struct {
 }
 
 // New builds the monitor service. px is read for the dashboard's TG WS / SOCKS5
-// status cards.
-func New(cfg *config.Config, st *store.Store, px *proxy.Service) *Service {
+// status cards; aw for the AWG2 VPN tunnel card(s).
+func New(cfg *config.Config, st *store.Store, px *proxy.Service, aw *awgroute.Service) *Service {
 	return &Service{
 		cfg:    cfg,
 		store:  st,
 		proxy:  px,
+		awg:    aw,
 		traces: map[string]*Trace{},
 		pcaps:  map[string]*Pcap{},
 	}
@@ -47,6 +50,9 @@ func New(cfg *config.Config, st *store.Store, px *proxy.Service) *Service {
 type DashboardView struct {
 	TGWS   proxy.TGWSStatus   `json:"tgws"`
 	Socks5 proxy.Socks5Status `json:"socks5"`
+
+	// AWG is the AWG2 VPN tunnel(s) — state + transfer + stats per connection ([] not null).
+	AWG []awgroute.AWGConn `json:"awg"`
 
 	// Nfqws2Running is true when the DPI engine's NFQUEUE (MainQueue) is bound.
 	Nfqws2Running bool `json:"nfqws2_running"`
@@ -74,6 +80,7 @@ func (s *Service) Dashboard(host string) DashboardView {
 	var d DashboardView
 	d.TGWS = s.proxy.TGWSStatusFor(host)
 	d.Socks5 = s.proxy.Socks5StatusFor(host)
+	d.AWG = s.awg.DashboardConns()
 	d.MainQueue = s.cfg.MainQueue
 	d.Conns.ByProto = map[string]int{}
 

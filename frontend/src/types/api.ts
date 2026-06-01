@@ -308,9 +308,24 @@ export interface Awg2Status {
   client: AwgClientStatus | null;
 }
 
+export interface AwgConn {
+  id: string;
+  label: string;
+  endpoint: string;
+  state: "connected" | "stale" | "down" | "off" | string;
+  connected: boolean;
+  running: boolean;
+  last_handshake: number;
+  rx_bytes: number;
+  tx_bytes: number;
+  mtu: number;
+  address: string;
+}
+
 export interface Dashboard {
   tgws: TgwsStatus;
   socks5: Socks5Status;
+  awg: AwgConn[];
   nfqws2_running: boolean;
   conntrack: { count: number; max: number };
   conns: { total: number; failing: number; by_proto: Record<string, number> };
