@@ -114,6 +114,7 @@ type RoutingConfig struct {
 	MTU          int    `json:"mtu"` // awg0 client MTU
 	Killswitch   bool   `json:"killswitch"`
 	DomainSource string `json:"domain_source"` // "resolve"|"dnsproxy"
+	SNIRouting   bool   `json:"sni_routing"`   // additional: sniff TLS ClientHello SNI and route matched domains' IPs via the tunnel (beats DoH + CDN)
 	Active       bool   `json:"active"`        // committed → re-apply on boot (set on commit, cleared on explicit teardown)
 }
 
@@ -184,6 +185,14 @@ func (c *ServerConfig) Normalize() {
 			p.AllowedIPs = "0.0.0.0/0, ::/0"
 		}
 		p.HasPrivate = strings.TrimSpace(p.PrivateKey) != ""
+		// Self-heal a peer that kept its private key but lost its public key (a
+		// corrupted save / a bad re-deploy). Without this the server conf renders
+		// `PublicKey = ` (empty) → `awg setconf` parse error → server won't start.
+		if strings.TrimSpace(p.PublicKey) == "" && p.HasPrivate {
+			if pub, err := PubFromPriv(p.PrivateKey); err == nil {
+				p.PublicKey = pub
+			}
+		}
 	}
 	if c.Routing.Mode == "" {
 		c.Routing.Mode = "off"
@@ -264,7 +273,9 @@ func (c *ServerConfig) Validate() []string {
 			errs = append(errs, "повтор имени пира: "+name)
 		}
 		seenName[name] = true
-		if p.PublicKey != "" {
+		if strings.TrimSpace(p.PublicKey) == "" {
+			errs = append(errs, "у пира пустой публичный ключ: "+name)
+		} else {
 			if seenPub[p.PublicKey] {
 				errs = append(errs, "повтор публичного ключа пира: "+name)
 			}

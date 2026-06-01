@@ -75,6 +75,11 @@ type awgRouteState struct {
 	incMatchers atomic.Pointer[[]awg.DomainMatcher]
 	excMatchers atomic.Pointer[[]awg.DomainMatcher]
 
+	// Optional SNI-routing sniffer (reads TLS ClientHellos off the LAN bridges and
+	// routes matched domains' server IPs via the tunnel — beats DoH + CDN rotation).
+	sni         *sniSniffer
+	sniMatchers atomic.Pointer[[]awg.DomainMatcher]
+
 	// Cached TunnelUp() result: the Telegram proxies call it per connection, so we
 	// avoid a UAPI round-trip more than ~once per 5s.
 	tunnelUpVal atomic.Bool

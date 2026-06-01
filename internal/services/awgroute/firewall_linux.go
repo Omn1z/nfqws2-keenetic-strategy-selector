@@ -99,6 +99,9 @@ func awgFirewallHook(mode, endpointIP string, mtu int, dnsRedirect bool) string 
 	s.WriteString("ip link show " + awgIface + " >/dev/null 2>&1 || exit 0\n")
 	s.WriteString("ipset create " + awgSetInc + " hash:net family inet -exist 2>/dev/null\n")
 	s.WriteString("ipset create " + awgSetExc + " hash:net family inet -exist 2>/dev/null\n")
+	// SNI-learned server IPs (short-lived); always created so the include rule below
+	// loads even when SNI-routing is off (then the set is simply empty = no matches).
+	s.WriteString("ipset create " + awgSetSNI + " hash:ip family inet timeout " + strconv.Itoa(awgSNITTL) + " -exist 2>/dev/null\n")
 	s.WriteString("iptables -t mangle -N " + awgChain + " 2>/dev/null\n")
 	s.WriteString("iptables -t mangle -F " + awgChain + "\n")
 	for _, ex := range awgExcludes {
@@ -117,6 +120,9 @@ func awgFirewallHook(mode, endpointIP string, mtu int, dnsRedirect bool) string 
 		// CIDR), then include-zones go through the tunnel.
 		s.WriteString("iptables -t mangle -A " + awgChain + " -m set --match-set " + awgSetExc + " dst -j RETURN\n")
 		s.WriteString("iptables -t mangle -A " + awgChain + " -m set --match-set " + awgSetInc + " dst -j MARK --set-xmark " + awgMarkRule + "\n")
+		// SNI-learned IPs (awg2_sni) ride the same whitelist as awg2_inc — placed after
+		// the exclude RETURN so an excluded domain still wins even if SNI saw it.
+		s.WriteString("iptables -t mangle -A " + awgChain + " -m set --match-set " + awgSetSNI + " dst -j MARK --set-xmark " + awgMarkRule + "\n")
 	case "exclude":
 		s.WriteString("iptables -t mangle -A " + awgChain + " -m set ! --match-set " + awgSetExc + " dst -j MARK --set-xmark " + awgMarkRule + "\n")
 	case "full":

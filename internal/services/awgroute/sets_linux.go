@@ -20,59 +20,16 @@ const (
 	awgRecentFile = awgSetDir + "/awg2_recent.json"
 )
 
-// awgEffectiveMode collapses the per-zone directions + global mode into the chain
-// shape the firewall hook renders:
-//
-//	"full"    → mark everything (route all traffic)
-//	"include" → whitelist: only include-zones tunnel; exclude-zones carve out
-//	"exclude" → blacklist: everything tunnels except exclude-zones
-//	""        → "zones" but no enabled zones with entries → nothing marked (all direct)
-//	"off"     → routing disabled
-//
-// Rule: if ANY enabled include-zone has entries → whitelist (the user is selecting
-// what goes through VPN). If there are only exclude-zones → blacklist (everything
-// via VPN except them).
-func awgEffectiveMode(r awg.RoutingConfig) string {
-	switch r.Mode {
-	case "off":
-		return "off"
-	case "full":
-		return "full"
-	}
-	hasInc, hasExc := false, false
-	for _, z := range r.Zones {
-		if !z.Enabled || (len(z.Domains) == 0 && len(z.IPs) == 0) {
-			continue
-		}
-		if z.Mode == "exclude" {
-			hasExc = true
-		} else {
-			hasInc = true
-		}
-	}
-	switch {
-	case hasInc:
-		return "include"
-	case hasExc:
-		return "exclude"
-	default:
-		return ""
-	}
-}
-
-// isMaskEntry reports whether a zone domain entry is a glob/regex mask (which the
-// DNS proxy resolves on the fly) rather than a plain resolvable hostname.
-func isMaskEntry(s string) bool {
-	s = strings.ToLower(strings.TrimSpace(s))
-	return strings.ContainsAny(s, "*#") || strings.HasPrefix(s, "[re]")
-}
+// awgEffectiveMode, isMaskEntry, awgUsesDNSProxy and the catch-all helpers live in
+// mode.go (build-tag-free, so they can be unit-tested on any platform).
 
 func (svc *Service) awgBuildSets(cfg *awg.ServerConfig) error {
 	_, _ = awgRun("ipset create " + awgSetInc + " hash:net family inet -exist")
 	_, _ = awgRun("ipset create " + awgSetExc + " hash:net family inet -exist")
-	// In dnsproxy mode the proxy adds matched mask IPs dynamically — don't flush them
-	// here (the refresh path flushes explicitly when zones change).
-	if cfg.Routing.DomainSource != "dnsproxy" {
+	// When the DNS proxy is in use it adds matched mask IPs dynamically — don't flush
+	// them here (the refresh path flushes explicitly when zones change), otherwise the
+	// watchdog's periodic rebuild would wipe every proxy-learned IP between queries.
+	if !awgUsesDNSProxy(cfg) {
 		_, _ = awgRun("ipset flush " + awgSetInc)
 		_, _ = awgRun("ipset flush " + awgSetExc)
 	}

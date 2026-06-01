@@ -22,7 +22,7 @@ func awgZoneMatchers(cfg *awg.ServerConfig) []awg.DomainMatcher {
 			entries = append(entries, z.Domains...)
 		}
 	}
-	ms, _ := awg.CompileMatchers(entries)
+	ms, _ := awg.CompileMatchers(awgDropCatchAll(entries))
 	return ms
 }
 
@@ -42,7 +42,7 @@ func awgZoneMatchersByMode(cfg *awg.ServerConfig, mode string) []awg.DomainMatch
 			entries = append(entries, z.Domains...)
 		}
 	}
-	ms, _ := awg.CompileMatchers(entries)
+	ms, _ := awg.CompileMatchers(awgDropCatchAll(entries))
 	return ms
 }
 
@@ -52,7 +52,13 @@ func awgZoneMatchersByMode(cfg *awg.ServerConfig, mode string) []awg.DomainMatch
 // the LAN :53 REDIRECT only while the proxy is actually up (never blackhole DNS).
 func (svc *Service) awgEnsureDNSProxy(cfg *awg.ServerConfig) bool {
 	ms := awgZoneMatchers(cfg)
-	want := cfg.Routing.Mode != "off" && cfg.Routing.Mode != "full" && cfg.Routing.DomainSource == "dnsproxy" && len(ms) > 0
+	// Run the proxy only when the routing selects a SUBSET (include/exclude) and that
+	// subset needs DNS interception — either the user turned it on, or a real mask is
+	// present (a "*.com"/"*ip*" mask can ONLY be matched via interception). Skip it for
+	// "full" (everything is marked at the firewall — no per-name decision needed), and
+	// for "off"/"" (nothing to route).
+	eff := awgEffectiveMode(cfg.Routing)
+	want := (eff == "include" || eff == "exclude") && len(ms) > 0 && awgUsesDNSProxy(cfg)
 	svc.route.mu.Lock()
 	p := svc.route.dnsProxy
 	svc.route.mu.Unlock()

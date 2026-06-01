@@ -145,6 +145,14 @@ func (m *Manager) EnsureKeys() (bool, error) {
 	if strings.TrimSpace(m.cfg.PrivateKey) != "" {
 		return false, nil
 	}
+	// An ALREADY-DEPLOYED server whose private key went missing is a corrupted
+	// config — regenerating keys (and obf) here would silently change the server
+	// identity and break every existing client/handshake (this exact bug took the
+	// tunnel down). Refuse loudly instead of nuking it. Keys+obf are generated only
+	// for a fresh, never-deployed server.
+	if m.cfg.DeployedAt > 0 {
+		return false, fmt.Errorf("сервер уже развёрнут, но приватный ключ потерян — конфиг повреждён; перегенерация ключей сломала бы существующих клиентов. Восстановите ключ или создайте сервер заново")
+	}
 	priv, pub, err := GenKeypair()
 	if err != nil {
 		return false, err

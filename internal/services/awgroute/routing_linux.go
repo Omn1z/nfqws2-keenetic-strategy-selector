@@ -84,7 +84,7 @@ func (svc *Service) awgApplyRoutingOS() error {
 	// run so those domains stay in the tunnel across a panel restart / reboot
 	// (the kernel set is recreated empty on restart; without this, every masked
 	// domain falls out of the tunnel until the device happens to re-query it).
-	if r.DomainSource == "dnsproxy" {
+	if awgUsesDNSProxy(&cfg) {
 		awgRestoreSets()
 	}
 	// 3) tunnel table + fwmark rule (survive Keenetic reloads on their own)
@@ -100,6 +100,9 @@ func (svc *Service) awgApplyRoutingOS() error {
 	// BEFORE the hook so the hook's DNS REDIRECT is only installed once the proxy
 	// is actually listening (never blackhole LAN DNS).
 	dnsOn := svc.awgEnsureDNSProxy(&cfg)
+	// 4b) optional SNI-routing sniffer (no-op unless sni_routing is on + include mode):
+	// learns matched domains' server IPs off the TLS handshake into awg2_sni.
+	svc.awgEnsureSNISniff(&cfg)
 	// 5) firewall hook (marking chain + FORWARD/NAT/MSS [+ DNS REDIRECT]) — a Keenetic
 	// ndm netfilter.d hook so it survives the firewall rebuilds that flush foreign
 	// iptables chains; awgWriteHook also applies it immediately.
@@ -143,7 +146,7 @@ func (svc *Service) awgRefreshRoutingOS() error {
 	// removed domain stays tunneled ("старая зона не выгрузилась"). Flush the dynamic
 	// set + its on-disk snapshot, then rebuild the explicit IP/CIDR entries; the DNS
 	// proxy re-learns the (new) masks on the next query.
-	if r.DomainSource == "dnsproxy" {
+	if awgUsesDNSProxy(&cfg) {
 		_, _ = awgRun("ipset flush " + awgSetInc)
 		_, _ = awgRun("ipset flush " + awgSetExc)
 		_ = os.Remove(awgSetDir + "/" + awgSetInc + ".ipset")
@@ -157,6 +160,7 @@ func (svc *Service) awgRefreshRoutingOS() error {
 	_, _ = awgRun("ip rule add fwmark " + awgMarkRule + " table " + awgTable + " 2>/dev/null")
 	awgApplyKillswitch(r.Killswitch)
 	dnsOn := svc.awgEnsureDNSProxy(&cfg)
+	svc.awgEnsureSNISniff(&cfg) // start/stop/refresh the SNI sniffer to match the new zones
 	if err := awgWriteHook(awgEffectiveMode(r), endpointIP, r.MTU, dnsOn); err != nil {
 		return fmt.Errorf("firewall-хук: %w", err)
 	}
@@ -217,12 +221,17 @@ func (svc *Service) awgStartRefresh() {
 				// keep the killswitch blackhole in the state the user chose.
 				_, _ = awgRun("ip route replace default dev " + awgIface + " table " + awgTable)
 				awgApplyKillswitch(c.Routing.Killswitch)
-				awgSetAccel(false) // re-assert: Keenetic may re-enable accelerators on reconfig
+				awgSetAccel(false)        // re-assert: Keenetic may re-enable accelerators on reconfig
+				svc.awgEnsureSNISniff(&c) // re-assert the SNI sniffer (idempotent; restarts if a socket died)
 				ticks++
-				if ticks%15 == 0 && (c.Routing.Mode == "include" || c.Routing.Mode == "exclude") {
+				// re-resolve plain domains into the ipset every ~15 min (their IPs drift).
+				// Gate on the EFFECTIVE mode: a per-zone config stores Mode=="zones", so the
+				// old Mode=="include"/"exclude" check never fired and plain domains went stale.
+				weff := awgEffectiveMode(c.Routing)
+				if ticks%15 == 0 && (weff == "include" || weff == "exclude") {
 					_ = svc.awgBuildSets(&c)
 				}
-				if ticks%5 == 0 && c.Routing.DomainSource == "dnsproxy" {
+				if ticks%5 == 0 && awgUsesDNSProxy(&c) {
 					awgSaveSets()       // persist proxy-learned IPs so they survive a restart/reboot
 					svc.awgSaveRecent() // persist seen domains so masks re-apply after a restart
 				}
@@ -265,6 +274,7 @@ func (svc *Service) awgTeardownRoutingOS() error {
 	svc.route.mu.Unlock()
 
 	svc.awgStopDNSProxy()      // stop the domain-mask proxy + remove its LAN :53 REDIRECT
+	svc.awgStopSNISniff()      // stop the SNI sniffer (closes its AF_PACKET sockets)
 	awgSetAccel(true)          // restore Keenetic's NAT accelerators (off only while routing active)
 	_ = os.Remove(awgHookPath) // stop Keenetic's ndm from re-adding our rules
 	_, _ = awgRun("iptables -t mangle -D PREROUTING -j " + awgChain + " 2>/dev/null")
@@ -287,6 +297,7 @@ func (svc *Service) awgTeardownRoutingOS() error {
 	_, _ = awgRun("iptables -D FORWARD -o " + awgIface + " -j ACCEPT 2>/dev/null")
 	_, _ = awgRun("ipset destroy " + awgSetInc + " 2>/dev/null")
 	_, _ = awgRun("ipset destroy " + awgSetExc + " 2>/dev/null")
+	_, _ = awgRun("ipset destroy " + awgSetSNI + " 2>/dev/null")
 	logbuf.Append("awg2", "info", "маршрутизация снята")
 	return nil
 }
