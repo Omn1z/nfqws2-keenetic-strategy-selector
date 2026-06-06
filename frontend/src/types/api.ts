@@ -173,6 +173,48 @@ export interface Device {
   failing_dsts: string[];
 }
 
+export interface PortForwardRange {
+  start: number;
+  end: number;
+}
+
+export interface PortForwardProfile {
+  id: string;
+  name: string;
+  tcp: PortForwardRange[];
+  udp: PortForwardRange[];
+}
+
+export interface PortForwardPreset {
+  id: string;
+  name: string;
+  source: string;
+  profiles: PortForwardProfile[];
+}
+
+export interface PortForwardRule {
+  id: string;
+  name: string;
+  preset_id: string;
+  profile_id: string;
+  device_ip: string;
+  device_name: string;
+  device_mac: string;
+  device_iface: string;
+  enabled: boolean;
+  tcp: PortForwardRange[];
+  udp: PortForwardRange[];
+  created_at: number;
+  updated_at: number;
+}
+
+export interface PortForwardView {
+  presets: PortForwardPreset[];
+  rules: PortForwardRule[];
+  wan_ifaces: string[];
+  hook_path: string;
+}
+
 export interface TgwsSnapshot {
   connections: { total: number; active: number; ws: number; tcp_fallback: number; cfproxy: number; bad: number; masked: number };
   traffic: { bytes_up: number; bytes_down: number; human_up: string; human_down: string };

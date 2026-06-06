@@ -144,6 +144,8 @@ type awgRouteState struct {
 	// routes matched domains' server IPs via the tunnel — beats DoH + CDN rotation).
 	sni         *sniSniffer
 	sniMatchers atomic.Pointer[[]awg.DomainMatcher]
+	// One-shot log suppression for learned domain-to-IP skips on shared CDN edges.
+	sharedCDNSkips sync.Map
 
 	// Cached TunnelUp() result: the Telegram proxies call it per connection, so we
 	// avoid a UAPI round-trip more than ~once per 5s.

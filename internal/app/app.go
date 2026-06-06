@@ -18,12 +18,14 @@ import (
 	"nfqws2strategy/internal/services/blobs"
 	"nfqws2strategy/internal/services/monitor"
 	"nfqws2strategy/internal/services/nfqws2"
+	"nfqws2strategy/internal/services/portforward"
 	"nfqws2strategy/internal/services/proxy"
 	"nfqws2strategy/internal/services/strategy/core/catalog"
 	"nfqws2strategy/internal/services/strategy/core/engine"
 	"nfqws2strategy/internal/tools/auth"
 	"nfqws2strategy/internal/tools/config"
 	"nfqws2strategy/internal/tools/dns"
+	"nfqws2strategy/internal/tools/logbuf"
 	"nfqws2strategy/internal/tools/store"
 )
 
@@ -55,6 +57,7 @@ type App struct {
 	nfqws2   *nfqws2.Manager   // nfqws2 engine file/version/update/reload (nfqws2 tab)
 	awgroute *awgroute.Service // AWG2 server + router client/split-routing (AWG2 tab)
 	blobs    *blobs.Service    // fake-payload blob store + ClientHello capture (Blobs tab)
+	portfwd  *portforward.Service
 
 	dnsMu      sync.Mutex
 	dnsServers []dns.Server // configured DoH/DoT servers (DNS tab + run matrix)
@@ -81,9 +84,10 @@ func New(cfg *config.Config) (*App, error) {
 	a.initAuth()
 	a.loadRuns()
 	a.proxy = proxy.New(st)
+	a.portfwd = portforward.New(cfg, st)
 	a.awgroute = awgroute.New(cfg, st)                    // creates the manager; may autostart the tunnel + re-apply committed routing
 	a.monitor = monitor.New(cfg, st, a.proxy, a.awgroute) // dashboard reads the proxy + AWG2 tunnel status
-	a.proxy.SetAWGFallbackProbe(a.awgroute.FallbackUp) // Telegram proxies route ISP-blocked DC1/3/5 via the selected AWG2 server while it is up
+	a.proxy.SetAWGFallbackProbe(a.awgroute.FallbackUp)    // Telegram proxies route ISP-blocked DC1/3/5 via the selected AWG2 server while it is up
 	a.initDNS()
 	// Repair any sandbox state leaked by a previous unclean exit (stale STRAT_*
 	// iptables chains / orphaned test nfqws2 children). Without this a killed run
@@ -92,6 +96,9 @@ func New(cfg *config.Config) (*App, error) {
 	// Clear any leaked AWG2 routing state from an unclean exit. Runs AFTER the
 	// manager exists but BEFORE the autostart goroutine's delayed routing re-apply.
 	a.awgroute.RepairRouting()
+	if err := a.portfwd.Apply(); err != nil {
+		logbuf.Append("port-forwarding", "warn", err.Error())
+	}
 	return a, nil
 }
 

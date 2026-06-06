@@ -80,6 +80,7 @@ func (svc *Service) awgApplyRoutingOS() error {
 	if err := svc.awgBuildSets(&cfg); err != nil {
 		return err
 	}
+	awgResetSNISet()
 	// 2b) restore the IPs the DNS proxy learned for masked domains in a previous
 	// run so those domains stay in the tunnel across a panel restart / reboot
 	// (the kernel set is recreated empty on restart; without this, every masked
@@ -155,6 +156,7 @@ func (svc *Service) awgRefreshRoutingOS() error {
 	if err := svc.awgBuildSets(&cfg); err != nil {
 		return err
 	}
+	awgResetSNISet()
 	_, _ = awgRun("ip route replace default dev " + awgIface + " table " + awgTable)
 	_, _ = awgRun("ip rule del fwmark " + awgMarkRule + " table " + awgTable + " 2>/dev/null")
 	_, _ = awgRun("ip rule add fwmark " + awgMarkRule + " table " + awgTable + " 2>/dev/null")

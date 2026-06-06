@@ -26,10 +26,10 @@ import (
 // still goes direct (that handshake is what teaches the IP); subsequent ones tunnel.
 
 const (
-	awgSetSNI = "awg2_sni"      // hash:ip with a TTL — SNI-learned server IPs
-	awgSNITTL = 3600            // seconds a learned IP stays routed (refreshed on re-sight)
-	ethPAll   = uint16(0x0003)  // ETH_P_ALL
-	soAttachF = 26              // SO_ATTACH_FILTER
+	awgSetSNI = "awg2_sni"     // hash:ip with a TTL — SNI-learned server IPs
+	awgSNITTL = 3600           // seconds a learned IP stays routed (refreshed on re-sight)
+	ethPAll   = uint16(0x0003) // ETH_P_ALL
+	soAttachF = 26             // SO_ATTACH_FILTER
 )
 
 func htons16(v uint16) uint16 { return v<<8 | v>>8 }
@@ -88,6 +88,10 @@ func (svc *Service) awgEnsureSNISniff(cfg *awg.ServerConfig) bool {
 	}
 	ns := newSNISniffer(func(dstIP, sni string) {
 		if m := svc.route.sniMatchers.Load(); m != nil && awg.MatchAny(*m, sni) {
+			if provider, ok := sharedCDNProvider(dstIP); ok {
+				svc.awgNoteSharedCDNSkip("sni", sni, dstIP, provider)
+				return
+			}
 			_, _ = awgRun("ipset add " + awgSetSNI + " " + dstIP + " timeout " + strconv.Itoa(awgSNITTL) + " -exist")
 		}
 	})

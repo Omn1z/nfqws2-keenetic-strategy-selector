@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 
 	"nfqws2strategy/internal/services/awg"
@@ -70,6 +71,10 @@ func (svc *Service) awgBuildSets(cfg *awg.ServerConfig) error {
 				continue
 			}
 			for _, ip := range resolveDomain(d) {
+				if provider, ok := sharedCDNProvider(ip); ok {
+					svc.awgNoteSharedCDNSkip("resolve", d, ip, provider)
+					continue
+				}
 				_, _ = awgRun("ipset add " + target + " " + ip + "/32 -exist")
 				bump()
 			}
@@ -77,6 +82,11 @@ func (svc *Service) awgBuildSets(cfg *awg.ServerConfig) error {
 	}
 	logbuf.Append("awg2", "info", fmt.Sprintf("ipset: include=%d, exclude=%d записей", nInc, nExc))
 	return nil
+}
+
+func awgResetSNISet() {
+	_, _ = awgRun("ipset create " + awgSetSNI + " hash:ip family inet timeout " + strconv.Itoa(awgSNITTL) + " -exist")
+	_, _ = awgRun("ipset flush " + awgSetSNI + " 2>/dev/null")
 }
 
 // awgSaveSets persists the ipset members so the IPs the DNS proxy learned for

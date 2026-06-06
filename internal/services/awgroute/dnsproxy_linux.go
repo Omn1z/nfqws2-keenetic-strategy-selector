@@ -79,6 +79,10 @@ func (svc *Service) awgEnsureDNSProxy(cfg *awg.ServerConfig) bool {
 		return true
 	}
 	np := awg.NewDNSProxy(awgDNSAddr, awgDNSUpstream, func(name, ip string) {
+		if provider, ok := sharedCDNProvider(ip); ok {
+			svc.awgNoteSharedCDNSkip("dnsproxy", name, ip, provider)
+			return
+		}
 		// Route the matched IP to the exclude set when the name matched an exclude
 		// zone (exclude wins on overlap), else the include set. Matchers are read live
 		// so a zone edit takes effect without recreating the proxy. Idempotent -exist;

@@ -16,6 +16,7 @@ import (
 
 	"nfqws2strategy/internal/app"
 	"nfqws2strategy/internal/services/awg"
+	"nfqws2strategy/internal/services/portforward"
 	"nfqws2strategy/internal/services/strategy/core/catalog"
 	"nfqws2strategy/internal/services/tgws"
 	"nfqws2strategy/internal/tools/dns"
@@ -178,6 +179,10 @@ func (s *Server) routes() {
 	m.HandleFunc("GET /api/system/settings", s.getSystemSettings)
 	m.HandleFunc("POST /api/system/settings", s.setSystemSettings)
 	m.HandleFunc("POST /api/services/restart", s.restartServices)
+	m.HandleFunc("GET /api/port-forwarding", s.getPortForwarding)
+	m.HandleFunc("POST /api/port-forwarding/rules", s.savePortForwardingRule)
+	m.HandleFunc("POST /api/port-forwarding/rules/{id}/enabled", s.setPortForwardingRuleEnabled)
+	m.HandleFunc("DELETE /api/port-forwarding/rules/{id}", s.deletePortForwardingRule)
 
 	m.HandleFunc("GET /api/logs", s.getLogs)
 	m.HandleFunc("POST /api/logs/clear", s.clearLogs)
@@ -414,6 +419,51 @@ func (s *Server) installPackage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, map[string]any{"ok": true, "output": out})
+}
+
+// ---------- Port Forwarding ----------
+
+func (s *Server) getPortForwarding(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, 200, s.app.PortForwardingView())
+}
+
+func (s *Server) savePortForwardingRule(w http.ResponseWriter, r *http.Request) {
+	var in portforward.Rule
+	if err := readJSON(r, &in); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	view, err := s.app.SavePortForwardRule(in)
+	if err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, view)
+}
+
+func (s *Server) setPortForwardingRuleEnabled(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Enabled bool `json:"enabled"`
+	}
+	if err := readJSON(r, &in); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	view, err := s.app.SetPortForwardRuleEnabled(r.PathValue("id"), in.Enabled)
+	if err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, view)
+}
+
+func (s *Server) deletePortForwardingRule(w http.ResponseWriter, r *http.Request) {
+	view, err := s.app.DeletePortForwardRule(r.PathValue("id"))
+	if err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, view)
 }
 
 // ---------- logs (in-memory ring, UI "Логи" tab) ----------
