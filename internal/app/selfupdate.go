@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"runtime"
+	"strings"
 	"time"
 )
 
@@ -64,10 +65,13 @@ func (a *App) SelfUpdate() (UpdateInfo, error) {
 		return info, err
 	}
 	asset := "nfqws2-strategy-linux-" + runtime.GOARCH
-	url := fmt.Sprintf("https://github.com/%s/releases/download/%s/%s", a.Cfg.Repo, info.Latest, asset)
+	urls := []string{
+		fmt.Sprintf("https://github.com/%s/releases/download/%s/%s", a.Cfg.Repo, info.Latest, asset),
+		fmt.Sprintf("https://github.com/%s/releases/latest/download/%s", a.Cfg.Repo, asset),
+	}
 
 	tmp := exe + ".new"
-	if err := downloadFile(url, tmp); err != nil {
+	if err := downloadFile(urls, tmp); err != nil {
 		_ = os.Remove(tmp)
 		return info, fmt.Errorf("download: %w", err)
 	}
@@ -86,22 +90,87 @@ func (a *App) SelfUpdate() (UpdateInfo, error) {
 	return info, nil
 }
 
-func downloadFile(url, dst string) error {
+func downloadFile(urls []string, dst string) error {
+	if len(urls) == 0 {
+		return fmt.Errorf("no download urls")
+	}
+	var lastErr error
+	for _, url := range urls {
+		if strings.TrimSpace(url) == "" {
+			continue
+		}
+		if err := downloadWithRetry(url, dst); err != nil {
+			lastErr = err
+			continue
+		}
+		return nil
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("no usable download urls")
+	}
+	return lastErr
+}
+
+func downloadWithRetry(url, dst string) error {
+	part := dst + ".part"
+	_ = os.Remove(part)
+	client := &http.Client{Timeout: 180 * time.Second}
+	var lastErr error
+	for attempt := 1; attempt <= 5; attempt++ {
+		err := downloadAttempt(client, url, part)
+		if err == nil {
+			if err := os.Rename(part, dst); err != nil {
+				return err
+			}
+			return nil
+		}
+		lastErr = err
+		if attempt < 5 {
+			time.Sleep(time.Duration(attempt) * time.Second)
+		}
+	}
+	_ = os.Remove(part)
+	return lastErr
+}
+
+func downloadAttempt(client *http.Client, url, part string) error {
+	var offset int64
+	if st, err := os.Stat(part); err == nil {
+		offset = st.Size()
+	}
 	req, _ := http.NewRequest("GET", url, nil)
 	req.Header.Set("User-Agent", "nfqws2-strategy")
-	resp, err := (&http.Client{Timeout: 120 * time.Second}).Do(req)
+	req.Header.Set("Cache-Control", "no-cache")
+	if offset > 0 {
+		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", offset))
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
+	switch {
+	case offset > 0 && resp.StatusCode == http.StatusPartialContent:
+		// resume
+	case resp.StatusCode == http.StatusOK:
+		offset = 0
+	default:
 		return fmt.Errorf("status %d", resp.StatusCode)
 	}
-	f, err := os.Create(dst)
+	flag := os.O_CREATE | os.O_WRONLY
+	if offset > 0 {
+		flag |= os.O_APPEND
+	} else {
+		flag |= os.O_TRUNC
+	}
+	f, err := os.OpenFile(part, flag, 0o755)
 	if err != nil {
 		return err
 	}
-	defer f.Close()
-	_, err = io.Copy(f, resp.Body)
-	return err
+	_, copyErr := io.Copy(f, resp.Body)
+	closeErr := f.Close()
+	if copyErr != nil {
+		return copyErr
+	}
+	return closeErr
 }
