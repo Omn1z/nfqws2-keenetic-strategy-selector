@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { api } from "@/lib/api";
 import { toast } from "@/components/ui/Toast";
 import { Card } from "@/components/ui/Card";
@@ -8,7 +8,7 @@ import type { Awg2Status, AwgServerConfig } from "@/types/api";
 
 interface Form {
   host: string; port: string; user: string; auth_kind: string;
-  password: string; key_pem: string; key_pass: string;
+  password: string; key_pem: string; key_pass: string; known_key: string;
   install: string;
   listen_port: string; address: string; subnet: string; mtu: string; dns: string; wan_iface: string; endpoint: string;
   jc: string; jmin: string; jmax: string; s1: string; s2: string; s3: string; s4: string;
@@ -19,7 +19,7 @@ interface Form {
 const S = (n: number | undefined) => String(n ?? "");
 const toForm = (c: AwgServerConfig): Form => ({
   host: c.conn.host || "", port: S(c.conn.port || 22), user: c.conn.user || "root", auth_kind: c.conn.auth_kind || "password",
-  password: "", key_pem: "", key_pass: "",
+  password: "", key_pem: "", key_pass: "", known_key: c.conn.known_key || "",
   install: c.install || "apt",
   listen_port: S(c.listen_port || 51820), address: c.address || "", subnet: c.subnet || "", mtu: S(c.mtu || 1420),
   dns: c.dns || "", wan_iface: c.wan_iface || "", endpoint: c.endpoint || "",
@@ -30,7 +30,7 @@ const toForm = (c: AwgServerConfig): Form => ({
 const int = (s: string) => parseInt(s, 10) || 0;
 const collect = (f: Form) => ({
   install: f.install,
-  conn: { host: f.host.trim(), port: int(f.port) || 22, user: f.user.trim() || "root", auth_kind: f.auth_kind, password: f.password, key_pem: f.key_pem, key_pass: f.key_pass, known_key: "" },
+  conn: { host: f.host.trim(), port: int(f.port) || 22, user: f.user.trim() || "root", auth_kind: f.auth_kind, password: f.password, key_pem: f.key_pem, key_pass: f.key_pass, known_key: f.known_key },
   listen_port: int(f.listen_port) || 51820, address: f.address.trim(), subnet: f.subnet.trim(), mtu: int(f.mtu) || 1420,
   dns: f.dns.trim(), wan_iface: f.wan_iface.trim(), endpoint: f.endpoint.trim(),
   obf: { jc: int(f.jc), jmin: int(f.jmin), jmax: int(f.jmax), s1: int(f.s1), s2: int(f.s2), s3: int(f.s3), s4: int(f.s4), h1: f.h1.trim() || "1", h2: f.h2.trim() || "2", h3: f.h3.trim() || "3", h4: f.h4.trim() || "4", i1: f.i1.trim(), i2: f.i2.trim(), i3: f.i3.trim(), i4: f.i4.trim(), i5: f.i5.trim() },
@@ -39,6 +39,9 @@ const collect = (f: Form) => ({
 export default function ServerPane({ st, reload }: { st: Awg2Status; reload: () => void }) {
   const [form, setForm] = useState<Form>(() => toForm(st.config));
   const [saving, setSaving] = useState(false);
+  useEffect(() => {
+    setForm(toForm(st.config));
+  }, [st.active_server_id, st.config.conn.known_key]);
   const set = <K extends keyof Form>(k: K, v: Form[K]) => setForm((f) => ({ ...f, [k]: v }));
 
   const save = async () => {
@@ -73,7 +76,7 @@ export default function ServerPane({ st, reload }: { st: Awg2Status; reload: () 
         {form.auth_kind === "key" && (
           <Field label="Приватный SSH-ключ (PEM)" hint={st.has_key ? "(сохранён — пусто = не менять)" : ""}><Textarea rows={4} value={form.key_pem} placeholder={st.has_key ? "(сохранён)" : "-----BEGIN OPENSSH PRIVATE KEY-----"} onChange={(e) => set("key_pem", e.target.value)} /></Field>
         )}
-        {st.config.conn.known_key && <p className="text-[11px] text-muted [overflow-wrap:anywhere]">Ключ хоста закреплён (TOFU): <code>{st.config.conn.known_key.slice(0, 48)}…</code></p>}
+        {form.known_key && <p className="text-[11px] text-muted [overflow-wrap:anywhere]">Ключ хоста закреплён (TOFU): <code>{form.known_key.slice(0, 48)}…</code> <Button mini variant="ghost" onClick={() => set("known_key", "")}>Сбросить</Button></p>}
         <div className="mt-1 flex flex-wrap gap-4">
           <Field label="Метод установки" className="w-64 shrink-0"><Select value={form.install} onChange={(e) => set("install", e.target.value)}><option value="apt">apt (модуль ядра) + fallback</option><option value="userspace">userspace amneziawg-go</option></Select></Field>
         </div>

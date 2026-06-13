@@ -242,6 +242,9 @@ func (s *Server) routes() {
 	m.HandleFunc("POST /api/proxy/awg-fallback", s.proxyAWGFallbackSet)
 
 	m.HandleFunc("GET /api/awg2", s.awg2Status)
+	m.HandleFunc("POST /api/awg2/servers", s.awg2AddServer)
+	m.HandleFunc("POST /api/awg2/servers/{id}/select", s.awg2SelectServer)
+	m.HandleFunc("DELETE /api/awg2/servers/{id}", s.awg2DeleteServer)
 	m.HandleFunc("POST /api/awg2/config", s.awg2Config)
 	m.HandleFunc("POST /api/awg2/deploy", s.awg2Deploy)
 	m.HandleFunc("POST /api/awg2/status/refresh", s.awg2RefreshStatus)
@@ -1247,6 +1250,30 @@ func (s *Server) proxyAWGFallbackSet(w http.ResponseWriter, r *http.Request) {
 // ---------- AWG2 (AmneziaWG 2.0) ----------
 
 func (s *Server) awg2Status(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, 200, s.app.AWG2StatusView())
+}
+
+func (s *Server) awg2AddServer(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Name string `json:"name"`
+	}
+	_ = readJSON(r, &in) // body is optional
+	writeJSON(w, 200, s.app.AWG2AddServer(in.Name))
+}
+
+func (s *Server) awg2SelectServer(w http.ResponseWriter, r *http.Request) {
+	if err := s.app.AWG2SelectServer(r.PathValue("id")); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, s.app.AWG2StatusView())
+}
+
+func (s *Server) awg2DeleteServer(w http.ResponseWriter, r *http.Request) {
+	if err := s.app.AWG2DeleteServer(r.PathValue("id")); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
 	writeJSON(w, 200, s.app.AWG2StatusView())
 }
 

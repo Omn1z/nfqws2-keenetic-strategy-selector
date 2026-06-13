@@ -337,8 +337,15 @@ export interface AwgClientStatus {
   running: boolean; iface_present: boolean; last_handshake: number; rx_bytes: number; tx_bytes: number;
   endpoint: string; address: string; mtu: number; connected: boolean; error?: string;
 }
+export interface Awg2ServerSummary {
+  id: string; label: string; host: string; endpoint: string;
+  active: boolean; deployed: boolean; connected: boolean; reachable: boolean;
+  has_password: boolean; has_key: boolean; has_server_key: boolean; last_error?: string;
+}
 export interface Awg2Status {
   config: AwgServerConfig; // redacted (no secrets)
+  active_server_id: string;
+  servers: Awg2ServerSummary[];
   has_password: boolean;
   has_key: boolean;
   has_server_key: boolean;

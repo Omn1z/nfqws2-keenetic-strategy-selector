@@ -58,48 +58,52 @@ type AWGConn struct {
 // no server is configured and nothing is running, so the dashboard hides the card.
 func (svc *Service) DashboardConns() []AWGConn {
 	out := []AWGConn{}
-	cfg := svc.awg.Config()
-	endpoint := strings.TrimSpace(cfg.Endpoint)
 	cs := svc.awgClientStatus() // nil off-router
-	if endpoint == "" && (cs == nil || !cs.Running) {
-		return out
-	}
-	label := endpoint
-	if i := strings.LastIndex(label, ":"); i > 0 {
-		label = label[:i]
-	}
-	id := cfg.Interface
-	if id == "" {
-		id = "awg0"
-	}
-	c := AWGConn{ID: id, Label: label, Endpoint: endpoint, State: "off"}
-	if cs != nil {
-		c.Connected, c.Running = cs.Connected, cs.Running
-		c.LastHandshake, c.RxBytes, c.TxBytes = cs.LastHandshake, cs.RxBytes, cs.TxBytes
-		c.MTU, c.Address = cs.MTU, cs.Address
-		switch {
-		case cs.Connected:
-			c.State = "connected"
-		case cs.Running:
-			c.State = "stale" // iface up but the handshake is old (>~180s)
-		default:
-			c.State = "down"
+	svc.mu.RLock()
+	activeID := svc.activeID
+	entries := make([]*managedServer, 0, len(svc.order))
+	for _, id := range svc.order {
+		if srv := svc.servers[id]; srv != nil {
+			entries = append(entries, srv)
 		}
 	}
-	// The live UAPI status doesn't report MTU/address (set via `ip`, not UAPI) — fall
-	// back to the configured tunnel MTU and the router peer's tunnel address.
-	if c.MTU == 0 {
-		c.MTU = cfg.Routing.MTU
-	}
-	if c.Address == "" {
-		for _, p := range cfg.Peers {
-			if p.IsRouter {
-				c.Address = p.Address
-				break
+	svc.mu.RUnlock()
+
+	for _, srv := range entries {
+		cfg := srv.Manager.Config()
+		endpoint := strings.TrimSpace(cfg.Endpoint)
+		isActive := srv.ID == activeID
+		if endpoint == "" && (!isActive || cs == nil || !cs.Running) {
+			continue
+		}
+		c := AWGConn{ID: srv.ID, Label: awgServerLabel(srv, cfg), Endpoint: endpoint, State: "off"}
+		if isActive && cs != nil {
+			c.Connected, c.Running = cs.Connected, cs.Running
+			c.LastHandshake, c.RxBytes, c.TxBytes = cs.LastHandshake, cs.RxBytes, cs.TxBytes
+			c.MTU, c.Address = cs.MTU, cs.Address
+			switch {
+			case cs.Connected:
+				c.State = "connected"
+			case cs.Running:
+				c.State = "stale" // iface up but the handshake is old (>~180s)
+			default:
+				c.State = "down"
 			}
 		}
+		if c.MTU == 0 {
+			c.MTU = cfg.Routing.MTU
+		}
+		if c.Address == "" {
+			for _, p := range cfg.Peers {
+				if p.IsRouter {
+					c.Address = p.Address
+					break
+				}
+			}
+		}
+		out = append(out, c)
 	}
-	return append(out, c)
+	return out
 }
 
 // Public app methods (delegating to the OS impl) used by the server handlers.
@@ -114,6 +118,7 @@ func (svc *Service) AWG2ClientUp() error {
 		return err
 	}
 	svc.awg.SetClientEnabled(true)
+	svc.route.tunnelUpAt.Store(0)
 	svc.awgSave()
 	return nil
 }
@@ -123,6 +128,7 @@ func (svc *Service) AWG2ClientUp() error {
 func (svc *Service) AWG2ClientDown() error {
 	svc.awgTeardownRouting()
 	svc.awg.SetClientEnabled(false)
+	svc.route.tunnelUpAt.Store(0)
 	svc.awgSave()
 	return svc.awgClientDownOS()
 }
@@ -186,11 +192,29 @@ type ServerInfo struct {
 // Servers lists the AWG2 servers available as a Telegram-proxy fallback target
 // (non-nil so it marshals as [] not null).
 func (svc *Service) Servers() []ServerInfo {
-	cfg := svc.awg.Config()
-	if strings.TrimSpace(cfg.Endpoint) == "" {
-		return []ServerInfo{}
+	svc.mu.RLock()
+	activeID := svc.activeID
+	entries := make([]*managedServer, 0, len(svc.order))
+	for _, id := range svc.order {
+		if srv := svc.servers[id]; srv != nil {
+			entries = append(entries, srv)
+		}
 	}
-	return []ServerInfo{{ID: "awg0", Label: cfg.Endpoint, Connected: svc.TunnelUp()}}
+	svc.mu.RUnlock()
+	up := svc.TunnelUp()
+	out := make([]ServerInfo, 0, len(entries))
+	for _, srv := range entries {
+		cfg := srv.Manager.Config()
+		if strings.TrimSpace(cfg.Endpoint) == "" {
+			continue
+		}
+		out = append(out, ServerInfo{
+			ID:        srv.ID,
+			Label:     awgServerLabel(srv, cfg),
+			Connected: srv.ID == activeID && up,
+		})
+	}
+	return out
 }
 
 // FallbackUp reports whether the AWG2 fallback selected by sel is usable now (its
@@ -200,10 +224,10 @@ func (svc *Service) FallbackUp(sel string) bool {
 	switch sel {
 	case "", "off":
 		return false
-	case "auto", "awg0":
+	case "auto":
 		return svc.TunnelUp()
 	default:
-		return false
+		return sel == svc.activeServerID() && svc.TunnelUp()
 	}
 }
 

@@ -9,6 +9,7 @@ package awgroute
 import (
 	"os"
 	"strings"
+	"sync"
 
 	"nfqws2strategy/internal/services/awg"
 	"nfqws2strategy/internal/tools/config"
@@ -20,8 +21,22 @@ import (
 type Service struct {
 	cfg   *config.Config
 	store *store.Store
+
+	mu       sync.RWMutex
+	activeID string
+	order    []string
+	servers  map[string]*managedServer
+
+	// awg is the currently selected server manager. Low-level client/routing code
+	// still operates on one local awg0 tunnel, so it always reads this active one.
 	awg   *awg.Manager
 	route awgRouteState
+}
+
+type managedServer struct {
+	ID      string
+	Name    string
+	Manager *awg.Manager
 }
 
 // New loads the persisted AWG2 config, creates the server manager, and — if the

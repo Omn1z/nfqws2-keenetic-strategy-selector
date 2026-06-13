@@ -64,7 +64,11 @@ type Status struct {
 
 func (c ServerConfig) clone() ServerConfig {
 	cp := c
-	cp.Peers = append([]Peer(nil), c.Peers...)
+	if c.Peers == nil {
+		cp.Peers = []Peer{}
+	} else {
+		cp.Peers = append([]Peer{}, c.Peers...)
+	}
 	cp.Routing.Zones = make([]Zone, len(c.Routing.Zones))
 	for i, z := range c.Routing.Zones {
 		z.Domains = append([]string(nil), z.Domains...)
