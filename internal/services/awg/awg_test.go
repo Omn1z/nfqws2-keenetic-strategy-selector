@@ -36,8 +36,10 @@ func TestConfObfIdentical(t *testing.T) {
 	if so == "" || so != co {
 		t.Fatalf("obf blocks differ:\n--server--\n%s\n--client--\n%s", so, co)
 	}
-	if !strings.Contains(srv, "PostUp =") || !strings.Contains(srv, "%i") {
-		t.Fatal("server conf missing NAT PostUp / %i")
+	for _, want := range []string{"PostUp =", "iptables -t nat -C POSTROUTING", "iptables -C FORWARD -i %i", "PostDown = while iptables -t nat -D"} {
+		if !strings.Contains(srv, want) {
+			t.Fatalf("server conf missing %q:\n%s", want, srv)
+		}
 	}
 	if !strings.Contains(cli, "Endpoint = vpn.example.com:51820") {
 		t.Fatalf("client conf missing endpoint:\n%s", cli)

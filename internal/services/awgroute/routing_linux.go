@@ -181,6 +181,8 @@ func (svc *Service) awgArmRollback(d time.Duration) {
 	svc.route.active = true
 	svc.route.rollback = time.AfterFunc(d, func() {
 		logbuf.Append("awg2", "error", "маршрутизация не подтверждена вовремя — авто-откат")
+		svc.awg.SetRoutingActive(false)
+		svc.awgSave()
 		_ = svc.awgTeardownRoutingOS()
 	})
 }

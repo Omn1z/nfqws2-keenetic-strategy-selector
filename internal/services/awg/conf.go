@@ -21,8 +21,8 @@ func ServerConf(c *ServerConfig) string {
 	if wan == "" {
 		wan = "eth0"
 	}
-	fmt.Fprintf(&b, "PostUp = sysctl -w net.ipv4.ip_forward=1; iptables -t nat -A POSTROUTING -s %s -o %s -j MASQUERADE; iptables -A FORWARD -i %%i -j ACCEPT; iptables -A FORWARD -o %%i -j ACCEPT\n", c.Subnet, wan)
-	fmt.Fprintf(&b, "PostDown = iptables -t nat -D POSTROUTING -s %s -o %s -j MASQUERADE; iptables -D FORWARD -i %%i -j ACCEPT; iptables -D FORWARD -o %%i -j ACCEPT\n", c.Subnet, wan)
+	fmt.Fprintf(&b, "PostUp = %s\n", serverPostUpCommands(c.Subnet, wan, "%i"))
+	fmt.Fprintf(&b, "PostDown = %s\n", serverPostDownCommands(c.Subnet, wan, "%i"))
 	for _, p := range c.Peers {
 		b.WriteString("\n")
 		b.WriteString(serverPeerBlock(p))
@@ -120,6 +120,20 @@ func serverPeerBlock(p Peer) string {
 	}
 	fmt.Fprintf(&b, "AllowedIPs = %s\n", hostRoute(p.Address))
 	return b.String()
+}
+
+func serverPostUpCommands(subnet, wan, iface string) string {
+	if strings.TrimSpace(wan) == "" {
+		wan = "eth0"
+	}
+	return fmt.Sprintf("sysctl -w net.ipv4.ip_forward=1; iptables -t nat -C POSTROUTING -s %[1]s -o %[2]s -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -s %[1]s -o %[2]s -j MASQUERADE; iptables -C FORWARD -i %[3]s -j ACCEPT 2>/dev/null || iptables -A FORWARD -i %[3]s -j ACCEPT; iptables -C FORWARD -o %[3]s -j ACCEPT 2>/dev/null || iptables -A FORWARD -o %[3]s -j ACCEPT", subnet, wan, iface)
+}
+
+func serverPostDownCommands(subnet, wan, iface string) string {
+	if strings.TrimSpace(wan) == "" {
+		wan = "eth0"
+	}
+	return fmt.Sprintf("while iptables -t nat -D POSTROUTING -s %[1]s -o %[2]s -j MASQUERADE 2>/dev/null; do :; done; while iptables -D FORWARD -i %[3]s -j ACCEPT 2>/dev/null; do :; done; while iptables -D FORWARD -o %[3]s -j ACCEPT 2>/dev/null; do :; done", subnet, wan, iface)
 }
 
 func hdr(v, def string) string {

@@ -71,8 +71,8 @@ func (c ServerConfig) clone() ServerConfig {
 	}
 	cp.Routing.Zones = make([]Zone, len(c.Routing.Zones))
 	for i, z := range c.Routing.Zones {
-		z.Domains = append([]string(nil), z.Domains...)
-		z.IPs = append([]string(nil), z.IPs...)
+		z.Domains = append([]string{}, z.Domains...)
+		z.IPs = append([]string{}, z.IPs...)
 		cp.Routing.Zones[i] = z
 	}
 	return cp
@@ -421,7 +421,11 @@ func syncPeers(ctx context.Context, dial Dialer, cred Credentials, cfg *ServerCo
 	if err := r.Put(ctx, "/etc/amnezia/amneziawg/"+iface+".conf", 0o600, []byte(ServerConf(cfg))); err != nil {
 		return err
 	}
-	_, errOut, err := r.Run(ctx, fmt.Sprintf("awg-quick strip %[1]s > /tmp/awg-%[1]s.sync 2>/dev/null && awg syncconf %[1]s /tmp/awg-%[1]s.sync; rm -f /tmp/awg-%[1]s.sync", iface))
+	_, errOut, err := r.Run(ctx, fmt.Sprintf(`awg-quick strip %[1]s > /tmp/awg-%[1]s.sync 2>/dev/null && awg syncconf %[1]s /tmp/awg-%[1]s.sync
+rc=$?
+rm -f /tmp/awg-%[1]s.sync
+[ "$rc" -eq 0 ] || exit "$rc"
+%[2]s`, iface, serverPostUpCommands(cfg.Subnet, cfg.WANIface, iface)))
 	if err != nil {
 		return fmt.Errorf("%s", strings.TrimSpace(errOut))
 	}

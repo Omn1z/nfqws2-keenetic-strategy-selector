@@ -231,7 +231,15 @@ func (svc *Service) FallbackUp(sel string) bool {
 	}
 }
 
-func (svc *Service) AWG2ApplyRouting() error { return svc.awgApplyRoutingOS() }
+func (svc *Service) AWG2ApplyRouting() error {
+	if err := svc.awgApplyRoutingOS(); err != nil {
+		return err
+	}
+	cfg := svc.awg.Config()
+	svc.awg.SetRoutingActive(cfg.Routing.Mode != "off")
+	svc.awgSave()
+	return nil
+}
 
 // AWG2CommitRouting disarms the dead-man's switch and marks routing committed so
 // it auto-applies after a restart/reboot.

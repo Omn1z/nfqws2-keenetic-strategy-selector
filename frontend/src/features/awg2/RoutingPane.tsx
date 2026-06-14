@@ -44,12 +44,35 @@ const ago = (t: number) => {
 };
 
 export default function RoutingPane({ st, reload }: { st: Awg2Status; reload: () => void }) {
-  const [r, setR] = useState<AwgRoutingConfig>(() => st.config.routing);
+  const [r, setRState] = useState<AwgRoutingConfig>(() => st.config.routing);
+  const [dirty, setDirty] = useState(false);
   const [busy, setBusy] = useState(false);
   const [countdown, setCountdown] = useState(0);
   const timer = useRef<number | null>(null);
   const autoTimer = useRef<number | null>(null);
+  const serverID = st.active_server_id || "";
+  const routingKey = JSON.stringify(st.config.routing || {});
+  const syncRef = useRef({ serverID, routingKey });
   useEffect(() => () => { if (timer.current) window.clearInterval(timer.current); if (autoTimer.current) window.clearTimeout(autoTimer.current); }, []);
+  useEffect(() => {
+    const prev = syncRef.current;
+    const serverChanged = prev.serverID !== serverID;
+    const routingChanged = prev.routingKey !== routingKey;
+    if (serverChanged || (!dirty && routingChanged)) {
+      setRState(st.config.routing);
+      setDirty(false);
+      syncRef.current = { serverID, routingKey };
+    }
+  }, [dirty, routingKey, serverID, st.config.routing]);
+  const setR = (next: AwgRoutingConfig | ((prev: AwgRoutingConfig) => AwgRoutingConfig)) => {
+    setDirty(true);
+    setRState(next);
+  };
+  const markSaved = (next: AwgRoutingConfig) => {
+    setRState(next);
+    setDirty(false);
+    syncRef.current = { serverID, routingKey: JSON.stringify(next) };
+  };
 
   const eng = st.engine;
   const cl = st.client;
@@ -58,9 +81,9 @@ export default function RoutingPane({ st, reload }: { st: Awg2Status; reload: ()
   // a dead-man's switch — it can't cut panel access).
   const active = !!st.config.routing.active && r.mode !== "off";
 
-  const post = async (path: string, body: unknown, ok: string, after?: () => void) => {
+  const post = async (path: string, body: unknown, ok: string, after?: () => void, savedRouting?: AwgRoutingConfig) => {
     setBusy(true);
-    try { await api("POST", path, body); toast(ok, "ok"); after?.(); await reload(); }
+    try { await api("POST", path, body); if (savedRouting) markSaved(savedRouting); toast(ok, "ok"); after?.(); await reload(); }
     catch (e) { toast((e as Error).message, "err"); }
     finally { setBusy(false); }
   };
@@ -94,7 +117,9 @@ export default function RoutingPane({ st, reload }: { st: Awg2Status; reload: ()
     }))) return;
     setBusy(true);
     try {
-      await api("POST", "/api/awg2/routing/config", cleanRouting(r));
+      const nextRouting = cleanRouting(r);
+      await api("POST", "/api/awg2/routing/config", nextRouting);
+      markSaved(nextRouting);
       await api("POST", "/api/awg2/routing/apply", {});
       toast("Применено — подтверждаю автоматически…", "ok");
       startCountdown();
@@ -112,7 +137,10 @@ export default function RoutingPane({ st, reload }: { st: Awg2Status; reload: ()
     } catch (e) { toast((e as Error).message, "err"); } finally { setBusy(false); }
   };
   const commit = () => post("/api/awg2/routing/commit", {}, "Подтверждено — авто-откат отменён", stopCountdown);
-  const teardown = () => post("/api/awg2/routing/teardown", {}, "Маршрутизация снята", stopCountdown);
+  const teardown = () => {
+    const nextRouting = cleanRouting({ ...r, mode: "off" });
+    void post("/api/awg2/routing/config", nextRouting, "Маршрутизация снята", stopCountdown, nextRouting);
+  };
 
   const setZone = (i: number, patch: Partial<AwgZone>) => setR((p) => ({ ...p, zones: p.zones.map((z, j) => (j === i ? { ...z, ...patch } : z)) }));
   const addZone = () => setR((p) => ({ ...p, zones: [...(p.zones || []), { name: "новая зона", mode: "include", domains: [], ips: [], enabled: true }] }));
@@ -195,10 +223,10 @@ export default function RoutingPane({ st, reload }: { st: Awg2Status; reload: ()
           {r.mode === "off" ? (
             <Button variant="primary" onClick={teardown} disabled={busy}>Снять маршрутизацию</Button>
           ) : active ? (
-            <Button variant="primary" onClick={() => post("/api/awg2/routing/config", cleanRouting(r), "Сохранено и применено к туннелю")} disabled={busy}>Сохранить и применить</Button>
+            <Button variant="primary" onClick={() => { const nextRouting = cleanRouting(r); void post("/api/awg2/routing/config", nextRouting, "Сохранено и применено к туннелю", undefined, nextRouting); }} disabled={busy}>Сохранить и применить</Button>
           ) : (
             <>
-              <Button onClick={() => post("/api/awg2/routing/config", cleanRouting(r), "Маршрутизация сохранена")} disabled={busy}>Сохранить</Button>
+              <Button onClick={() => { const nextRouting = cleanRouting(r); void post("/api/awg2/routing/config", nextRouting, "Маршрутизация сохранена", undefined, nextRouting); }} disabled={busy}>Сохранить</Button>
               <Button variant="primary" onClick={applyRouting} disabled={busy || !cl?.running}>Применить</Button>
             </>
           )}
@@ -233,7 +261,7 @@ export default function RoutingPane({ st, reload }: { st: Awg2Status; reload: ()
             </div>
           ))
         )}
-        {(r.zones || []).length > 0 && <Button variant={active ? "primary" : undefined} onClick={() => post("/api/awg2/routing/config", cleanRouting(r), active ? "Зоны сохранены и применены к туннелю" : "Зоны сохранены")} disabled={busy}>{active ? "Сохранить и применить зоны" : "Сохранить зоны"}</Button>}
+        {(r.zones || []).length > 0 && <Button variant={active ? "primary" : undefined} onClick={() => { const nextRouting = cleanRouting(r); void post("/api/awg2/routing/config", nextRouting, active ? "Зоны сохранены и применены к туннелю" : "Зоны сохранены", undefined, nextRouting); }} disabled={busy}>{active ? "Сохранить и применить зоны" : "Сохранить зоны"}</Button>}
       </Card>
     </>
   );

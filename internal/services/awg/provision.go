@@ -91,7 +91,7 @@ func Deploy(ctx context.Context, r runner, c *ServerConfig, progress func(Step))
 	emit(Step{Name: "write conf", OK: true, Detail: confPath})
 
 	// 5. bring up (syncconf if already up, else enable the systemd unit)
-	step("bring up", bringUpScript(c.Interface))
+	step("bring up", bringUpScript(c))
 
 	// 6. verify (interface up, listening, handshake best-effort)
 	out, _ := step("verify", fmt.Sprintf("awg show %s 2>&1 | head -8; echo '==LISTEN=='; (ss -lun 2>/dev/null || netstat -lun 2>/dev/null) | grep ':%d' || echo none", c.Interface, c.ListenPort))
@@ -145,8 +145,22 @@ func userspaceInstallScript() string {
 	}, "\n")
 }
 
-func bringUpScript(iface string) string {
-	return fmt.Sprintf(`if ip link show %[1]s >/dev/null 2>&1; then awg-quick strip %[1]s > /tmp/awg-%[1]s.sync 2>/dev/null && awg syncconf %[1]s /tmp/awg-%[1]s.sync 2>&1; rm -f /tmp/awg-%[1]s.sync; else (systemctl enable --now awg-quick@%[1]s 2>&1 || awg-quick up %[1]s 2>&1); fi; echo bring-up-done`, iface)
+func bringUpScript(c *ServerConfig) string {
+	iface := strings.TrimSpace(c.Interface)
+	if iface == "" {
+		iface = "awg0"
+	}
+	return fmt.Sprintf(`systemctl enable awg-quick@%[1]s >/dev/null 2>&1 || true
+if ip link show %[1]s >/dev/null 2>&1; then
+  awg-quick strip %[1]s > /tmp/awg-%[1]s.sync 2>/dev/null && awg syncconf %[1]s /tmp/awg-%[1]s.sync 2>&1
+  rc=$?
+  rm -f /tmp/awg-%[1]s.sync
+  [ "$rc" -eq 0 ] || exit "$rc"
+else
+  (systemctl start awg-quick@%[1]s 2>&1 || awg-quick up %[1]s 2>&1) || exit 1
+fi
+%[2]s
+echo bring-up-done`, iface, serverPostUpCommands(c.Subnet, c.WANIface, iface))
 }
 
 func lastLinesAWG(s string, n int) string {

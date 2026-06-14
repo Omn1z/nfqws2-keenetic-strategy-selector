@@ -119,13 +119,20 @@ func TestAddPeerSyncsWhenDeployed(t *testing.T) {
 		t.Fatalf("expected first peer addr .2, got %q", p.Address)
 	}
 	syncd := false
+	forwarding := false
 	for _, c := range f.cmds {
 		if strings.Contains(c, "awg syncconf awg0") {
 			syncd = true
 		}
+		if strings.Contains(c, "iptables -t nat -C POSTROUTING") && strings.Contains(c, "iptables -C FORWARD -i awg0") {
+			forwarding = true
+		}
 	}
 	if !syncd {
 		t.Fatalf("expected live syncconf; cmds=%v", f.cmds)
+	}
+	if !forwarding {
+		t.Fatalf("expected live sync to re-assert server forwarding/NAT; cmds=%v", f.cmds)
 	}
 	// client config renders and contains the endpoint + private key
 	text, name, err := m.ClientConfig(p.ID)
@@ -134,6 +141,18 @@ func TestAddPeerSyncsWhenDeployed(t *testing.T) {
 	}
 	if !strings.Contains(text, "PrivateKey = "+p.PrivateKey) || !strings.HasSuffix(name, ".conf") {
 		t.Fatalf("unexpected client config:\n%s", text)
+	}
+}
+
+func TestConfigClonePreservesEmptyZoneSlices(t *testing.T) {
+	cfg := Default()
+	cfg.Routing.Zones = []Zone{{Name: "empty", Mode: "include", Domains: []string{}, IPs: []string{}, Enabled: true}}
+	cp := cfg.clone()
+	if cp.Routing.Zones[0].Domains == nil {
+		t.Fatal("expected empty Domains to stay []")
+	}
+	if cp.Routing.Zones[0].IPs == nil {
+		t.Fatal("expected empty IPs to stay []")
 	}
 }
 

@@ -111,6 +111,8 @@ func (svc *Service) loadAWGState() awgPersisted {
 			if json.Unmarshal(b, &st) == nil && len(st.Servers) > 0 {
 				return normalizeAWGState(st)
 			}
+			log.Printf("awg: persisted multi-server config is invalid, using defaults without legacy remap")
+			return defaultAWGState()
 		}
 	}
 	var legacy awg.ServerConfig
