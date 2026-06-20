@@ -14,7 +14,8 @@ import (
 // private keys and the VPS password). It mirrors the socks5/tgws config shape
 // (Default/Normalize/Validate).
 type ServerConfig struct {
-	Enabled bool `json:"enabled"` // UI hint only; deploy is always an explicit action
+	Enabled  bool   `json:"enabled"`            // profile is available in the UI; deploy/connect are still explicit actions
+	Protocol string `json:"protocol,omitempty"` // "awg" (default) | "wireguard" (plain WG import)
 
 	Conn    Credentials `json:"conn"`    // VPS SSH connection
 	Install string      `json:"install"` // "apt" (default) | "userspace"
@@ -119,9 +120,10 @@ type RoutingConfig struct {
 	Active       bool   `json:"active"`        // committed → re-apply on boot (set on commit, cleared on explicit teardown)
 }
 
-// Default returns a disabled, ready-to-fill server config with AWG 2.0 defaults.
+// Default returns a ready-to-fill server config with AWG 2.0 defaults.
 func Default() *ServerConfig {
 	return &ServerConfig{
+		Enabled:    true,
 		Conn:       Credentials{Port: 22, User: "root", AuthKind: "password"},
 		Install:    "apt",
 		ListenPort: 51820,
@@ -141,6 +143,10 @@ func Default() *ServerConfig {
 	}
 }
 
+func (c ServerConfig) UseObfuscation() bool {
+	return c.Protocol != "wireguard"
+}
+
 // Normalize fills zero/blank fields with defaults so a partial config is usable.
 func (c *ServerConfig) Normalize() {
 	if c.Conn.Port == 0 {
@@ -152,8 +158,11 @@ func (c *ServerConfig) Normalize() {
 	if c.Conn.AuthKind != "key" {
 		c.Conn.AuthKind = "password"
 	}
-	if c.Install != "userspace" {
+	if c.Install != "userspace" && c.Install != "imported" {
 		c.Install = "apt"
+	}
+	if c.Protocol != "wireguard" {
+		c.Protocol = "awg"
 	}
 	if c.ListenPort == 0 {
 		c.ListenPort = 51820
@@ -247,7 +256,7 @@ func (c *ServerConfig) Validate() []string {
 	if c.Conn.AuthKind != "password" && c.Conn.AuthKind != "key" {
 		errs = append(errs, "неизвестный метод авторизации SSH")
 	}
-	if c.Install != "apt" && c.Install != "userspace" {
+	if c.Install != "apt" && c.Install != "userspace" && c.Install != "imported" {
 		errs = append(errs, "неизвестный метод установки")
 	}
 	if c.ListenPort < 1 || c.ListenPort > 65535 {
@@ -262,7 +271,9 @@ func (c *ServerConfig) Validate() []string {
 	if c.MTU < 1280 || c.MTU > 1500 {
 		errs = append(errs, "MTU вне диапазона 1280–1500")
 	}
-	errs = append(errs, c.Obf.Validate()...)
+	if c.Protocol != "wireguard" {
+		errs = append(errs, c.Obf.Validate()...)
+	}
 	seenName := map[string]bool{}
 	seenPub := map[string]bool{}
 	seenAddr := map[string]bool{}
@@ -305,6 +316,14 @@ func validPeerAddr(s string) bool {
 	s = strings.TrimSpace(s)
 	if s == "" {
 		return false
+	}
+	if strings.Contains(s, ",") {
+		for _, part := range strings.Split(s, ",") {
+			if !validPeerAddr(part) {
+				return false
+			}
+		}
+		return true
 	}
 	if _, _, err := net.ParseCIDR(s); err == nil {
 		return true

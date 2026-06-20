@@ -74,7 +74,7 @@ type sharedConfig struct {
 func (s *Service) initShared() {
 	var c sharedConfig
 	if err := s.store.Load(sharedConfigFile, &c); err != nil {
-		c.AWGFallback = "auto" // default preserves the v0.12.0 AWG2-fallback behavior
+		c.AWGFallback = "off"
 	}
 	v := normalizeFallback(c.AWGFallback)
 	s.awgFallback.Store(&v)
@@ -82,7 +82,7 @@ func (s *Service) initShared() {
 
 func normalizeFallback(v string) string {
 	if v == "" {
-		return "auto"
+		return "off"
 	}
 	return v
 }
@@ -92,7 +92,7 @@ func (s *Service) AWGFallback() string {
 	if p := s.awgFallback.Load(); p != nil {
 		return *p
 	}
-	return "auto"
+	return "off"
 }
 
 // SetAWGFallback updates and persists the shared selection. Takes effect

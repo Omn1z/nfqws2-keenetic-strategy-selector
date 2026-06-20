@@ -5,21 +5,60 @@ import { usePoll } from "@/lib/hooks";
 import { Card } from "@/components/ui/Card";
 import { Badge } from "@/components/ui/Badge";
 import { Button } from "@/components/ui/Button";
+import { Switch } from "@/components/ui/Switch";
 import { toast } from "@/components/ui/Toast";
 import { confirmDialog } from "@/components/ui/Confirm";
 import ServerPane from "./ServerPane";
 import ClientsPane from "./ClientsPane";
 import RoutingPane from "./RoutingPane";
-import type { Awg2Status, AwgDeployResult } from "@/types/api";
+import type { Awg2ServerSummary, Awg2Status, AwgClientStatus, AwgDeployResult } from "@/types/api";
 
 type Sub = "server" | "clients" | "routing";
+type DeployOpts = { quiet?: boolean; skipReload?: boolean };
+
+const human = (n: number) => {
+  if (!n) return "0 B";
+  const u = ["B", "KB", "MB", "GB", "TB"];
+  let i = 0, v = n;
+  while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+  return `${v.toFixed(v < 10 && i > 0 ? 1 : 0)} ${u[i]}`;
+};
+const ago = (t: number) => {
+  if (!t) return "нет";
+  const s = Math.max(0, Math.floor(Date.now() / 1000) - t);
+  return s < 60 ? `${s} с` : s < 3600 ? `${Math.floor(s / 60)} мин` : `${Math.floor(s / 3600)} ч`;
+};
+
+function MiniSpinner() {
+  return <span className="inline-block h-3 w-3 animate-spin rounded-full border-2 border-current border-r-transparent align-[-1px]" />;
+}
+
+function serverLine(srv: Awg2ServerSummary, deploying: boolean) {
+  if (!srv.enabled) return { kind: "neutral" as const, label: "сервер выкл" };
+  if (deploying) return { kind: "warn" as const, label: "деплой..." };
+  if (srv.imported) return { kind: "ok" as const, label: srv.protocol === "wireguard" ? "WG import" : "AWG import" };
+  if (!srv.deployed) return { kind: "neutral" as const, label: "черновик" };
+  if (srv.reachable) return { kind: "ok" as const, label: "сервер online" };
+  return { kind: "warn" as const, label: srv.last_error ? "сервер offline" : "статус ждёт" };
+}
+
+function tunnelLine(srv: Awg2ServerSummary, cl: AwgClientStatus | null) {
+  if (!srv.enabled) return { kind: "neutral" as const, label: "туннель выкл" };
+  if (!srv.active) return { kind: "neutral" as const, label: "туннель не выбран" };
+  if (!cl?.running) return { kind: "neutral" as const, label: "туннель опущен" };
+  if (cl.connected) return { kind: "ok" as const, label: "туннель connected" };
+  return { kind: "warn" as const, label: "туннель поднят" };
+}
 
 /** «Сервисы → AWG2»: deploy an AmneziaWG 2.0 server on a VPS over SSH, hand out
  *  client configs, and (Routing tab) split-route LAN traffic through the tunnel. */
 export default function AWG2() {
   const [sub, setSub] = useState<Sub>("server");
   const [st, setSt] = useState<Awg2Status | null>(null);
-  const [deploying, setDeploying] = useState(false);
+  const [deploying, setDeploying] = useState<Record<string, boolean>>({});
+  const [toggling, setToggling] = useState<Record<string, boolean>>({});
+  const [selected, setSelected] = useState<Record<string, boolean>>({});
+  const [batch, setBatch] = useState<{ done: number; total: number } | null>(null);
 
   usePoll(async () => {
     try {
@@ -49,20 +88,52 @@ export default function AWG2() {
     }
   };
 
-  const deploy = async () => {
-    if (deploying) return;
-    setDeploying(true);
-    toast("Запущен деплой AWG2-сервера…", "ok");
+  const deployServer = async (id: string, opts: DeployOpts = {}) => {
+    const srv = st?.servers?.find((s) => s.id === id);
+    if (!srv) return false;
+    if (!srv.enabled) {
+      toast("Сервер выключен — включите его перед деплоем", "err");
+      return false;
+    }
+    if (srv.imported) {
+      toast("Это импортированный профиль: деплой на VPS недоступен, можно поднимать туннель", "err");
+      return false;
+    }
+    if (deploying[id]) return false;
+    setDeploying((m) => ({ ...m, [id]: true }));
+    if (!opts.quiet) toast("Запущен деплой AWG2-сервера…", "ok");
     try {
-      const d = await api<{ ok: boolean; result: AwgDeployResult; error?: string }>("POST", "/api/awg2/deploy", {});
-      await reload();
-      if (d.ok) toast("Сервер развёрнут", "ok");
-      else toast("Деплой с ошибкой: " + (d.error || d.result?.error || "см. журнал"), "err");
+      const d = await api<{ ok: boolean; result: AwgDeployResult; error?: string }>("POST", `/api/awg2/servers/${encodeURIComponent(id)}/deploy`, {});
+      if (!opts.skipReload) await reload();
+      if (!opts.quiet) {
+        if (d.ok) toast("Сервер развёрнут", "ok");
+        else toast("Деплой с ошибкой: " + (d.error || d.result?.error || "см. журнал"), "err");
+      }
+      return !!d.ok;
     } catch (e) {
       toast((e as Error).message, "err");
+      return false;
     } finally {
-      setDeploying(false);
+      setDeploying((m) => ({ ...m, [id]: false }));
     }
+  };
+
+  const deploySelected = async () => {
+    if (!st || batch) return;
+    const ids = st.servers.filter((s) => selected[s.id] && s.enabled && !s.imported).map((s) => s.id);
+    if (ids.length === 0) {
+      toast("Выберите включённые VPS-серверы без imported-профилей", "err");
+      return;
+    }
+    setBatch({ done: 0, total: ids.length });
+    let ok = 0;
+    for (let i = 0; i < ids.length; i++) {
+      if (await deployServer(ids[i], { quiet: true, skipReload: true })) ok++;
+      setBatch({ done: i + 1, total: ids.length });
+      await reload();
+    }
+    setBatch(null);
+    toast(`Деплой завершён: ${ok}/${ids.length}`, ok === ids.length ? "ok" : "err");
   };
 
   const addServer = async () => {
@@ -78,6 +149,11 @@ export default function AWG2() {
 
   const selectServer = async (id: string) => {
     if (!id || id === st?.active_server_id) return;
+    const srv = st?.servers?.find((s) => s.id === id);
+    if (srv && !srv.enabled) {
+      toast("Сервер выключен — включите его перед выбором", "err");
+      return;
+    }
     try {
       const next = await api<Awg2Status>("POST", `/api/awg2/servers/${encodeURIComponent(id)}/select`, {});
       setSt(next);
@@ -85,6 +161,20 @@ export default function AWG2() {
       toast("Сервер AWG2 выбран", "ok");
     } catch (e) {
       toast((e as Error).message, "err");
+    }
+  };
+
+  const toggleServer = async (id: string, enabled: boolean) => {
+    if (toggling[id]) return;
+    setToggling((m) => ({ ...m, [id]: true }));
+    try {
+      const next = await api<Awg2Status>("POST", `/api/awg2/servers/${encodeURIComponent(id)}/enabled`, { enabled });
+      setSt(next);
+      toast(enabled ? "Сервер включён" : "Сервер выключен", "ok");
+    } catch (e) {
+      toast((e as Error).message, "err");
+    } finally {
+      setToggling((m) => ({ ...m, [id]: false }));
     }
   };
 
@@ -116,24 +206,28 @@ export default function AWG2() {
   const dep = st.last_deploy;
   const servers = st.servers ?? [];
   const activeServer = servers.find((s) => s.id === st.active_server_id) ?? servers.find((s) => s.active);
-  const statusKind = st.deployed ? (st.status?.up ? "ok" : "warn") : "neutral";
-  const statusText = st.deployed ? (st.status?.up ? "развёрнут" : "развёрнут (нет связи)") : "не развёрнут";
+  const selectedIDs = servers.filter((s) => selected[s.id]).map((s) => s.id);
+  const canDeploySelected = selectedIDs.some((id) => {
+    const srv = servers.find((s) => s.id === id);
+    return !!srv?.enabled && !srv.imported;
+  });
+  const importedActive = st.config.install === "imported";
+  const statusKind = importedActive ? (st.client?.connected ? "ok" : st.client?.running ? "warn" : "neutral") : st.deployed ? (st.status?.up ? "ok" : "warn") : "neutral";
+  const statusText = importedActive ? (st.client?.connected ? "imported · connected" : st.client?.running ? "imported · поднят" : "imported профиль") : st.deployed ? (st.status?.up ? "развёрнут" : "развёрнут (нет связи)") : "не развёрнут";
 
   return (
     <>
       <Card
         title="AWG2 — AmneziaWG 2.0 VPN"
-        sub="свой сервер на VPS + сплит-роутинг"
+        sub="свой VPS или imported .conf/.vpn + сплит-роутинг"
         head={
           <div className="flex flex-wrap items-center gap-2">
             <Badge kind={statusKind}>{statusText}</Badge>
-            <Button variant="primary" onClick={deploy} disabled={deploying || !st.config.conn.host}>
-              {deploying ? "Деплой…" : st.deployed ? "Переразвернуть" : "Развернуть сервер"}
-            </Button>
+            {st.client?.running && <Badge kind={st.client.connected ? "ok" : "warn"}>{st.client.connected ? "туннель connected" : "туннель поднят"}</Badge>}
           </div>
         }
       >
-        <p className="text-xs text-muted">Разворачивает обфусцированный AmneziaWG 2.0 сервер на вашем VPS по SSH, выдаёт клиентам конфиги и (вкладка «Маршрутизация») гоняет трафик через туннель по доменным зонам/IP. Деплой и маршрутизация — явные действия; роутер не перезагружается.</p>
+        <p className="text-xs text-muted">Разворачивает обфусцированный AmneziaWG 2.0 сервер на вашем VPS по SSH или подключает роутер к уже существующему AWG/WireGuard профилю. Деплой, подключение и маршрутизация — явные действия; роутер не перезагружается.</p>
         {dep && dep.steps?.length > 0 && (
           <div className="mt-3 rounded-lg border border-line bg-line-soft p-2.5">
             <div className="mb-1 text-[11px] font-semibold text-ink-soft">Последний деплой ({dep.method}{dep.wan_iface ? `, WAN ${dep.wan_iface}` : ""}):</div>
@@ -152,23 +246,77 @@ export default function AWG2() {
 
       <Card
         title="Серверы AWG2"
-        sub="активный сервер используется для деплоя, пиров и туннеля awg0"
+        sub="активный сервер владеет пирами, туннелем awg0 и маршрутизацией"
         head={<Button mini onClick={addServer}>Добавить сервер</Button>}
       >
-        <div className="flex flex-wrap gap-2">
+        {selectedIDs.length > 0 && (
+          <div className="mb-3 flex flex-wrap items-center gap-2 rounded-lg border border-line bg-line-soft px-3 py-2">
+            <span className="text-xs font-semibold text-ink-soft">Выбрано: {selectedIDs.length}</span>
+            <Button mini variant="primary" onClick={deploySelected} disabled={!!batch || !canDeploySelected}>
+              {batch ? `Деплой ${batch.done}/${batch.total}` : "Переразвернуть выбранные"}
+            </Button>
+            <Button mini variant="ghost" onClick={() => setSelected({})} disabled={!!batch}>Снять выбор</Button>
+          </div>
+        )}
+        <div className="grid gap-2 md:grid-cols-2 xl:grid-cols-3">
           {servers.map((srv) => {
-            const kind = srv.active ? (srv.connected ? "ok" : srv.deployed ? "warn" : "neutral") : "neutral";
-            const label = srv.active ? "активен" : srv.deployed ? "развёрнут" : "черновик";
+            const busy = !!deploying[srv.id];
+            const sLine = serverLine(srv, busy);
+            const tLine = tunnelLine(srv, st.client);
             return (
-              <button
+              <div
                 key={srv.id}
-                type="button"
-                onClick={() => selectServer(srv.id)}
-                className={cn("inline-flex min-w-[180px] max-w-full items-center justify-between gap-2 rounded-lg border px-3 py-2 text-left text-[12.5px] transition", srv.active ? "border-primary bg-primary/10 text-foreground" : "border-line bg-panel text-ink-soft hover:bg-line-soft")}
+                className={cn(
+                  "min-h-[168px] rounded-lg border p-3 text-[12.5px] transition",
+                  srv.active ? "border-primary bg-primary/10 text-foreground" : "border-line bg-panel text-ink-soft",
+                  !srv.enabled && "opacity-70",
+                  busy && "animate-pulse",
+                )}
               >
-                <span className="min-w-0 truncate">{srv.label || srv.host || srv.id}</span>
-                <Badge kind={kind}>{label}</Badge>
-              </button>
+                <div className="flex items-start gap-2">
+                  <input
+                    type="checkbox"
+                    checked={!!selected[srv.id]}
+                    onChange={(e) => setSelected((m) => ({ ...m, [srv.id]: e.target.checked }))}
+                    className="mt-1"
+                    aria-label="Выбрать сервер"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => selectServer(srv.id)}
+                    className="min-w-0 flex-1 text-left outline-none focus-visible:ring-2 focus-visible:ring-ring/40"
+                  >
+                    <div className="flex min-h-6 items-center gap-2">
+                      <span className="min-w-0 truncate text-[13px] font-semibold text-ink">{srv.label || srv.host || srv.id}</span>
+                      {srv.active && <Badge kind="ok">активен</Badge>}
+                    </div>
+                    <div className="mt-0.5 truncate text-[11.5px] text-muted">{srv.endpoint || srv.host || "адрес не задан"}</div>
+                  </button>
+                  <Switch checked={!!srv.enabled} onChange={(v) => toggleServer(srv.id, v)} />
+                </div>
+
+                <div className="mt-3 flex flex-wrap gap-1.5">
+                  <Badge kind={sLine.kind}>{busy && <MiniSpinner />} {sLine.label}</Badge>
+                  <Badge kind={tLine.kind}>{tLine.label}</Badge>
+                </div>
+                {srv.active && st.client?.running && (
+                  <div className="mt-2 text-[11.5px] text-muted">
+                    Хендшейк: {ago(st.client.last_handshake)} назад · ↓ {human(st.client.rx_bytes)} / ↑ {human(st.client.tx_bytes)}
+                  </div>
+                )}
+                {srv.last_error && <div className="mt-2 line-clamp-2 text-[11px] text-warn" title={srv.last_error}>{srv.last_error}</div>}
+                {busy && (
+                  <div className="mt-3 h-1.5 overflow-hidden rounded-full bg-line">
+                    <div className="h-full w-2/3 animate-pulse rounded-full bg-accent" />
+                  </div>
+                )}
+                <div className="mt-3 flex flex-wrap items-center gap-2">
+                  <Button mini onClick={() => deployServer(srv.id)} disabled={busy || !srv.enabled || srv.imported || !srv.host}>
+                    {busy ? "Деплой..." : srv.deployed ? "Переразвернуть" : "Развернуть"}
+                  </Button>
+                  {srv.imported && <span className="text-[11px] text-muted">без SSH-деплоя</span>}
+                </div>
+              </div>
             );
           })}
         </div>
@@ -186,7 +334,7 @@ export default function AWG2() {
         {seg("routing", "Маршрутизация")}
       </div>
 
-      {sub === "server" && <ServerPane st={st} reload={reload} />}
+      {sub === "server" && <ServerPane st={st} reload={reload} deployActive={() => activeServer ? deployServer(activeServer.id) : Promise.resolve(false)} deploying={!!(activeServer && deploying[activeServer.id])} />}
       {sub === "clients" && <ClientsPane st={st} reload={reload} />}
       {sub === "routing" && <RoutingPane st={st} reload={reload} />}
     </>

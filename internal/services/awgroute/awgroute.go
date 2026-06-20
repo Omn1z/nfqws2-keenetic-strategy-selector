@@ -35,6 +35,9 @@ type AWG2ServerSummary struct {
 	Label        string `json:"label"`
 	Host         string `json:"host"`
 	Endpoint     string `json:"endpoint"`
+	Enabled      bool   `json:"enabled"`
+	Imported     bool   `json:"imported"`
+	Protocol     string `json:"protocol"`
 	Active       bool   `json:"active"`
 	Deployed     bool   `json:"deployed"`
 	Connected    bool   `json:"connected"`
@@ -43,6 +46,14 @@ type AWG2ServerSummary struct {
 	HasKey       bool   `json:"has_key"`
 	HasServerKey bool   `json:"has_server_key"`
 	LastError    string `json:"last_error,omitempty"`
+}
+
+type AWG2DeployServerResult struct {
+	ID     string           `json:"id"`
+	Label  string           `json:"label"`
+	OK     bool             `json:"ok"`
+	Result awg.DeployResult `json:"result"`
+	Error  string           `json:"error,omitempty"`
 }
 
 // AWG2Status is the combined view the AWG2 tab polls.
@@ -261,6 +272,9 @@ func (svc *Service) awgServerSummaries() []AWG2ServerSummary {
 			Label:        awgServerLabel(srv, cfg),
 			Host:         strings.TrimSpace(cfg.Conn.Host),
 			Endpoint:     strings.TrimSpace(cfg.Endpoint),
+			Enabled:      cfg.Enabled,
+			Imported:     cfg.Install == "imported",
+			Protocol:     cfg.Protocol,
 			Active:       srv.ID == activeID,
 			Deployed:     cfg.DeployedAt > 0,
 			HasPassword:  strings.TrimSpace(cfg.Conn.Password) != "",
@@ -332,6 +346,9 @@ func (svc *Service) AWG2SelectServer(id string) error {
 	if srv == nil {
 		return fmt.Errorf("AWG2-сервер не найден")
 	}
+	if !srv.Manager.Config().Enabled {
+		return fmt.Errorf("AWG2-сервер выключен")
+	}
 	if id == oldID {
 		return nil
 	}
@@ -347,6 +364,27 @@ func (svc *Service) AWG2SelectServer(id string) error {
 	svc.awg = srv.Manager
 	svc.mu.Unlock()
 	svc.route.tunnelUpAt.Store(0)
+	svc.awgSave()
+	return nil
+}
+
+func (svc *Service) AWG2SetServerEnabled(id string, enabled bool) error {
+	id = strings.TrimSpace(id)
+	svc.mu.RLock()
+	srv := svc.servers[id]
+	active := id != "" && id == svc.activeID
+	svc.mu.RUnlock()
+	if srv == nil {
+		return fmt.Errorf("AWG2-сервер не найден")
+	}
+	if !enabled && active {
+		_ = svc.awgTeardownRoutingOS()
+		srv.Manager.SetClientEnabled(false)
+		srv.Manager.SetRoutingActive(false)
+		_ = svc.awgClientDownOS()
+		svc.route.tunnelUpAt.Store(0)
+	}
+	srv.Manager.SetEnabled(enabled)
 	svc.awgSave()
 	return nil
 }
@@ -407,6 +445,12 @@ func (svc *Service) AWG2SetConfig(in *awg.ServerConfig) error {
 	if strings.TrimSpace(in.Conn.KeyPass) == "" {
 		in.Conn.KeyPass = cur.Conn.KeyPass
 	}
+	if !in.Enabled && cur.Enabled {
+		in.Enabled = cur.Enabled
+	}
+	if strings.TrimSpace(in.Protocol) == "" {
+		in.Protocol = cur.Protocol
+	}
 	in.PrivateKey = cur.PrivateKey
 	in.PublicKey = cur.PublicKey
 	in.DeployedAt = cur.DeployedAt
@@ -430,17 +474,64 @@ func sameSSHIdentity(a, b awg.Credentials) bool {
 		strings.TrimSpace(a.AuthKind) == strings.TrimSpace(b.AuthKind)
 }
 
-// AWG2Deploy generates+persists the server keys (once) then provisions over SSH.
 func (svc *Service) AWG2Deploy() (awg.DeployResult, error) {
-	if changed, err := svc.awg.EnsureKeys(); err != nil {
+	return svc.AWG2DeployServer(svc.activeServerID())
+}
+
+func (svc *Service) AWG2DeployServer(id string) (awg.DeployResult, error) {
+	id = strings.TrimSpace(id)
+	svc.mu.RLock()
+	srv := svc.servers[id]
+	svc.mu.RUnlock()
+	if srv == nil {
+		return awg.DeployResult{}, fmt.Errorf("AWG2-сервер не найден")
+	}
+	return svc.deployServer(srv)
+}
+
+func (svc *Service) AWG2DeployServers(ids []string) []AWG2DeployServerResult {
+	results := []AWG2DeployServerResult{}
+	for _, id := range ids {
+		id = strings.TrimSpace(id)
+		if id == "" {
+			continue
+		}
+		svc.mu.RLock()
+		srv := svc.servers[id]
+		svc.mu.RUnlock()
+		if srv == nil {
+			results = append(results, AWG2DeployServerResult{ID: id, OK: false, Error: "AWG2-сервер не найден"})
+			continue
+		}
+		cfg := srv.Manager.Config()
+		res, err := svc.deployServer(srv)
+		item := AWG2DeployServerResult{ID: srv.ID, Label: awgServerLabel(srv, cfg), OK: err == nil && res.OK, Result: res}
+		if err != nil {
+			item.Error = err.Error()
+		}
+		results = append(results, item)
+	}
+	return results
+}
+
+// deployServer generates+persists the server keys (once) then provisions over SSH.
+func (svc *Service) deployServer(srv *managedServer) (awg.DeployResult, error) {
+	cfg := srv.Manager.Config()
+	if !cfg.Enabled {
+		return awg.DeployResult{}, fmt.Errorf("сервер выключен")
+	}
+	if cfg.Install == "imported" {
+		return awg.DeployResult{}, fmt.Errorf("это импортированный конфиг — деплой на VPS недоступен, можно только поднимать туннель")
+	}
+	if changed, err := srv.Manager.EnsureKeys(); err != nil {
 		return awg.DeployResult{}, err
 	} else if changed {
 		svc.awgSave() // persist keys BEFORE deploy so a crash never loses them
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Second)
 	defer cancel()
-	logbuf.Append("awg2", "info", "деплой AWG2-сервера…")
-	res, err := svc.awg.Deploy(ctx, func(s awg.Step) {
+	logbuf.Append("awg2", "info", "деплой AWG2-сервера "+awgServerLabel(srv, cfg)+"…")
+	res, err := srv.Manager.Deploy(ctx, func(s awg.Step) {
 		lvl := "info"
 		if !s.OK {
 			lvl = "error"
@@ -455,7 +546,7 @@ func (svc *Service) AWG2Deploy() (awg.DeployResult, error) {
 	if res.OK {
 		// populate live status right away so the card doesn't show «нет связи»
 		sctx, scancel := context.WithTimeout(context.Background(), 25*time.Second)
-		_, _ = svc.awg.Status(sctx)
+		_, _ = srv.Manager.Status(sctx)
 		scancel()
 	}
 	if err != nil {

@@ -343,6 +343,7 @@ export interface AwgRoutingConfig {
 export interface AwgClientConfig { enabled: boolean; peer_id: string }
 export interface AwgServerConfig {
   enabled: boolean;
+  protocol?: string;
   conn: AwgCredentials;
   install: string;
   private_key?: string;
@@ -382,8 +383,12 @@ export interface AwgClientStatus {
 }
 export interface Awg2ServerSummary {
   id: string; label: string; host: string; endpoint: string;
+  enabled: boolean; imported: boolean; protocol: string;
   active: boolean; deployed: boolean; connected: boolean; reachable: boolean;
   has_password: boolean; has_key: boolean; has_server_key: boolean; last_error?: string;
+}
+export interface AwgDeployServerResult {
+  id: string; label: string; ok: boolean; result: AwgDeployResult; error?: string;
 }
 export interface Awg2Status {
   config: AwgServerConfig; // redacted (no secrets)

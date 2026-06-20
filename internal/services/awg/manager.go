@@ -133,6 +133,13 @@ func (m *Manager) SetClientEnabled(v bool) {
 	m.mu.Unlock()
 }
 
+// SetEnabled toggles the profile availability flag used by the server selector.
+func (m *Manager) SetEnabled(v bool) {
+	m.mu.Lock()
+	m.cfg.Enabled = v
+	m.mu.Unlock()
+}
+
 // SetRoutingActive marks split-routing as committed/active, persisted so the
 // panel re-applies it automatically after a restart/reboot.
 func (m *Manager) SetRoutingActive(v bool) {

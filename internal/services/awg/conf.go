@@ -16,7 +16,9 @@ func ServerConf(c *ServerConfig) string {
 	if c.MTU > 0 {
 		fmt.Fprintf(&b, "MTU = %d\n", c.MTU)
 	}
-	b.WriteString(obfLines(c.Obf))
+	if c.UseObfuscation() {
+		b.WriteString(obfLines(c.Obf))
+	}
 	wan := strings.TrimSpace(c.WANIface)
 	if wan == "" {
 		wan = "eth0"
@@ -43,7 +45,9 @@ func ClientConf(c *ServerConfig, p Peer) string {
 	if c.MTU > 0 {
 		fmt.Fprintf(&b, "MTU = %d\n", c.MTU)
 	}
-	b.WriteString(obfLines(c.Obf))
+	if c.UseObfuscation() {
+		b.WriteString(obfLines(c.Obf))
+	}
 	b.WriteString("\n[Peer]\n")
 	fmt.Fprintf(&b, "PublicKey = %s\n", c.PublicKey)
 	if strings.TrimSpace(p.PSK) != "" {
@@ -100,7 +104,9 @@ func SetConfText(c *ServerConfig, p Peer) string {
 	var b strings.Builder
 	b.WriteString("[Interface]\n")
 	fmt.Fprintf(&b, "PrivateKey = %s\n", p.PrivateKey)
-	b.WriteString(obfLines(c.Obf))
+	if c.UseObfuscation() {
+		b.WriteString(obfLines(c.Obf))
+	}
 	b.WriteString("\n[Peer]\n")
 	fmt.Fprintf(&b, "PublicKey = %s\n", c.PublicKey)
 	if strings.TrimSpace(p.PSK) != "" {

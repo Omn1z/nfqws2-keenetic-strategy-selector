@@ -2,10 +2,10 @@ package app
 
 // Hands-off automation for the DPI bypass:
 //
-//   - WATCHDOG. NFQWS2 is the primary DPI bypass and must stay on by default.
-//     The watchdog can still start it if AWG dies, but it never stops NFQWS2
-//     just because AWG looks healthy; that surprised users and looked like a
-//     crash. Users who really want it off can choose mode=off explicitly.
+//   - WATCHDOG. Optional NFQWS2 fallback for AWG. Disabled by default because it
+//     can change how traffic is routed (what stopped answering may be sent
+//     through VPN). When enabled, it can still start NFQWS2 if AWG dies, but it
+//     never stops NFQWS2 just because AWG looks healthy.
 //
 //   - AUTO-PICK. Picking a working DPI strategy is normally a manual scan +
 //     pick + apply dance. On first boot (or when the configured strategy
@@ -54,7 +54,7 @@ var defaultAutoPickTargets = []string{
 
 // AutomationConfig is the user-tunable part.
 type AutomationConfig struct {
-	Mode         string `json:"mode"`          // "off" | "on" | "auto" (default: "on")
+	Mode         string `json:"mode"`          // "off" | "on" | "auto" (default: "off"; off = no service control)
 	AutoPick     bool   `json:"auto_pick"`     // run a scan-and-apply if conf is empty/dead at boot (default true)
 	PeriodicScan bool   `json:"periodic_scan"` // re-pick every IntervalH hours (default false — opt-in)
 	IntervalH    int    `json:"interval_h"`    // re-scan period when PeriodicScan is on (default 24)
@@ -97,7 +97,7 @@ type automationRuntime struct {
 func defaultAutomation() AutomationState {
 	return AutomationState{
 		AutomationConfig: AutomationConfig{
-			Mode:         "on",
+			Mode:         "off",
 			AutoPick:     true,
 			PeriodicScan: false,
 			IntervalH:    24,
@@ -172,9 +172,7 @@ func (a *App) automationStep() {
 
 	switch mode {
 	case "off":
-		if a.nfqws2Running() {
-			a.silentNfqws2Stop("mode=off")
-		}
+		// Watchdog disabled: leave NFQWS2 exactly as the user/service manager set it.
 	case "on":
 		if !a.nfqws2Running() {
 			a.silentNfqws2Start("mode=on")

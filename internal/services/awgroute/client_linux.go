@@ -176,7 +176,7 @@ func (svc *Service) awgClientUpOS() error {
 		"mkdir -p /var/run/amneziawg",
 		"ip link show " + awgIface + " >/dev/null 2>&1 || (" + awgGoBin() + " " + awgIface + "; sleep 1)",
 		"ip addr flush dev " + awgIface + " 2>/dev/null || true",
-		"ip addr add " + p.Address + " dev " + awgIface,
+		awgAddressScript(p.Address),
 		"ip link set " + awgIface + " mtu " + strconv.Itoa(mtu),
 		"ip link set " + awgIface + " up",
 		"echo iface-up",
@@ -304,6 +304,25 @@ func portOf(endpoint string) int {
 		return n
 	}
 	return 0
+}
+
+func awgAddressScript(addresses string) string {
+	lines := []string{}
+	for _, raw := range strings.Split(addresses, ",") {
+		addr := strings.TrimSpace(raw)
+		if addr == "" {
+			continue
+		}
+		lines = append(lines, "ip addr add "+shellQuote(addr)+" dev "+awgIface)
+	}
+	if len(lines) == 0 {
+		return "true"
+	}
+	return strings.Join(lines, "\n")
+}
+
+func shellQuote(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'"
 }
 
 func contextTimeout(d time.Duration) (context.Context, context.CancelFunc) {

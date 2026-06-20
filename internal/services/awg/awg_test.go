@@ -1,6 +1,10 @@
 package awg
 
 import (
+	"bytes"
+	"compress/zlib"
+	"encoding/base64"
+	"encoding/json"
 	"strings"
 	"testing"
 )
@@ -122,5 +126,94 @@ func TestRenderUAPISet(t *testing.T) {
 	st := ParseUAPIGet("public_key=abcd\nendpoint=1.2.3.4:51820\nlast_handshake_time_sec=1700000000\nrx_bytes=123\ntx_bytes=456\nerrno=0\n")
 	if st.LastHandshake != 1700000000 || st.RxBytes != 123 || st.TxBytes != 456 || st.Endpoint != "1.2.3.4:51820" {
 		t.Errorf("ParseUAPIGet wrong: %+v", st)
+	}
+}
+
+func TestImportPlainWireGuardConfOmitsObfuscation(t *testing.T) {
+	conf := `[Interface]
+PrivateKey = kBAoKn010lyD1EfH/HTuCwLjpcweg7v70BzZ4ynfb1s=
+Address = 10.44.0.2/32, fd44::2/128
+DNS = 1.1.1.1
+
+[Peer]
+PublicKey = RB78swIIfUFo/YfDnFJk32oggQFd8c5uJXodSj86xxs=
+Endpoint = vpn.example.com:51820
+AllowedIPs = 0.0.0.0/0, ::/0
+PersistentKeepalive = 25
+`
+	cfg, err := ImportClientConf(conf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Install != "imported" || cfg.Protocol != "wireguard" || !cfg.Enabled {
+		t.Fatalf("unexpected imported config flags: install=%q protocol=%q enabled=%v", cfg.Install, cfg.Protocol, cfg.Enabled)
+	}
+	if got := cfg.Peers[0].Address; got != "10.44.0.2/32, fd44::2/128" {
+		t.Fatalf("peer address lost: %q", got)
+	}
+	out, err := RenderUAPISet(cfg, cfg.Peers[0], "1.2.3.4", 51820)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, bad := range []string{"jc=", "jmin=", "h1=", "s1="} {
+		if strings.Contains(out, bad) {
+			t.Fatalf("plain WireGuard import must not send %q:\n%s", bad, out)
+		}
+	}
+}
+
+func TestImportAmneziaVPNString(t *testing.T) {
+	conf := `[Interface]
+PrivateKey = kBAoKn010lyD1EfH/HTuCwLjpcweg7v70BzZ4ynfb1s=
+Address = 10.55.0.2/32
+DNS = $PRIMARY_DNS, $SECONDARY_DNS
+Jc = 5
+Jmin = 10
+Jmax = 80
+H1 = 123
+H2 = 124
+H3 = 125
+H4 = 126
+
+[Peer]
+PublicKey = RB78swIIfUFo/YfDnFJk32oggQFd8c5uJXodSj86xxs=
+Endpoint = vpn.example.com:51820
+AllowedIPs = 0.0.0.0/0
+`
+	last, err := json.Marshal(map[string]any{"config": conf, "mtu": 1320, "port": 51820})
+	if err != nil {
+		t.Fatal(err)
+	}
+	root, err := json.Marshal(map[string]any{
+		"dns1": "9.9.9.9",
+		"dns2": "149.112.112.112",
+		"containers": []map[string]any{{
+			"awg": map[string]any{"last_config": string(last)},
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload bytes.Buffer
+	payload.Write([]byte{0, 0, 0, 0})
+	zw := zlib.NewWriter(&payload)
+	if _, err := zw.Write(root); err != nil {
+		t.Fatal(err)
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := ImportClientConf("vpn://" + base64.RawURLEncoding.EncodeToString(payload.Bytes()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.Protocol != "awg" || cfg.Install != "imported" {
+		t.Fatalf("unexpected flags: protocol=%q install=%q", cfg.Protocol, cfg.Install)
+	}
+	if cfg.DNS != "9.9.9.9, 149.112.112.112" || cfg.MTU != 1320 {
+		t.Fatalf("vpn placeholders/mtu not applied: dns=%q mtu=%d", cfg.DNS, cfg.MTU)
+	}
+	if cfg.Obf.Jc != 5 || cfg.Obf.H1 != "123" {
+		t.Fatalf("obfuscation not imported: %+v", cfg.Obf)
 	}
 }

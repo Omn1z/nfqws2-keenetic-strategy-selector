@@ -91,7 +91,7 @@ export function AutomationPanel() {
   return (
     <Card
       title="Автоматика"
-      sub="watchdog запуска NFQWS2 + авто-пик стратегии"
+      sub="опциональный watchdog NFQWS2 + авто-пик стратегии"
       head={
         <div className="flex flex-wrap items-center gap-1.5">
           {st.awg_healthy
@@ -107,12 +107,12 @@ export function AutomationPanel() {
         <div>
           <div className="mb-1 text-[12px] uppercase tracking-wide text-muted">Режим NFQWS2</div>
           <div className="inline-flex overflow-hidden rounded-lg border border-line">
-            {modeBtn("off", "всегда выкл", "Не запускать — даже если VPN упадёт")}
+            {modeBtn("off", "watchdog выкл", "Не управлять NFQWS2 автоматически")}
             {modeBtn("auto", "авто (fallback)", "Запускать если VPN не отвечает 60+ с, но не выключать автоматически")}
-            {modeBtn("on", "всегда вкл", "Держать включённым постоянно (как было раньше)")}
+            {modeBtn("on", "держать вкл", "Поднимать NFQWS2, если он остановлен")}
           </div>
           <p className="mt-1 text-[11.5px] text-muted">
-            По умолчанию NFQWS2 держится включённым. «авто» — только поднимает NFQWS2, если AWG-туннель тух (handshake &gt; 3 мин или rx стоит), но не выключает его обратно.
+            По умолчанию watchdog выключен и не трогает сервис. «авто» только поднимает NFQWS2, если AWG-туннель тух (handshake &gt; 3 мин или rx стоит), но не выключает его обратно.
           </p>
         </div>
 

@@ -5,6 +5,7 @@ package awgroute
 // OS-specific work lives in awgclient_{linux,other}.go.
 
 import (
+	"fmt"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -114,6 +115,9 @@ func (svc *Service) awgClientStatus() *ClientStatus     { return svc.awgClientSt
 // AWG2ClientUp brings up the local tunnel and persists Client.Enabled=true so it
 // autostarts after a panel restart.
 func (svc *Service) AWG2ClientUp() error {
+	if !svc.awg.Config().Enabled {
+		return fmt.Errorf("AWG2-сервер выключен")
+	}
 	if err := svc.awgClientUpOS(); err != nil {
 		return err
 	}
@@ -224,6 +228,9 @@ func (svc *Service) Servers() []ServerInfo {
 	out := make([]ServerInfo, 0, len(entries))
 	for _, srv := range entries {
 		cfg := srv.Manager.Config()
+		if !cfg.Enabled {
+			continue
+		}
 		if strings.TrimSpace(cfg.Endpoint) == "" {
 			continue
 		}

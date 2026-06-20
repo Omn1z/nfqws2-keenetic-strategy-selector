@@ -249,7 +249,10 @@ func (s *Server) routes() {
 	m.HandleFunc("GET /api/awg2", s.awg2Status)
 	m.HandleFunc("POST /api/awg2/servers", s.awg2AddServer)
 	m.HandleFunc("POST /api/awg2/import", s.awg2Import)
+	m.HandleFunc("POST /api/awg2/servers/deploy", s.awg2DeployServers)
 	m.HandleFunc("POST /api/awg2/servers/{id}/select", s.awg2SelectServer)
+	m.HandleFunc("POST /api/awg2/servers/{id}/enabled", s.awg2SetServerEnabled)
+	m.HandleFunc("POST /api/awg2/servers/{id}/deploy", s.awg2DeployServer)
 	m.HandleFunc("DELETE /api/awg2/servers/{id}", s.awg2DeleteServer)
 	m.HandleFunc("POST /api/awg2/config", s.awg2Config)
 	m.HandleFunc("POST /api/awg2/deploy", s.awg2Deploy)
@@ -1393,6 +1396,21 @@ func (s *Server) awg2SelectServer(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, s.app.AWG2StatusView())
 }
 
+func (s *Server) awg2SetServerEnabled(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Enabled bool `json:"enabled"`
+	}
+	if err := readJSON(r, &in); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	if err := s.app.AWG2SetServerEnabled(r.PathValue("id"), in.Enabled); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, s.app.AWG2StatusView())
+}
+
 func (s *Server) awg2DeleteServer(w http.ResponseWriter, r *http.Request) {
 	if err := s.app.AWG2DeleteServer(r.PathValue("id")); err != nil {
 		httpErr(w, 400, err)
@@ -1421,6 +1439,26 @@ func (s *Server) awg2Deploy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, map[string]any{"ok": res.OK, "result": res})
+}
+
+func (s *Server) awg2DeployServer(w http.ResponseWriter, r *http.Request) {
+	res, err := s.app.AWG2DeployServer(r.PathValue("id"))
+	if err != nil {
+		writeJSON(w, 200, map[string]any{"ok": false, "result": res, "error": err.Error()})
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": res.OK, "result": res})
+}
+
+func (s *Server) awg2DeployServers(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		IDs []string `json:"ids"`
+	}
+	if err := readJSON(r, &in); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"results": s.app.AWG2DeployServers(in.IDs)})
 }
 
 func (s *Server) awg2RefreshStatus(w http.ResponseWriter, r *http.Request) {

@@ -2,7 +2,12 @@ package awg
 
 import (
 	"bufio"
+	"bytes"
+	"compress/zlib"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"strconv"
 	"strings"
@@ -28,7 +33,11 @@ import (
 // The server's PrivateKey stays empty: we are a client, we don't have it, and
 // nothing on the router-side path (client/up, routing) needs it.
 func ImportClientConf(text string) (*ServerConfig, error) {
-	iface, peer, err := parseConfSections(text)
+	confText, err := normalizeImportedConfig(text)
+	if err != nil {
+		return nil, err
+	}
+	iface, peer, err := parseConfSections(confText)
 	if err != nil {
 		return nil, err
 	}
@@ -62,6 +71,11 @@ func ImportClientConf(text string) (*ServerConfig, error) {
 	cfg := Default()
 	cfg.Enabled = true
 	cfg.Install = "imported" // ponytail: marker so UI knows there is no remote SSH to redeploy
+	if hasAWGObfuscation(iface) {
+		cfg.Protocol = "awg"
+	} else {
+		cfg.Protocol = "wireguard"
+	}
 	cfg.DeployedAt = time.Now().Unix()
 	cfg.Interface = "awg0"
 
@@ -131,6 +145,182 @@ func ImportClientConf(text string) (*ServerConfig, error) {
 	return cfg, nil
 }
 
+func normalizeImportedConfig(text string) (string, error) {
+	text = strings.TrimSpace(text)
+	if text == "" {
+		return "", fmt.Errorf("конфиг пустой")
+	}
+	if vpn := findVPNString(text); vpn != "" {
+		return confFromVPNString(vpn)
+	}
+	return text, nil
+}
+
+func findVPNString(text string) string {
+	for _, f := range strings.Fields(text) {
+		if strings.HasPrefix(strings.ToLower(strings.TrimSpace(f)), "vpn://") {
+			return strings.TrimSpace(f)
+		}
+	}
+	if strings.HasPrefix(strings.ToLower(strings.TrimSpace(text)), "vpn://") {
+		return strings.TrimSpace(text)
+	}
+	return ""
+}
+
+func confFromVPNString(vpn string) (string, error) {
+	encoded := strings.TrimSpace(vpn)
+	if len(encoded) >= len("vpn://") {
+		encoded = encoded[len("vpn://"):]
+	}
+	if encoded == "" {
+		return "", fmt.Errorf("vpn:// строка пустая")
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(encoded)
+	if err != nil {
+		raw, err = base64.URLEncoding.DecodeString(encoded + strings.Repeat("=", (4-len(encoded)%4)%4))
+	}
+	if err != nil {
+		return "", fmt.Errorf("не удалось декодировать vpn://: %w", err)
+	}
+	if len(raw) <= 4 {
+		return "", fmt.Errorf("vpn:// данные слишком короткие")
+	}
+	zr, err := zlib.NewReader(bytes.NewReader(raw[4:]))
+	if err != nil {
+		return "", fmt.Errorf("не удалось распаковать vpn://: %w", err)
+	}
+	plain, err := io.ReadAll(io.LimitReader(zr, 4<<20))
+	_ = zr.Close()
+	if err != nil {
+		return "", fmt.Errorf("не удалось прочитать vpn://: %w", err)
+	}
+	return confFromAmneziaJSON(plain)
+}
+
+func confFromAmneziaJSON(data []byte) (string, error) {
+	var root struct {
+		DNS1       string `json:"dns1"`
+		DNS2       string `json:"dns2"`
+		Containers []struct {
+			AWG struct {
+				LastConfig json.RawMessage `json:"last_config"`
+			} `json:"awg"`
+		} `json:"containers"`
+	}
+	if err := json.Unmarshal(data, &root); err != nil {
+		return "", fmt.Errorf("vpn:// JSON не распознан: %w", err)
+	}
+	var lastRaw json.RawMessage
+	for i := len(root.Containers) - 1; i >= 0; i-- {
+		if len(root.Containers[i].AWG.LastConfig) > 0 && string(root.Containers[i].AWG.LastConfig) != "null" {
+			lastRaw = root.Containers[i].AWG.LastConfig
+			break
+		}
+	}
+	if len(lastRaw) == 0 {
+		return "", fmt.Errorf("в .vpn не найден AWG last_config")
+	}
+
+	var lastJSON []byte
+	var lastStr string
+	if err := json.Unmarshal(lastRaw, &lastStr); err == nil {
+		lastJSON = []byte(lastStr)
+	} else {
+		lastJSON = lastRaw
+	}
+	var last struct {
+		Config string          `json:"config"`
+		MTU    json.RawMessage `json:"mtu"`
+		Port   json.RawMessage `json:"port"`
+	}
+	if err := json.Unmarshal(lastJSON, &last); err != nil {
+		return "", fmt.Errorf("AWG last_config не распознан: %w", err)
+	}
+	conf := strings.TrimSpace(last.Config)
+	if conf == "" {
+		return "", fmt.Errorf("AWG last_config не содержит WireGuard config")
+	}
+	conf = strings.ReplaceAll(conf, "$PRIMARY_DNS", strings.TrimSpace(root.DNS1))
+	conf = strings.ReplaceAll(conf, "$SECONDARY_DNS", strings.TrimSpace(root.DNS2))
+	if mtu := rawJSONString(last.MTU); mtu != "" {
+		conf = setInterfaceKV(conf, "MTU", mtu)
+	}
+	if port := rawJSONString(last.Port); port != "" {
+		conf = setInterfaceKV(conf, "ListenPort", port)
+	}
+	return conf, nil
+}
+
+func rawJSONString(raw json.RawMessage) string {
+	if len(raw) == 0 || string(raw) == "null" {
+		return ""
+	}
+	var s string
+	if err := json.Unmarshal(raw, &s); err == nil {
+		return strings.TrimSpace(s)
+	}
+	var n json.Number
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	if err := dec.Decode(&n); err == nil {
+		return n.String()
+	}
+	return ""
+}
+
+func setInterfaceKV(conf, key, value string) string {
+	if strings.TrimSpace(value) == "" {
+		return conf
+	}
+	lines := strings.Split(conf, "\n")
+	inIface := false
+	insertAt := -1
+	for i, line := range lines {
+		t := strings.TrimSpace(line)
+		if strings.HasPrefix(t, "[") && strings.HasSuffix(t, "]") {
+			if inIface {
+				insertAt = i
+				break
+			}
+			inIface = strings.EqualFold(strings.TrimSpace(t[1:len(t)-1]), "Interface")
+			continue
+		}
+		if inIface {
+			insertAt = i + 1
+			if k, _, ok := splitKV(t); ok && strings.EqualFold(k, key) {
+				lines[i] = key + " = " + value
+				return strings.Join(lines, "\n")
+			}
+		}
+	}
+	if insertAt < 0 {
+		return conf
+	}
+	line := key + " = " + value
+	lines = append(lines, "")
+	copy(lines[insertAt+1:], lines[insertAt:])
+	lines[insertAt] = line
+	return strings.Join(lines, "\n")
+}
+
+func splitKV(line string) (key, value string, ok bool) {
+	eq := strings.IndexByte(line, '=')
+	if eq < 0 {
+		return "", "", false
+	}
+	return strings.TrimSpace(line[:eq]), strings.TrimSpace(line[eq+1:]), true
+}
+
+func hasAWGObfuscation(iface map[string]string) bool {
+	for _, k := range []string{"Jc", "Jmin", "Jmax", "S1", "S2", "S3", "S4", "H1", "H2", "H3", "H4", "I1", "I2", "I3", "I4", "I5"} {
+		if strings.TrimSpace(iface[k]) != "" {
+			return true
+		}
+	}
+	return false
+}
+
 // parseConfSections returns the [Interface] and [Peer] key-value maps from the
 // given .conf text. Multiple [Peer] sections are not supported here (a client
 // .conf has exactly one).
@@ -148,12 +338,10 @@ func parseConfSections(text string) (iface, peer map[string]string, err error) {
 			section = strings.ToLower(strings.TrimSpace(line[1 : len(line)-1]))
 			continue
 		}
-		eq := strings.IndexByte(line, '=')
-		if eq < 0 {
+		k, v, ok := splitKV(line)
+		if !ok {
 			continue
 		}
-		k := strings.TrimSpace(line[:eq])
-		v := strings.TrimSpace(line[eq+1:])
 		switch section {
 		case "interface":
 			iface[k] = v
@@ -177,6 +365,9 @@ func parseConfSections(text string) (iface, peer map[string]string, err error) {
 // client's Address. Used only for UI display; the local client doesn't need them
 // to bring its tunnel up.
 func deriveServerAddrs(clientAddr string) (addr, subnet string) {
+	if strings.Contains(clientAddr, ",") {
+		clientAddr = strings.Split(clientAddr, ",")[0]
+	}
 	ip, _, err := net.ParseCIDR(strings.TrimSpace(clientAddr))
 	if err != nil || ip.To4() == nil {
 		return "", ""

@@ -38,7 +38,7 @@ export default function AwgFallback() {
   return (
     <Card title="AWG2-фолбэк для заблокированных DC" sub="DC1/3/5 (медиа) — общий для MTProto и SOCKS5" head={status}>
       <p className="mb-3 text-xs text-muted">
-        Часть дата-центров Telegram (обычно DC1/3/5, медиа) провайдер режет напрямую. Если выбран AWG2-сервер и его туннель поднят — эти DC идут через него; иначе — обычный фолбэк (Cloudflare-воркер). Настройка общая для обоих прокси.
+        Часть дата-центров Telegram (обычно DC1/3/5, медиа) провайдер режет напрямую. По умолчанию выключено: если выбрать AWG2-сервер и его туннель поднят — эти DC идут через него; иначе — обычный фолбэк (Cloudflare-воркер). Настройка общая для обоих прокси.
       </p>
       <Field label="Сервер AWG2 для фолбэка" className="max-w-sm">
         <Select value={data.value} onChange={(e) => change(e.target.value)}>

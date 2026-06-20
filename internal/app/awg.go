@@ -11,21 +11,31 @@ import (
 // TeardownRouting / StopAWG) is wired from app.New / app.Shutdown.
 
 type (
-	AWG2Status   = awgroute.AWG2Status
-	EngineInfo   = awgroute.EngineInfo
-	ClientStatus = awgroute.ClientStatus
+	AWG2Status             = awgroute.AWG2Status
+	EngineInfo             = awgroute.EngineInfo
+	ClientStatus           = awgroute.ClientStatus
+	AWG2DeployServerResult = awgroute.AWG2DeployServerResult
 )
 
-func (a *App) AWG2StatusView() AWG2Status               { return a.awgroute.AWG2StatusView() }
-func (a *App) AWG2AddServer(name string) AWG2Status     { return a.awgroute.AWG2AddServer(name) }
-func (a *App) AWG2SelectServer(id string) error         { return a.awgroute.AWG2SelectServer(id) }
+func (a *App) AWG2StatusView() AWG2Status           { return a.awgroute.AWG2StatusView() }
+func (a *App) AWG2AddServer(name string) AWG2Status { return a.awgroute.AWG2AddServer(name) }
+func (a *App) AWG2SelectServer(id string) error     { return a.awgroute.AWG2SelectServer(id) }
+func (a *App) AWG2SetServerEnabled(id string, enabled bool) error {
+	return a.awgroute.AWG2SetServerEnabled(id, enabled)
+}
 func (a *App) AWG2Import(text, name string) (AWG2Status, error) {
 	return a.awgroute.AWG2Import(text, name)
 }
 func (a *App) AWG2DeleteServer(id string) error         { return a.awgroute.AWG2DeleteServer(id) }
 func (a *App) AWG2SetConfig(in *awg.ServerConfig) error { return a.awgroute.AWG2SetConfig(in) }
 func (a *App) AWG2Deploy() (awg.DeployResult, error)    { return a.awgroute.AWG2Deploy() }
-func (a *App) AWG2RefreshStatus() (awg.Status, error)   { return a.awgroute.AWG2RefreshStatus() }
+func (a *App) AWG2DeployServer(id string) (awg.DeployResult, error) {
+	return a.awgroute.AWG2DeployServer(id)
+}
+func (a *App) AWG2DeployServers(ids []string) []AWG2DeployServerResult {
+	return a.awgroute.AWG2DeployServers(ids)
+}
+func (a *App) AWG2RefreshStatus() (awg.Status, error) { return a.awgroute.AWG2RefreshStatus() }
 func (a *App) AWG2AddPeer(in awg.Peer) (awg.Peer, error) {
 	return a.awgroute.AWG2AddPeer(in)
 }
