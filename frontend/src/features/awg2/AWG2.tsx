@@ -384,6 +384,7 @@ export default function AWG2() {
         <Modal
           title="Добавить AWG2 сервер"
           onClose={() => setAddOpen(false)}
+          size="lg"
           actions={<><Button onClick={() => setAddOpen(false)}>Отмена</Button><Button variant="primary" onClick={addServer} disabled={creating}>{creating ? "..." : "Добавить"}</Button></>}
         >
           <div className="space-y-3">

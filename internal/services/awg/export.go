@@ -11,36 +11,11 @@ import (
 	"strings"
 )
 
-func ClientVPNURI(c *ServerConfig, p Peer) (string, error) {
-	conf := ClientConf(c, p)
-	dns1, dns2 := splitDNS(c.DNS)
-	mtu := c.MTU
-	if mtu == 0 {
-		mtu = c.Routing.MTU
-	}
-	if mtu == 0 {
-		mtu = 1280
-	}
-	last, err := json.Marshal(map[string]any{
-		"config": conf,
-		"mtu":    strconv.Itoa(mtu),
-		"port":   c.ListenPort,
-	})
+func ClientVPNPayload(c *ServerConfig, p Peer) (string, error) {
+	root, err := clientAmneziaJSON(c, p)
 	if err != nil {
 		return "", err
 	}
-	root, err := json.Marshal(map[string]any{
-		"dns1":     dns1,
-		"dns2":     dns2,
-		"hostName": hostOnly(c.Endpoint),
-		"containers": []map[string]any{{
-			"awg": map[string]any{"last_config": string(last)},
-		}},
-	})
-	if err != nil {
-		return "", err
-	}
-
 	var compressed bytes.Buffer
 	var head [4]byte
 	binary.BigEndian.PutUint32(head[:], uint32(len(root)))
@@ -52,7 +27,130 @@ func ClientVPNURI(c *ServerConfig, p Peer) (string, error) {
 	if err := zw.Close(); err != nil {
 		return "", err
 	}
-	return "vpn://" + base64.RawURLEncoding.EncodeToString(compressed.Bytes()), nil
+	return base64.RawURLEncoding.EncodeToString(compressed.Bytes()), nil
+}
+
+func ClientVPNURI(c *ServerConfig, p Peer) (string, error) {
+	payload, err := ClientVPNPayload(c, p)
+	if err != nil {
+		return "", err
+	}
+	return "vpn://" + payload, nil
+}
+
+func clientAmneziaJSON(c *ServerConfig, p Peer) ([]byte, error) {
+	dns1, dns2 := splitDNS(c.DNS)
+	mtu := c.MTU
+	if mtu == 0 {
+		mtu = c.Routing.MTU
+	}
+	if mtu == 0 {
+		mtu = 1280
+	}
+	host := hostOnly(c.Endpoint)
+	lastConfig := map[string]any{
+		"config":                ClientConf(c, p),
+		"hostName":              host,
+		"port":                  c.ListenPort,
+		"client_ip":             p.Address,
+		"client_priv_key":       p.PrivateKey,
+		"client_pub_key":        p.PublicKey,
+		"server_pub_key":        c.PublicKey,
+		"allowed_ips":           splitList(peerAllowedIPs(p)),
+		"persistent_keep_alive": strconv.Itoa(peerKeepalive(p)),
+		"mtu":                   strconv.Itoa(mtu),
+	}
+	if psk := strings.TrimSpace(p.PSK); psk != "" {
+		lastConfig["psk_key"] = psk
+	}
+	if c.UseObfuscation() {
+		addAmneziaObf(lastConfig, c.Obf)
+		lastConfig["isObfuscationEnabled"] = true
+	}
+	last, err := json.Marshal(lastConfig)
+	if err != nil {
+		return nil, err
+	}
+	proto := map[string]any{
+		"last_config":        string(last),
+		"isThirdPartyConfig": true,
+		"port":               strconv.Itoa(c.ListenPort),
+		"transport_proto":    "udp",
+	}
+	if v := amneziaProtocolVersion(c.Obf); v != "" {
+		proto["protocol_version"] = v
+	}
+	return json.Marshal(map[string]any{
+		"description":      safeName(p.Name),
+		"dns1":             dns1,
+		"dns2":             dns2,
+		"hostName":         host,
+		"defaultContainer": "amnezia-awg",
+		"containers": []map[string]any{{
+			"container": "amnezia-awg",
+			"awg":       proto,
+		}},
+	})
+}
+
+func addAmneziaObf(dst map[string]any, o Obfuscation) {
+	dst["Jc"] = strconv.Itoa(o.Jc)
+	dst["Jmin"] = strconv.Itoa(o.Jmin)
+	dst["Jmax"] = strconv.Itoa(o.Jmax)
+	dst["S1"] = strconv.Itoa(o.S1)
+	dst["S2"] = strconv.Itoa(o.S2)
+	if o.S3 > 0 {
+		dst["S3"] = strconv.Itoa(o.S3)
+	}
+	if o.S4 > 0 {
+		dst["S4"] = strconv.Itoa(o.S4)
+	}
+	dst["H1"] = hdr(o.H1, "1")
+	dst["H2"] = hdr(o.H2, "2")
+	dst["H3"] = hdr(o.H3, "3")
+	dst["H4"] = hdr(o.H4, "4")
+	for _, kv := range []struct {
+		k string
+		v string
+	}{{"I1", o.I1}, {"I2", o.I2}, {"I3", o.I3}, {"I4", o.I4}, {"I5", o.I5}} {
+		if v := strings.TrimSpace(kv.v); v != "" {
+			dst[kv.k] = v
+		}
+	}
+}
+
+func splitList(s string) []string {
+	var out []string
+	for _, p := range strings.Split(s, ",") {
+		if t := strings.TrimSpace(p); t != "" {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+func peerKeepalive(p Peer) int {
+	if p.Keepalive > 0 {
+		return p.Keepalive
+	}
+	return 25
+}
+
+func peerAllowedIPs(p Peer) string {
+	if allowed := strings.TrimSpace(p.AllowedIPs); allowed != "" {
+		return allowed
+	}
+	return "0.0.0.0/0, ::/0"
+}
+
+func amneziaProtocolVersion(o Obfuscation) string {
+	if o.S3 > 0 && o.S4 > 0 {
+		return "2"
+	}
+	if strings.TrimSpace(o.I1) != "" || strings.TrimSpace(o.I2) != "" || strings.TrimSpace(o.I3) != "" || strings.TrimSpace(o.I4) != "" || strings.TrimSpace(o.I5) != "" {
+		return "1.5"
+	}
+	return ""
 }
 
 func splitDNS(s string) (string, string) {

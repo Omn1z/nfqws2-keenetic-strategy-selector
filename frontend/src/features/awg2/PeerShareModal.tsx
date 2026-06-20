@@ -13,6 +13,19 @@ import type { Awg2Status, AwgPeer, AwgPeerStatus } from "@/types/api";
 type ExportFormat = "conf" | "vpn";
 
 const safeFile = (s: string, format: ExportFormat) => `${s.replace(/[^\w.-]+/g, "_") || "awg-client"}.${format}`;
+const awgConf = (text: string) => /\nJc\s*=|\nJmin\s*=|\nJmax\s*=|\nH1\s*=|\nS1\s*=/.test(`\n${text}`);
+const qrPayload = (format: ExportFormat, text: string) => {
+  const trimmed = text.trim();
+  if (format === "vpn" && trimmed.toLowerCase().startsWith("vpn://")) return trimmed.slice("vpn://".length);
+  return text;
+};
+const qrText = async (peerId: string, format: ExportFormat, text: string) => {
+  if (format === "vpn") return qrPayload(format, text);
+  if (!awgConf(text)) return text;
+  const res = await fetch(`/api/awg2/peers/${encodeURIComponent(peerId)}/config?format=vpn`);
+  if (!res.ok) return text;
+  return qrPayload("vpn", await res.text());
+};
 const human = (n: number): string => {
   if (!n) return "0 B";
   const u = ["B", "KB", "MB", "GB", "TB"];
@@ -46,7 +59,9 @@ function PeerExport({ peer }: { peer: AwgPeer }) {
         const body = await res.text();
         if (stop) return;
         setText(body);
-        setQr(await QRCode.toDataURL(body, { errorCorrectionLevel: "M", margin: 1, width: 220 }));
+        const encoded = await qrText(peer.id, format, body);
+        if (stop) return;
+        setQr(await QRCode.toDataURL(encoded, { errorCorrectionLevel: encoded.length > 500 ? "L" : "M", margin: 1, width: 220 }));
       } catch (e) {
         if (!stop) toast((e as Error).message || "Не удалось собрать QR", "err");
       } finally {
@@ -135,7 +150,7 @@ export default function PeerShareModal({ st, onClose, reload }: { st: Awg2Status
   };
 
   return (
-    <Modal title="Клиенты AWG2" onClose={onClose} actions={<Button variant="primary" onClick={onClose}>Закрыть</Button>}>
+    <Modal title="Клиенты AWG2" onClose={onClose} size="lg" actions={<Button variant="primary" onClick={onClose}>Закрыть</Button>}>
       <div className="space-y-4">
         <div className="rounded-lg border border-line bg-line-soft p-3">
           <div className="flex flex-wrap items-center gap-2">
@@ -145,7 +160,7 @@ export default function PeerShareModal({ st, onClose, reload }: { st: Awg2Status
         </div>
 
         <div className="rounded-lg border border-line p-3">
-          <div className="grid gap-3 sm:grid-cols-[minmax(160px,1fr)_220px_auto] sm:items-end">
+          <div className="grid gap-3 sm:grid-cols-[minmax(0,1fr)_minmax(160px,220px)] sm:items-end">
             <Field label="Новый клиент">
               <Input value={name} placeholder="телефон, второй роутер, ноутбук" onChange={(e) => setName(e.target.value)} />
             </Field>
@@ -155,7 +170,9 @@ export default function PeerShareModal({ st, onClose, reload }: { st: Awg2Status
                 <option value="split">Только VPN-подсеть</option>
               </Select>
             </Field>
-            <Button variant="primary" onClick={add} disabled={busy}>{busy ? "..." : "Добавить"}</Button>
+          </div>
+          <div className="mt-3 flex justify-end">
+            <Button variant="primary" className="w-full sm:w-auto" onClick={add} disabled={busy}>{busy ? "..." : "Добавить"}</Button>
           </div>
         </div>
 

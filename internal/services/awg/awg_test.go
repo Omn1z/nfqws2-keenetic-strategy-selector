@@ -217,3 +217,99 @@ AllowedIPs = 0.0.0.0/0
 		t.Fatalf("obfuscation not imported: %+v", cfg.Obf)
 	}
 }
+
+func TestClientVPNExportMatchesAmneziaShape(t *testing.T) {
+	c := Default()
+	c.PrivateKey = "SERVERPRIV"
+	c.PublicKey = "RB78swIIfUFo/YfDnFJk32oggQFd8c5uJXodSj86xxs="
+	c.Conn.Host = "vpn.example.com"
+	c.Endpoint = "vpn.example.com:51820"
+	c.Obf = Obfuscation{Jc: 5, Jmin: 10, Jmax: 80, S1: 44, S2: 102, H1: "123", H2: "124", H3: "125", H4: "126"}
+	c.Normalize()
+	p := Peer{
+		Name:       "phone",
+		PublicKey:  "PEERPUB",
+		PrivateKey: "kBAoKn010lyD1EfH/HTuCwLjpcweg7v70BzZ4ynfb1s=",
+		PSK:        "mJpNnaSR9h4gCHB7e4v4DNdGBZrV07pSgMzMU5VNCvI=",
+		Address:    "10.13.13.22/32",
+		AllowedIPs: "0.0.0.0/0, ::/0",
+		Keepalive:  25,
+	}
+	uri, err := ClientVPNURI(c, p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(uri, "vpn://") {
+		t.Fatalf("missing vpn:// prefix: %q", uri[:20])
+	}
+	raw := mustDecodeVPNPayload(t, strings.TrimPrefix(uri, "vpn://"))
+	var root struct {
+		HostName         string `json:"hostName"`
+		DefaultContainer string `json:"defaultContainer"`
+		Containers       []struct {
+			Container string `json:"container"`
+			AWG       struct {
+				LastConfig         string `json:"last_config"`
+				IsThirdPartyConfig bool   `json:"isThirdPartyConfig"`
+				Port               string `json:"port"`
+				TransportProto     string `json:"transport_proto"`
+			} `json:"awg"`
+		} `json:"containers"`
+	}
+	if err := json.Unmarshal(raw, &root); err != nil {
+		t.Fatal(err)
+	}
+	if root.HostName != "vpn.example.com" || root.DefaultContainer != "amnezia-awg" || len(root.Containers) != 1 {
+		t.Fatalf("bad amnezia root: %+v", root)
+	}
+	if got := root.Containers[0].Container; got != "amnezia-awg" {
+		t.Fatalf("missing container name: %q", got)
+	}
+	awg := root.Containers[0].AWG
+	if !awg.IsThirdPartyConfig || awg.Port != "51820" || awg.TransportProto != "udp" || awg.LastConfig == "" {
+		t.Fatalf("bad awg block: %+v", awg)
+	}
+	var last map[string]any
+	if err := json.Unmarshal([]byte(awg.LastConfig), &last); err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"config", "hostName", "port", "client_ip", "client_priv_key", "server_pub_key", "allowed_ips", "persistent_keep_alive", "mtu", "Jc", "Jmin", "Jmax", "S1", "S2", "H1", "H2", "H3", "H4"} {
+		if _, ok := last[key]; !ok {
+			t.Fatalf("last_config missing %s: %#v", key, last)
+		}
+	}
+	if _, ok := last["S3"]; ok {
+		t.Fatalf("S3=0 must stay omitted to match rendered client config: %#v", last)
+	}
+	if _, ok := last["S4"]; ok {
+		t.Fatalf("S4=0 must stay omitted to match rendered client config: %#v", last)
+	}
+	imported, err := ImportClientConf(uri)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if imported.Protocol != "awg" || imported.Endpoint != "vpn.example.com:51820" || imported.Obf.Jc != 5 {
+		t.Fatalf("export/import mismatch: protocol=%q endpoint=%q obf=%+v", imported.Protocol, imported.Endpoint, imported.Obf)
+	}
+}
+
+func mustDecodeVPNPayload(t *testing.T, encoded string) []byte {
+	t.Helper()
+	raw, err := base64.RawURLEncoding.DecodeString(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(raw) <= 4 {
+		t.Fatalf("payload too short: %d", len(raw))
+	}
+	zr, err := zlib.NewReader(bytes.NewReader(raw[4:]))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer zr.Close()
+	plain := new(bytes.Buffer)
+	if _, err := plain.ReadFrom(zr); err != nil {
+		t.Fatal(err)
+	}
+	return plain.Bytes()
+}
