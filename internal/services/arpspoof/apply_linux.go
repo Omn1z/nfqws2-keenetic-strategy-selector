@@ -21,6 +21,17 @@ const (
 )
 
 func (s *Service) applyConfig(cfg Config) error {
+	return s.applyConfigLinux(cfg, true)
+}
+
+func (s *Service) refreshConfig(cfg Config) error {
+	if !cfg.Enabled {
+		return nil
+	}
+	return s.applyConfigLinux(cfg, false)
+}
+
+func (s *Service) applyConfigLinux(cfg Config, logAnnounce bool) error {
 	_ = os.Remove(legacyHookPath)
 	if !cfg.Enabled {
 		return s.restoreOriginalMACs()
@@ -49,7 +60,7 @@ func (s *Service) applyConfig(cfg Config) error {
 			s.origMACs[name] = current
 		}
 		if current == cfg.MAC {
-			announceARP(name)
+			announceARP(name, logAnnounce)
 			continue
 		}
 		if out, err := runShell("ip link set dev " + shellQuote(name) + " address " + shellQuote(cfg.MAC)); err != nil {
@@ -58,7 +69,7 @@ func (s *Service) applyConfig(cfg Config) error {
 			return fmt.Errorf("set %s MAC: %v: %s", name, err, msg)
 		}
 		logbuf.Append("arp-spoofing", "info", "interface "+name+" MAC -> "+cfg.MAC)
-		announceARP(name)
+		announceARP(name, logAnnounce)
 	}
 	return nil
 }
@@ -91,7 +102,7 @@ func applyTarget(name string) (string, bool) {
 	return name, true
 }
 
-func announceARP(iface string) {
+func announceARP(iface string, logAnnounce bool) {
 	if lookupTool("arping") == "" {
 		return
 	}
@@ -100,7 +111,7 @@ func announceARP(iface string) {
 		_, _ = runShell("arping -q -U -c 3 -I " + shellQuote(iface) + " -s " + shellQuote(ip) + " " + shellQuote(ip))
 		_, _ = runShell("arping -q -A -c 2 -I " + shellQuote(iface) + " -s " + shellQuote(ip) + " " + shellQuote(ip))
 	}
-	if len(ips) > 0 {
+	if logAnnounce && len(ips) > 0 {
 		logbuf.Append("arp-spoofing", "info", "gratuitous ARP sent on "+iface+" for "+strings.Join(ips, ", "))
 	}
 }

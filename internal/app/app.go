@@ -128,6 +128,7 @@ func (a *App) Shutdown() {
 	engine.CleanupSandboxes(a.Cfg, maxThreads)
 	a.StopTGWS()
 	a.StopSocks5()
+	a.arpspoof.Stop()
 	a.awgroute.StopAWG()
 	a.awgroute.TeardownRouting()
 }

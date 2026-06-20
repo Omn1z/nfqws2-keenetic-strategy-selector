@@ -18,6 +18,8 @@ import (
 
 const stateFile = "arp_spoofing.json"
 
+const arpRefreshInterval = 30 * time.Second
+
 var (
 	reMACPrefix = regexp.MustCompile(`^[0-9A-Fa-f]{2}([:-]?[0-9A-Fa-f]{2}){0,2}$`)
 	reIfaceName = regexp.MustCompile(`^[A-Za-z0-9_.:-]+$`)
@@ -33,6 +35,8 @@ type Service struct {
 	lastError string
 	appliedAt int64
 	origMACs  map[string]string
+
+	stopRefresh chan struct{}
 }
 
 func New(cfg *config.Config, st *store.Store) *Service {
@@ -40,6 +44,9 @@ func New(cfg *config.Config, st *store.Store) *Service {
 	var stt state
 	if err := st.Load(stateFile, &stt); err == nil {
 		s.config = normalizeConfig(stt.Config)
+		if hasWirelessSlaveIface(s.config.Ifaces) {
+			s.config.Ifaces = nil
+		}
 		s.lastError = stt.LastError
 		s.appliedAt = stt.AppliedAt
 		s.origMACs = cleanMACMap(stt.OriginalMACs)
@@ -124,6 +131,12 @@ func (s *Service) Apply() error {
 	return s.saveApply()
 }
 
+func (s *Service) Stop() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.stopRefreshLocked()
+}
+
 func (s *Service) GenerateMAC(prefix string) (string, error) {
 	p, err := normalizePrefix(prefix)
 	if err != nil {
@@ -182,16 +195,75 @@ func (s *Service) prepareConfig(in Config) (Config, error) {
 func (s *Service) saveApply() error {
 	if err := s.applyConfig(s.config); err != nil {
 		s.lastError = err.Error()
+		if s.config.Enabled {
+			s.startRefreshLocked()
+		} else {
+			s.stopRefreshLocked()
+		}
 		_ = s.save()
 		return err
 	}
 	s.lastError = ""
 	s.appliedAt = time.Now().Unix()
+	if s.config.Enabled {
+		s.startRefreshLocked()
+	} else {
+		s.stopRefreshLocked()
+	}
 	return s.save()
 }
 
 func (s *Service) save() error {
 	return s.store.Save(stateFile, state{Config: s.config, LastError: s.lastError, AppliedAt: s.appliedAt, OriginalMACs: s.origMACs})
+}
+
+func (s *Service) startRefreshLocked() {
+	if s.stopRefresh != nil {
+		return
+	}
+	stop := make(chan struct{})
+	s.stopRefresh = stop
+	go s.refreshLoop(stop)
+}
+
+func (s *Service) stopRefreshLocked() {
+	if s.stopRefresh == nil {
+		return
+	}
+	close(s.stopRefresh)
+	s.stopRefresh = nil
+}
+
+func (s *Service) refreshLoop(stop <-chan struct{}) {
+	ticker := time.NewTicker(arpRefreshInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-ticker.C:
+			s.refreshOnce()
+		}
+	}
+}
+
+func (s *Service) refreshOnce() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.config.Enabled {
+		return
+	}
+	if err := s.refreshConfig(s.config); err != nil {
+		if s.lastError != err.Error() {
+			s.lastError = err.Error()
+			_ = s.save()
+		}
+		return
+	}
+	if s.lastError != "" {
+		s.lastError = ""
+		_ = s.save()
+	}
 }
 
 func normalizeConfig(in Config) Config {
@@ -368,6 +440,20 @@ func looksLAN(name string) bool {
 	n := strings.ToLower(name)
 	return strings.HasPrefix(n, "br") ||
 		strings.HasPrefix(n, "lan")
+}
+
+func hasWirelessSlaveIface(ifaces []string) bool {
+	for _, name := range ifaces {
+		n := strings.ToLower(name)
+		if strings.HasPrefix(n, "ra") ||
+			strings.HasPrefix(n, "apcli") ||
+			strings.HasPrefix(n, "wifi") ||
+			strings.HasPrefix(n, "wlan") ||
+			strings.HasPrefix(n, "wl") {
+			return true
+		}
+	}
+	return false
 }
 
 func toolStatus() Tools {
