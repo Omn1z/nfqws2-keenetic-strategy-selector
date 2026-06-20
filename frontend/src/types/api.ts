@@ -165,10 +165,13 @@ export interface Conn {
 export interface Device {
   ip: string;
   mac: string;
+  hostname?: string;
   iface: string;
   total: number;
   established: number;
   failing: number;
+  bytes_up: number;
+  bytes_down: number;
   working: string[];
   failing_dsts: string[];
 }
@@ -331,7 +334,7 @@ export interface AwgPeer {
   address: string; allowed_ips: string; keepalive: number;
   is_router: boolean; has_private: boolean; created_at: number;
 }
-export interface AwgZone { name: string; mode: string; domains: string[]; ips: string[]; enabled: boolean }
+export interface AwgZone { name: string; mode: string; domains: string[]; ips: string[]; source_ips?: string[]; enabled: boolean }
 export interface AwgRoutingConfig {
   mode: string; zones: AwgZone[]; mtu: number; killswitch: boolean; domain_source: string;
   sni_routing?: boolean;
@@ -411,6 +414,78 @@ export interface AwgConn {
   address: string;
 }
 
+export interface TempZone { label: string; c: number; }
+export interface ServiceStat {
+  name: string;
+  pid: number;
+  cpu_percent: number;
+  rss_kb: number;
+  uptime_sec: number;
+}
+export interface SystemStats {
+  cpu_percent: number;
+  load_avg: [number, number, number];
+  mem_total_kb: number;
+  mem_free_kb: number;
+  mem_avail_kb: number;
+  mem_used_kb: number;
+  mem_apps_kb: number;
+  mem_kernel_kb: number;
+  mem_cache_kb: number;
+  swap_total_kb: number;
+  swap_free_kb: number;
+  uptime_sec: number;
+  temps: TempZone[];
+  services: ServiceStat[];
+}
+
+export interface PiholeConfig {
+  password: string;
+  dns_port: number;
+  ui_port: number;
+  data_root: string;
+  timezone: string;
+  dns_chain_enabled: boolean;
+}
+export interface PiholeStatus extends PiholeConfig {
+  installed: boolean;
+  running: boolean;
+  healthy: boolean;
+  state: string;
+  container_id: string;
+  uptime_sec: number;
+  image_digest: string;
+  upgrade_avail: boolean;
+  error?: string;
+}
+export interface PiholeStats {
+  total_queries: number;
+  blocked_queries: number;
+  percent_blocked: number;
+  domains_on_list: number;
+  unique_domains: number;
+  unique_clients: number;
+  active_clients: number;
+  blocking_status: string;
+  error?: string;
+}
+
+export interface AutomationStatus {
+  mode: "off" | "on" | "auto";
+  auto_pick: boolean;
+  periodic_scan: boolean;
+  interval_h: number;
+  last_pick_at?: number;
+  last_pick_args?: string;
+  last_pick_name?: string;
+  last_pick_error?: string;
+  awg_healthy: boolean;
+  handshake_age_sec: number;
+  nfqws2_running: boolean;
+  pick_in_progress: boolean;
+  note?: string;
+}
+
 export interface Dashboard {
   tgws: TgwsStatus;
   socks5: Socks5Status;
@@ -421,6 +496,8 @@ export interface Dashboard {
   queues: QueueStat[];
   main_queue: number;
   wan: IfaceBytes[];
+  system: SystemStats;
+  top_devices: Device[];
 }
 
 export interface ConnectionsView {
@@ -441,6 +518,19 @@ export interface GeoFile {
   name: string;
   kind: string;
   categories: GeoCategory[];
+}
+
+export interface GeoAutoConfig {
+  enabled: boolean;
+  geosite_url: string;
+  geoip_url: string;
+  interval_hours: number;
+  last_fetched_at: number;
+  last_error: string;
+  last_geosite_at: number;
+  last_geoip_at: number;
+  last_geosite_len: number;
+  last_geoip_len: number;
 }
 
 export interface Blobs {

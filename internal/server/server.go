@@ -248,6 +248,7 @@ func (s *Server) routes() {
 
 	m.HandleFunc("GET /api/awg2", s.awg2Status)
 	m.HandleFunc("POST /api/awg2/servers", s.awg2AddServer)
+	m.HandleFunc("POST /api/awg2/import", s.awg2Import)
 	m.HandleFunc("POST /api/awg2/servers/{id}/select", s.awg2SelectServer)
 	m.HandleFunc("DELETE /api/awg2/servers/{id}", s.awg2DeleteServer)
 	m.HandleFunc("POST /api/awg2/config", s.awg2Config)
@@ -279,6 +280,9 @@ func (s *Server) routes() {
 	m.HandleFunc("DELETE /api/geo/{name}", s.deleteGeo)
 	m.HandleFunc("POST /api/geo/import", s.importGeo)
 	m.HandleFunc("POST /api/geo/resolve", s.resolveGeo)
+	m.HandleFunc("GET /api/geo/auto", s.getGeoAuto)
+	m.HandleFunc("POST /api/geo/auto", s.setGeoAuto)
+	m.HandleFunc("POST /api/geo/fetch-now", s.fetchGeoNow)
 
 	// NFQWS2 engine: file management (conf/list/lua) + version/update/reload.
 	m.HandleFunc("GET /api/nfqws2/version", s.nfqws2Version)
@@ -294,6 +298,24 @@ func (s *Server) routes() {
 	m.HandleFunc("POST /api/nfqws2/file/upload", s.nfqws2UploadFile)
 	m.HandleFunc("DELETE /api/nfqws2/file", s.nfqws2DeleteFile)
 	m.HandleFunc("GET /api/nfqws2/file/download", s.nfqws2DownloadFile)
+
+	// Automation: NFQWS2 fallback watchdog + auto-pick (NFQWS2 tab panel).
+	m.HandleFunc("GET /api/nfqws2/automation", s.getAutomation)
+	m.HandleFunc("POST /api/nfqws2/automation", s.setAutomation)
+	m.HandleFunc("POST /api/nfqws2/automation/pick-now", s.triggerAutoPick)
+
+	// Pi-hole v6 (ad-block DNS sinkhole in a docker container).
+	m.HandleFunc("GET /api/pihole/status", s.piholeStatus)
+	m.HandleFunc("GET /api/pihole/stats", s.piholeStats)
+	m.HandleFunc("POST /api/pihole/config", s.piholeSaveConfig)
+	m.HandleFunc("POST /api/pihole/install", s.piholeInstall)
+	m.HandleFunc("POST /api/pihole/start", s.piholeStart)
+	m.HandleFunc("POST /api/pihole/stop", s.piholeStop)
+	m.HandleFunc("POST /api/pihole/restart", s.piholeRestart)
+	m.HandleFunc("POST /api/pihole/upgrade", s.piholeUpgrade)
+	m.HandleFunc("POST /api/pihole/remove", s.piholeRemove)
+	m.HandleFunc("GET /api/pihole/logs", s.piholeLogs)
+	m.HandleFunc("POST /api/pihole/chain", s.piholeSetChain)
 
 	// Single-file React app: any non-/api path serves the inlined index.html, so
 	// History-API routes (/lists, /runs, …) deep-link and refresh cleanly. /api/*
@@ -941,6 +963,33 @@ func (s *Server) resolveGeo(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]any{"targets": targets})
 }
 
+func (s *Server) getGeoAuto(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, 200, s.app.GeoAuto())
+}
+
+func (s *Server) setGeoAuto(w http.ResponseWriter, r *http.Request) {
+	var in app.GeoAutoConfig
+	if err := readJSON(r, &in); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	if err := s.app.SetGeoAuto(&in); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, s.app.GeoAuto())
+}
+
+func (s *Server) fetchGeoNow(w http.ResponseWriter, r *http.Request) {
+	cfg, err := s.app.FetchGeoNow()
+	if err != nil {
+		// Still return the (possibly partially-updated) config so the UI can show LastError.
+		writeJSON(w, 200, cfg)
+		return
+	}
+	writeJSON(w, 200, cfg)
+}
+
 // ---------- NFQWS2 engine file management + version/update/reload ----------
 
 func (s *Server) nfqws2Version(w http.ResponseWriter, r *http.Request) {
@@ -1318,6 +1367,23 @@ func (s *Server) awg2AddServer(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, s.app.AWG2AddServer(in.Name))
 }
 
+func (s *Server) awg2Import(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Conf string `json:"conf"`
+		Name string `json:"name"`
+	}
+	if err := readJSON(r, &in); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	st, err := s.app.AWG2Import(in.Conf, in.Name)
+	if err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, st)
+}
+
 func (s *Server) awg2SelectServer(w http.ResponseWriter, r *http.Request) {
 	if err := s.app.AWG2SelectServer(r.PathValue("id")); err != nil {
 		httpErr(w, 400, err)
@@ -1466,6 +1532,32 @@ func (s *Server) nfqws2StartSvc(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) nfqws2StopSvc(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, s.app.Nfqws2Stop())
+}
+
+func (s *Server) getAutomation(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, 200, s.app.AutomationStatus())
+}
+
+func (s *Server) setAutomation(w http.ResponseWriter, r *http.Request) {
+	var in app.AutomationConfig
+	if err := readJSON(r, &in); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	st, err := s.app.SetAutomationConfig(in)
+	if err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, st)
+}
+
+func (s *Server) triggerAutoPick(w http.ResponseWriter, r *http.Request) {
+	if err := s.app.TriggerAutoPickNow(); err != nil {
+		httpErr(w, 409, err)
+		return
+	}
+	writeJSON(w, 202, s.app.AutomationStatus())
 }
 
 // hostFromHeader strips the port from a Host header so the tg:// link points at

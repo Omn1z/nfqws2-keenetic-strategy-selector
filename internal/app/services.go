@@ -90,13 +90,24 @@ func (a *App) restartSocks5() ServiceResult {
 // NFQWS2 Start/Stop controls; the router is never rebooted.
 func (a *App) Nfqws2Start() ServiceResult {
 	init := a.Cfg.Nfqws2Init
-	script := "killall nfqws2 2>/dev/null\nkillall nfqws2-keenetic 2>/dev/null\nsleep 1\n" + init + " start 2>&1"
+	script := "for n in nfqws2 nfqws2.real nfqws2-keenetic; do killall \"$n\" 2>/dev/null; done\nsleep 1\n" + init + " start 2>&1"
 	return a.nfqws2Ctl("start", script)
 }
 
+// The upstream S51 init's stop is fragile on installations where the actual
+// binary is "nfqws2.real" (an Entware wrapper) and/or where the pidfile got
+// wiped: is_running()'s pidfile check fails, stop() bails with "not running",
+// the .real daemon survives, the queue stays bound. So we do the cleanup
+// ourselves first — kill every known process name AND every nfqws2.real PID
+// found via pidof — then run the init's stop to clean up firewall rules.
 func (a *App) Nfqws2Stop() ServiceResult {
 	init := a.Cfg.Nfqws2Init
-	script := init + " stop 2>&1 || true\nkillall nfqws2 2>/dev/null\nkillall nfqws2-keenetic 2>/dev/null\necho 'nfqws2 stopped'"
+	script := "for n in nfqws2 nfqws2.real nfqws2-keenetic; do killall \"$n\" 2>/dev/null; done\n" +
+		"for pid in $(pidof nfqws2.real 2>/dev/null); do kill -15 \"$pid\" 2>/dev/null; done\n" +
+		"sleep 1\n" +
+		"for pid in $(pidof nfqws2.real 2>/dev/null); do kill -9 \"$pid\" 2>/dev/null; done\n" +
+		init + " stop 2>&1 || true\n" +
+		"echo 'nfqws2 stopped'"
 	return a.nfqws2Ctl("stop", script)
 }
 

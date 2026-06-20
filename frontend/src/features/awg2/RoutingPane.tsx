@@ -8,7 +8,44 @@ import { Button } from "@/components/ui/Button";
 import { Badge } from "@/components/ui/Badge";
 import { Switch } from "@/components/ui/Switch";
 import { Field, Input, Select, Textarea } from "@/components/ui/form";
-import type { Awg2Status, AwgRoutingConfig, AwgZone } from "@/types/api";
+import type { Awg2Status, AwgRoutingConfig, AwgZone, Device } from "@/types/api";
+
+// DevicePicker fetches the live device list (DHCP leases + ARP cache, same data
+// the Devices tab shows) so the user can click a hostname instead of typing the
+// IP. Picking a device appends its LAN IP to the zone's source_ips; the v6 path
+// auto-derives from the MAC at apply time (see firewall_linux.go), so one click
+// covers both families.
+function DevicePicker({ onPick }: { onPick: (ip: string) => void }) {
+  const [devices, setDevices] = useState<Device[]>([]);
+  const [open, setOpen] = useState(false);
+  useEffect(() => {
+    if (!open) return;
+    void (async () => {
+      try {
+        const v = await api<{ devices: Device[] }>("GET", "/api/devices");
+        setDevices((v.devices ?? []).filter((d) => d.ip));
+      } catch (e) { toast((e as Error).message, "err"); }
+    })();
+  }, [open]);
+  return (
+    <span className="relative inline-block">
+      <Button mini onClick={() => setOpen((v) => !v)}>+ из списка</Button>
+      {open && (
+        <div className="absolute left-0 top-full z-10 mt-1 max-h-72 w-72 overflow-y-auto rounded-lg border border-line bg-panel p-1 text-xs shadow-lg">
+          {devices.length === 0 ? (
+            <div className="px-2 py-1 text-muted">Загрузка...</div>
+          ) : devices.map((d) => (
+            <button key={d.mac + d.ip} type="button" onClick={() => { onPick(d.ip); setOpen(false); }} className="block w-full rounded px-2 py-1 text-left hover:bg-line-soft">
+              {d.hostname && <b className="text-ink">{d.hostname} </b>}
+              <span className="font-mono">{d.ip}</span>
+              {!d.hostname && <span className="ml-2 text-muted">{d.mac}</span>}
+            </button>
+          ))}
+        </div>
+      )}
+    </span>
+  );
+}
 
 // One combined list per zone: domains/masks AND IPv4/IPv6/CIDR in the same box.
 // During editing everything lives in z.domains; on save we split IP/CIDR lines into
@@ -52,18 +89,27 @@ export default function RoutingPane({ st, reload }: { st: Awg2Status; reload: ()
   const autoTimer = useRef<number | null>(null);
   const serverID = st.active_server_id || "";
   const routingKey = JSON.stringify(st.config.routing || {});
-  const syncRef = useRef({ serverID, routingKey });
+  const lastServerIDRef = useRef(serverID);
+  // Suppress poll-driven resync for a brief window after a save. Otherwise the
+  // parent's 2.5s usePoll can race with our local markSaved: a poll fetched at
+  // the same time as POST may have captured pre-save state, and its setSt then
+  // overrides our just-applied edits via the resync useEffect. 3s covers at
+  // least one full poll cycle so the next refetch sees the saved values.
+  const savedAtRef = useRef(0);
   useEffect(() => () => { if (timer.current) window.clearInterval(timer.current); if (autoTimer.current) window.clearTimeout(autoTimer.current); }, []);
   useEffect(() => {
-    const prev = syncRef.current;
-    const serverChanged = prev.serverID !== serverID;
-    const routingChanged = prev.routingKey !== routingKey;
-    if (serverChanged || (!dirty && routingChanged)) {
+    if (lastServerIDRef.current !== serverID) {
+      // User switched to a different AWG server — its routing config is wholly
+      // different, force-reset whatever was in flight.
+      lastServerIDRef.current = serverID;
       setRState(st.config.routing);
       setDirty(false);
-      syncRef.current = { serverID, routingKey };
+      return;
     }
-  }, [dirty, routingKey, serverID, st.config.routing]);
+    if (dirty) return;
+    if (Date.now() - savedAtRef.current < 3000) return;
+    setRState(st.config.routing);
+  }, [routingKey, serverID, dirty, st.config.routing]);
   const setR = (next: AwgRoutingConfig | ((prev: AwgRoutingConfig) => AwgRoutingConfig)) => {
     setDirty(true);
     setRState(next);
@@ -71,7 +117,7 @@ export default function RoutingPane({ st, reload }: { st: Awg2Status; reload: ()
   const markSaved = (next: AwgRoutingConfig) => {
     setRState(next);
     setDirty(false);
-    syncRef.current = { serverID, routingKey: JSON.stringify(next) };
+    savedAtRef.current = Date.now();
   };
 
   const eng = st.engine;
@@ -137,13 +183,38 @@ export default function RoutingPane({ st, reload }: { st: Awg2Status; reload: ()
     } catch (e) { toast((e as Error).message, "err"); } finally { setBusy(false); }
   };
   const commit = () => post("/api/awg2/routing/commit", {}, "Подтверждено — авто-откат отменён", stopCountdown);
+
+  // Save + apply + commit when the tunnel is ALREADY active. No confirm dialog
+  // and no 90s dead-man's countdown — the panel can't lose itself because
+  // LAN/private/self are always excluded from the tunnel, so re-applying live
+  // zones can't cut access. The previous behaviour (POST only /routing/config)
+  // was wrong: the backend persists the new config but doesn't rebuild ipsets
+  // until /apply, so zone edits silently never took effect.
+  const applyRoutingLive = async () => {
+    setBusy(true);
+    try {
+      const nextRouting = cleanRouting(r);
+      await api("POST", "/api/awg2/routing/config", nextRouting);
+      markSaved(nextRouting);
+      await api("POST", "/api/awg2/routing/apply", {});
+      // Commit immediately — there's no need for the dead-man's switch because
+      // the tunnel is already up; this is a refresh, not a cut-over.
+      await api("POST", "/api/awg2/routing/commit", {});
+      toast("Зоны применены к туннелю", "ok");
+      await reload();
+    } catch (e) {
+      toast((e as Error).message, "err");
+    } finally {
+      setBusy(false);
+    }
+  };
   const teardown = () => {
     const nextRouting = cleanRouting({ ...r, mode: "off" });
     void post("/api/awg2/routing/config", nextRouting, "Маршрутизация снята", stopCountdown, nextRouting);
   };
 
   const setZone = (i: number, patch: Partial<AwgZone>) => setR((p) => ({ ...p, zones: p.zones.map((z, j) => (j === i ? { ...z, ...patch } : z)) }));
-  const addZone = () => setR((p) => ({ ...p, zones: [...(p.zones || []), { name: "новая зона", mode: "include", domains: [], ips: [], enabled: true }] }));
+  const addZone = () => setR((p) => ({ ...p, zones: [...(p.zones || []), { name: "новая зона", mode: "include", domains: [], ips: [], source_ips: [], enabled: true }] }));
   const delZone = (i: number) => setR((p) => ({ ...p, zones: p.zones.filter((_, j) => j !== i) }));
 
   // Per-zone Include/Exclude picker: each zone routes its own members THROUGH the
@@ -255,13 +326,23 @@ export default function RoutingPane({ st, reload }: { st: Awg2Status; reload: ()
                 <Switch checked={z.enabled} onChange={(v) => setZone(i, { enabled: v })} label="вкл" />
                 <Button mini onClick={() => delZone(i)}>Удалить</Button>
               </div>
-              <Field label="Домены, маски и IP — всё в одном списке (по строке)">
-                <Textarea rows={6} value={toLines(zoneLines(z))} placeholder={"youtube.com\n*ip*\n104.18.0.0/16\n2606:4700::/32"} onChange={(e) => setZone(i, { domains: splitRaw(e.target.value), ips: [] })} />
+              <Field label="Домены, маски и IP — всё в одном списке (по строке)" hint={"Префиксы xray-стиля: domain:vk.com (суффикс), full:exact.com (точный), geosite:cn / geoip:cn (категория из загруженного geosite.dat/geoip.dat), regexp:^.*\\.foo$ (Go regex), keyword:foo (substring), list:user (читает /opt/etc/nfqws2/lists/user.list). Без префикса работает по-старому."}>
+                <Textarea rows={6} value={toLines(zoneLines(z))} placeholder={"youtube.com\n*ip*\ndomain:vk.com\ngeosite:cn\nregexp:^.*\\.googlevideo\\.com$\nlist:user\n104.18.0.0/16"} onChange={(e) => setZone(i, { domains: splitRaw(e.target.value), ips: [] })} />
+              </Field>
+              <Field label="Источники (LAN IP/CIDR — пусто = вся сеть)" hint={"Если задано, зона применяется ТОЛЬКО к пакетам от этих устройств (IPv4 — по адресу, IPv6 — по MAC из ARP-кэша). Семантика для source-зоны: include + пустые домены = ВЕСЬ трафик источников в туннель; include + домены = только эти домены в туннель для этих источников; exclude + домены = эти домены идут direct ДЛЯ ЭТИХ источников (carve-out поверх include). Order: exclude перебивает include. Source-зоны не влияют на других пользователей сети."}>
+                <div className="flex items-start gap-2">
+                  <Textarea rows={2} className="flex-1" value={toLines(z.source_ips || [])} placeholder={"192.168.31.243\n192.168.31.100"} onChange={(e) => setZone(i, { source_ips: splitRaw(e.target.value) })} />
+                  <DevicePicker onPick={(ip) => {
+                    const cur = (z.source_ips || []).map((s) => s.trim()).filter(Boolean);
+                    if (cur.includes(ip)) return;
+                    setZone(i, { source_ips: [...cur, ip] });
+                  }} />
+                </div>
               </Field>
             </div>
           ))
         )}
-        {(r.zones || []).length > 0 && <Button variant={active ? "primary" : undefined} onClick={() => { const nextRouting = cleanRouting(r); void post("/api/awg2/routing/config", nextRouting, active ? "Зоны сохранены и применены к туннелю" : "Зоны сохранены", undefined, nextRouting); }} disabled={busy}>{active ? "Сохранить и применить зоны" : "Сохранить зоны"}</Button>}
+        {(r.zones || []).length > 0 && <Button variant="primary" onClick={() => { if (!active) { void applyRouting(); } else { void applyRoutingLive(); } }} disabled={busy}>Сохранить и применить зоны</Button>}
       </Card>
     </>
   );

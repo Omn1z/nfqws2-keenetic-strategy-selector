@@ -73,7 +73,24 @@ func awgZonesHaveMask(cfg *awg.ServerConfig) bool {
 // even when the toggle is off — otherwise typing "*.com" in the default resolve mode
 // is silently ignored.
 func awgUsesDNSProxy(cfg *awg.ServerConfig) bool {
-	return cfg.Routing.DomainSource == "dnsproxy" || awgZonesHaveMask(cfg)
+	if cfg.Routing.DomainSource == "dnsproxy" || awgZonesHaveMask(cfg) {
+		return true
+	}
+	// Source-bound zones with domain-shaped entries (plain/domain:/full:/list:/
+	// geosite:) rely on live DNS interception to track CDN-served destinations
+	// — without it the per-zone ipset only has whatever the panel pre-resolved
+	// once and misses every later IP rotation. Auto-enable the proxy in this
+	// case so the user doesn't have to flip a toggle for per-device routing to
+	// actually carve out RU/etc destinations.
+	for _, z := range cfg.Routing.Zones {
+		if !z.Enabled || len(z.SourceIPs) == 0 {
+			continue
+		}
+		if len(z.Domains) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // awgEffectiveMode collapses the per-zone directions + global mode into the chain
@@ -101,6 +118,12 @@ func awgEffectiveMode(r awg.RoutingConfig) string {
 	hasInc, hasExc, incAll := false, false, false
 	for _, z := range r.Zones {
 		if !z.Enabled || (len(z.Domains) == 0 && len(z.IPs) == 0) {
+			continue
+		}
+		// Source-bound zones are evaluated by the per-source firewall block — they
+		// must NOT influence the global chain shape (otherwise an exclude-zone
+		// scoped to one device would also exclude that destination for everyone).
+		if len(z.SourceIPs) > 0 {
 			continue
 		}
 		if z.Mode == "exclude" {

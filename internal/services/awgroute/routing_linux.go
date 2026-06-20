@@ -49,9 +49,19 @@ const (
 
 	// Domain-mask DNS proxy: transparently intercepts LAN :53 (via an iptables
 	// REDIRECT in the hook) and adds the IPs of matching names to the ipset.
-	awgDNSAddr     = "127.0.0.1:5354"
+	// Bind 0.0.0.0 because iptables REDIRECT rewrites dst-IP to the primary IP
+	// of the incoming interface (br-lan → 192.168.31.1, br-docker → 172.17.0.1,
+	// etc.) — a 127.0.0.1-only socket would miss every redirected packet and
+	// kernel would ICMP-unreachable the LAN client. WAN access stays closed via
+	// fw3's default DROP on zone_wan_input.
+	awgDNSAddr     = "0.0.0.0:5354"
 	awgDNSPort     = "5354"
 	awgDNSUpstream = "127.0.0.1:53" // Keenetic ndnproxy — the real LAN resolver
+
+	// Pi-hole FTL port — iptables REDIRECT target so pi-hole receives queries
+	// directly (preserving client src IP in its query log). Pi-hole then forwards
+	// to our proxy on awgDNSPort as its upstream. Mirrors pihole.DefaultDNSPort.
+	awgPiholeDNSPort = "5353"
 )
 
 func (svc *Service) awgApplyRoutingOS() error {
@@ -76,8 +86,8 @@ func (svc *Service) awgApplyRoutingOS() error {
 	}
 	// 1) pin the endpoint via the ORIGINAL gateway first (prevents the WG loop)
 	_, _ = awgRun("ip route replace " + endpointIP + "/32 via " + gw + " dev " + wandev)
-	// 2) ipset membership
-	if err := svc.awgBuildSets(&cfg); err != nil {
+	// 2) ipset membership — force=true so a user-triggered apply always rebuilds
+	if err := svc.awgBuildSetsForce(&cfg, true); err != nil {
 		return err
 	}
 	awgResetSNISet()
@@ -94,6 +104,14 @@ func (svc *Service) awgApplyRoutingOS() error {
 	if _, err := awgRun("ip rule add fwmark " + awgMarkRule + " table " + awgTable); err != nil {
 		return fmt.Errorf("ip rule: %w", err)
 	}
+	// 3-v6) IPv6 mirror: separate table state (same id is fine — v4 and v6 are
+	// independent), default-route into awg0, fwmark rule. AmneziaWG tunnels both
+	// families when MTU/peer allow, so this is enough for IPv6 sites to ride the
+	// existing per-source MARK or just the global blanket. Failures here are
+	// non-fatal (kernel may lack v6 forwarding), so we don't roll back v4.
+	_, _ = awgRun("ip -6 route replace default dev " + awgIface + " table " + awgTable)
+	_, _ = awgRun("ip -6 rule del fwmark " + awgMarkRule + " table " + awgTable + " 2>/dev/null")
+	_, _ = awgRun("ip -6 rule add fwmark " + awgMarkRule + " table " + awgTable)
 	// 3b) killswitch (Эксклюзивный маршрут): a blackhole fallback in the tunnel table
 	// so marked traffic is DROPPED (not leaked to the direct WAN) when awg0 is down.
 	awgApplyKillswitch(r.Killswitch)
@@ -107,7 +125,7 @@ func (svc *Service) awgApplyRoutingOS() error {
 	// 5) firewall hook (marking chain + FORWARD/NAT/MSS [+ DNS REDIRECT]) — a Keenetic
 	// ndm netfilter.d hook so it survives the firewall rebuilds that flush foreign
 	// iptables chains; awgWriteHook also applies it immediately.
-	if err := awgWriteHook(awgEffectiveMode(r), endpointIP, r.MTU, dnsOn); err != nil {
+	if err := awgWriteHook(awgEffectiveMode(r), endpointIP, r.MTU, dnsOn, r.Zones); err != nil {
 		return fmt.Errorf("firewall-хук: %w", err)
 	}
 	// 6) disable Keenetic's NAT accelerators — their fast-path silently drops our
@@ -153,7 +171,10 @@ func (svc *Service) awgRefreshRoutingOS() error {
 		_ = os.Remove(awgSetDir + "/" + awgSetInc + ".ipset")
 		_ = os.Remove(awgSetDir + "/" + awgSetExc + ".ipset")
 	}
-	if err := svc.awgBuildSets(&cfg); err != nil {
+	// force=true: a config refresh triggered by SetRouting is a user edit (or
+	// fresh apply on startup) so the zones may have changed even if their hash
+	// happens to look the same after flushing the DNS-proxy-learned entries.
+	if err := svc.awgBuildSetsForce(&cfg, true); err != nil {
 		return err
 	}
 	awgResetSNISet()
@@ -163,7 +184,7 @@ func (svc *Service) awgRefreshRoutingOS() error {
 	awgApplyKillswitch(r.Killswitch)
 	dnsOn := svc.awgEnsureDNSProxy(&cfg)
 	svc.awgEnsureSNISniff(&cfg) // start/stop/refresh the SNI sniffer to match the new zones
-	if err := awgWriteHook(awgEffectiveMode(r), endpointIP, r.MTU, dnsOn); err != nil {
+	if err := awgWriteHook(awgEffectiveMode(r), endpointIP, r.MTU, dnsOn, r.Zones); err != nil {
 		return fmt.Errorf("firewall-хук: %w", err)
 	}
 	awgSetAccel(false)
@@ -216,7 +237,7 @@ func (svc *Service) awgStartRefresh() {
 				// re-assert the firewall hook: rewrite the file if Keenetic/anything
 				// removed it, otherwise just re-run it (fast, idempotent).
 				if _, err := os.Stat(awgHookPath); err != nil {
-					_ = awgWriteHook(awgEffectiveMode(c.Routing), resolveHostIP(hostOf(c.Endpoint)), c.Routing.MTU, svc.awgEnsureDNSProxy(&c))
+					_ = awgWriteHook(awgEffectiveMode(c.Routing), resolveHostIP(hostOf(c.Endpoint)), c.Routing.MTU, svc.awgEnsureDNSProxy(&c), c.Routing.Zones)
 				} else {
 					_, _ = awgRun("sh " + awgHookPath)
 				}
@@ -302,6 +323,22 @@ func (svc *Service) awgTeardownRoutingOS() error {
 	_, _ = awgRun("ipset destroy " + awgSetInc + " 2>/dev/null")
 	_, _ = awgRun("ipset destroy " + awgSetExc + " 2>/dev/null")
 	_, _ = awgRun("ipset destroy " + awgSetSNI + " 2>/dev/null")
+	// IPv6 teardown: mirror of the v4 cleanup above (chain detach + flush, ip -6
+	// rule + route, per-zone v6 ipsets). Per-zone v4 sets persist across teardown
+	// by design (they're rebuilt by awgBuildSourceSets on next apply), so we leave
+	// the v6 counterparts alone the same way.
+	_, _ = awgRun("ip6tables -t mangle -D PREROUTING -j " + awgChain + "6 2>/dev/null")
+	_, _ = awgRun("ip6tables -t mangle -D OUTPUT -j " + awgChain + "6 2>/dev/null")
+	_, _ = awgRun("ip6tables -t mangle -F " + awgChain + "6 2>/dev/null")
+	_, _ = awgRun("ip6tables -t mangle -X " + awgChain + "6 2>/dev/null")
+	_, _ = awgRun("ip -6 rule del fwmark " + awgMarkRule + " table " + awgTable + " 2>/dev/null")
+	_, _ = awgRun("ip -6 route flush table " + awgTable + " 2>/dev/null")
+	_, _ = awgRun("ip6tables -t nat -D POSTROUTING -o " + awgIface + " -j MASQUERADE 2>/dev/null")
+	for _, dir := range []string{"-o", "-i"} {
+		_, _ = awgRun("ip6tables -t mangle -D FORWARD " + dir + " " + awgIface + " -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss " + mss + " 2>/dev/null")
+	}
+	_, _ = awgRun("ip6tables -D FORWARD -i " + awgIface + " -j ACCEPT 2>/dev/null")
+	_, _ = awgRun("ip6tables -D FORWARD -o " + awgIface + " -j ACCEPT 2>/dev/null")
 	logbuf.Append("awg2", "info", "маршрутизация снята")
 	return nil
 }

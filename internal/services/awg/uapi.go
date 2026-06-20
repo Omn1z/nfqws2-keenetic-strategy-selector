@@ -45,7 +45,18 @@ func RenderUAPISet(c *ServerConfig, p Peer, endpointIP string, port int) (string
 	fmt.Fprintf(&b, "private_key=%s\n", priv)
 	o := c.Obf
 	fmt.Fprintf(&b, "jc=%d\njmin=%d\njmax=%d\n", o.Jc, o.Jmin, o.Jmax)
-	fmt.Fprintf(&b, "s1=%d\ns2=%d\ns3=%d\ns4=%d\n", o.S1, o.S2, o.S3, o.S4)
+	fmt.Fprintf(&b, "s1=%d\ns2=%d\n", o.S1, o.S2)
+	// S3/S4 only when non-zero. Sending s3=0/s4=0 in UAPI is NOT equivalent to
+	// omitting them — the server validates the handshake auth tag using the same
+	// magic-byte protocol, and zero-vs-absent shifts which bytes appear in the
+	// init packet. If server config has no S3/S4, client must mirror that or the
+	// handshake auth check silently fails (server drops without log).
+	if o.S3 > 0 {
+		fmt.Fprintf(&b, "s3=%d\n", o.S3)
+	}
+	if o.S4 > 0 {
+		fmt.Fprintf(&b, "s4=%d\n", o.S4)
+	}
 	fmt.Fprintf(&b, "h1=%s\nh2=%s\nh3=%s\nh4=%s\n", hdr(o.H1, "1"), hdr(o.H2, "2"), hdr(o.H3, "3"), hdr(o.H4, "4"))
 	for i, v := range []string{o.I1, o.I2, o.I3, o.I4, o.I5} {
 		if strings.TrimSpace(v) != "" {

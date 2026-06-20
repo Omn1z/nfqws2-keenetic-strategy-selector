@@ -7,6 +7,7 @@ import { Button } from "@/components/ui/Button";
 import { Badge } from "@/components/ui/Badge";
 import { FileManager } from "./FileManager";
 import { ConfigPane } from "./ConfigPane";
+import { AutomationPanel } from "./AutomationPanel";
 import type { Nfqws2Version } from "@/types/api";
 
 type Sub = "config" | "scripts" | "lists";
@@ -73,6 +74,10 @@ export default function Nfqws2() {
       >
         <p className="text-xs text-muted">Редактирование живого движка nfqws2: конфиг, Lua-скрипты обхода и списки доменов/IP. «Применить (reload)» перечитывает списки без обрыва очереди; «Перезапустить» нужен после смены портов, интерфейса или стратегий.</p>
       </Card>
+
+      <div className="mb-4">
+        <AutomationPanel />
+      </div>
 
       <div className="mb-4 inline-flex overflow-hidden rounded-lg border border-line">
         {seg("config", "Конфиг")}

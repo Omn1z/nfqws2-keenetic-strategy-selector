@@ -5,6 +5,7 @@ import (
 	"net/netip"
 	"sort"
 	"strconv"
+	"strings"
 )
 
 // GroupDevices groups connections by their LAN initiator (original-direction
@@ -18,6 +19,7 @@ func GroupDevices(conns []Conn, arp []ARPEntry) []Device {
 	for _, a := range arp {
 		byIP[a.IP] = a
 	}
+	hostnames := HostnamesByMAC() // mac → friendly name from DHCP leases (best-effort)
 
 	type acc struct {
 		dev     Device
@@ -51,6 +53,8 @@ func GroupDevices(conns []Conn, arp []ARPEntry) []Device {
 			m[src] = a
 		}
 		a.dev.Total++
+		a.dev.BytesUp += c.Bytes
+		a.dev.BytesDown += c.ReplyBytes
 		dst := c.Dst.String()
 		if c.DstPort != 0 { // omit ":0" for portless protocols (icmp)
 			dst = net.JoinHostPort(c.Dst.String(), strconv.Itoa(c.DstPort))
@@ -68,6 +72,9 @@ func GroupDevices(conns []Conn, arp []ARPEntry) []Device {
 	for _, a := range m {
 		a.dev.Working = sortedKeys(a.working)
 		a.dev.FailingDsts = sortedKeys(a.failing)
+		if name, ok := hostnames[strings.ToLower(a.dev.MAC)]; ok {
+			a.dev.Hostname = name
+		}
 		out = append(out, a.dev)
 	}
 	// Most-failing devices first (they're the ones worth picking strategies for),

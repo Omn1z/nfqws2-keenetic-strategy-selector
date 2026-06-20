@@ -90,13 +90,21 @@ type IfaceBytes struct {
 // Device aggregates a LAN device's connections, splitting destinations into ones
 // that responded (Working) and ones that didn't (FailingDsts) — the latter feed
 // the strategy-picking workflow.
+//
+// BytesUp / BytesDown are the SUM of conntrack byte counters across the device's
+// live connections — uplink is the original-direction bytes (LAN→WAN), downlink
+// is the reply direction. Counters go stale under hardware offload, so these
+// are display-only and never used for routing decisions.
 type Device struct {
 	IP          string   `json:"ip"`
 	MAC         string   `json:"mac"`
+	Hostname    string   `json:"hostname"` // best-effort from DHCP leases; "" when unknown
 	Iface       string   `json:"iface"`
 	Total       int      `json:"total"`
 	Established int      `json:"established"`
 	Failing     int      `json:"failing"`
+	BytesUp     int64    `json:"bytes_up"`
+	BytesDown   int64    `json:"bytes_down"`
 	Working     []string `json:"working"`
 	FailingDsts []string `json:"failing_dsts"`
 }

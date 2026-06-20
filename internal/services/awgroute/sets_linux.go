@@ -3,6 +3,8 @@
 package awgroute
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -25,25 +27,75 @@ const (
 // mode.go (build-tag-free, so they can be unit-tested on any platform).
 
 func (svc *Service) awgBuildSets(cfg *awg.ServerConfig) error {
+	return svc.awgBuildSetsForce(cfg, false)
+}
+
+// awgBuildSetsForce is the actual builder. When force=false the call short-
+// circuits if the zones config is byte-for-byte the same as the last successful
+// build — the watchdog uses this so a "nothing changed" tick doesn't burn 30 s
+// re-resolving 14 k entries and re-warming the geo parse cache (~150 MB).
+// Apply / on-zone-change always passes force=true so a user edit always rebuilds.
+func (svc *Service) awgBuildSetsForce(cfg *awg.ServerConfig, force bool) error {
+	zb, _ := json.Marshal(cfg.Routing.Zones)
+	sum := sha256.Sum256(zb)
+	h := hex.EncodeToString(sum[:])
+	if !force {
+		if last := svc.route.lastZonesHash.Load(); last != nil && *last == h {
+			return nil // zones unchanged since last build — leave the kernel ipsets alone
+		}
+	}
+	defer svc.route.lastZonesHash.Store(&h)
+
 	_, _ = awgRun("ipset create " + awgSetInc + " hash:net family inet -exist")
 	_, _ = awgRun("ipset create " + awgSetExc + " hash:net family inet -exist")
+	_, _ = awgRun("ipset create " + awgSetInc + "_6 hash:net family inet6 -exist")
+	_, _ = awgRun("ipset create " + awgSetExc + "_6 hash:net family inet6 -exist")
 	// When the DNS proxy is in use it adds matched mask IPs dynamically — don't flush
 	// them here (the refresh path flushes explicitly when zones change), otherwise the
 	// watchdog's periodic rebuild would wipe every proxy-learned IP between queries.
 	if !awgUsesDNSProxy(cfg) {
 		_, _ = awgRun("ipset flush " + awgSetInc)
 		_, _ = awgRun("ipset flush " + awgSetExc)
+		_, _ = awgRun("ipset flush " + awgSetInc + "_6")
+		_, _ = awgRun("ipset flush " + awgSetExc + "_6")
 	}
+
+	// Build the whole load script and pipe it into a single `ipset restore`. With
+	// catch-all zones (geosite:cn + geoip:cn) the entries can be > 30k; one
+	// fork+exec saves minutes vs N invocations of `ipset add`.
+	seen := map[string]struct{}{}
+	var b strings.Builder
+	addLine := func(set, entry string) bool {
+		key := set + " " + entry
+		if _, ok := seen[key]; ok {
+			return false
+		}
+		seen[key] = struct{}{}
+		b.WriteString("add ")
+		b.WriteString(set)
+		b.WriteByte(' ')
+		b.WriteString(entry)
+		b.WriteByte('\n')
+		return true
+	}
+
 	nInc, nExc := 0, 0
 	for _, z := range cfg.Routing.Zones {
 		if !z.Enabled {
 			continue
 		}
-		// Each zone feeds its OWN set by its direction: include → awg2_inc (tunnel),
-		// exclude → awg2_exc (bypass).
-		target := awgSetInc
+		// Source-bound zones get their own per-zone ipset built below — skip them
+		// here so their destinations don't leak into the global include/exclude
+		// sets that would apply to every device on the LAN.
+		if len(z.SourceIPs) > 0 {
+			continue
+		}
+		// Each zone feeds its OWN direction's set; v4 and v6 entries go to the
+		// family-matching ipset (awg2_inc / awg2_inc_6 etc.) so ip6tables can
+		// match them in the IPv6 chain.
+		set4, set6 := awgSetInc, awgSetInc+"_6"
 		if z.Mode == "exclude" {
-			target = awgSetExc
+			set4, set6 = awgSetExc, awgSetExc+"_6"
 		}
 		bump := func() {
 			if z.Mode == "exclude" {
@@ -52,36 +104,133 @@ func (svc *Service) awgBuildSets(cfg *awg.ServerConfig) error {
 				nInc++
 			}
 		}
-		for _, ip := range z.IPs {
+		// Expand xray-style prefixes (geosite:/geoip:/list:/domain:/full:) into the
+		// flat (plain domains, plain IPs) the resolver and ipset below already know.
+		// Plain entries pass through unchanged, so legacy zones stay byte-identical.
+		expDomains, expIPs := svc.expandEntries(z.Domains)
+		for _, ip := range append(append([]string{}, z.IPs...), expIPs...) {
 			ip = strings.TrimSpace(ip)
 			if ip == "" {
 				continue
 			}
-			if _, err := awgRun("ipset add " + target + " " + ip + " -exist"); err == nil {
+			target := set4
+			if isIPv6(strings.SplitN(ip, "/", 2)[0]) {
+				target = set6
+			}
+			if addLine(target, ip) {
 				bump()
 			}
 		}
-		for _, d := range z.Domains {
-			// Mask/regex entries (e.g. "2ip.*", "*ip*", "[re]…") can't be resolved as
-			// a hostname — trying to (net.LookupHost on a bogus name) blocks on slow
-			// DNS timeouts and would hang «Сохранить и применить». The DNS proxy is
-			// what matches masks, so skip them here; only PLAIN domains get a direct
-			// server-side resolve (which makes them tunnel/bypass immediately).
-			if isMaskEntry(d) {
-				continue
+		// Plain domains are resolved live via the shared parallel resolver (used
+		// by source-bound zones too). Mask/regex stays in DNSProxy/SNI matchers.
+		var plain []string
+		for _, d := range expDomains {
+			if !isMaskEntry(d) {
+				plain = append(plain, d)
 			}
-			for _, ip := range resolveDomain(d) {
+		}
+		for _, r := range parallelResolve(plain, 32) {
+			for _, ip := range r {
 				if provider, ok := sharedCDNProvider(ip); ok {
-					svc.awgNoteSharedCDNSkip("resolve", d, ip, provider)
+					svc.awgNoteSharedCDNSkip("resolve", "", ip, provider)
 					continue
 				}
-				_, _ = awgRun("ipset add " + target + " " + ip + "/32 -exist")
-				bump()
+				target, suffix := set4, "/32"
+				if isIPv6(ip) {
+					target, suffix = set6, "/128"
+				}
+				if addLine(target, ip+suffix) {
+					bump()
+				}
 			}
 		}
 	}
+	if b.Len() > 0 {
+		if _, err := awgRunStdin("ipset restore -exist", b.String()); err != nil {
+			logbuf.Append("awg2", "warn", "ipset restore (global): "+err.Error())
+		}
+	}
 	logbuf.Append("awg2", "info", fmt.Sprintf("ipset: include=%d, exclude=%d записей", nInc, nExc))
+	svc.awgBuildSourceSets(cfg)
 	return nil
+}
+
+// awgBuildSourceSets creates one ipset per enabled source-bound zone and fills
+// it with the zone's expanded domains/IPs. The firewall hook references these
+// sets in the per-source mangle rules (see firewall_linux.go). Source-bound
+// zones are intentionally isolated from awg2_inc/exc so they only affect the
+// devices named in `source_ips`, never the rest of the LAN.
+func (svc *Service) awgBuildSourceSets(cfg *awg.ServerConfig) {
+	sb := sourceBoundZones(cfg.Routing.Zones)
+	for i, z := range sb {
+		set4 := sourceZoneSetName(i)
+		set6 := sourceZoneSetName6(i)
+		_, _ = awgRun("ipset create " + set4 + " hash:net family inet -exist")
+		_, _ = awgRun("ipset create " + set6 + " hash:net family inet6 -exist")
+		_, _ = awgRun("ipset flush " + set4)
+		_, _ = awgRun("ipset flush " + set6)
+		if len(z.Domains) == 0 && len(z.IPs) == 0 {
+			continue // empty destinations = whole-source rule, no ipset entries needed
+		}
+		// Build the whole ipset script in memory and feed it to a SINGLE
+		// `ipset restore` invocation. With a category like geosite:ru + geoip:ru
+		// this can be 20–30k lines — one fork+exec instead of that many is the
+		// difference between «apply takes 2 minutes» and «apply takes 1 second».
+		expDomains, expIPs := svc.expandEntries(z.Domains)
+		seen := map[string]struct{}{}
+		var b strings.Builder
+		addLine := func(set, entry string) {
+			key := set + " " + entry
+			if _, ok := seen[key]; ok {
+				return
+			}
+			seen[key] = struct{}{}
+			b.WriteString("add ")
+			b.WriteString(set)
+			b.WriteByte(' ')
+			b.WriteString(entry)
+			b.WriteByte('\n')
+		}
+		for _, ip := range append(append([]string{}, z.IPs...), expIPs...) {
+			ip = strings.TrimSpace(ip)
+			if ip == "" {
+				continue
+			}
+			target := set4
+			if isIPv6(strings.SplitN(ip, "/", 2)[0]) {
+				target = set6
+			}
+			addLine(target, ip)
+		}
+		// Plain domains need a live DNS resolve each. With geosite:category-ru that
+		// is thousands of names; serial nslookup made apply take ~2 minutes. Fan
+		// out across a small worker pool — the router's resolver handles parallel
+		// queries fine and the wall-clock collapses to ~5 s.
+		var plain []string
+		for _, d := range expDomains {
+			if !isMaskEntry(d) {
+				plain = append(plain, d)
+			}
+		}
+		for _, r := range parallelResolve(plain, 32) {
+			for _, ip := range r {
+				if _, ok := sharedCDNProvider(ip); ok {
+					continue
+				}
+				target, suffix := set4, "/32"
+				if isIPv6(ip) {
+					target, suffix = set6, "/128"
+				}
+				addLine(target, ip+suffix)
+			}
+		}
+		if b.Len() == 0 {
+			continue
+		}
+		if _, err := awgRunStdin("ipset restore -exist", b.String()); err != nil {
+			logbuf.Append("awg2", "warn", fmt.Sprintf("ipset restore zone[%d]: %v", i, err))
+		}
+	}
 }
 
 func awgResetSNISet() {

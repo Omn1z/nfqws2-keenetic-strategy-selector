@@ -1,11 +1,8 @@
 package awgroute
 
 import (
-	"fmt"
 	"net/netip"
 	"sync"
-
-	"nfqws2strategy/internal/tools/logbuf"
 )
 
 // Domain-based split routing eventually becomes IP routing. Shared CDN edge
@@ -74,14 +71,18 @@ func sharedCDNProvider(ip string) (string, bool) {
 	return "", false
 }
 
+// awgNoteSharedCDNSkip records that we skipped putting a shared-CDN IP into the
+// destination ipsets. The behaviour is INTENTIONAL — putting a Cloudflare /
+// Akamai edge IP into awg2_exc would also bypass every unrelated site on the
+// same IP, which is wrong. In Russia specifically that's even the correct
+// outcome (Cloudflare ranges are network-blocked, so traffic to them rides VPN
+// anyway). The early code surfaced this as a per-IP `warn` line in the panel
+// log; it spammed dozens of lines per apply and convinced users something was
+// broken. So we now keep ONLY the dedup map (in case future code wants to
+// reason over it) and stay silent in the log.
 func (svc *Service) awgNoteSharedCDNSkip(source, name, ip, provider string) {
-	key := source + "|" + provider + "|" + ip
-	if _, loaded := svc.route.sharedCDNSkips.LoadOrStore(key, struct{}{}); loaded {
-		return
-	}
-	suffix := ""
-	if name != "" {
-		suffix = " for " + name
-	}
-	logbuf.Append("awg2", "warn", fmt.Sprintf("%s: skipped learned %s IP %s%s to avoid routing unrelated shared-CDN sites", source, provider, ip, suffix))
+	_ = name
+	_ = provider
+	key := source + "|" + ip
+	svc.route.sharedCDNSkips.LoadOrStore(key, struct{}{})
 }

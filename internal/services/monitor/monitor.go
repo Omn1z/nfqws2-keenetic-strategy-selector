@@ -6,6 +6,7 @@
 package monitor
 
 import (
+	"sort"
 	"sync"
 
 	"nfqws2strategy/internal/services/awgroute"
@@ -71,6 +72,12 @@ type DashboardView struct {
 	Queues    []netmon.QueueStat  `json:"queues"`
 	MainQueue int                 `json:"main_queue"`
 	WAN       []netmon.IfaceBytes `json:"wan"`
+
+	// System health snapshot (CPU / RAM / temp / uptime / load).
+	System netmon.SystemStats `json:"system"`
+
+	// Top-talking LAN devices by bytes (sum of up+down). Capped to 8.
+	TopDevices []netmon.Device `json:"top_devices"`
 }
 
 // Dashboard assembles the home view. The TG WS card works on any platform; the
@@ -116,6 +123,21 @@ func (s *Service) Dashboard(host string) DashboardView {
 				d.WAN = append(d.WAN, f)
 			}
 		}
+	}
+
+	// System + top-talking devices (best-effort; empty on non-Linux dev box).
+	d.System = netmon.System()
+	if conns, err := netmon.Conntrack(); err == nil {
+		arp, _ := netmon.ARP()
+		devs := netmon.GroupDevices(conns, arp)
+		// Sort by total bytes (up+down) descending and keep at most 8 for the dashboard.
+		sort.Slice(devs, func(i, j int) bool {
+			return devs[i].BytesUp+devs[i].BytesDown > devs[j].BytesUp+devs[j].BytesDown
+		})
+		if len(devs) > 8 {
+			devs = devs[:8]
+		}
+		d.TopDevices = devs
 	}
 	return d
 }

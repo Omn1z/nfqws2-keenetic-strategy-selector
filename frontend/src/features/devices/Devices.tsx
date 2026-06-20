@@ -206,6 +206,7 @@ export default function Devices() {
           return (
             <div key={d.ip} className="mb-3 rounded-[10px] border border-line bg-panel p-3.5">
               <div className="mb-2.5 flex flex-wrap items-center gap-2.5">
+                {d.hostname && <b className="text-sm text-ink">{d.hostname}</b>}
                 <span className="font-mono text-sm font-bold">{d.ip}</span>
                 {d.mac && <span className="font-mono text-xs text-muted">{d.mac}</span>}
                 {d.iface && <Badge>{d.iface}</Badge>}

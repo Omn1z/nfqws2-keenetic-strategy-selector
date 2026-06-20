@@ -1,6 +1,20 @@
 package awgroute
 
-import "sync"
+import (
+	"sync"
+
+	"nfqws2strategy/internal/services/awg"
+)
+
+// sourceZoneMatchers is the compiled matcher set for one source-bound zone +
+// the ipset its matches must land in. The DNS proxy / SNI sniffer iterate this
+// slice for each name they see and add the resolved IP to the right per-zone
+// ipset, so CDN-served destinations stay routed correctly as they rotate.
+// Defined in a tag-free file so it's visible to client.go (non-linux too).
+type sourceZoneMatchers struct {
+	Matchers []awg.DomainMatcher
+	SetName  string
+}
 
 // sniSniffer passively reads TLS ClientHellos off the LAN bridges and calls onHello
 // with each (destination IP, SNI). SNI-routing uses it to learn which server IPs a
