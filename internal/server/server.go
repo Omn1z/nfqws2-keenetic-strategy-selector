@@ -294,6 +294,11 @@ func (s *Server) routes() {
 	m.HandleFunc("DELETE /api/nfqws2/file", s.nfqws2DeleteFile)
 	m.HandleFunc("GET /api/nfqws2/file/download", s.nfqws2DownloadFile)
 
+	// Automation: NFQWS2 fallback watchdog + auto-pick (NFQWS2 tab panel).
+	m.HandleFunc("GET /api/nfqws2/automation", s.getAutomation)
+	m.HandleFunc("POST /api/nfqws2/automation", s.setAutomation)
+	m.HandleFunc("POST /api/nfqws2/automation/pick-now", s.triggerAutoPick)
+
 	// Pi-hole v6 (ad-block DNS sinkhole in a docker container).
 	m.HandleFunc("GET /api/pihole/status", s.piholeStatus)
 	m.HandleFunc("GET /api/pihole/stats", s.piholeStats)
@@ -1470,6 +1475,32 @@ func (s *Server) nfqws2StartSvc(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) nfqws2StopSvc(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, s.app.Nfqws2Stop())
+}
+
+func (s *Server) getAutomation(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, 200, s.app.AutomationStatus())
+}
+
+func (s *Server) setAutomation(w http.ResponseWriter, r *http.Request) {
+	var in app.AutomationConfig
+	if err := readJSON(r, &in); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	st, err := s.app.SetAutomationConfig(in)
+	if err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, st)
+}
+
+func (s *Server) triggerAutoPick(w http.ResponseWriter, r *http.Request) {
+	if err := s.app.TriggerAutoPickNow(); err != nil {
+		httpErr(w, 409, err)
+		return
+	}
+	writeJSON(w, 202, s.app.AutomationStatus())
 }
 
 // hostFromHeader strips the port from a Host header so the tg:// link points at

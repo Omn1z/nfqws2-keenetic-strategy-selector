@@ -430,6 +430,22 @@ export interface PiholeStats {
   error?: string;
 }
 
+export interface AutomationStatus {
+  mode: "off" | "on" | "auto";
+  auto_pick: boolean;
+  periodic_scan: boolean;
+  interval_h: number;
+  last_pick_at?: number;
+  last_pick_args?: string;
+  last_pick_name?: string;
+  last_pick_error?: string;
+  awg_healthy: boolean;
+  handshake_age_sec: number;
+  nfqws2_running: boolean;
+  pick_in_progress: boolean;
+  note?: string;
+}
+
 export interface Dashboard {
   tgws: TgwsStatus;
   socks5: Socks5Status;

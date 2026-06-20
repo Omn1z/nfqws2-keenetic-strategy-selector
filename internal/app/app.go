@@ -66,6 +66,8 @@ type App struct {
 	dnsServers []dns.Server // configured DoH/DoT servers (DNS tab + run matrix)
 
 	geoAuto geoAutoState // background geosite.dat / geoip.dat updater (Geo tab)
+
+	automation *automationRuntime // watchdog + auto-pick (NFQWS2 automation panel)
 }
 
 const (
@@ -105,6 +107,7 @@ func New(cfg *config.Config) (*App, error) {
 		logbuf.Append("port-forwarding", "warn", err.Error())
 	}
 	a.startGeoAutoLoop()
+	a.initAutomation()
 	a.initPihole()
 	return a, nil
 }
@@ -180,6 +183,7 @@ func (a *App) Shutdown() {
 	a.awgroute.StopAWG()
 	a.awgroute.TeardownRouting()
 	a.stopGeoAutoLoop()
+	a.stopAutomation()
 }
 
 // ---------- Lists ----------
