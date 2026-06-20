@@ -61,6 +61,8 @@ type App struct {
 
 	dnsMu      sync.Mutex
 	dnsServers []dns.Server // configured DoH/DoT servers (DNS tab + run matrix)
+
+	geoAuto geoAutoState // background geosite.dat / geoip.dat updater (Geo tab)
 }
 
 const (
@@ -99,6 +101,7 @@ func New(cfg *config.Config) (*App, error) {
 	if err := a.portfwd.Apply(); err != nil {
 		logbuf.Append("port-forwarding", "warn", err.Error())
 	}
+	a.startGeoAutoLoop()
 	return a, nil
 }
 
@@ -124,6 +127,7 @@ func (a *App) Shutdown() {
 	a.StopSocks5()
 	a.awgroute.StopAWG()
 	a.awgroute.TeardownRouting()
+	a.stopGeoAutoLoop()
 }
 
 // ---------- Lists ----------

@@ -274,6 +274,9 @@ func (s *Server) routes() {
 	m.HandleFunc("DELETE /api/geo/{name}", s.deleteGeo)
 	m.HandleFunc("POST /api/geo/import", s.importGeo)
 	m.HandleFunc("POST /api/geo/resolve", s.resolveGeo)
+	m.HandleFunc("GET /api/geo/auto", s.getGeoAuto)
+	m.HandleFunc("POST /api/geo/auto", s.setGeoAuto)
+	m.HandleFunc("POST /api/geo/fetch-now", s.fetchGeoNow)
 
 	// NFQWS2 engine: file management (conf/list/lua) + version/update/reload.
 	m.HandleFunc("GET /api/nfqws2/version", s.nfqws2Version)
@@ -882,6 +885,33 @@ func (s *Server) resolveGeo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, map[string]any{"targets": targets})
+}
+
+func (s *Server) getGeoAuto(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, 200, s.app.GeoAuto())
+}
+
+func (s *Server) setGeoAuto(w http.ResponseWriter, r *http.Request) {
+	var in app.GeoAutoConfig
+	if err := readJSON(r, &in); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	if err := s.app.SetGeoAuto(&in); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, s.app.GeoAuto())
+}
+
+func (s *Server) fetchGeoNow(w http.ResponseWriter, r *http.Request) {
+	cfg, err := s.app.FetchGeoNow()
+	if err != nil {
+		// Still return the (possibly partially-updated) config so the UI can show LastError.
+		writeJSON(w, 200, cfg)
+		return
+	}
+	writeJSON(w, 200, cfg)
 }
 
 // ---------- NFQWS2 engine file management + version/update/reload ----------

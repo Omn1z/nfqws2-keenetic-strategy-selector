@@ -433,6 +433,19 @@ export interface GeoFile {
   categories: GeoCategory[];
 }
 
+export interface GeoAutoConfig {
+  enabled: boolean;
+  geosite_url: string;
+  geoip_url: string;
+  interval_hours: number;
+  last_fetched_at: number;
+  last_error: string;
+  last_geosite_at: number;
+  last_geoip_at: number;
+  last_geosite_len: number;
+  last_geoip_len: number;
+}
+
 export interface Blobs {
   system: string[];
   custom: string[];

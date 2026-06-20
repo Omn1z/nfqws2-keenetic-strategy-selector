@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { api, uploadForm } from "@/lib/api";
 import { useStore } from "@/providers/StoreProvider";
 import { toast } from "@/components/ui/Toast";
@@ -6,9 +6,72 @@ import { confirmDialog } from "@/components/ui/Confirm";
 import { Card } from "@/components/ui/Card";
 import { Button } from "@/components/ui/Button";
 import { Badge } from "@/components/ui/Badge";
+import { Switch } from "@/components/ui/Switch";
 import { Dropzone } from "@/components/ui/Dropzone";
 import { Field, Input, Select } from "@/components/ui/form";
-import type { GeoFile, List } from "@/types/api";
+import type { GeoAutoConfig, GeoFile, List } from "@/types/api";
+
+function fmtAgo(ts: number): string {
+  if (!ts) return "никогда";
+  const d = new Date(ts * 1000);
+  return d.toLocaleString();
+}
+
+function fmtSize(n: number): string {
+  if (!n) return "—";
+  if (n < 1024) return `${n} B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
+  return `${(n / 1024 / 1024).toFixed(2)} MB`;
+}
+
+function GeoAutoPanel({ onChanged }: { onChanged: () => void }) {
+  const [cfg, setCfg] = useState<GeoAutoConfig | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  const load = async () => {
+    try { setCfg(await api<GeoAutoConfig>("GET", "/api/geo/auto")); } catch (e) { toast((e as Error).message, "err"); }
+  };
+  useEffect(() => { void load(); }, []);
+
+  if (!cfg) return null;
+
+  const save = async (patch: Partial<GeoAutoConfig>) => {
+    const next = { ...cfg, ...patch };
+    setCfg(next);
+    try { setCfg(await api<GeoAutoConfig>("POST", "/api/geo/auto", next)); toast("Сохранено", "ok"); }
+    catch (e) { toast((e as Error).message, "err"); }
+  };
+  const fetchNow = async () => {
+    setBusy(true);
+    try {
+      const next = await api<GeoAutoConfig>("POST", "/api/geo/fetch-now", {});
+      setCfg(next);
+      if (next.last_error) toast(next.last_error, "err"); else toast("Скачано", "ok");
+      onChanged();
+    } catch (e) { toast((e as Error).message, "err"); }
+    finally { setBusy(false); }
+  };
+
+  return (
+    <Card title="Авто-обновление" sub="периодически тянет свежие geosite.dat / geoip.dat с upstream-релизов">
+      <div className="mb-3 flex flex-wrap items-center gap-4">
+        <Switch checked={cfg.enabled} onChange={(v) => save({ enabled: v })} label="Включено" />
+        <Field label="Интервал (часов)" className="w-28">
+          <Input type="number" min={1} value={cfg.interval_hours} onChange={(e) => setCfg({ ...cfg, interval_hours: parseInt(e.target.value, 10) || 24 })} onBlur={() => save({})} />
+        </Field>
+        <Button onClick={fetchNow} disabled={busy} variant="primary">{busy ? "Скачиваю…" : "Обновить сейчас"}</Button>
+      </div>
+      <Field label="geosite.dat URL"><Input value={cfg.geosite_url} onChange={(e) => setCfg({ ...cfg, geosite_url: e.target.value })} onBlur={() => save({})} /></Field>
+      <Field label="geoip.dat URL"><Input value={cfg.geoip_url} onChange={(e) => setCfg({ ...cfg, geoip_url: e.target.value })} onBlur={() => save({})} /></Field>
+      <div className="mt-2 grid grid-cols-1 gap-1 text-[12px] text-muted sm:grid-cols-2">
+        <div>Последнее обновление: <b className="text-ink">{fmtAgo(cfg.last_fetched_at)}</b></div>
+        <div>geosite.dat: <b className="text-ink">{fmtSize(cfg.last_geosite_len)}</b> ({fmtAgo(cfg.last_geosite_at)})</div>
+        <div>geoip.dat: <b className="text-ink">{fmtSize(cfg.last_geoip_len)}</b> ({fmtAgo(cfg.last_geoip_at)})</div>
+        {cfg.last_error && <div className="text-danger">Ошибка: {cfg.last_error}</div>}
+      </div>
+    </Card>
+  );
+}
 
 function GeoFileCard({ file, lists, onChanged }: { file: GeoFile; lists: List[]; onChanged: () => void }) {
   const cats = file.categories ?? [];
@@ -68,6 +131,7 @@ export default function Geo() {
 
   return (
     <>
+      <GeoAutoPanel onChanged={reloadGeo} />
       <Card title="GeoSite / GeoIP">
         <p className="mb-3 text-xs text-muted">Загрузите <code>geosite.dat</code> / <code>geoip.dat</code> (формат v2ray) или текстовый список (домен/IP в строке). Затем импортируйте категорию в тестовый список.</p>
         <div className="flex flex-col gap-3.5 sm:flex-row sm:items-stretch">
