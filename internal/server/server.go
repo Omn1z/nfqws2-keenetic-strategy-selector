@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"nfqws2strategy/internal/app"
+	"nfqws2strategy/internal/services/arpspoof"
 	"nfqws2strategy/internal/services/awg"
 	"nfqws2strategy/internal/services/portforward"
 	"nfqws2strategy/internal/services/strategy/core/catalog"
@@ -183,6 +184,10 @@ func (s *Server) routes() {
 	m.HandleFunc("POST /api/port-forwarding/rules", s.savePortForwardingRule)
 	m.HandleFunc("POST /api/port-forwarding/rules/{id}/enabled", s.setPortForwardingRuleEnabled)
 	m.HandleFunc("DELETE /api/port-forwarding/rules/{id}", s.deletePortForwardingRule)
+	m.HandleFunc("GET /api/arp-spoofing", s.getARPSpoofing)
+	m.HandleFunc("POST /api/arp-spoofing/config", s.saveARPSpoofingConfig)
+	m.HandleFunc("POST /api/arp-spoofing/enabled", s.setARPSpoofingEnabled)
+	m.HandleFunc("POST /api/arp-spoofing/generate", s.generateARPSpoofingMAC)
 
 	m.HandleFunc("GET /api/logs", s.getLogs)
 	m.HandleFunc("POST /api/logs/clear", s.clearLogs)
@@ -489,6 +494,58 @@ func (s *Server) deletePortForwardingRule(w http.ResponseWriter, r *http.Request
 		return
 	}
 	writeJSON(w, 200, view)
+}
+
+// ---------- ARP Spoofing ----------
+
+func (s *Server) getARPSpoofing(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, 200, s.app.ARPSpoofingView())
+}
+
+func (s *Server) saveARPSpoofingConfig(w http.ResponseWriter, r *http.Request) {
+	var in arpspoof.Config
+	if err := readJSON(r, &in); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	view, err := s.app.SaveARPSpoofingConfig(in)
+	if err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, view)
+}
+
+func (s *Server) setARPSpoofingEnabled(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Enabled bool `json:"enabled"`
+	}
+	if err := readJSON(r, &in); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	view, err := s.app.SetARPSpoofingEnabled(in.Enabled)
+	if err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, view)
+}
+
+func (s *Server) generateARPSpoofingMAC(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Prefix string `json:"prefix"`
+	}
+	if err := readJSON(r, &in); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	mac, err := s.app.GenerateARPSpoofingMAC(in.Prefix)
+	if err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, map[string]string{"mac": mac})
 }
 
 // ---------- logs (in-memory ring, UI "Логи" tab) ----------
