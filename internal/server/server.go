@@ -268,6 +268,7 @@ func (s *Server) routes() {
 	m.HandleFunc("POST /api/apply", s.applyStrategy)
 
 	m.HandleFunc("GET /api/update/check", s.checkUpdate)
+	m.HandleFunc("GET /api/update/status", s.updateStatus)
 	m.HandleFunc("POST /api/update", s.doUpdate)
 
 	m.HandleFunc("GET /api/auth/status", s.authStatus)
@@ -1604,12 +1605,16 @@ func (s *Server) checkUpdate(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) doUpdate(w http.ResponseWriter, r *http.Request) {
-	info, err := s.app.SelfUpdate()
+	st, err := s.app.StartSelfUpdate()
 	if err != nil {
 		httpErr(w, 400, err)
 		return
 	}
-	writeJSON(w, 200, map[string]any{"status": "updating", "from": info.Current, "to": info.Latest})
+	writeJSON(w, http.StatusAccepted, st)
+}
+
+func (s *Server) updateStatus(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, 200, s.app.SelfUpdateStatus())
 }
 
 // ---------- helpers ----------

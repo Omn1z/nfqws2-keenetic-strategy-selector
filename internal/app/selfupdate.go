@@ -9,6 +9,8 @@ import (
 	"runtime"
 	"strings"
 	"time"
+
+	"nfqws2strategy/internal/tools/logbuf"
 )
 
 // UpdateInfo describes the result of an update check.
@@ -17,6 +19,17 @@ type UpdateInfo struct {
 	Latest    string `json:"latest"`
 	Available bool   `json:"available"`
 	URL       string `json:"url"`
+}
+
+// SelfUpdateStatus is the observable state of a UI-triggered self-update.
+type SelfUpdateStatus struct {
+	Running    bool   `json:"running"`
+	Current    string `json:"current"`
+	Latest     string `json:"latest"`
+	Stage      string `json:"stage"`
+	Error      string `json:"error,omitempty"`
+	StartedAt  int64  `json:"started_at"`
+	FinishedAt int64  `json:"finished_at,omitempty"`
 }
 
 // CheckUpdate queries the GitHub Releases API for the latest tag.
@@ -49,13 +62,105 @@ func (a *App) CheckUpdate() (UpdateInfo, error) {
 	return info, nil
 }
 
+// StartSelfUpdate starts a background self-update and returns immediately. The
+// web UI uses this so a slow download never pins the browser request.
+func (a *App) StartSelfUpdate() (SelfUpdateStatus, error) {
+	a.selfUpdateMu.Lock()
+	if a.selfUpdate.Running {
+		st := a.selfUpdate
+		a.selfUpdateMu.Unlock()
+		return st, nil
+	}
+	now := time.Now().Unix()
+	a.selfUpdate = SelfUpdateStatus{
+		Running:   true,
+		Current:   a.Cfg.Version,
+		Stage:     "queued",
+		StartedAt: now,
+	}
+	st := a.selfUpdate
+	a.selfUpdateMu.Unlock()
+
+	go a.runSelfUpdateJob()
+	return st, nil
+}
+
+func (a *App) SelfUpdateStatus() SelfUpdateStatus {
+	a.selfUpdateMu.Lock()
+	defer a.selfUpdateMu.Unlock()
+	st := a.selfUpdate
+	if st.Current == "" {
+		st.Current = a.Cfg.Version
+		st.Stage = "idle"
+	}
+	return st
+}
+
+func (a *App) runSelfUpdateJob() {
+	logbuf.Append("update", "info", "self-update started")
+	info, err := a.selfUpdateWithProgress(func(stage string, info UpdateInfo) {
+		a.setSelfUpdateStatus(func(st *SelfUpdateStatus) {
+			st.Stage = stage
+			if info.Current != "" {
+				st.Current = info.Current
+			}
+			if info.Latest != "" {
+				st.Latest = info.Latest
+			}
+			st.Error = ""
+		})
+	})
+	if err != nil {
+		msg := err.Error()
+		logbuf.Append("update", "error", "self-update failed: "+msg)
+		a.setSelfUpdateStatus(func(st *SelfUpdateStatus) {
+			st.Running = false
+			st.Stage = "error"
+			st.Error = msg
+			st.FinishedAt = time.Now().Unix()
+			if info.Current != "" {
+				st.Current = info.Current
+			}
+			if info.Latest != "" {
+				st.Latest = info.Latest
+			}
+		})
+		return
+	}
+	logbuf.Append("update", "info", "self-update scheduled restart: "+info.Current+" -> "+info.Latest)
+	a.setSelfUpdateStatus(func(st *SelfUpdateStatus) {
+		st.Running = false
+		st.Stage = "restarting"
+		st.Error = ""
+		st.FinishedAt = time.Now().Unix()
+		st.Current = info.Current
+		st.Latest = info.Latest
+	})
+}
+
+func (a *App) setSelfUpdateStatus(fn func(*SelfUpdateStatus)) {
+	a.selfUpdateMu.Lock()
+	defer a.selfUpdateMu.Unlock()
+	fn(&a.selfUpdate)
+}
+
 // SelfUpdate downloads the latest release binary for this architecture, replaces
 // the running executable, and triggers a detached service restart. The HTTP
 // response returns before the restart fires (the restart is delayed).
 func (a *App) SelfUpdate() (UpdateInfo, error) {
+	return a.selfUpdateWithProgress(nil)
+}
+
+func (a *App) selfUpdateWithProgress(progress func(string, UpdateInfo)) (UpdateInfo, error) {
+	if progress != nil {
+		progress("checking", UpdateInfo{Current: a.Cfg.Version})
+	}
 	info, err := a.CheckUpdate()
 	if err != nil {
 		return info, err
+	}
+	if progress != nil {
+		progress("checked", info)
 	}
 	if !info.Available {
 		return info, fmt.Errorf("already up to date (%s)", info.Current)
@@ -71,6 +176,9 @@ func (a *App) SelfUpdate() (UpdateInfo, error) {
 	}
 
 	tmp := exe + ".new"
+	if progress != nil {
+		progress("downloading", info)
+	}
 	if err := downloadFile(urls, tmp); err != nil {
 		_ = os.Remove(tmp)
 		return info, fmt.Errorf("download: %w", err)
@@ -79,10 +187,16 @@ func (a *App) SelfUpdate() (UpdateInfo, error) {
 		_ = os.Remove(tmp)
 		return info, fmt.Errorf("downloaded file looks invalid")
 	}
+	if progress != nil {
+		progress("replacing", info)
+	}
 	_ = os.Chmod(tmp, 0o755)
 	if err := os.Rename(tmp, exe); err != nil {
 		_ = os.Remove(tmp)
 		return info, fmt.Errorf("replace binary: %w", err)
+	}
+	if progress != nil {
+		progress("restarting", info)
 	}
 	if err := detachedRestart(a.Cfg.InitScript); err != nil {
 		return info, fmt.Errorf("schedule restart: %w", err)

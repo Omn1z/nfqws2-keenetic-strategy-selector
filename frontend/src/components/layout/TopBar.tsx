@@ -22,7 +22,27 @@ interface Pending {
   to: string;
 }
 
+interface SelfUpdateStatus {
+  running: boolean;
+  current: string;
+  latest: string;
+  stage: string;
+  error?: string;
+}
+
 const iconBtn = "grid h-7 w-7 place-items-center rounded-lg text-ink-soft transition hover:bg-line-soft hover:text-accent";
+
+const updateStageText: Record<string, string> = {
+  queued: "Готовим обновление…",
+  checking: "Проверяем последнюю версию…",
+  checked: "Версия найдена, начинаем скачивание…",
+  downloading: "Скачиваем новую версию…",
+  replacing: "Заменяем бинарь панели…",
+  restarting: "Перезапускаем сервис…",
+  error: "Обновление остановилось с ошибкой.",
+};
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 
 export function TopBar({ authEnabled, onMenu }: { authEnabled: boolean; onMenu: () => void }) {
   const { config } = useStore();
@@ -59,11 +79,31 @@ export function TopBar({ authEnabled, onMenu }: { authEnabled: boolean; onMenu: 
 
   // Update flows (no confirm — the modal is the confirmation).
   const appUpdateFlow = async () => {
-    const target = latest;
-    try { await api("POST", "/api/update"); } catch (e) { toast((e as Error).message, "err"); return; }
-    setUpdating({ target, msg: "Скачиваем новую версию и перезапускаем сервис." });
-    for (let i = 0; i < 40; i++) {
-      await new Promise((r) => setTimeout(r, 1500));
+    let target = latest;
+    if (!target) return;
+    setUpdating({ target, msg: "Готовим обновление…" });
+    try {
+      const st = await api<SelfUpdateStatus>("POST", "/api/update");
+      target = st.latest || target;
+      setUpdating({ target, msg: updateStageText[st.stage] || "Обновление запущено…" });
+    } catch (e) {
+      setUpdating(null);
+      toast((e as Error).message, "err");
+      return;
+    }
+    for (let i = 0; i < 240; i++) {
+      await sleep(1500);
+      try {
+        const st = await api<SelfUpdateStatus>("GET", "/api/update/status");
+        target = st.latest || target;
+        if (st.error) {
+          setUpdating(null);
+          toast("Обновление панели: " + st.error, "err");
+          await check(true);
+          return;
+        }
+        setUpdating({ target, msg: updateStageText[st.stage] || "Обновляем панель…" });
+      } catch { /* server may be restarting */ }
       try {
         const st = await api<{ version: string }>("GET", "/api/auth/status");
         if (st.version === target) { setUpdating({ target, msg: "Готово, перезагружаем…" }); setTimeout(() => location.reload(), 1000); return; }

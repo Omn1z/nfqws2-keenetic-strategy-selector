@@ -54,6 +54,8 @@ type App struct {
 	authEnabled      bool
 	loggingDisabled  bool
 	httpLogsDisabled bool // suppress the per-request HTTP access log line
+	selfUpdateMu     sync.Mutex
+	selfUpdate       SelfUpdateStatus
 
 	proxy    *proxy.Service    // Telegram proxies: MTProto->WS + SOCKS5 (Telegram tab)
 	monitor  *monitor.Service  // live network views: dashboard, conns, devices, traces, pcaps
