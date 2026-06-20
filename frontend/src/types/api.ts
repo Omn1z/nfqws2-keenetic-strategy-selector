@@ -165,10 +165,13 @@ export interface Conn {
 export interface Device {
   ip: string;
   mac: string;
+  hostname?: string;
   iface: string;
   total: number;
   established: number;
   failing: number;
+  bytes_up: number;
+  bytes_down: number;
   working: string[];
   failing_dsts: string[];
 }
@@ -371,6 +374,31 @@ export interface AwgConn {
   address: string;
 }
 
+export interface TempZone { label: string; c: number; }
+export interface ServiceStat {
+  name: string;
+  pid: number;
+  cpu_percent: number;
+  rss_kb: number;
+  uptime_sec: number;
+}
+export interface SystemStats {
+  cpu_percent: number;
+  load_avg: [number, number, number];
+  mem_total_kb: number;
+  mem_free_kb: number;
+  mem_avail_kb: number;
+  mem_used_kb: number;
+  mem_apps_kb: number;
+  mem_kernel_kb: number;
+  mem_cache_kb: number;
+  swap_total_kb: number;
+  swap_free_kb: number;
+  uptime_sec: number;
+  temps: TempZone[];
+  services: ServiceStat[];
+}
+
 export interface Dashboard {
   tgws: TgwsStatus;
   socks5: Socks5Status;
@@ -381,6 +409,8 @@ export interface Dashboard {
   queues: QueueStat[];
   main_queue: number;
   wan: IfaceBytes[];
+  system: SystemStats;
+  top_devices: Device[];
 }
 
 export interface ConnectionsView {

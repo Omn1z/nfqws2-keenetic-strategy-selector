@@ -252,9 +252,10 @@ export default function Dashboard() {
         <Nfqws2Card running={d.nfqws2_running} queue={d.main_queue} />
       </div>
 
-      {/* VPN-туннели AWG2 — по каждому соединению: состояние, трафик, статистика */}
+      {/* VPN-туннели AWG2 — по каждому соединению: состояние, трафик, статистика.
+          Grid flexes to the number of tunnels — 1 → full width, 2 → 2-up, ≥3 → GRID3. */}
       {(d.awg?.length ?? 0) > 0 && (
-        <div className={`${GRID3} mb-4`}>
+        <div className={`mb-4 grid gap-4 ${d.awg.length === 1 ? "grid-cols-1" : d.awg.length === 2 ? "grid-cols-1 sm:grid-cols-2" : GRID3}`}>
           {d.awg.map((c) => {
             const r = awgRates[c.id];
             const st = AWG_STATE[c.state] ?? AWG_STATE.off;
@@ -317,6 +318,154 @@ export default function Dashboard() {
           <Sparkline data={hist.map((s) => s.rx / 1024)} label="WAN ↓ КБ/с" value={`${Math.round((last?.rx ?? 0) / 1024)}`} />
           <Sparkline data={hist.map((s) => s.tx / 1024)} label="WAN ↑ КБ/с" value={`${Math.round((last?.tx ?? 0) / 1024)}`} color="var(--c-warn)" />
         </div>
+      </Card>
+
+      {/* Система + сервисы + топ устройств */}
+      <SystemPanel d={d} />
+    </>
+  );
+}
+
+// fmtUptime: rough "Xд Yч Zм" for the dashboard. Negative / 0 → «—».
+function fmtUptime(sec: number): string {
+  if (!sec || sec < 0) return "—";
+  const d = Math.floor(sec / 86400);
+  const h = Math.floor((sec % 86400) / 3600);
+  const m = Math.floor((sec % 3600) / 60);
+  if (d > 0) return `${d}д ${h}ч`;
+  if (h > 0) return `${h}ч ${m}м`;
+  return `${m}м`;
+}
+
+function fmtKB(kb: number): string {
+  if (!kb) return "—";
+  if (kb < 1024) return `${kb} KB`;
+  if (kb < 1024 * 1024) return `${(kb / 1024).toFixed(1)} MB`;
+  return `${(kb / 1024 / 1024).toFixed(2)} GB`;
+}
+
+function SystemPanel({ d }: { d: DashboardData }) {
+  const sys = d.system;
+  if (!sys) return null;
+  // Honest 3-way RAM split — `free -h`'s single "used" number lies on this
+  // router because most of it is the kernel slab (qca-wifi/NSS contexts on
+  // IPQ9554, ~210 MB of SUnreclaim), not actual apps. So the bar shows:
+  //   apps   — sum of userspace RSS (the processes you can blame/kill)
+  //   kernel — SUnreclaim (slab; mostly wifi-driver + conntrack, NOT ipset)
+  //   cache  — buff + page-cache + SReclaimable (reclaimable when apps want it)
+  const total = sys.mem_total_kb || 1;
+  const apps = sys.mem_apps_kb || 0;
+  const kernel = sys.mem_kernel_kb || 0;
+  const cache = sys.mem_cache_kb || 0;
+  const appsPct = Math.round((apps / total) * 100);
+  const kernelPct = Math.round((kernel / total) * 100);
+  const cachePct = Math.round((cache / total) * 100);
+  const cpuPct = sys.cpu_percent >= 0 ? Math.round(sys.cpu_percent) : null;
+  const hottest = sys.temps && sys.temps[0];
+  const top = d.top_devices || [];
+  const cpuBar = (pct: number, color: string) => (
+    <div className="mt-1 h-1.5 w-full rounded bg-line-soft">
+      <div className="h-full rounded" style={{ width: `${Math.min(100, pct)}%`, background: color }} />
+    </div>
+  );
+  // Stacked RAM bar: apps (solid warn) | kernel slab (red) | cache (light).
+  const ramBar = (
+    <div className="mt-1 flex h-1.5 w-full overflow-hidden rounded bg-line-soft">
+      <div style={{ width: `${Math.min(100, appsPct)}%`, background: "var(--c-warn)" }} title={`приложения: ${fmtKB(apps)}`} />
+      <div style={{ width: `${Math.min(100 - appsPct, kernelPct)}%`, background: "var(--c-bad)" }} title={`ядро (slab): ${fmtKB(kernel)}`} />
+      <div style={{ width: `${Math.min(100 - appsPct - kernelPct, cachePct)}%`, background: "rgb(255 184 0 / .35)" }} title={`кэш: ${fmtKB(cache)}`} />
+    </div>
+  );
+  return (
+    <>
+      <div className={`${GRID3} mt-4`}>
+        <Card title="Система" sub="ресурсы роутера" className={CARD}>
+          <Big value={cpuPct === null ? "…" : `${cpuPct}%`} sub="CPU сейчас" />
+          {cpuPct !== null && cpuBar(cpuPct, "var(--c-accent)")}
+          <Row l="Приложения (RSS)">{fmtKB(apps)} ({appsPct}%)</Row>
+          {ramBar}
+          <Row l="Ядро (slab)">{fmtKB(kernel)} ({kernelPct}%)</Row>
+          <Row l="Кэш / буферы">{fmtKB(cache)} ({cachePct}%)</Row>
+          <Row l="Доступно">{fmtKB(sys.mem_avail_kb)} из {fmtKB(sys.mem_total_kb)}</Row>
+          <Row l="Load 1 / 5 / 15 мин">{sys.load_avg[0].toFixed(2)} / {sys.load_avg[1].toFixed(2)} / {sys.load_avg[2].toFixed(2)}</Row>
+          <Row l="Аптайм">{fmtUptime(sys.uptime_sec)}</Row>
+          {sys.swap_total_kb > 0 && (
+            <Row l="Swap">{fmtKB(sys.swap_total_kb - sys.swap_free_kb)} / {fmtKB(sys.swap_total_kb)}</Row>
+          )}
+        </Card>
+
+        <Card title="Температура" sub="thermal_zone — топ‑8 сенсоров" className={CARD}>
+          {sys.temps && sys.temps.length > 0 ? (
+            <>
+              <Big value={`${hottest.c}°C`} sub={hottest.label} />
+              <div className="space-y-1 text-[12px]">
+                {sys.temps.map((t) => (
+                  <div key={t.label} className="flex justify-between border-t border-line-soft py-0.5 first:border-t-0">
+                    <span className="truncate text-ink-soft">{t.label}</span>
+                    <b className={`tabular-nums ${t.c >= 85 ? "text-bad" : t.c >= 70 ? "text-warn" : ""}`}>{t.c}°C</b>
+                  </div>
+                ))}
+              </div>
+            </>
+          ) : (
+            <p className="text-xs text-muted">Сенсоры temp недоступны.</p>
+          )}
+        </Card>
+
+        <Card title="Топ процессов" sub="по RAM · CPU · аптайм" className={CARD}>
+          {sys.services && sys.services.length > 0 ? (
+            <div className="space-y-1 text-[12px]">
+              <div className="grid grid-cols-[1fr_56px_60px_60px] gap-1.5 border-b border-line pb-1 text-[10.5px] uppercase tracking-wide text-muted">
+                <span>процесс</span>
+                <span className="text-right">CPU</span>
+                <span className="text-right">RAM</span>
+                <span className="text-right">up</span>
+              </div>
+              {sys.services.map((s) => (
+                <div key={s.name + s.pid} className="grid grid-cols-[1fr_56px_60px_60px] items-baseline gap-1.5 border-b border-line-soft py-1 last:border-b-0">
+                  <div className="truncate">
+                    <b className="text-ink">{s.name}</b>
+                    <span className="ml-1.5 text-[10.5px] text-muted">{s.pid}</span>
+                  </div>
+                  <span className="text-right tabular-nums">{s.cpu_percent < 0 ? "…" : `${s.cpu_percent.toFixed(1)}%`}</span>
+                  <span className="text-right tabular-nums">{fmtKB(s.rss_kb)}</span>
+                  <span className="text-right tabular-nums">{fmtUptime(s.uptime_sec)}</span>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <p className="text-xs text-muted">Нет данных по /proc.</p>
+          )}
+        </Card>
+      </div>
+
+      <Card title="Топ устройств по трафику" sub="суммарно по conntrack — стоит учитывать что под HW‑offload счётчики могут отставать" className="mt-4">
+        {top.length === 0 ? (
+          <p className="text-xs text-muted">Нет данных по LAN-устройствам.</p>
+        ) : (
+          <div className="space-y-1.5 text-[13px]">
+            <div className="grid grid-cols-[1fr_70px_90px_90px_90px] gap-2 border-b border-line pb-1 text-[11px] uppercase tracking-wide text-muted">
+              <span>Устройство</span>
+              <span className="text-right">conn.</span>
+              <span className="text-right">↑ upload</span>
+              <span className="text-right">↓ download</span>
+              <span className="text-right">всего</span>
+            </div>
+            {top.map((dev) => (
+              <div key={dev.ip + dev.mac} className="grid grid-cols-[1fr_70px_90px_90px_90px] items-center gap-2 border-b border-line-soft py-1 last:border-b-0">
+                <div className="truncate">
+                  {dev.hostname && <b className="text-ink">{dev.hostname}</b>}
+                  <span className={`${dev.hostname ? "ml-2 text-muted" : ""} font-mono`}>{dev.ip}</span>
+                  {dev.mac && !dev.hostname && <span className="ml-2 text-muted">{dev.mac}</span>}
+                </div>
+                <span className="text-right tabular-nums">{dev.total}</span>
+                <span className="text-right tabular-nums">{human(dev.bytes_up || 0)}</span>
+                <span className="text-right tabular-nums">{human(dev.bytes_down || 0)}</span>
+                <b className="text-right tabular-nums">{human((dev.bytes_up || 0) + (dev.bytes_down || 0))}</b>
+              </div>
+            ))}
+          </div>
+        )}
       </Card>
     </>
   );
