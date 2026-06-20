@@ -215,6 +215,46 @@ export interface PortForwardView {
   hook_path: string;
 }
 
+export interface ARPSpoofVendor {
+  id: string;
+  name: string;
+  prefixes: string[];
+}
+
+export interface ARPSpoofConfig {
+  enabled: boolean;
+  mac: string;
+  vendor_id: string;
+  prefix: string;
+  ifaces: string[];
+  updated_at: number;
+}
+
+export interface ARPSpoofInterface {
+  name: string;
+  mac: string;
+  up: boolean;
+  suggested: boolean;
+}
+
+export interface ARPSpoofTools {
+  ip: boolean;
+  arptables: boolean;
+  ebtables: boolean;
+}
+
+export interface ARPSpoofView {
+  config: ARPSpoofConfig;
+  vendors: ARPSpoofVendor[];
+  ifaces: ARPSpoofInterface[];
+  suggested_ifaces: string[];
+  hook_path: string;
+  tools: ARPSpoofTools;
+  active: boolean;
+  last_error: string;
+  applied_at: number;
+}
+
 export interface TgwsSnapshot {
   connections: { total: number; active: number; ws: number; tcp_fallback: number; cfproxy: number; bad: number; masked: number };
   traffic: { bytes_up: number; bytes_down: number; human_up: string; human_down: string };

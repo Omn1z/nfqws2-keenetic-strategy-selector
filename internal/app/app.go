@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"nfqws2strategy/internal/services/arpspoof"
 	"nfqws2strategy/internal/services/awgroute"
 	"nfqws2strategy/internal/services/blobs"
 	"nfqws2strategy/internal/services/monitor"
@@ -58,6 +59,7 @@ type App struct {
 	awgroute *awgroute.Service // AWG2 server + router client/split-routing (AWG2 tab)
 	blobs    *blobs.Service    // fake-payload blob store + ClientHello capture (Blobs tab)
 	portfwd  *portforward.Service
+	arpspoof *arpspoof.Service
 
 	dnsMu      sync.Mutex
 	dnsServers []dns.Server // configured DoH/DoT servers (DNS tab + run matrix)
@@ -85,6 +87,7 @@ func New(cfg *config.Config) (*App, error) {
 	a.loadRuns()
 	a.proxy = proxy.New(st)
 	a.portfwd = portforward.New(cfg, st)
+	a.arpspoof = arpspoof.New(cfg, st)
 	a.awgroute = awgroute.New(cfg, st)                    // creates the manager; may autostart the tunnel + re-apply committed routing
 	a.monitor = monitor.New(cfg, st, a.proxy, a.awgroute) // dashboard reads the proxy + AWG2 tunnel status
 	a.proxy.SetAWGFallbackProbe(a.awgroute.FallbackUp)    // Telegram proxies route ISP-blocked DC1/3/5 via the selected AWG2 server while it is up
@@ -98,6 +101,9 @@ func New(cfg *config.Config) (*App, error) {
 	a.awgroute.RepairRouting()
 	if err := a.portfwd.Apply(); err != nil {
 		logbuf.Append("port-forwarding", "warn", err.Error())
+	}
+	if err := a.arpspoof.Apply(); err != nil {
+		logbuf.Append("arp-spoofing", "warn", err.Error())
 	}
 	return a, nil
 }
