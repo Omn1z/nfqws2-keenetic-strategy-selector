@@ -145,11 +145,19 @@ type awgRouteState struct {
 	// reads so a DNS answer never blocks on a routing op holding mu). Linux-only use.
 	incMatchers atomic.Pointer[[]awg.DomainMatcher]
 	excMatchers atomic.Pointer[[]awg.DomainMatcher]
+	// Per-source-bound-zone matchers + their per-zone ipset name. The DNS proxy
+	// iterates these per query and routes matched IPs to the right awg2_z<idx>
+	// so CDN destinations tracked for a specific device stay isolated.
+	srcZoneMatchers atomic.Pointer[[]sourceZoneMatchers]
 
 	// Optional SNI-routing sniffer (reads TLS ClientHellos off the LAN bridges and
 	// routes matched domains' server IPs via the tunnel — beats DoH + CDN rotation).
 	sni         *sniSniffer
 	sniMatchers atomic.Pointer[[]awg.DomainMatcher]
+	// Hot-path cache: dst IPs we've already routed (either by a static ipset rule
+	// or a previous SNI match) — skip the regex/glob matcher loop for them on the
+	// next ClientHello. unix-seconds of insertion; pruned lazily.
+	sniSeen sync.Map // map[string]int64
 	// One-shot log suppression for learned domain-to-IP skips on shared CDN edges.
 	sharedCDNSkips sync.Map
 
@@ -157,6 +165,12 @@ type awgRouteState struct {
 	// avoid a UAPI round-trip more than ~once per 5s.
 	tunnelUpVal atomic.Bool
 	tunnelUpAt  atomic.Int64 // unix nanos of the last probe
+
+	// Hash of the last zones config the watchdog actually built ipsets for. The
+	// 15-min refresh ticks compare against this to skip a full re-resolve when
+	// the user hasn't touched the zones — which avoids re-warming the geo cache
+	// (~150 MB) and re-running thousands of nslookups for no reason.
+	lastZonesHash atomic.Pointer[string]
 }
 
 // TunnelUp reports whether the local AWG2 client tunnel is enabled AND connected

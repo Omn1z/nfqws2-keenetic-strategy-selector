@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"nfqws2strategy/internal/services/awg"
@@ -67,12 +68,25 @@ var sniBPF = []bpfInsn{
 	{0x06, 0, 0, 0x00000000}, // 10: ret #0
 }
 
-// awgEnsureSNISniff starts/refreshes the SNI sniffer when SNI-routing is enabled and
-// the effective mode is a whitelist (include) with at least one include matcher;
-// otherwise it stops it. Returns whether it is now running.
+// awgEnsureSNISniff starts/refreshes the SNI sniffer when SNI-routing is enabled
+// and there is at least one global zone (include OR exclude) with domain matchers.
+//
+// Why exclude direction matters: with mode=exclude (whitelist-VPN, carve-out RU)
+// many RU sites are Cloudflare-fronted (gismeteo, gosuslugi-backed CDNs, comss,
+// etc.). The shared-CDN guard in DNS-proxy refuses to add their Cloudflare IPs
+// to awg2_exc (otherwise we'd route every unrelated *.com on the same IP direct
+// too). Same with browser DoH/DoT — the proxy never sees the query at all.
+// In both cases the only place we can recover the destination is the TLS
+// ClientHello on the actual connection: read its SNI and, if it matches the
+// exclude zone, drop the destination IP into awg2_exc on the fly.
+//
+// For include direction we still feed awg2_sni (separate set, hash:ip w/ TTL).
 func (svc *Service) awgEnsureSNISniff(cfg *awg.ServerConfig) bool {
-	inc := awgZoneMatchersByMode(cfg, "include")
-	want := cfg.Routing.SNIRouting && awgEffectiveMode(cfg.Routing) == "include" && len(inc) > 0
+	inc := svc.awgZoneMatchersByMode(cfg, "include")
+	exc := svc.awgZoneMatchersByMode(cfg, "exclude")
+	eff := awgEffectiveMode(cfg.Routing)
+	want := cfg.Routing.SNIRouting &&
+		((eff == "include" && len(inc) > 0) || (eff == "exclude" && len(exc) > 0) || (eff == "full" && len(exc) > 0))
 	svc.route.mu.Lock()
 	s := svc.route.sni
 	svc.route.mu.Unlock()
@@ -82,18 +96,57 @@ func (svc *Service) awgEnsureSNISniff(cfg *awg.ServerConfig) bool {
 		}
 		return false
 	}
-	svc.route.sniMatchers.Store(&inc) // lock-free read in the hot path
+	svc.route.sniMatchers.Store(&inc) // lock-free read in the hot path (include direction)
+	svc.route.excMatchers.Store(&exc) // exclude matchers are already used by the DNS proxy too
+	// Zone edits / new matchers may flip earlier decisions, so the short-circuit
+	// cache has to be re-learned from scratch. Cheap (single Range + Delete).
+	svc.route.sniSeen.Range(func(k, _ any) bool {
+		svc.route.sniSeen.Delete(k)
+		return true
+	})
 	if s != nil {
 		return true // already running; matchers refreshed above
 	}
 	ns := newSNISniffer(func(dstIP, sni string) {
-		if m := svc.route.sniMatchers.Load(); m != nil && awg.MatchAny(*m, sni) {
-			if provider, ok := sharedCDNProvider(dstIP); ok {
-				svc.awgNoteSharedCDNSkip("sni", sni, dstIP, provider)
+		// Short-circuit: this IP has already been routed by an earlier ClientHello
+		// in this TTL window. Skip the matcher loop and the ipset call.
+		now := time.Now().Unix()
+		if v, ok := svc.route.sniSeen.Load(dstIP); ok {
+			if ts, _ := v.(int64); now-ts < int64(awgSNITTL) {
 				return
 			}
-			_, _ = awgRun("ipset add " + awgSetSNI + " " + dstIP + " timeout " + strconv.Itoa(awgSNITTL) + " -exist")
+			svc.route.sniSeen.Delete(dstIP)
 		}
+		// Exclude wins on overlap (matches the DNS proxy + iptables semantics).
+		if e := svc.route.excMatchers.Load(); e != nil && awg.MatchAny(*e, sni) {
+			// We deliberately do NOT consult sharedCDNProvider here — the whole
+			// point of SNI is to carve out the SHARED CDN IP for this specific
+			// hostname, knowing the same IP also serves unrelated names. That's
+			// safe because awg2_exc only causes a RETURN (no marking); other
+			// sites on the same CDN IP that don't match an exclude rule never
+			// get into awg2_exc here.
+			suffix := ""
+			if isIPv6(dstIP) {
+				suffix = "_6"
+			}
+			_, _ = awgRun("ipset add " + awgSetExc + suffix + " " + dstIP + " -exist")
+			svc.route.sniSeen.Store(dstIP, now)
+			return
+		}
+		m := svc.route.sniMatchers.Load()
+		if m == nil || !awg.MatchAny(*m, sni) {
+			return
+		}
+		if provider, ok := sharedCDNProvider(dstIP); ok {
+			svc.awgNoteSharedCDNSkip("sni", sni, dstIP, provider)
+			return
+		}
+		suffix := ""
+		if isIPv6(dstIP) {
+			suffix = "_6"
+		}
+		_, _ = awgRun("ipset add " + awgSetSNI + suffix + " " + dstIP + " timeout " + strconv.Itoa(awgSNITTL) + " -exist")
+		svc.route.sniSeen.Store(dstIP, now)
 	})
 	if err := ns.start(); err != nil {
 		logbuf.Append("awg2", "warn", "SNI-маршрутизация: сниффер не запустился: "+err.Error())

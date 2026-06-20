@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -18,6 +19,52 @@ func awgRun(cmd string) (string, error) {
 	ctx, cancel := contextTimeout(15 * time.Second)
 	defer cancel()
 	out, err := exec.CommandContext(ctx, "sh", "-c", cmd).CombinedOutput()
+	return strings.TrimSpace(string(out)), err
+}
+
+// parallelResolve runs resolveDomainAll concurrently across a small worker pool
+// and returns the per-domain IP lists in the SAME order as the input slice.
+// Resolving 1000+ category-ru hostnames serially takes ~2 minutes; with 32
+// workers it finishes in seconds (the router's resolver handles parallel queries
+// fine — nslookup is just fork+exec + a UDP round trip).
+func parallelResolve(domains []string, workers int) [][]string {
+	if len(domains) == 0 {
+		return nil
+	}
+	if workers < 1 {
+		workers = 1
+	}
+	out := make([][]string, len(domains))
+	jobs := make(chan int, len(domains))
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := range jobs {
+				out[i] = resolveDomainAll(domains[i])
+			}
+		}()
+	}
+	for i := range domains {
+		jobs <- i
+	}
+	close(jobs)
+	wg.Wait()
+	return out
+}
+
+// awgRunStdin runs `cmd` and pipes `stdin` into it. Used for bulk-feeding ipset
+// rule streams via `ipset restore` so an apply that adds 20k entries to a zone
+// finishes in a single fork+exec instead of N of them (each ~10–30 ms on the
+// router, which is the real reason a full geoip:ru expansion took ~2 minutes).
+func awgRunStdin(cmd, stdin string) (string, error) {
+	// ipset restore for a full geoip:ru can be ~25k lines; allow a generous timeout.
+	ctx, cancel := contextTimeout(90 * time.Second)
+	defer cancel()
+	c := exec.CommandContext(ctx, "sh", "-c", cmd)
+	c.Stdin = strings.NewReader(stdin)
+	out, err := c.CombinedOutput()
 	return strings.TrimSpace(string(out)), err
 }
 
@@ -108,4 +155,72 @@ func resolveDomain(d string) []string {
 		}
 	}
 	return out
+}
+
+// resolveDomainAll returns both IPv4 and IPv6 addresses (raw String form), so the
+// per-zone ipset builder can populate hash:net inet AND inet6 sets in one pass.
+//
+// Uses the system resolver via the busybox `nslookup` command instead of Go's
+// net.LookupIP — CGO_ENABLED=0 binaries fall back to a pure-Go resolver that
+// doesn't talk reliably to the router's ndnproxy on 127.0.0.1:53 (it returned
+// empty for plain `.ru` hostnames in practice). nslookup goes through the libc
+// resolver and matches what every other tool on the router uses.
+func resolveDomainAll(d string) []string {
+	d = strings.TrimSpace(d)
+	if d == "" {
+		return nil
+	}
+	// nslookup is authoritative here because Go's pure resolver may return only
+	// one family (IPv6-only on this router, despite the libc resolver giving
+	// both), which leaves the IPv4 ipset empty and breaks bypass. nslookup goes
+	// through the libc resolver via the router's ndnproxy and reliably returns
+	// every A and AAAA answer.
+	var ips []string
+	seen := map[string]struct{}{}
+	if out, _ := awgRun("nslookup " + d + " 2>/dev/null"); out != "" {
+		ips = appendNslookupIPs(ips, seen, out)
+	}
+	if goIPs, err := net.LookupIP(d); err == nil {
+		for _, ip := range goIPs {
+			s := ip.String()
+			if _, ok := seen[s]; ok {
+				continue
+			}
+			seen[s] = struct{}{}
+			ips = append(ips, s)
+		}
+	}
+	return ips
+}
+
+func appendNslookupIPs(ips []string, seen map[string]struct{}, out string) []string {
+	for _, ln := range strings.Split(out, "\n") {
+		// busybox nslookup format:
+		//   Name:      2ip.ru
+		//   Address 1: 188.40.167.82
+		//   Address 2: 2a06:98c1:3120::5fe5:dffd
+		ln = strings.TrimSpace(ln)
+		if !strings.HasPrefix(ln, "Address") {
+			continue
+		}
+		colon := strings.IndexByte(ln, ':')
+		if colon < 0 {
+			continue
+		}
+		val := strings.TrimSpace(ln[colon+1:])
+		// "Address 1: 127.0.0.1" — drop the server-line which always echoes the
+		// resolver itself before the actual answer rows.
+		if val == "127.0.0.1" || val == "::1" {
+			continue
+		}
+		if ip := net.ParseIP(val); ip != nil {
+			s := ip.String()
+			if _, ok := seen[s]; ok {
+				continue
+			}
+			seen[s] = struct{}{}
+			ips = append(ips, s)
+		}
+	}
+	return ips
 }

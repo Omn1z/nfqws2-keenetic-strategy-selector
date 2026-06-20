@@ -100,11 +100,12 @@ type ClientConfig struct {
 // own direction: Mode "include" routes its members THROUGH the tunnel, "exclude"
 // keeps them DIRECT (bypass) — exclude wins on overlap (carve-out).
 type Zone struct {
-	Name    string   `json:"name"`
-	Mode    string   `json:"mode"` // "include" (→ tunnel) | "exclude" (→ direct/bypass)
-	Domains []string `json:"domains"`
-	IPs     []string `json:"ips"`
-	Enabled bool     `json:"enabled"`
+	Name      string   `json:"name"`
+	Mode      string   `json:"mode"` // "include" (→ tunnel) | "exclude" (→ direct/bypass)
+	Domains   []string `json:"domains"`
+	IPs       []string `json:"ips"`
+	SourceIPs []string `json:"source_ips"` // per-source-device filter: if non-empty, the zone applies ONLY to packets from these LAN IPs/CIDRs. Empty = whole LAN (the historical default).
+	Enabled   bool     `json:"enabled"`
 }
 
 // RoutingConfig controls the local-router split routing (Part C).

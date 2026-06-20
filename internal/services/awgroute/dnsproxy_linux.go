@@ -15,23 +15,27 @@ import (
 // awgZoneMatchers compiles domain matchers from ALL enabled zones (any direction).
 // The proxy fires onMatch for a name matching any zone; the callback then routes
 // the IP to the include or exclude set by which zone matched.
-func awgZoneMatchers(cfg *awg.ServerConfig) []awg.DomainMatcher {
+func (svc *Service) awgZoneMatchers(cfg *awg.ServerConfig) []awg.DomainMatcher {
 	var entries []string
 	for _, z := range cfg.Routing.Zones {
-		if z.Enabled {
-			entries = append(entries, z.Domains...)
+		if !z.Enabled {
+			continue
 		}
+		exp, _ := svc.expandEntries(z.Domains)
+		entries = append(entries, exp...)
 	}
 	ms, _ := awg.CompileMatchers(awgDropCatchAll(entries))
 	return ms
 }
 
-// awgZoneMatchersByMode compiles matchers for the enabled zones of one direction
-// ("include" or "exclude"), so a matched mask's IPs land in the right set.
-func awgZoneMatchersByMode(cfg *awg.ServerConfig, mode string) []awg.DomainMatcher {
+// awgZoneMatchersByMode compiles matchers for the enabled GLOBAL zones of one
+// direction ("include" or "exclude"). Source-bound zones are isolated to their
+// own per-zone ipset (see awgZoneSourceMatchers) and excluded here so a domain
+// scoped to one device never lands in the LAN-wide awg2_inc / awg2_exc sets.
+func (svc *Service) awgZoneMatchersByMode(cfg *awg.ServerConfig, mode string) []awg.DomainMatcher {
 	var entries []string
 	for _, z := range cfg.Routing.Zones {
-		if !z.Enabled {
+		if !z.Enabled || len(z.SourceIPs) > 0 {
 			continue
 		}
 		zm := "include"
@@ -39,11 +43,25 @@ func awgZoneMatchersByMode(cfg *awg.ServerConfig, mode string) []awg.DomainMatch
 			zm = "exclude"
 		}
 		if zm == mode {
-			entries = append(entries, z.Domains...)
+			exp, _ := svc.expandEntries(z.Domains)
+			entries = append(entries, exp...)
 		}
 	}
 	ms, _ := awg.CompileMatchers(awgDropCatchAll(entries))
 	return ms
+}
+
+// awgZoneSourceMatchers builds the per-source-zone matcher list in the same
+// order as awgBuildSourceSets so each entry's SetName matches its zone's ipset.
+func (svc *Service) awgZoneSourceMatchers(cfg *awg.ServerConfig) []sourceZoneMatchers {
+	sb := sourceBoundZones(cfg.Routing.Zones)
+	out := make([]sourceZoneMatchers, 0, len(sb))
+	for i, z := range sb {
+		exp, _ := svc.expandEntries(z.Domains)
+		ms, _ := awg.CompileMatchers(awgDropCatchAll(exp))
+		out = append(out, sourceZoneMatchers{Matchers: ms, SetName: sourceZoneSetName(i)})
+	}
+	return out
 }
 
 // awgEnsureDNSProxy starts/updates the domain-mask DNS proxy when
@@ -51,14 +69,23 @@ func awgZoneMatchersByMode(cfg *awg.ServerConfig, mode string) []awg.DomainMatch
 // returns true when the proxy is (now) running, so the firewall hook installs
 // the LAN :53 REDIRECT only while the proxy is actually up (never blackhole DNS).
 func (svc *Service) awgEnsureDNSProxy(cfg *awg.ServerConfig) bool {
-	ms := awgZoneMatchers(cfg)
+	ms := svc.awgZoneMatchers(cfg)
 	// Run the proxy only when the routing selects a SUBSET (include/exclude) and that
 	// subset needs DNS interception — either the user turned it on, or a real mask is
 	// present (a "*.com"/"*ip*" mask can ONLY be matched via interception). Skip it for
 	// "full" (everything is marked at the firewall — no per-name decision needed), and
 	// for "off"/"" (nothing to route).
 	eff := awgEffectiveMode(cfg.Routing)
-	want := (eff == "include" || eff == "exclude") && len(ms) > 0 && awgUsesDNSProxy(cfg)
+	// Source-bound zones don't affect eff (they're per-device, see mode.go), but
+	// they still need DNS interception to track CDN-served destinations live.
+	hasSrc := false
+	for _, z := range cfg.Routing.Zones {
+		if z.Enabled && len(z.SourceIPs) > 0 && len(z.Domains) > 0 {
+			hasSrc = true
+			break
+		}
+	}
+	want := (eff == "include" || eff == "exclude" || hasSrc) && len(ms) > 0 && awgUsesDNSProxy(cfg)
 	svc.route.mu.Lock()
 	p := svc.route.dnsProxy
 	svc.route.mu.Unlock()
@@ -70,10 +97,12 @@ func (svc *Service) awgEnsureDNSProxy(cfg *awg.ServerConfig) bool {
 	}
 	// Publish the per-direction matchers the onMatch callback routes by (lock-free,
 	// so it never contends with a routing op holding route.mu). Refreshed every call.
-	inc := awgZoneMatchersByMode(cfg, "include")
-	exc := awgZoneMatchersByMode(cfg, "exclude")
+	inc := svc.awgZoneMatchersByMode(cfg, "include")
+	exc := svc.awgZoneMatchersByMode(cfg, "exclude")
+	src := svc.awgZoneSourceMatchers(cfg)
 	svc.route.incMatchers.Store(&inc)
 	svc.route.excMatchers.Store(&exc)
+	svc.route.srcZoneMatchers.Store(&src)
 	if p != nil {
 		p.SetMatchers(ms) // refresh on zone change
 		return true
@@ -83,13 +112,27 @@ func (svc *Service) awgEnsureDNSProxy(cfg *awg.ServerConfig) bool {
 			svc.awgNoteSharedCDNSkip("dnsproxy", name, ip, provider)
 			return
 		}
+		// Per-source-bound zones first: a name landing in a device-scoped zone
+		// must reach that zone's ipset regardless of any global include/exclude
+		// overlap. v6 vs v4 picks the family-matching per-zone set.
+		v6Suffix := ""
+		if isIPv6(ip) {
+			v6Suffix = "_6"
+		}
+		if szs := svc.route.srcZoneMatchers.Load(); szs != nil {
+			for _, sz := range *szs {
+				if awg.MatchAny(sz.Matchers, name) {
+					_, _ = awgRun("ipset add " + sz.SetName + v6Suffix + " " + ip + " -exist")
+				}
+			}
+		}
 		// Route the matched IP to the exclude set when the name matched an exclude
 		// zone (exclude wins on overlap), else the include set. Matchers are read live
 		// so a zone edit takes effect without recreating the proxy. Idempotent -exist;
 		// a zone edit flushes the sets so the next query re-learns cleanly.
-		set := awgSetInc
+		set := awgSetInc + v6Suffix
 		if e := svc.route.excMatchers.Load(); e != nil && awg.MatchAny(*e, name) {
-			set = awgSetExc
+			set = awgSetExc + v6Suffix
 		}
 		_, _ = awgRun("ipset add " + set + " " + ip + " -exist")
 	})
@@ -118,5 +161,7 @@ func (svc *Service) awgStopDNSProxy() {
 	}
 	_, _ = awgRun("for br in $(ls /sys/class/net/ 2>/dev/null | grep '^br'); do " +
 		"iptables -t nat -D PREROUTING -i $br -p udp --dport 53 -j REDIRECT --to-ports " + awgDNSPort + " 2>/dev/null; " +
-		"iptables -t nat -D PREROUTING -i $br -p tcp --dport 53 -j REDIRECT --to-ports " + awgDNSPort + " 2>/dev/null; done")
+		"iptables -t nat -D PREROUTING -i $br -p tcp --dport 53 -j REDIRECT --to-ports " + awgDNSPort + " 2>/dev/null; " +
+		"ip6tables -t nat -D PREROUTING -i $br -p udp --dport 53 -j REDIRECT --to-ports " + awgDNSPort + " 2>/dev/null; " +
+		"ip6tables -t nat -D PREROUTING -i $br -p tcp --dport 53 -j REDIRECT --to-ports " + awgDNSPort + " 2>/dev/null; done")
 }
