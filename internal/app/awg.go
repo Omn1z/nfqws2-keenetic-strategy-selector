@@ -19,6 +19,9 @@ type (
 func (a *App) AWG2StatusView() AWG2Status               { return a.awgroute.AWG2StatusView() }
 func (a *App) AWG2AddServer(name string) AWG2Status     { return a.awgroute.AWG2AddServer(name) }
 func (a *App) AWG2SelectServer(id string) error         { return a.awgroute.AWG2SelectServer(id) }
+func (a *App) AWG2Import(text, name string) (AWG2Status, error) {
+	return a.awgroute.AWG2Import(text, name)
+}
 func (a *App) AWG2DeleteServer(id string) error         { return a.awgroute.AWG2DeleteServer(id) }
 func (a *App) AWG2SetConfig(in *awg.ServerConfig) error { return a.awgroute.AWG2SetConfig(in) }
 func (a *App) AWG2Deploy() (awg.DeployResult, error)    { return a.awgroute.AWG2Deploy() }

@@ -72,8 +72,15 @@ func obfLines(o Obfuscation) string {
 	fmt.Fprintf(&b, "Jmax = %d\n", o.Jmax)
 	fmt.Fprintf(&b, "S1 = %d\n", o.S1)
 	fmt.Fprintf(&b, "S2 = %d\n", o.S2)
-	fmt.Fprintf(&b, "S3 = %d\n", o.S3)
-	fmt.Fprintf(&b, "S4 = %d\n", o.S4)
+	// S3/S4 only when non-zero. AmneziaWG treats absent vs 0 as DIFFERENT — if
+	// the server config has no S3/S4 line, the client MUST also omit it or the
+	// handshake silently fails (server drops the auth-tagged packet).
+	if o.S3 > 0 {
+		fmt.Fprintf(&b, "S3 = %d\n", o.S3)
+	}
+	if o.S4 > 0 {
+		fmt.Fprintf(&b, "S4 = %d\n", o.S4)
+	}
 	fmt.Fprintf(&b, "H1 = %s\n", hdr(o.H1, "1"))
 	fmt.Fprintf(&b, "H2 = %s\n", hdr(o.H2, "2"))
 	fmt.Fprintf(&b, "H3 = %s\n", hdr(o.H3, "3"))

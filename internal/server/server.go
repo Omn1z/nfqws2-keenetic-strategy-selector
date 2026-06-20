@@ -243,6 +243,7 @@ func (s *Server) routes() {
 
 	m.HandleFunc("GET /api/awg2", s.awg2Status)
 	m.HandleFunc("POST /api/awg2/servers", s.awg2AddServer)
+	m.HandleFunc("POST /api/awg2/import", s.awg2Import)
 	m.HandleFunc("POST /api/awg2/servers/{id}/select", s.awg2SelectServer)
 	m.HandleFunc("DELETE /api/awg2/servers/{id}", s.awg2DeleteServer)
 	m.HandleFunc("POST /api/awg2/config", s.awg2Config)
@@ -1289,6 +1290,23 @@ func (s *Server) awg2AddServer(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = readJSON(r, &in) // body is optional
 	writeJSON(w, 200, s.app.AWG2AddServer(in.Name))
+}
+
+func (s *Server) awg2Import(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Conf string `json:"conf"`
+		Name string `json:"name"`
+	}
+	if err := readJSON(r, &in); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	st, err := s.app.AWG2Import(in.Conf, in.Name)
+	if err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, st)
 }
 
 func (s *Server) awg2SelectServer(w http.ResponseWriter, r *http.Request) {
