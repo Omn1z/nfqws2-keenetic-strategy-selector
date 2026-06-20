@@ -16,7 +16,7 @@ import (
 // The raw-message parsing helpers live in dnswire.go.
 type DNSProxy struct {
 	addr     string
-	upstream string
+	upstream atomic.Pointer[string] // swappable live so the pi-hole chain toggle takes effect without restarting the proxy
 	onMatch  func(name, ip string)
 	matchers atomic.Pointer[[]DomainMatcher]
 
@@ -38,10 +38,28 @@ const recentCap = 4096
 // query name + each matched A/AAAA IP (safe for concurrent use); the caller routes
 // the IP to the right ipset by which zone the name matched.
 func NewDNSProxy(addr, upstream string, onMatch func(name, ip string)) *DNSProxy {
-	p := &DNSProxy{addr: addr, upstream: upstream, onMatch: onMatch}
+	p := &DNSProxy{addr: addr, onMatch: onMatch}
+	p.upstream.Store(&upstream)
 	var empty []DomainMatcher
 	p.matchers.Store(&empty)
 	return p
+}
+
+// SetUpstream atomically swaps the resolver the proxy forwards to. Used by the
+// pi-hole chain toggle: switching between system DNS (127.0.0.1:53) and pi-hole
+// (127.0.0.1:5353) without tearing down the proxy or its iptables REDIRECT.
+func (p *DNSProxy) SetUpstream(addr string) {
+	if addr == "" {
+		return
+	}
+	p.upstream.Store(&addr)
+}
+
+func (p *DNSProxy) upstreamAddr() string {
+	if s := p.upstream.Load(); s != nil {
+		return *s
+	}
+	return ""
 }
 
 // SetMatchers atomically swaps the active matcher set and re-checks recently-seen
@@ -190,7 +208,7 @@ func (p *DNSProxy) handleUDP(uc *net.UDPConn, client *net.UDPAddr, query []byte)
 // forwardUDP relays a raw query to the upstream resolver and returns the raw
 // response.
 func (p *DNSProxy) forwardUDP(query []byte) ([]byte, error) {
-	c, err := net.DialTimeout("udp", p.upstream, 4*time.Second)
+	c, err := net.DialTimeout("udp", p.upstreamAddr(), 4*time.Second)
 	if err != nil {
 		return nil, err
 	}
@@ -228,7 +246,7 @@ func (p *DNSProxy) handleTCP(conn net.Conn) {
 		_ = writeTCPMsg(conn, blk)
 		return
 	}
-	up, err := net.DialTimeout("tcp", p.upstream, 4*time.Second)
+	up, err := net.DialTimeout("tcp", p.upstreamAddr(), 4*time.Second)
 	if err != nil {
 		return
 	}

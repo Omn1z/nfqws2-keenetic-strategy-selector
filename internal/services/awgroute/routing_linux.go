@@ -57,6 +57,11 @@ const (
 	awgDNSAddr     = "0.0.0.0:5354"
 	awgDNSPort     = "5354"
 	awgDNSUpstream = "127.0.0.1:53" // Keenetic ndnproxy — the real LAN resolver
+
+	// Pi-hole FTL port — iptables REDIRECT target so pi-hole receives queries
+	// directly (preserving client src IP in its query log). Pi-hole then forwards
+	// to our proxy on awgDNSPort as its upstream. Mirrors pihole.DefaultDNSPort.
+	awgPiholeDNSPort = "5353"
 )
 
 func (svc *Service) awgApplyRoutingOS() error {

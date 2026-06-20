@@ -294,6 +294,19 @@ func (s *Server) routes() {
 	m.HandleFunc("DELETE /api/nfqws2/file", s.nfqws2DeleteFile)
 	m.HandleFunc("GET /api/nfqws2/file/download", s.nfqws2DownloadFile)
 
+	// Pi-hole v6 (ad-block DNS sinkhole in a docker container).
+	m.HandleFunc("GET /api/pihole/status", s.piholeStatus)
+	m.HandleFunc("GET /api/pihole/stats", s.piholeStats)
+	m.HandleFunc("POST /api/pihole/config", s.piholeSaveConfig)
+	m.HandleFunc("POST /api/pihole/install", s.piholeInstall)
+	m.HandleFunc("POST /api/pihole/start", s.piholeStart)
+	m.HandleFunc("POST /api/pihole/stop", s.piholeStop)
+	m.HandleFunc("POST /api/pihole/restart", s.piholeRestart)
+	m.HandleFunc("POST /api/pihole/upgrade", s.piholeUpgrade)
+	m.HandleFunc("POST /api/pihole/remove", s.piholeRemove)
+	m.HandleFunc("GET /api/pihole/logs", s.piholeLogs)
+	m.HandleFunc("POST /api/pihole/chain", s.piholeSetChain)
+
 	// Single-file React app: any non-/api path serves the inlined index.html, so
 	// History-API routes (/lists, /runs, …) deep-link and refresh cleanly. /api/*
 	// patterns are more specific and take precedence.

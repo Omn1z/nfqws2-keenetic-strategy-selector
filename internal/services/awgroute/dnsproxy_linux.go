@@ -107,7 +107,7 @@ func (svc *Service) awgEnsureDNSProxy(cfg *awg.ServerConfig) bool {
 		p.SetMatchers(ms) // refresh on zone change
 		return true
 	}
-	np := awg.NewDNSProxy(awgDNSAddr, awgDNSUpstream, func(name, ip string) {
+	np := awg.NewDNSProxy(awgDNSAddr, svc.awgEffectiveDNSUpstream(), func(name, ip string) {
 		if provider, ok := sharedCDNProvider(ip); ok {
 			svc.awgNoteSharedCDNSkip("dnsproxy", name, ip, provider)
 			return
@@ -159,9 +159,14 @@ func (svc *Service) awgStopDNSProxy() {
 	if p != nil {
 		p.Stop()
 	}
+	// Strip both possible REDIRECT targets — :5354 (legacy, proxy-first) and
+	// :5353 (current, pi-hole-first) — so a chain-mode flip doesn't leave a
+	// stale rule pointing at a dead port.
 	_, _ = awgRun("for br in $(ls /sys/class/net/ 2>/dev/null | grep '^br'); do " +
-		"iptables -t nat -D PREROUTING -i $br -p udp --dport 53 -j REDIRECT --to-ports " + awgDNSPort + " 2>/dev/null; " +
-		"iptables -t nat -D PREROUTING -i $br -p tcp --dport 53 -j REDIRECT --to-ports " + awgDNSPort + " 2>/dev/null; " +
-		"ip6tables -t nat -D PREROUTING -i $br -p udp --dport 53 -j REDIRECT --to-ports " + awgDNSPort + " 2>/dev/null; " +
-		"ip6tables -t nat -D PREROUTING -i $br -p tcp --dport 53 -j REDIRECT --to-ports " + awgDNSPort + " 2>/dev/null; done")
+		"for port in " + awgDNSPort + " " + awgPiholeDNSPort + "; do " +
+		"iptables -t nat -D PREROUTING -i $br -p udp --dport 53 -j REDIRECT --to-ports $port 2>/dev/null; " +
+		"iptables -t nat -D PREROUTING -i $br -p tcp --dport 53 -j REDIRECT --to-ports $port 2>/dev/null; " +
+		"ip6tables -t nat -D PREROUTING -i $br -p udp --dport 53 -j REDIRECT --to-ports $port 2>/dev/null; " +
+		"ip6tables -t nat -D PREROUTING -i $br -p tcp --dport 53 -j REDIRECT --to-ports $port 2>/dev/null; " +
+		"done; done")
 }

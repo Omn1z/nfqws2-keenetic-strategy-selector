@@ -4,6 +4,7 @@
 package app
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -18,6 +19,7 @@ import (
 	"nfqws2strategy/internal/services/blobs"
 	"nfqws2strategy/internal/services/monitor"
 	"nfqws2strategy/internal/services/nfqws2"
+	"nfqws2strategy/internal/services/pihole"
 	"nfqws2strategy/internal/services/portforward"
 	"nfqws2strategy/internal/services/proxy"
 	"nfqws2strategy/internal/services/strategy/core/catalog"
@@ -58,6 +60,7 @@ type App struct {
 	awgroute *awgroute.Service // AWG2 server + router client/split-routing (AWG2 tab)
 	blobs    *blobs.Service    // fake-payload blob store + ClientHello capture (Blobs tab)
 	portfwd  *portforward.Service
+	pihole   *pihole.Service // Pi-hole v6 container (ad-block, DNS sinkhole)
 
 	dnsMu      sync.Mutex
 	dnsServers []dns.Server // configured DoH/DoT servers (DNS tab + run matrix)
@@ -102,7 +105,56 @@ func New(cfg *config.Config) (*App, error) {
 		logbuf.Append("port-forwarding", "warn", err.Error())
 	}
 	a.startGeoAutoLoop()
+	a.initPihole()
 	return a, nil
+}
+
+// initPihole loads the persisted Pi-hole config or seeds defaults. The container
+// itself is not touched on boot — install/start is an explicit user action. The
+// chain-toggle hook is wired here so awgroute's DNS proxy upstream swaps live
+// when the user flips DNSChainEnabled in the UI.
+func (a *App) initPihole() {
+	var cfg pihole.Config
+	if err := a.store.Load("pihole.json", &cfg); err != nil || cfg.DataRoot == "" {
+		cfg = pihole.Default()
+		_ = a.store.Save("pihole.json", &cfg)
+	}
+	a.pihole = pihole.New(cfg)
+	// fw3 wipes our LAN-input rule on every reboot — re-apply at boot so the
+	// admin UI (port {ui_port}) stays reachable from the LAN without user action.
+	a.pihole.EnsureFirewall()
+	// The bundled xiaomi-docker leaves a stale containerd shim directory on
+	// reboot, so a plain "--restart unless-stopped" doesn't actually bring the
+	// container back. Recover by remove+run if the container is in a bad state.
+	a.pihole.EnsureRunning()
+	// Inverted chain: pi-hole sits at the iptables REDIRECT target (its FTL
+	// port), and forwards to the AWG2 proxy as its only upstream. That keeps
+	// real client IPs in pi-hole's per-client log while still letting the proxy
+	// classify every (non-blocked) query for SNI/zone routing.
+	a.pihole.SetChainChangeHook(func(enabled bool, _ string) {
+		ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+		defer cancel()
+		if enabled {
+			_ = a.pihole.SetUpstreams(ctx, []string{awgroute.DNSProxyUpstreamAddr()})
+		} else {
+			_ = a.pihole.SetUpstreams(ctx, nil) // restore FTL defaults
+		}
+	})
+	// Apply the persisted state at boot so a chain-enabled config survives reboot.
+	if cfg.DNSChainEnabled {
+		ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+		defer cancel()
+		_ = a.pihole.SetUpstreams(ctx, []string{awgroute.DNSProxyUpstreamAddr()})
+	}
+}
+
+// Pihole exposes the service for the API layer.
+func (a *App) Pihole() *pihole.Service { return a.pihole }
+
+// SavePiholeConfig persists pi-hole settings + applies them.
+func (a *App) SavePiholeConfig(cfg pihole.Config) error {
+	a.pihole.SetConfig(cfg)
+	return a.store.Save("pihole.json", &cfg)
 }
 
 // Shutdown cancels any active run/block check, tears down every test sandbox

@@ -399,6 +399,37 @@ export interface SystemStats {
   services: ServiceStat[];
 }
 
+export interface PiholeConfig {
+  password: string;
+  dns_port: number;
+  ui_port: number;
+  data_root: string;
+  timezone: string;
+  dns_chain_enabled: boolean;
+}
+export interface PiholeStatus extends PiholeConfig {
+  installed: boolean;
+  running: boolean;
+  healthy: boolean;
+  state: string;
+  container_id: string;
+  uptime_sec: number;
+  image_digest: string;
+  upgrade_avail: boolean;
+  error?: string;
+}
+export interface PiholeStats {
+  total_queries: number;
+  blocked_queries: number;
+  percent_blocked: number;
+  domains_on_list: number;
+  unique_domains: number;
+  unique_clients: number;
+  active_clients: number;
+  blocking_status: string;
+  error?: string;
+}
+
 export interface Dashboard {
   tgws: TgwsStatus;
   socks5: Socks5Status;

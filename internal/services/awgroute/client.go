@@ -141,6 +141,11 @@ type awgRouteState struct {
 	stopRefresh chan struct{}
 	active      bool
 	dnsProxy    *awg.DNSProxy
+	// dnsUpstreamOverride is set when an external service (Pi-hole chain) wants
+	// the DNS proxy to forward elsewhere than awgDNSUpstream. Empty = use default.
+	// The pi-hole module calls SetDNSUpstream() which both updates this and pushes
+	// the new addr into the live DNSProxy without restarting it.
+	dnsUpstreamOverride string
 	// Per-direction domain matchers for the DNS proxy's onMatch callback (lock-free
 	// reads so a DNS answer never blocks on a routing op holding mu). Linux-only use.
 	incMatchers atomic.Pointer[[]awg.DomainMatcher]
