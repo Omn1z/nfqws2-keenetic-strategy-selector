@@ -45,6 +45,8 @@ const collect = (f: Form) => ({
 export default function ServerPane({ st, reload, deployActive, deploying }: { st: Awg2Status; reload: () => void; deployActive: () => Promise<boolean>; deploying: boolean }) {
   const [form, setForm] = useState<Form>(() => toForm(st.config));
   const [saving, setSaving] = useState(false);
+  const [advanced, setAdvanced] = useState(false);
+  const [passwordOpen, setPasswordOpen] = useState(false);
   const [importName, setImportName] = useState("");
   const [importText, setImportText] = useState("");
   const [importing, setImporting] = useState(false);
@@ -122,14 +124,44 @@ export default function ServerPane({ st, reload, deployActive, deploying }: { st
         </div>
       </Card>
 
+      {!imported && (
+        <Card
+          title="Развертывание VPS"
+          sub="обычно достаточно адреса и пароля"
+          head={<Button mini variant="primary" onClick={() => { void deployActive(); }} disabled={deploying || !st.config.enabled || !st.config.conn.host}>{deploying ? "Деплой..." : st.deployed ? "Переразвернуть этот сервер" : "Развернуть этот сервер"}</Button>}
+        >
+          <div className="grid gap-3 lg:grid-cols-[minmax(180px,1fr)_110px_140px_auto] lg:items-end">
+            <Field label="Адрес VPS">
+              <Input value={form.host} placeholder="1.2.3.4 или vpn.example.com" onChange={(e) => set("host", e.target.value)} />
+            </Field>
+            <Field label="SSH">
+              <Input type="number" min={1} max={65535} value={form.port} onChange={(e) => set("port", e.target.value)} />
+            </Field>
+            <Field label="Пользователь">
+              <Input value={form.user} onChange={(e) => set("user", e.target.value)} />
+            </Field>
+            <Button onClick={save} disabled={saving}>{saving ? "..." : "Сохранить доступ"}</Button>
+          </div>
+          <div className="mt-3 flex flex-wrap items-center gap-2">
+            <Badge kind={st.has_password || st.has_key ? "ok" : "warn"}>{st.has_password || st.has_key ? "доступ сохранён" : "нужен доступ SSH"}</Badge>
+            {st.has_password && !passwordOpen ? <Button mini onClick={() => setPasswordOpen(true)}>Обновить пароль</Button> : null}
+            <Button mini variant="ghost" onClick={() => setAdvanced((v) => !v)}>{advanced ? "Скрыть тонкие настройки" : "Тонкие настройки"}</Button>
+          </div>
+          {(!st.has_password || passwordOpen) && form.auth_kind === "password" && (
+            <div className="mt-3 grid gap-3 sm:grid-cols-[minmax(180px,1fr)_auto] sm:items-end">
+              <Field label="Пароль SSH" hint={st.has_password ? "новый пароль, если старый устарел" : ""}>
+                <Input type="password" value={form.password} placeholder={st.has_password ? "новый пароль" : ""} onChange={(e) => set("password", e.target.value)} />
+              </Field>
+              <Button onClick={async () => { await save(); setPasswordOpen(false); }} disabled={saving || !form.password}>{saving ? "..." : "Сохранить пароль"}</Button>
+            </div>
+          )}
+        </Card>
+      )}
+
+      {advanced && !imported && (
       <Card
         title="Сервер (VPS) и SSH"
-        sub={imported ? "imported-профиль: SSH-деплой недоступен" : "куда и как разворачивать"}
-        head={
-          imported
-            ? <Badge kind="ok">{plainWG ? "WireGuard import" : "AWG import"}</Badge>
-            : <Button mini variant="primary" onClick={() => { void deployActive(); }} disabled={deploying || !st.config.enabled || !st.config.conn.host}>{deploying ? "Деплой..." : st.deployed ? "Переразвернуть этот сервер" : "Развернуть этот сервер"}</Button>
-        }
+        sub="куда и как разворачивать"
       >
         <div className="flex flex-wrap gap-4">
           <Field label="Адрес VPS" className="min-w-[200px] flex-1"><Input value={form.host} placeholder="1.2.3.4 или vpn.example.com" onChange={(e) => set("host", e.target.value)} /></Field>
@@ -152,7 +184,9 @@ export default function ServerPane({ st, reload, deployActive, deploying }: { st
           <Field label="Метод установки" className="w-64 shrink-0"><Select value={form.install} onChange={(e) => set("install", e.target.value)}><option value="apt">apt (модуль ядра) + fallback</option><option value="userspace">userspace amneziawg-go</option><option value="imported">imported (без SSH-деплоя)</option></Select></Field>
         </div>
       </Card>
+      )}
 
+      {advanced && !imported && (
       <Card title="Сеть туннеля">
         <div className="flex flex-wrap gap-4">
           <Field label="UDP-порт" className="w-32 shrink-0"><Input type="number" min={1} max={65535} value={form.listen_port} onChange={(e) => set("listen_port", e.target.value)} /></Field>
@@ -166,6 +200,7 @@ export default function ServerPane({ st, reload, deployActive, deploying }: { st
         </div>
         <Field label="Endpoint для клиентов" hint="пусто = адрес VPS : UDP-порт"><Input value={form.endpoint} placeholder="vpn.example.com:51820" onChange={(e) => set("endpoint", e.target.value)} /></Field>
       </Card>
+      )}
 
       {plainWG ? (
         <Card title="WireGuard профиль" sub="plain WG: AWG-obfuscation параметры не отправляются">
@@ -174,7 +209,7 @@ export default function ServerPane({ st, reload, deployActive, deploying }: { st
             <Button variant="primary" onClick={save} disabled={saving}>{saving ? "Сохранение..." : "Сохранить настройки"}</Button>
           </div>
         </Card>
-      ) : (
+      ) : advanced && !imported ? (
       <Card title="Обфускация AmneziaWG 2.0" sub="случайная при первом деплое; должна совпадать у сервера и клиента">
         <div className="flex flex-wrap gap-3">
           <Field label="Jc" className="w-20 shrink-0"><Input type="number" value={form.jc} onChange={(e) => set("jc", e.target.value)} /></Field>
@@ -200,7 +235,7 @@ export default function ServerPane({ st, reload, deployActive, deploying }: { st
         </Field>
         <div className="mt-2 flex flex-wrap items-center gap-2.5"><Button variant="primary" onClick={save} disabled={saving}>{saving ? "Сохранение…" : "Сохранить настройки"}</Button><span className="text-xs text-muted">деплой — кнопкой на карточке или здесь во вкладке сервера</span></div>
       </Card>
-      )}
+      ) : null}
     </>
   );
 }

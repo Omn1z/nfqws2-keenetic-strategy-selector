@@ -5,6 +5,7 @@ package awgroute
 // OS-specific work lives in awgclient_{linux,other}.go.
 
 import (
+	"context"
 	"fmt"
 	"strings"
 	"sync"
@@ -117,6 +118,13 @@ func (svc *Service) awgClientStatus() *ClientStatus     { return svc.awgClientSt
 func (svc *Service) AWG2ClientUp() error {
 	if !svc.awg.Config().Enabled {
 		return fmt.Errorf("AWG2-сервер выключен")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
+	defer cancel()
+	if _, changed, err := svc.awg.EnsureRouterPeer(ctx); err != nil {
+		return err
+	} else if changed {
+		svc.awgSave()
 	}
 	if err := svc.awgClientUpOS(); err != nil {
 		return err

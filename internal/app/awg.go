@@ -43,6 +43,9 @@ func (a *App) AWG2RemovePeer(id string) error { return a.awgroute.AWG2RemovePeer
 func (a *App) AWG2ClientConfig(id string) (text, filename string, err error) {
 	return a.awgroute.AWG2ClientConfig(id)
 }
+func (a *App) AWG2ClientExport(id, format string) (text, filename, contentType string, err error) {
+	return a.awgroute.AWG2ClientExport(id, format)
+}
 
 func (a *App) AWG2EngineInfo() EngineInfo         { return a.awgroute.AWG2EngineInfo() }
 func (a *App) AWG2InstallEngine() (string, error) { return a.awgroute.AWG2InstallEngine() }

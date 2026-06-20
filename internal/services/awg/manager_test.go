@@ -144,6 +144,25 @@ func TestAddPeerSyncsWhenDeployed(t *testing.T) {
 	}
 }
 
+func TestEnsureRouterPeerCreatesOnlyOnce(t *testing.T) {
+	f := &fakeRunner{}
+	m, _ := newManagerWithFake(f)
+	p, created, err := m.EnsureRouterPeer(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !created || !p.IsRouter || p.PrivateKey == "" || p.Address == "" {
+		t.Fatalf("expected created router peer with secrets/address, got created=%v peer=%+v", created, p)
+	}
+	p2, created, err := m.EnsureRouterPeer(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if created || p2.ID != p.ID || len(m.Config().Peers) != 1 {
+		t.Fatalf("expected idempotent router peer, created=%v p1=%s p2=%s peers=%d", created, p.ID, p2.ID, len(m.Config().Peers))
+	}
+}
+
 func TestConfigClonePreservesEmptyZoneSlices(t *testing.T) {
 	cfg := Default()
 	cfg.Routing.Zones = []Zone{{Name: "empty", Mode: "include", Domains: []string{}, IPs: []string{}, Enabled: true}}

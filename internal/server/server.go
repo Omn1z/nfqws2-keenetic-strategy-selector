@@ -1493,12 +1493,15 @@ func (s *Server) awg2RemovePeer(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) awg2PeerConfig(w http.ResponseWriter, r *http.Request) {
-	text, name, err := s.app.AWG2ClientConfig(r.PathValue("id"))
+	text, name, contentType, err := s.app.AWG2ClientExport(r.PathValue("id"), r.URL.Query().Get("format"))
 	if err != nil {
 		httpErr(w, 400, err)
 		return
 	}
-	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	if contentType == "" {
+		contentType = "text/plain; charset=utf-8"
+	}
+	w.Header().Set("Content-Type", contentType)
 	w.Header().Set("Content-Disposition", `attachment; filename="`+safeDispoName(name)+`"`)
 	_, _ = w.Write([]byte(text))
 }

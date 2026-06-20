@@ -8,12 +8,14 @@ import { Button } from "@/components/ui/Button";
 import { Switch } from "@/components/ui/Switch";
 import { toast } from "@/components/ui/Toast";
 import { confirmDialog } from "@/components/ui/Confirm";
+import { Modal } from "@/components/ui/Modal";
+import { Field, Input, Select } from "@/components/ui/form";
 import ServerPane from "./ServerPane";
-import ClientsPane from "./ClientsPane";
+import PeerShareModal from "./PeerShareModal";
 import RoutingPane from "./RoutingPane";
 import type { Awg2ServerSummary, Awg2Status, AwgClientStatus, AwgDeployResult } from "@/types/api";
 
-type Sub = "server" | "clients" | "routing";
+type Sub = "server" | "routing";
 type DeployOpts = { quiet?: boolean; skipReload?: boolean };
 
 const human = (n: number) => {
@@ -59,6 +61,10 @@ export default function AWG2() {
   const [toggling, setToggling] = useState<Record<string, boolean>>({});
   const [selected, setSelected] = useState<Record<string, boolean>>({});
   const [batch, setBatch] = useState<{ done: number; total: number } | null>(null);
+  const [addOpen, setAddOpen] = useState(false);
+  const [clientsOpen, setClientsOpen] = useState(false);
+  const [newServer, setNewServer] = useState({ name: "", host: "", port: "22", user: "root", auth: "password", password: "" });
+  const [creating, setCreating] = useState(false);
 
   usePoll(async () => {
     try {
@@ -137,13 +143,32 @@ export default function AWG2() {
   };
 
   const addServer = async () => {
+    if (creating) return;
+    setCreating(true);
     try {
-      const next = await api<Awg2Status>("POST", "/api/awg2/servers", {});
+      let next = await api<Awg2Status>("POST", "/api/awg2/servers", { name: newServer.name.trim() });
+      if (newServer.host.trim()) {
+        next = await api<Awg2Status>("POST", "/api/awg2/config", {
+          ...next.config,
+          conn: {
+            ...next.config.conn,
+            host: newServer.host.trim(),
+            port: parseInt(newServer.port, 10) || 22,
+            user: newServer.user.trim() || "root",
+            auth_kind: newServer.auth,
+            password: newServer.auth === "password" ? newServer.password : "",
+          },
+        });
+      }
       setSt(next);
       setSub("server");
+      setAddOpen(false);
+      setNewServer({ name: "", host: "", port: "22", user: "root", auth: "password", password: "" });
       toast("Сервер AWG2 добавлен", "ok");
     } catch (e) {
       toast((e as Error).message, "err");
+    } finally {
+      setCreating(false);
     }
   };
 
@@ -189,6 +214,22 @@ export default function AWG2() {
     } catch (e) {
       toast((e as Error).message, "err");
     }
+  };
+
+  const openClients = async (srv: Awg2ServerSummary) => {
+    if (srv.imported) {
+      toast("Imported-профиль подключает только этот роутер к чужому серверу — добавлять клиентов к нему нельзя", "err");
+      return;
+    }
+    if (!srv.active) {
+      try {
+        setSt(await api<Awg2Status>("POST", `/api/awg2/servers/${encodeURIComponent(srv.id)}/select`, {}));
+      } catch (e) {
+        toast((e as Error).message, "err");
+        return;
+      }
+    }
+    setClientsOpen(true);
   };
 
   const seg = (m: Sub, label: string) => (
@@ -247,7 +288,7 @@ export default function AWG2() {
       <Card
         title="Серверы AWG2"
         sub="активный сервер владеет пирами, туннелем awg0 и маршрутизацией"
-        head={<Button mini onClick={addServer}>Добавить сервер</Button>}
+        head={<Button mini onClick={() => setAddOpen(true)}>Добавить сервер</Button>}
       >
         {selectedIDs.length > 0 && (
           <div className="mb-3 flex flex-wrap items-center gap-2 rounded-lg border border-line bg-line-soft px-3 py-2">
@@ -314,6 +355,9 @@ export default function AWG2() {
                   <Button mini onClick={() => deployServer(srv.id)} disabled={busy || !srv.enabled || srv.imported || !srv.host}>
                     {busy ? "Деплой..." : srv.deployed ? "Переразвернуть" : "Развернуть"}
                   </Button>
+                  <Button mini onClick={() => { void openClients(srv); }} disabled={!srv.enabled || srv.imported}>
+                    Добавить клиента
+                  </Button>
                   {srv.imported && <span className="text-[11px] text-muted">без SSH-деплоя</span>}
                 </div>
               </div>
@@ -330,13 +374,48 @@ export default function AWG2() {
 
       <div className="mb-4 inline-flex overflow-hidden rounded-lg border border-line">
         {seg("server", "Сервер")}
-        {seg("clients", "Клиенты")}
         {seg("routing", "Маршрутизация")}
       </div>
 
       {sub === "server" && <ServerPane st={st} reload={reload} deployActive={() => activeServer ? deployServer(activeServer.id) : Promise.resolve(false)} deploying={!!(activeServer && deploying[activeServer.id])} />}
-      {sub === "clients" && <ClientsPane st={st} reload={reload} />}
       {sub === "routing" && <RoutingPane st={st} reload={reload} />}
+      {clientsOpen && <PeerShareModal st={st} reload={reload} onClose={() => setClientsOpen(false)} />}
+      {addOpen && (
+        <Modal
+          title="Добавить AWG2 сервер"
+          onClose={() => setAddOpen(false)}
+          actions={<><Button onClick={() => setAddOpen(false)}>Отмена</Button><Button variant="primary" onClick={addServer} disabled={creating}>{creating ? "..." : "Добавить"}</Button></>}
+        >
+          <div className="space-y-3">
+            <Field label="Название">
+              <Input value={newServer.name} placeholder="Moscow VPS" onChange={(e) => setNewServer((s) => ({ ...s, name: e.target.value }))} />
+            </Field>
+            <div className="grid gap-3 sm:grid-cols-[minmax(180px,1fr)_90px]">
+              <Field label="Адрес VPS">
+                <Input value={newServer.host} placeholder="IP или домен" onChange={(e) => setNewServer((s) => ({ ...s, host: e.target.value }))} />
+              </Field>
+              <Field label="SSH">
+                <Input type="number" value={newServer.port} onChange={(e) => setNewServer((s) => ({ ...s, port: e.target.value }))} />
+              </Field>
+            </div>
+            <div className="grid gap-3 sm:grid-cols-[140px_150px_minmax(160px,1fr)]">
+              <Field label="Пользователь">
+                <Input value={newServer.user} onChange={(e) => setNewServer((s) => ({ ...s, user: e.target.value }))} />
+              </Field>
+              <Field label="Авторизация">
+                <Select value={newServer.auth} onChange={(e) => setNewServer((s) => ({ ...s, auth: e.target.value }))}>
+                  <option value="password">Пароль</option>
+                  <option value="key">SSH-ключ позже</option>
+                </Select>
+              </Field>
+              <Field label="Пароль SSH" hint="можно оставить пустым">
+                <Input type="password" value={newServer.password} onChange={(e) => setNewServer((s) => ({ ...s, password: e.target.value }))} disabled={newServer.auth !== "password"} />
+              </Field>
+            </div>
+            <p className="text-[11px] text-muted">Остальные параметры берутся автоматически. Тонкие настройки можно раскрыть во вкладке сервера.</p>
+          </div>
+        </Modal>
+      )}
     </>
   );
 }

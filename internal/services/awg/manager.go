@@ -148,6 +148,62 @@ func (m *Manager) SetRoutingActive(v bool) {
 	m.mu.Unlock()
 }
 
+// EnsureRouterPeer makes sure the local Keenetic router has its own client peer.
+// It is intentionally idempotent: imported configs already contain the router
+// peer, while self-hosted VPS configs get one automatically so users do not need
+// to visit a separate clients tab before bringing awg0 up.
+func (m *Manager) EnsureRouterPeer(ctx context.Context) (Peer, bool, error) {
+	m.mu.Lock()
+	p, created, err := m.ensureRouterPeerLocked()
+	if err != nil {
+		m.mu.Unlock()
+		return Peer{}, false, err
+	}
+	if !created {
+		m.mu.Unlock()
+		return p, false, nil
+	}
+	cfg := m.cfg.clone()
+	cred := m.cfg.Conn
+	iface := m.cfg.Interface
+	deployed := m.cfg.DeployedAt > 0
+	dial := m.dial
+	m.mu.Unlock()
+	if deployed {
+		if err := syncPeers(ctx, dial, cred, &cfg, iface); err != nil {
+			return p, true, fmt.Errorf("пир роутера создан, но не применён на сервере: %w", err)
+		}
+	}
+	return p, true, nil
+}
+
+func (m *Manager) EnsureRouterPeerLocal() (Peer, bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.ensureRouterPeerLocked()
+}
+
+func (m *Manager) ensureRouterPeerLocked() (Peer, bool, error) {
+	for i := range m.cfg.Peers {
+		if m.cfg.Peers[i].IsRouter || (m.cfg.Client.PeerID != "" && m.cfg.Peers[i].ID == m.cfg.Client.PeerID) {
+			m.cfg.Peers[i].IsRouter = true
+			m.cfg.Client.PeerID = m.cfg.Peers[i].ID
+			return m.cfg.Peers[i], false, nil
+		}
+	}
+	p, err := m.addPeerLocked(Peer{
+		Name:       "Этот роутер",
+		IsRouter:   true,
+		AllowedIPs: "0.0.0.0/0, ::/0",
+		Keepalive:  25,
+	})
+	if err != nil {
+		return p, false, err
+	}
+	m.cfg.Client.PeerID = p.ID
+	return p, true, nil
+}
+
 // EnsureKeys generates the server keypair + randomized 2.0 obfuscation once.
 // Returns true if anything changed (so the caller persists before deploying).
 func (m *Manager) EnsureKeys() (bool, error) {
@@ -294,10 +350,30 @@ func (m *Manager) Status(ctx context.Context) (Status, error) {
 // server is already deployed, applies it live via awg syncconf.
 func (m *Manager) AddPeer(ctx context.Context, in Peer) (Peer, error) {
 	m.mu.Lock()
+	in, err := m.addPeerLocked(in)
+	if err != nil {
+		m.mu.Unlock()
+		return Peer{}, err
+	}
+	cfg := m.cfg.clone()
+	cred := m.cfg.Conn
+	iface := m.cfg.Interface
+	deployed := m.cfg.DeployedAt > 0
+	dial := m.dial
+	m.mu.Unlock()
+
+	if deployed {
+		if err := syncPeers(ctx, dial, cred, &cfg, iface); err != nil {
+			return in, fmt.Errorf("пир сохранён, но не применён на сервере: %w", err)
+		}
+	}
+	return in, nil
+}
+
+func (m *Manager) addPeerLocked(in Peer) (Peer, error) {
 	if strings.TrimSpace(in.PublicKey) == "" {
 		priv, pub, err := GenKeypair()
 		if err != nil {
-			m.mu.Unlock()
 			return Peer{}, err
 		}
 		in.PrivateKey, in.PublicKey = priv, pub
@@ -305,7 +381,6 @@ func (m *Manager) AddPeer(ctx context.Context, in Peer) (Peer, error) {
 	if strings.TrimSpace(in.PSK) == "" {
 		psk, err := GenPSK()
 		if err != nil {
-			m.mu.Unlock()
 			return Peer{}, err
 		}
 		in.PSK = psk
@@ -328,18 +403,6 @@ func (m *Manager) AddPeer(ctx context.Context, in Peer) (Peer, error) {
 	in.CreatedAt = time.Now().Unix()
 	in.HasPrivate = strings.TrimSpace(in.PrivateKey) != ""
 	m.cfg.Peers = append(m.cfg.Peers, in)
-	cfg := m.cfg.clone()
-	cred := m.cfg.Conn
-	iface := m.cfg.Interface
-	deployed := m.cfg.DeployedAt > 0
-	dial := m.dial
-	m.mu.Unlock()
-
-	if deployed {
-		if err := syncPeers(ctx, dial, cred, &cfg, iface); err != nil {
-			return in, fmt.Errorf("пир сохранён, но не применён на сервере: %w", err)
-		}
-	}
 	return in, nil
 }
 
@@ -375,17 +438,22 @@ func (m *Manager) RemovePeer(ctx context.Context, id string) error {
 
 // ClientConfig renders the .conf a peer uses to connect (emits private key).
 func (m *Manager) ClientConfig(id string) (text, filename string, err error) {
+	text, filename, _, err = m.ClientExport(id, "conf")
+	return text, filename, err
+}
+
+func (m *Manager) ClientExport(id, format string) (text, filename, contentType string, err error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for _, p := range m.cfg.Peers {
 		if p.ID == id {
 			if strings.TrimSpace(p.PrivateKey) == "" {
-				return "", "", fmt.Errorf("для этого пира нет приватного ключа (добавьте пир заново)")
+				return "", "", "", fmt.Errorf("для этого пира нет приватного ключа (добавьте пир заново)")
 			}
-			return ClientConf(m.cfg, p), safeName(p.Name) + ".conf", nil
+			return ClientExport(m.cfg, p, format)
 		}
 	}
-	return "", "", fmt.Errorf("пир не найден")
+	return "", "", "", fmt.Errorf("пир не найден")
 }
 
 // RouterPeer returns the peer flagged as this router, or false.
@@ -393,7 +461,7 @@ func (m *Manager) RouterPeer() (Peer, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	for _, p := range m.cfg.Peers {
-		if p.IsRouter {
+		if p.IsRouter || (m.cfg.Client.PeerID != "" && p.ID == m.cfg.Client.PeerID) {
 			return p, true
 		}
 	}

@@ -77,6 +77,9 @@ type AWG2Status struct {
 func (svc *Service) initAWG() {
 	state := svc.loadAWGState()
 	svc.installAWGState(state)
+	if svc.ensureRouterPeersLocal() {
+		svc.awgSave()
+	}
 	// Bring the local client tunnel up on boot if the user enabled it (best-effort).
 	cfg := svc.awg.Config()
 	if cfg.Client.Enabled {
@@ -222,6 +225,29 @@ func (svc *Service) snapshotAWGState() awgPersisted {
 	return st
 }
 
+func (svc *Service) ensureRouterPeersLocal() bool {
+	svc.mu.RLock()
+	entries := make([]*managedServer, 0, len(svc.order))
+	for _, id := range svc.order {
+		if srv := svc.servers[id]; srv != nil {
+			entries = append(entries, srv)
+		}
+	}
+	svc.mu.RUnlock()
+
+	changed := false
+	for _, srv := range entries {
+		cfg := srv.Manager.Config()
+		if cfg.Install == "imported" {
+			continue
+		}
+		if _, ok, err := srv.Manager.EnsureRouterPeerLocal(); err == nil && ok {
+			changed = true
+		}
+	}
+	return changed
+}
+
 func (svc *Service) activeServerID() string {
 	svc.mu.RLock()
 	defer svc.mu.RUnlock()
@@ -313,6 +339,7 @@ func (svc *Service) AWG2AddServer(name string) AWG2Status {
 	cfg := awg.Default()
 	id := "awg-" + storeutil.NewID()
 	srv := &managedServer{ID: id, Name: strings.TrimSpace(name), Manager: awg.NewManager(cfg)}
+	_, _, _ = srv.Manager.EnsureRouterPeerLocal()
 	old := svc.awg
 	if old != nil {
 		_ = svc.awgTeardownRoutingOS()
@@ -523,6 +550,11 @@ func (svc *Service) deployServer(srv *managedServer) (awg.DeployResult, error) {
 	if cfg.Install == "imported" {
 		return awg.DeployResult{}, fmt.Errorf("это импортированный конфиг — деплой на VPS недоступен, можно только поднимать туннель")
 	}
+	if _, changed, err := srv.Manager.EnsureRouterPeer(context.Background()); err != nil {
+		return awg.DeployResult{}, err
+	} else if changed {
+		svc.awgSave()
+	}
 	if changed, err := srv.Manager.EnsureKeys(); err != nil {
 		return awg.DeployResult{}, err
 	} else if changed {
@@ -580,6 +612,10 @@ func (svc *Service) AWG2RemovePeer(id string) error {
 
 func (svc *Service) AWG2ClientConfig(id string) (text, filename string, err error) {
 	return svc.awg.ClientConfig(id)
+}
+
+func (svc *Service) AWG2ClientExport(id, format string) (text, filename, contentType string, err error) {
+	return svc.awg.ClientExport(id, format)
 }
 
 // AWG2SetRouting persists the split-routing config (mode/zones/mtu/etc.) and — when
