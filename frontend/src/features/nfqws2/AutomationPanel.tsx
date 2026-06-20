@@ -91,7 +91,7 @@ export function AutomationPanel() {
   return (
     <Card
       title="Автоматика"
-      sub="watchdog VPN → fallback на NFQWS2 + авто-пик стратегии"
+      sub="watchdog запуска NFQWS2 + авто-пик стратегии"
       head={
         <div className="flex flex-wrap items-center gap-1.5">
           {st.awg_healthy
@@ -108,11 +108,11 @@ export function AutomationPanel() {
           <div className="mb-1 text-[12px] uppercase tracking-wide text-muted">Режим NFQWS2</div>
           <div className="inline-flex overflow-hidden rounded-lg border border-line">
             {modeBtn("off", "всегда выкл", "Не запускать — даже если VPN упадёт")}
-            {modeBtn("auto", "авто (fallback)", "Включать только если VPN не отвечает 60+ с")}
+            {modeBtn("auto", "авто (fallback)", "Запускать если VPN не отвечает 60+ с, но не выключать автоматически")}
             {modeBtn("on", "всегда вкл", "Держать включённым постоянно (как было раньше)")}
           </div>
           <p className="mt-1 text-[11.5px] text-muted">
-            «авто» — по умолчанию NFQWS2 выключен, поднимается только когда AWG-туннель тух (handshake &gt; 3 мин или rx стоит). Возвращается AWG — гасим обратно. Это экономит ~50 MB RAM и нагрузку на NFQUEUE.
+            По умолчанию NFQWS2 держится включённым. «авто» — только поднимает NFQWS2, если AWG-туннель тух (handshake &gt; 3 мин или rx стоит), но не выключает его обратно.
           </p>
         </div>
 

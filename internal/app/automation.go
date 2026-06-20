@@ -2,11 +2,10 @@ package app
 
 // Hands-off automation for the DPI bypass:
 //
-//   - WATCHDOG. nfqws2 is heavy (~50 MB RSS, NFQUEUE traffic copy). When the
-//     AWG tunnel works, every blocked site rides the VPN and the DPI engine is
-//     wasted load. So we keep it OFF by default and start it ONLY when AWG
-//     dies. When AWG comes back, stop it again. The user can override via
-//     mode={off|on|auto}.
+//   - WATCHDOG. NFQWS2 is the primary DPI bypass and must stay on by default.
+//     The watchdog can still start it if AWG dies, but it never stops NFQWS2
+//     just because AWG looks healthy; that surprised users and looked like a
+//     crash. Users who really want it off can choose mode=off explicitly.
 //
 //   - AUTO-PICK. Picking a working DPI strategy is normally a manual scan +
 //     pick + apply dance. On first boot (or when the configured strategy
@@ -18,7 +17,7 @@ package app
 //     re-pick. Default OFF (user opt-in only) since each scan is real traffic.
 //
 // AWG health = (handshake age < 180s) AND (rx_bytes increasing OR no traffic
-// expected). 30s tick, 2 confirmations either way before flipping nfqws2.
+// expected). 30s tick, 2 confirmations before starting fallback in auto mode.
 
 import (
 	"context"
@@ -55,7 +54,7 @@ var defaultAutoPickTargets = []string{
 
 // AutomationConfig is the user-tunable part.
 type AutomationConfig struct {
-	Mode         string `json:"mode"`          // "off" | "on" | "auto" (default: "auto")
+	Mode         string `json:"mode"`          // "off" | "on" | "auto" (default: "on")
 	AutoPick     bool   `json:"auto_pick"`     // run a scan-and-apply if conf is empty/dead at boot (default true)
 	PeriodicScan bool   `json:"periodic_scan"` // re-pick every IntervalH hours (default false — opt-in)
 	IntervalH    int    `json:"interval_h"`    // re-scan period when PeriodicScan is on (default 24)
@@ -86,10 +85,10 @@ type automationRuntime struct {
 	state  AutomationState
 	stopCh chan struct{}
 
-	healthyStreak  int
+	healthyStreak   int
 	unhealthyStreak int
-	lastRx         int64
-	lastRxAt       time.Time
+	lastRx          int64
+	lastRxAt        time.Time
 
 	pickRunning bool
 	pickedAt    time.Time // last time we successfully applied a strategy
@@ -98,7 +97,7 @@ type automationRuntime struct {
 func defaultAutomation() AutomationState {
 	return AutomationState{
 		AutomationConfig: AutomationConfig{
-			Mode:         "auto",
+			Mode:         "on",
 			AutoPick:     true,
 			PeriodicScan: false,
 			IntervalH:    24,
@@ -113,6 +112,13 @@ func (a *App) initAutomation() {
 	var st AutomationState
 	if err := a.store.Load(automationFile, &st); err != nil || st.Mode == "" {
 		st = defaultAutomation()
+		_ = a.store.Save(automationFile, &st)
+	}
+	if st.Mode == "auto" {
+		// v1.3.8 defaulted to "auto" and stopped NFQWS2 whenever AWG looked
+		// healthy. Migrate that surprising default back to the historical behavior:
+		// keep NFQWS2 running unless the user explicitly switches modes again.
+		st.Mode = "on"
 		_ = a.store.Save(automationFile, &st)
 	}
 	if st.IntervalH <= 0 {
@@ -135,6 +141,7 @@ func (a *App) automationLoop() {
 	// "unhealthy" with zero rx_bytes.
 	a.refreshAWGSample()
 	a.maybeRunFirstBootPick()
+	a.automationStep()
 
 	tick := time.NewTicker(tickInterval)
 	defer tick.Stop()
@@ -175,8 +182,6 @@ func (a *App) automationStep() {
 	default: // "auto"
 		if rt.unhealthyStreak >= confirmTicks && !a.nfqws2Running() {
 			a.silentNfqws2Start(fmt.Sprintf("AWG down %ds → fallback", hAge))
-		} else if rt.healthyStreak >= confirmTicks && a.nfqws2Running() {
-			a.silentNfqws2Stop("AWG healthy — stopping fallback")
 		}
 	}
 

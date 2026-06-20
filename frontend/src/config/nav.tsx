@@ -60,8 +60,7 @@ export const NAV_GROUPS: { title: string; items: NavItem[] }[] = [
   { title: "Статус", items: ["dashboard", "conns", "devices"] },
   { title: "Подбор", items: ["runs", "blockcheck", "strategies", "blobs"] },
   { title: "Списки и данные", items: ["lists", "geo", "dns"] },
-  { title: "Сервисы", items: [{ sub: "Telegram", tabs: ["mtproto", "socks5"] }, "nfqws2", "awg2", "portforward", "pihole"] },
-  { title: "Сервисы", items: [{ sub: "Telegram", tabs: ["mtproto", "socks5"] }, "nfqws2", "awg2", "portforward", "arpspoof"] },
+  { title: "Сервисы", items: [{ sub: "Telegram", tabs: ["mtproto", "socks5"] }, "nfqws2", "awg2", "portforward", "pihole", "arpspoof"] },
   { title: "Управление", items: ["logs", "system"] },
 ];
 
