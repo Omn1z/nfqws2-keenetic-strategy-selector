@@ -93,17 +93,23 @@ func (svc *Service) initAWG() {
 			// AND commit: the apply still arms the ~90s dead-man's switch, the
 			// commit disarms it, so a misapply still auto-rolls-back.
 			c := svc.awg.Config()
-			if c.Routing.Active && c.Routing.Mode != "off" {
+			if awgShouldRestoreRouting(c) {
 				time.Sleep(4 * time.Second) // let the handshake settle + startup repair finish
 				if err := svc.awgApplyRoutingOS(); err != nil {
 					log.Printf("awg: routing auto-apply: %v", err)
 				} else {
 					_ = svc.awgCommitRoutingOS()
+					svc.awg.SetRoutingActive(true)
+					svc.awgSave()
 					logbuf.Append("awg2", "info", "маршрутизация восстановлена после перезапуска")
 				}
 			}
 		}()
 	}
+}
+
+func awgShouldRestoreRouting(c awg.ServerConfig) bool {
+	return c.Routing.Mode != "off" && (c.Routing.Active || c.Client.Enabled)
 }
 
 func (svc *Service) awgSave() {
@@ -413,6 +419,15 @@ func (svc *Service) AWG2SetServerEnabled(id string, enabled bool) error {
 	}
 	srv.Manager.SetEnabled(enabled)
 	svc.awgSave()
+	if enabled && active && srv.Manager.Config().Routing.Mode != "off" {
+		go func() {
+			if err := svc.awgEnsureClientUpForRouting("включения сервера"); err != nil {
+				logbuf.Append("awg2", "warn", "туннель после включения сервера не поднялся: "+err.Error())
+				return
+			}
+			svc.awgRestoreCommittedRouting("включения сервера")
+		}()
+	}
 	return nil
 }
 
@@ -580,6 +595,9 @@ func (svc *Service) deployServer(srv *managedServer) (awg.DeployResult, error) {
 		sctx, scancel := context.WithTimeout(context.Background(), 25*time.Second)
 		_, _ = srv.Manager.Status(sctx)
 		scancel()
+		if srv.ID == svc.activeServerID() && srv.Manager.Config().Client.Enabled {
+			go svc.awgReconnectActiveClientAfterDeploy(srv.ID)
+		}
 	}
 	if err != nil {
 		logbuf.Append("awg2", "error", "деплой: "+err.Error())

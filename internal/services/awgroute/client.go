@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"nfqws2strategy/internal/services/awg"
+	"nfqws2strategy/internal/tools/logbuf"
 )
 
 // EngineInfo reports the installed userspace AmneziaWG engine on the router.
@@ -116,8 +117,24 @@ func (svc *Service) awgClientStatus() *ClientStatus     { return svc.awgClientSt
 // AWG2ClientUp brings up the local tunnel and persists Client.Enabled=true so it
 // autostarts after a panel restart.
 func (svc *Service) AWG2ClientUp() error {
+	if err := svc.awgEnsureClientUpForRouting("ручного включения"); err != nil {
+		return err
+	}
+	svc.awgRestoreCommittedRoutingAsync("поднятия туннеля")
+	return nil
+}
+
+func (svc *Service) awgEnsureClientUpForRouting(reason string) error {
 	if !svc.awg.Config().Enabled {
 		return fmt.Errorf("AWG2-сервер выключен")
+	}
+	if cs := svc.awgClientStatusOS(); cs != nil && cs.IfacePresent {
+		if !svc.awg.Config().Client.Enabled {
+			svc.awg.SetClientEnabled(true)
+			svc.route.tunnelUpAt.Store(0)
+			svc.awgSave()
+		}
+		return nil
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
 	defer cancel()
@@ -126,6 +143,7 @@ func (svc *Service) AWG2ClientUp() error {
 	} else if changed {
 		svc.awgSave()
 	}
+	logbuf.Append("awg2", "info", "туннель awg0 не поднят — поднимаю автоматически для "+reason)
 	if err := svc.awgClientUpOS(); err != nil {
 		return err
 	}
@@ -299,3 +317,41 @@ func (svc *Service) awgRepairRouting() { svc.awgRepairRoutingOS() }
 // awgTeardownRouting is the internal teardown (e.g. on client-down/shutdown). It
 // does NOT clear the committed flag, so routing restores when the tunnel returns.
 func (svc *Service) awgTeardownRouting() { _ = svc.awgTeardownRoutingOS() }
+
+func (svc *Service) awgRestoreCommittedRoutingAsync(reason string) {
+	cfg := svc.awg.Config()
+	if !awgShouldRestoreRouting(cfg) {
+		return
+	}
+	go svc.awgRestoreCommittedRouting(reason)
+}
+
+func (svc *Service) awgRestoreCommittedRouting(reason string) {
+	cfg := svc.awg.Config()
+	if !awgShouldRestoreRouting(cfg) {
+		return
+	}
+	if err := svc.awgRefreshRoutingOS(); err != nil {
+		logbuf.Append("awg2", "warn", "автовосстановление маршрутизации после "+reason+": "+err.Error())
+		return
+	}
+	svc.awg.SetRoutingActive(true)
+	svc.awgSave()
+	logbuf.Append("awg2", "info", "маршрутизация восстановлена после "+reason)
+}
+
+func (svc *Service) awgReconnectActiveClientAfterDeploy(id string) {
+	if svc.activeServerID() != id {
+		return
+	}
+	cfg := svc.awg.Config()
+	if !cfg.Client.Enabled {
+		return
+	}
+	if err := svc.awgClientUpOS(); err != nil {
+		logbuf.Append("awg2", "warn", "клиент после деплоя не переподнят: "+err.Error())
+		return
+	}
+	svc.route.tunnelUpAt.Store(0)
+	svc.awgRestoreCommittedRouting("деплоя сервера")
+}
