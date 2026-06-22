@@ -3,6 +3,11 @@
 Все заметные изменения проекта. Формат — [Keep a Changelog](https://keepachangelog.com/ru/),
 версионирование приближено к SemVer.
 
+## [v1.3.16] — 2026-06-22
+### Исправлено
+- **AWG2: `ip endpoint route ... Network is unreachable`.** Выбор default-маршрута теперь разбирает вывод `ip route show default` построчно, чтобы gateway и interface не склеивались из разных маршрутов (`via 192.168.0.1` + `dev nwg1`).
+- **AWG2: endpoint pin снова best-effort.** Неудачная попытка закрепить host-route до VPN endpoint больше не блокирует применение маршрутизации; критичными остаются только маршрут в table 998 и `ip rule add`.
+
 ## [v1.3.15] — 2026-06-22
 ### Исправлено
 - **AWG2: `ip route/rule batch: exit status 1` при применении маршрутизации.** Удаление старого `ip rule` больше не выполняется внутри проверяемого `ip -batch`: на первом применении правило ожидаемо отсутствует, а `iproute2` всё равно завершает batch с кодом 1. Критичные `route replace` и `rule add` по-прежнему проверяются.

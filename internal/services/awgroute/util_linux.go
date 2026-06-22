@@ -182,8 +182,32 @@ func awgTunnelV6Reaches() bool {
 
 func awgDefaultRoute() (gw, dev string) {
 	out, _ := awgRun("ip route show default")
-	f := strings.Fields(out)
-	for i := 0; i+1 < len(f); i++ {
+	return selectDefaultRoute(out)
+}
+
+func selectDefaultRoute(out string) (gw, dev string) {
+	var fallbackDev string
+	for _, ln := range strings.Split(out, "\n") {
+		g, d := parseDefaultRouteLine(ln)
+		if d == "" || d == awgIface {
+			continue
+		}
+		if g != "" {
+			return g, d
+		}
+		if fallbackDev == "" {
+			fallbackDev = d
+		}
+	}
+	return "", fallbackDev
+}
+
+func parseDefaultRouteLine(line string) (gw, dev string) {
+	f := strings.Fields(line)
+	if len(f) == 0 || f[0] != "default" {
+		return "", ""
+	}
+	for i := 1; i+1 < len(f); i++ {
 		switch f[i] {
 		case "via":
 			gw = f[i+1]
@@ -191,7 +215,14 @@ func awgDefaultRoute() (gw, dev string) {
 			dev = f[i+1]
 		}
 	}
-	return
+	return gw, dev
+}
+
+func awgEndpointRouteCmd(endpointIP, gw, dev string) string {
+	if gw != "" {
+		return "ip route replace " + endpointIP + "/32 via " + gw + " dev " + dev
+	}
+	return "ip route replace " + endpointIP + "/32 dev " + dev
 }
 
 // awgMarkCollision returns a non-empty fwmark string if some EXISTING ip rule

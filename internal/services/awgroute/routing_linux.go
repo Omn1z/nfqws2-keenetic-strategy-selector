@@ -93,7 +93,7 @@ func (svc *Service) awgApplyRoutingOS() error {
 	if endpointIP == "" {
 		return fmt.Errorf("не удалось определить IP сервера (endpoint)")
 	}
-	if gw == "" || wandev == "" {
+	if wandev == "" {
 		return fmt.Errorf("не удалось определить маршрут по умолчанию")
 	}
 	// 1) pin the endpoint via the ORIGINAL gateway first (prevents the WG loop)
@@ -113,8 +113,8 @@ func (svc *Service) awgApplyRoutingOS() error {
 	// checked batches: on a fresh apply it legitimately returns "not found".
 	// We do check the route/rule add path — a failed fwmark rule leaves packets
 	// marked by iptables but still routed through the native WAN.
-	if err := awgRunCheck("ip route replace " + endpointIP + "/32 via " + gw + " dev " + wandev); err != nil {
-		return fmt.Errorf("ip endpoint route: %w", err)
+	if err := awgRunCheck(awgEndpointRouteCmd(endpointIP, gw, wandev)); err != nil {
+		logbuf.Append("awg2", "warn", "не удалось закрепить маршрут до endpoint, продолжаем: "+err.Error())
 	}
 	if err := awgRunCheck("ip route replace default dev " + awgIface + " table " + awgTable); err != nil {
 		return fmt.Errorf("ip tunnel route: %w", err)
@@ -183,8 +183,8 @@ func (svc *Service) awgRefreshRoutingOS() error {
 	}
 	endpointIP := resolveHostIP(hostOf(cfg.Endpoint))
 	gw, wandev := awgDefaultRoute()
-	if endpointIP != "" && gw != "" && wandev != "" {
-		_, _ = awgRun("ip route replace " + endpointIP + "/32 via " + gw + " dev " + wandev)
+	if endpointIP != "" && wandev != "" {
+		_, _ = awgRun(awgEndpointRouteCmd(endpointIP, gw, wandev))
 	}
 	// A zone/mask edit must drop the IPs learned for the OLD masks — otherwise a
 	// removed domain stays tunneled ("старая зона не выгрузилась"). Flush the dynamic
