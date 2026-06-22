@@ -8,7 +8,6 @@ import (
 	"bytes"
 	"fmt"
 	"io"
-	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -39,7 +38,14 @@ var (
 	enabled atomic.Bool // logging on/off (the "Система" tab can disable it)
 )
 
-func init() { enabled.Store(true) }
+func init() {
+	enabled.Store(true)
+	// Pre-allocate ring at its steady-state capacity. Without this, the ring
+	// kept doubling through Go's append growth and ended up with twice the
+	// memory footprint (cap=4096 for len=2000) because the trim happens AFTER
+	// the underlying array has already grown.
+	ring = make([]Entry, 0, maxEntries+1)
+}
 
 // SetEnabled turns logging (ring + file) on or off. When off, Append is a no-op.
 func SetEnabled(on bool) { enabled.Store(on) }
@@ -58,7 +64,12 @@ func Init(w io.Writer) io.Writer {
 }
 
 // Append records one tagged line into the ring and (timestamped) to the base writer.
+// No-op when logging is disabled (the doc comment promised this; the previous
+// impl only honoured it inside the sink path, not on direct Append callers).
 func Append(module, level, msg string) {
+	if !enabled.Load() {
+		return
+	}
 	msg = strings.TrimRight(msg, "\n")
 	if msg == "" {
 		return
@@ -121,6 +132,9 @@ func Clear() {
 type sink struct{}
 
 func (sink) Write(p []byte) (int, error) {
+	if !enabled.Load() {
+		return len(p), nil // swallow silently when off
+	}
 	sinkMu.Lock()
 	partial = append(partial, p...)
 	var lines []string
@@ -142,8 +156,6 @@ func (sink) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-var reHTTP = regexp.MustCompile(`^(GET|POST|PUT|DELETE|PATCH) /`)
-
 func inferModule(line string) string {
 	switch {
 	case strings.HasPrefix(line, "tgws:"):
@@ -158,10 +170,19 @@ func inferModule(line string) string {
 		return "dns"
 	case strings.HasPrefix(line, "update") || strings.HasPrefix(line, "selfupdate"):
 		return "update"
-	case reHTTP.MatchString(line):
+	case isHTTPLine(line):
 		return "http"
 	}
 	return "system"
+}
+
+func isHTTPLine(line string) bool {
+	for _, v := range [...]string{"GET /", "POST /", "PUT /", "DELETE /", "PATCH /"} {
+		if strings.HasPrefix(line, v) {
+			return true
+		}
+	}
+	return false
 }
 
 func inferLevel(line string) string {
