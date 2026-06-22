@@ -26,11 +26,11 @@ func tQueryType(name string, qtype byte) []byte {
 func tQuery(name string) []byte { return tQueryType(name, 1) } // A
 
 func TestAAAABlock(t *testing.T) {
-	ms, _ := CompileMatchers([]string{"main.com"})
+	ms, _ := CompileMatcherSet([]string{"main.com"})
 	p := NewDNSProxy("127.0.0.1:0", "127.0.0.1:0", nil)
-	p.SetMatchers(ms)
+	p.SetMatchers(&ms)
 	// AAAA for a matched name → blocked (empty NOERROR response)
-	resp, ok := p.maybeBlockAAAA(tQueryType("a.main.com", 28))
+	resp, ok := p.maybeBlockAAAA("", tQueryType("a.main.com", 28))
 	if !ok {
 		t.Fatal("AAAA for a matched name should be blocked")
 	}
@@ -41,11 +41,11 @@ func TestAAAABlock(t *testing.T) {
 		t.Errorf("blocked response ANCOUNT=%d, want 0", an)
 	}
 	// AAAA for a non-matched name → not blocked
-	if _, ok := p.maybeBlockAAAA(tQueryType("other.com", 28)); ok {
+	if _, ok := p.maybeBlockAAAA("", tQueryType("other.com", 28)); ok {
 		t.Error("AAAA for a non-matched name should not be blocked")
 	}
 	// A for a matched name → not blocked (must be forwarded so we learn its IP)
-	if _, ok := p.maybeBlockAAAA(tQueryType("a.main.com", 1)); ok {
+	if _, ok := p.maybeBlockAAAA("", tQueryType("a.main.com", 1)); ok {
 		t.Error("A query should never be blocked")
 	}
 }
@@ -53,9 +53,9 @@ func TestAAAABlock(t *testing.T) {
 func TestRecentRematch(t *testing.T) {
 	var mu sync.Mutex
 	var got []string
-	p := NewDNSProxy("127.0.0.1:0", "127.0.0.1:0", func(_, ip string) {
+	p := NewDNSProxy("127.0.0.1:0", "127.0.0.1:0", func(_ string, ips []string) {
 		mu.Lock()
-		got = append(got, ip)
+		got = append(got, ips...)
 		mu.Unlock()
 	})
 	// The device resolved ipinfo.io while no mask matched it (remembered only).
@@ -63,8 +63,8 @@ func TestRecentRematch(t *testing.T) {
 	// Now the user adds a mask that DOES match it — the recent re-check must add the
 	// IP immediately, without the device looking it up again. Also asserts the
 	// "ip*.*" glob matches "ipinfo.io".
-	ms, _ := CompileMatchers([]string{"ip*.*"})
-	p.SetMatchers(ms)
+	ms, _ := CompileMatcherSet([]string{"ip*.*"})
+	p.SetMatchers(&ms)
 	time.Sleep(150 * time.Millisecond) // SetMatchers re-evaluates asynchronously
 	mu.Lock()
 	defer mu.Unlock()
@@ -120,13 +120,13 @@ func TestDNSProxyE2E(t *testing.T) {
 
 	var mu sync.Mutex
 	var got []string
-	p := NewDNSProxy("127.0.0.1:0", up.LocalAddr().String(), func(_, ip string) {
+	p := NewDNSProxy("127.0.0.1:0", up.LocalAddr().String(), func(_ string, ips []string) {
 		mu.Lock()
-		got = append(got, ip)
+		got = append(got, ips...)
 		mu.Unlock()
 	})
-	ms, _ := CompileMatchers([]string{"main.com"})
-	p.SetMatchers(ms)
+	ms, _ := CompileMatcherSet([]string{"main.com"})
+	p.SetMatchers(&ms)
 	if err := p.Start(); err != nil {
 		t.Fatal(err)
 	}
