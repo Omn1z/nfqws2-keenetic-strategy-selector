@@ -24,7 +24,7 @@ func (svc *Service) SetDNSChainEnabled(enabled bool) {
 	if svc.route.dnsChainEnabledFlag.Swap(enabled) == enabled {
 		return
 	}
-	_ = svc.awgRefreshRoutingOS()
+	svc.awgApplyMultiHostRoutesOS()
 }
 
 // dnsChainEnabled returns the current chain mode for the firewall hook generator.

@@ -10,6 +10,8 @@ func TestSharedCDNProvider(t *testing.T) {
 	}{
 		{"104.16.1.1", "Cloudflare", true},
 		{"172.67.1.1", "Cloudflare", true},
+		{"8.47.69.0", "Cloudflare", true},
+		{"8.6.112.0", "Cloudflare", true},
 		{"2606:4700::1", "Cloudflare", true},
 		{"8.8.8.8", "", false},
 		{"not-an-ip", "", false},

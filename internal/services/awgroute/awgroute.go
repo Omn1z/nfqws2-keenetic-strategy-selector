@@ -1067,11 +1067,8 @@ func (svc *Service) AWG2SetRouting(rc awg.RoutingConfig) error {
 	if cfg.Routing.Mode == "off" {
 		return svc.AWG2TeardownRouting()
 	}
-	// Apply to the live tunnel in the BACKGROUND so the HTTP response (and the UI
-	// «Сохранить и применить» button) returns instantly and can NEVER freeze on a
-	// slow router command — awgRefreshRoutingOS runs several ipset/iptables/ip calls
-	// (each capped at 15s) and a transiently-slow one would otherwise hang the request.
-	// The config is already persisted above; the refresh re-asserts the live state.
-	go func() { _ = svc.awgRefreshRoutingOS() }()
+	// Re-apply through the multi-policy datapath so config edits update AWG2_MULTI
+	// and awgm_* before the HTTP request returns.
+	svc.awgApplyMultiHostRoutesOS()
 	return nil
 }

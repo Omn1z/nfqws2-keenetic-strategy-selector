@@ -25,12 +25,12 @@ type DNSProxy struct {
 	// CDNs). The per-IP work — ipset add, family bookkeeping — happens
 	// inside the callback; the per-NAME decision (FMW route + source-zone
 	// match) is computed once at the top, not 2-8x per query.
-	onMatch  func(name string, ips []string)
+	onMatch func(name string, ips []string)
 	// onQuery, if set, is invoked once per successfully forwarded DNS query with
 	// the client IP, qname, qtype mnemonic ("A"/"AAAA"/raw uint), the resolved
-	// IPs, and whether the qname matched the active matchers. Used by the trace
-	// log; never on the routing decision path (that goes through onMatch).
-	onQuery  func(srcIP, qname, qtype string, ips []string, sinkholed bool)
+	// IPs, and whether the response was sinkholed. The route layer uses it for
+	// trace rows and source-aware DNS learning before the response returns.
+	onQuery func(srcIP, qname, qtype string, ips []string, sinkholed bool)
 	// onBlock, if set, is invoked when maybeBlockAAAA synthesizes an empty NOERROR
 	// response for a matched AAAA query — so trace can show "AAAA blocked, fallback to v4".
 	onBlock  func(srcIP, qname string)
@@ -309,8 +309,8 @@ func (p *DNSProxy) handleUDP(uc *net.UDPConn, client *net.UDPAddr, bp *[]byte, n
 	}
 	resp := respBuf[:respN]
 	p.inspectParsed(qname, qok, resp)
-	_, _ = uc.WriteToUDP(resp, client)
 	p.traceQueryParsed(srcIP, qname, qtype, qok, resp)
+	_, _ = uc.WriteToUDP(resp, client)
 }
 
 // traceQueryParsed is the parse-once variant: handleUDP/handleTCP parse the
@@ -401,7 +401,6 @@ func (p *DNSProxy) forwardUDPInto(query, respBuf []byte) (int, error) {
 	}
 }
 
-
 func (p *DNSProxy) serveTCP(tl net.Listener) {
 	for {
 		conn, err := tl.Accept()
@@ -455,8 +454,8 @@ func (p *DNSProxy) handleTCP(conn net.Conn) {
 	copy(out, respBuf[:n])
 	p.bufPool.Put(bp)
 	p.inspectParsed(qname, qok, out)
-	_ = writeTCPMsg(conn, out)
 	p.traceQueryParsed(srcIP, qname, qtype, qok, out)
+	_ = writeTCPMsg(conn, out)
 }
 
 // inspect reads the question name from the query and, if it matches, adds every

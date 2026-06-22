@@ -19,7 +19,7 @@ func TestMultiFirewallHookWaitsForXtablesLock(t *testing.T) {
 		SetName: "awgm_000",
 		HasDst:  true,
 		Sources: []string{"192.168.3.151"},
-	}})
+	}}, false, false)
 	for _, want := range []string{
 		"iptables -w -t mangle -D PREROUTING",
 		"IPTABLES_RESTORE='iptables-restore --noflush'",
@@ -41,6 +41,29 @@ func TestMultiFirewallHookWaitsForXtablesLock(t *testing.T) {
 	} {
 		if strings.Contains(hook, bad) {
 			t.Fatalf("multi hook still has non-waiting command %q:\n%s", bad, hook)
+		}
+	}
+}
+
+func TestMultiFirewallHookCanRedirectDNS(t *testing.T) {
+	hook := awgMultiFirewallHook([]awgMultiTunnel{{
+		Iface:      "awg0",
+		EndpointIP: "138.124.229.182",
+		Table:      901,
+		Mark:       awgMultiMark(1),
+		MTU:        1280,
+	}}, []awgMultiRule{{
+		Tunnel:  &awgMultiTunnel{Mark: awgMultiMark(1)},
+		SetName: "awgm_000",
+		HasDst:  true,
+	}}, true, false)
+	for _, want := range []string{
+		"grep -qi ':14EA ' /proc/net/udp /proc/net/udp6",
+		"--dport 53 -j REDIRECT --to-ports 5354",
+		"ip6tables -t nat -C PREROUTING",
+	} {
+		if !strings.Contains(hook, want) {
+			t.Fatalf("multi hook misses DNS redirect %q:\n%s", want, hook)
 		}
 	}
 }

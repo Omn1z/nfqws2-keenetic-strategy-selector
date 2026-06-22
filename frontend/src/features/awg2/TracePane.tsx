@@ -43,7 +43,6 @@ const PAGE_SIZES = [10, 25, 50, 100];
 const TRACE_KIND_OPTIONS: { value: TraceKind; label: string }[] = [
   { value: "dns", label: "DNS" },
   { value: "sni", label: "SNI" },
-  { value: "flow", label: "Flow" },
 ];
 const ALL_TRACE_KINDS = TRACE_KIND_OPTIONS.map((o) => o.value);
 

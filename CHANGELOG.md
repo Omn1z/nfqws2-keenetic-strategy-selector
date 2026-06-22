@@ -3,6 +3,12 @@
 Все заметные изменения проекта. Формат — [Keep a Changelog](https://keepachangelog.com/ru/),
 версионирование приближено к SemVer.
 
+## [v1.4.1a] — 2026-06-23
+### Исправлено
+- **AWG2 multi-routing: доменные правила применяются сразу.** После сохранения зон multi-policy обновляет `AWG2_MULTI`/`awgm_*` синхронно, а DNS-прокси для multi-режима учит IP до отдачи ответа клиенту, чтобы новый сайт начинал маршрутизироваться без нескольких долгих первых открытий.
+- **AWG2/Tarkov: shared Cloudflare/BYOIP адреса больше не затягивают чужие сервисы в туннель.** `8.47.69.0/24` и `8.6.112.0/24` исключены из статического resolve и DNS-learning для доменных multi-правил, поэтому `launcher.escapefromtarkov.com` не получает Cloudflare challenge HTML вместо JSON из-за соседних доменов на том же edge.
+- **AWG2 Trace: возвращена старая трассировка без Flow.** Фоновый conntrack flow collector больше не запускается, а фильтр трассировки снова показывает только `DNS` и `SNI`.
+
 ## [v1.4.1] — 2026-06-23
 ### Добавлено
 - **AWG2 Trace: реальные flow-события из conntrack.** Трассировка больше не зависит только от DNS/SNI runtime и показывает TCP/UDP/QUIC/ICMP соединения, порты, state/event, bytes/reply_bytes, matched rule и tunnel iface.

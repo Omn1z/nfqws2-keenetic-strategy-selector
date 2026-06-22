@@ -36,6 +36,8 @@ var sharedCDNPrefixSource = []struct {
 	{"Cloudflare", "104.24.0.0/14"},
 	{"Cloudflare", "172.64.0.0/13"},
 	{"Cloudflare", "131.0.72.0/22"},
+	{"Cloudflare", "8.47.69.0/24"},
+	{"Cloudflare", "8.6.112.0/24"},
 	{"Cloudflare", "2400:cb00::/32"},
 	{"Cloudflare", "2606:4700::/32"},
 	{"Cloudflare", "2803:f800::/32"},
