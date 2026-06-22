@@ -2,21 +2,12 @@
 
 package awgroute
 
-// External services (currently the Pi-hole chain toggle) can swap the DNS
-// proxy's upstream resolver — the AWG2 zone-routing logic doesn't change, only
-// where the proxy forwards unmatched queries.
-
 // awgEffectiveDNSUpstream returns the addr the DNS proxy should forward to.
-// Default is awgDNSUpstream (the system resolver); an override set by
-// SetDNSUpstream wins so the Pi-hole chain can splice into the path.
-func (svc *Service) awgEffectiveDNSUpstream() string {
-	svc.route.mu.Lock()
-	defer svc.route.mu.Unlock()
-	if svc.route.dnsUpstreamOverride != "" {
-		return svc.route.dnsUpstreamOverride
-	}
-	return awgDNSUpstream
-}
+// Currently always awgDNSUpstream — the chain toggle works by moving the
+// iptables REDIRECT target between :5353 (pi-hole-first) and :5354 (proxy-
+// direct), NOT by rewiring the proxy's upstream. Kept as a helper so future
+// non-REDIRECT chain topologies can splice in without touching every caller.
+func (svc *Service) awgEffectiveDNSUpstream() string { return awgDNSUpstream }
 
 // DNSProxyUpstreamAddr returns the proxy's listening address in pi-hole/dnsmasq
 // "IP#PORT" upstream syntax. Pi-hole points its upstream here when the chain is
@@ -24,19 +15,20 @@ func (svc *Service) awgEffectiveDNSUpstream() string {
 // classifies every query while pi-hole logs the real client IP.
 func DNSProxyUpstreamAddr() string { return "127.0.0.1#" + awgDNSPort }
 
-// SetDNSUpstream records an override (or clears it with "") and pushes it into
-// the running DNS proxy, if one exists. Cheap atomic swap on the proxy side —
-// in-flight queries finish on the old upstream; new ones use the new addr.
-func (svc *Service) SetDNSUpstream(addr string) {
-	svc.route.mu.Lock()
-	svc.route.dnsUpstreamOverride = addr
-	p := svc.route.dnsProxy
-	svc.route.mu.Unlock()
-	if p != nil {
-		if addr == "" {
-			p.SetUpstream(awgDNSUpstream)
-		} else {
-			p.SetUpstream(addr)
-		}
+// SetDNSChainEnabled flips the chain mode and rewrites the firewall hook so the
+// REDIRECT target moves to pi-hole (:5353) when on or back to the proxy (:5354)
+// when off. No-op when routing isn't currently applied — the hook will pick up
+// the new state on the next routing apply. The CAS on the atomic.Bool gives
+// us "already in that state → no-op" without a mutex round-trip.
+func (svc *Service) SetDNSChainEnabled(enabled bool) {
+	if svc.route.dnsChainEnabledFlag.Swap(enabled) == enabled {
+		return
 	}
+	_ = svc.awgRefreshRoutingOS()
+}
+
+// dnsChainEnabled returns the current chain mode for the firewall hook generator.
+// Called on every watchdog tick + every DNS-proxy ensure — lock-free read.
+func (svc *Service) dnsChainEnabled() bool {
+	return svc.route.dnsChainEnabledFlag.Load()
 }

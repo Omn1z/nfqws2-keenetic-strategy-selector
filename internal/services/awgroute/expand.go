@@ -29,7 +29,19 @@ const awgNfqwsListsDir = "/opt/etc/nfqws2/lists"
 // The expansion is performed every time the firewall/ipset/DNS pipeline rebuilds
 // (apply, watchdog, DNS-proxy reload). That keeps geosite/list edits picked up
 // without the user having to retype zone contents.
-func (svc *Service) expandEntries(in []string) (domains, ips []string) {
+//
+// expandEntries is the cached entry point — multiple apply-phase consumers
+// (sets v4/v6, decision build, DNS proxy ensure, source-zone matchers) hit
+// the same input slices, and the geosite/geoip/list expansion is multi-MB
+// of work per call. The cache is keyed on the (joined zone-text, zonesRevision)
+// tuple so any zones edit transparently invalidates everything.
+func (svc *Service) expandEntries(in []string) ([]string, []string) {
+	return svc.expandEntriesMemo(in)
+}
+
+// expandEntriesUncached is the raw expansion — does the geosite/geoip/list/regex
+// work. Wrapped by expandEntriesMemo for caching.
+func (svc *Service) expandEntriesUncached(in []string) (domains, ips []string) {
 	seenDom := map[string]struct{}{}
 	seenIP := map[string]struct{}{}
 	pushDom := func(s string) {

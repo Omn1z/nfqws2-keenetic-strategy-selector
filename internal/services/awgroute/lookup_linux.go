@@ -4,24 +4,35 @@ package awgroute
 
 import "strings"
 
-// lookupMAC returns the LAN MAC address (lowercased aa:bb:cc:dd:ee:ff) for a
-// given IPv4 source from the kernel ARP/neighbour cache; empty string if not
-// learned yet. The firewall hook calls this to emit `-m mac --mac-source` rules
-// in ip6tables for per-device routing — IPv6 source addresses rotate (SLAAC +
-// privacy extensions), but the device MAC stays put.
-func lookupMAC(ip string) string {
-	out, err := awgRun("ip neigh show " + ip)
-	if err != nil {
-		return ""
-	}
-	// Format: "192.168.31.243 dev br-lan lladdr 84:a9:38:c9:d4:36 REACHABLE"
-	for _, ln := range strings.Split(out, "\n") {
-		fs := strings.Fields(ln)
-		for i, f := range fs {
-			if f == "lladdr" && i+1 < len(fs) {
-				return strings.ToLower(fs[i+1])
+// lookupMACBatch dumps the IPv4 AND IPv6 neighbour caches and returns a
+// map[ip]mac. Hook generation calls this once and re-uses the map for every
+// per-source-IP rule emit, replacing N forks with 2 (one per family).
+//
+// Stock busybox iproute2 prints only ONE family per invocation: `ip neigh show`
+// without `-6` returns just the v4 table, so a source-bound zone whose
+// source_ips entry is a real IPv6 address (e.g. a GUA from SLAAC) would never
+// match a MAC and emitSourceRule6 would silently skip the rule. Run both
+// families explicitly.
+func lookupMACBatch() map[string]string {
+	m := make(map[string]string, 64)
+	for _, cmd := range []string{"ip -4 neigh show", "ip -6 neigh show"} {
+		out, err := awgRun(cmd)
+		if err != nil || out == "" {
+			continue
+		}
+		for _, ln := range strings.Split(out, "\n") {
+			fs := strings.Fields(ln)
+			if len(fs) < 1 {
+				continue
+			}
+			ip := fs[0]
+			for i := 1; i < len(fs); i++ {
+				if fs[i] == "lladdr" && i+1 < len(fs) {
+					m[ip] = strings.ToLower(fs[i+1])
+					break
+				}
 			}
 		}
 	}
-	return ""
+	return m
 }

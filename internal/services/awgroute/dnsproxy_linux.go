@@ -3,6 +3,8 @@
 package awgroute
 
 import (
+	"fmt"
+
 	"nfqws2strategy/internal/services/awg"
 	"nfqws2strategy/internal/tools/logbuf"
 )
@@ -12,57 +14,25 @@ import (
 // entry it adds the IPs to the routing ipset. Started/refreshed/stopped together
 // with split-routing when domain_source=="dnsproxy".
 
-// awgZoneMatchers compiles domain matchers from ALL enabled zones (any direction).
-// The proxy fires onMatch for a name matching any zone; the callback then routes
-// the IP to the include or exclude set by which zone matched.
-func (svc *Service) awgZoneMatchers(cfg *awg.ServerConfig) []awg.DomainMatcher {
+// awgZoneMatchers compiles a flat matcher of every enabled zone's domains —
+// used by the proxy's MatcherSet (the np.SetMatchers gate) to decide whether
+// a query is RELEVANT at all. The decision (tunnel vs direct) is made by the
+// onMatch callback walking the ORDERED list (awgZoneMatchersOrdered) below.
+func (svc *Service) awgZoneMatchers(cfg *awg.ServerConfig) *awg.MatcherSet {
 	var entries []string
-	for _, z := range cfg.Routing.Zones {
+	for _, z := range effectiveZones(cfg.Routing) {
 		if !z.Enabled {
 			continue
 		}
 		exp, _ := svc.expandEntries(z.Domains)
 		entries = append(entries, exp...)
 	}
-	ms, _ := awg.CompileMatchers(awgDropCatchAll(entries))
-	return ms
+	ms, _ := awg.CompileMatcherSet(awgDropCatchAll(entries))
+	return &ms
 }
 
-// awgZoneMatchersByMode compiles matchers for the enabled GLOBAL zones of one
-// direction ("include" or "exclude"). Source-bound zones are isolated to their
-// own per-zone ipset (see awgZoneSourceMatchers) and excluded here so a domain
-// scoped to one device never lands in the LAN-wide awg2_inc / awg2_exc sets.
-func (svc *Service) awgZoneMatchersByMode(cfg *awg.ServerConfig, mode string) []awg.DomainMatcher {
-	var entries []string
-	for _, z := range cfg.Routing.Zones {
-		if !z.Enabled || len(z.SourceIPs) > 0 {
-			continue
-		}
-		zm := "include"
-		if z.Mode == "exclude" {
-			zm = "exclude"
-		}
-		if zm == mode {
-			exp, _ := svc.expandEntries(z.Domains)
-			entries = append(entries, exp...)
-		}
-	}
-	ms, _ := awg.CompileMatchers(awgDropCatchAll(entries))
-	return ms
-}
-
-// awgZoneSourceMatchers builds the per-source-zone matcher list in the same
-// order as awgBuildSourceSets so each entry's SetName matches its zone's ipset.
-func (svc *Service) awgZoneSourceMatchers(cfg *awg.ServerConfig) []sourceZoneMatchers {
-	sb := sourceBoundZones(cfg.Routing.Zones)
-	out := make([]sourceZoneMatchers, 0, len(sb))
-	for i, z := range sb {
-		exp, _ := svc.expandEntries(z.Domains)
-		ms, _ := awg.CompileMatchers(awgDropCatchAll(exp))
-		out = append(out, sourceZoneMatchers{Matchers: ms, SetName: sourceZoneSetName(i)})
-	}
-	return out
-}
+// awgZoneMatchersOrdered + awgZoneSourceMatchers moved to decision.go so the
+// build-tag-free routeFor / buildRouteTable can call them.
 
 // awgEnsureDNSProxy starts/updates the domain-mask DNS proxy when
 // domain_source=="dnsproxy" with at least one matcher, otherwise stops it. It
@@ -85,7 +55,7 @@ func (svc *Service) awgEnsureDNSProxy(cfg *awg.ServerConfig) bool {
 			break
 		}
 	}
-	want := (eff == "include" || eff == "exclude" || hasSrc) && len(ms) > 0 && awgUsesDNSProxy(cfg)
+	want := (eff == "include" || eff == "exclude" || hasSrc) && ms.Len() > 0 && awgUsesDNSProxy(cfg)
 	svc.route.mu.Lock()
 	p := svc.route.dnsProxy
 	svc.route.mu.Unlock()
@@ -95,46 +65,143 @@ func (svc *Service) awgEnsureDNSProxy(cfg *awg.ServerConfig) bool {
 		}
 		return false
 	}
-	// Publish the per-direction matchers the onMatch callback routes by (lock-free,
-	// so it never contends with a routing op holding route.mu). Refreshed every call.
-	inc := svc.awgZoneMatchersByMode(cfg, "include")
-	exc := svc.awgZoneMatchersByMode(cfg, "exclude")
-	src := svc.awgZoneSourceMatchers(cfg)
-	svc.route.incMatchers.Store(&inc)
-	svc.route.excMatchers.Store(&exc)
-	svc.route.srcZoneMatchers.Store(&src)
+	// Publish a fresh routeTable snapshot — single source of truth for every
+	// hot-path decision. republishRouteTable short-circuits when the inputs
+	// match the last build (the SNI ensure that fires right after this one
+	// hits the cached snapshot for free instead of re-running expandEntries
+	// + matcher compilation).
+	tbl := svc.republishRouteTable(cfg, awgTunnelV6Reaches())
+	ordered := tbl.ordered
+	svc.route.orderedMatchers.Store(&ordered)
 	if p != nil {
 		p.SetMatchers(ms) // refresh on zone change
 		return true
 	}
-	np := awg.NewDNSProxy(awgDNSAddr, svc.awgEffectiveDNSUpstream(), func(name, ip string) {
-		if provider, ok := sharedCDNProvider(ip); ok {
-			svc.awgNoteSharedCDNSkip("dnsproxy", name, ip, provider)
-			return
-		}
-		// Per-source-bound zones first: a name landing in a device-scoped zone
-		// must reach that zone's ipset regardless of any global include/exclude
-		// overlap. v6 vs v4 picks the family-matching per-zone set.
-		v6Suffix := ""
-		if isIPv6(ip) {
-			v6Suffix = "_6"
-		}
-		if szs := svc.route.srcZoneMatchers.Load(); szs != nil {
-			for _, sz := range *szs {
-				if awg.MatchAny(sz.Matchers, name) {
-					_, _ = awgRun("ipset add " + sz.SetName + v6Suffix + " " + ip + " -exist")
+	np := awg.NewDNSProxy(awgDNSAddr, svc.awgEffectiveDNSUpstream(), func(name string, ips []string) {
+		// Per-NAME decisions computed ONCE per query. Per-IP work below
+		// shrinks to just family-pick + ipsetAddAsync. Before this hoist,
+		// the same routeFor walk + sourceZoneMatchers walk ran per IP, so
+		// a CDN answer with 8 IPs cost 8× the matcher work for an
+		// identical result.
+		dec := svc.routeFor(name, "")
+		tbl := svc.route.routeTable.Load()
+		// Pre-compute which source-bound zones matched this name. Source-
+		// bound zones are evaluated per-device but the MATCHER itself is
+		// per-NAME — hoisting the walk is correct.
+		var matchedSrc []sourceZoneDecision
+		if tbl != nil {
+			for _, sb := range tbl.source {
+				if sb.Matchers != nil && sb.Matchers.Len() > 0 && sb.Matchers.MatchAny(name) {
+					matchedSrc = append(matchedSrc, sb)
 				}
 			}
 		}
-		// Route the matched IP to the exclude set when the name matched an exclude
-		// zone (exclude wins on overlap), else the include set. Matchers are read live
-		// so a zone edit takes effect without recreating the proxy. Idempotent -exist;
-		// a zone edit flushes the sets so the next query re-learns cleanly.
-		set := awgSetInc + v6Suffix
-		if e := svc.route.excMatchers.Load(); e != nil && awg.MatchAny(*e, name) {
-			set = awgSetExc + v6Suffix
+		for _, ip := range ips {
+			v6Suffix := ""
+			if isIPv6(ip) {
+				v6Suffix = "_6"
+			}
+			// Source-bound zones first, BEFORE the shared-CDN skip: the user
+			// explicitly opted that device into this zone, so a Cloudflare/
+			// Akamai destination is what they asked for. Skipping it for "shared
+			// CDN" reasoning is correct for LAN-wide global sets (a stray vk.com
+			// → 104.16.0.0/13 routed everything-else-on-that-/13 through the
+			// tunnel) but wrong for a per-device carve-out.
+			for _, sb := range matchedSrc {
+				ipsetAddAsync(sb.SetName+v6Suffix, ip)
+			}
+			if _, ok := sharedCDNProvider(ip); ok {
+				svc.awgNoteSharedCDNSkip("dnsproxy", ip)
+				continue
+			}
+			switch dec.Route {
+			case RouteDirect:
+				ipsetAddAsync(awgSetExc+v6Suffix, ip)
+			case RouteTunnel:
+				ipsetAddAsync(awgSetInc+v6Suffix, ip)
+			}
 		}
-		_, _ = awgRun("ipset add " + set + " " + ip + " -exist")
+	})
+	// Trace hooks for the per-flow debug log. Both are no-ops when trace is off
+	// (the ring's atomic enabled-check kicks the hot path out in ~5ns).
+	//
+	// Decision logic mirrors what the firewall actually does. The DNS-proxy
+	// match alone can't tell — when the user picks a global catch-all "*" the
+	// include zone is empty AFTER awgDropCatchAll, but the firewall still
+	// marks everything-not-in-exclude → all those queries DO go via the
+	// tunnel. The trace has to know the effective mode to label them right.
+	traceMode := eff
+	np.SetOnQuery(func(srcIP, qname, qtype string, ips []string, sinkholed bool) {
+		// Don't gate on traceEnabled() here — the lifetime counters that the
+		// dashboard's "запросов в минуту" reads from must keep ticking even
+		// when ring recording is off ("trace_mode=off"). traceAppend itself
+		// always increments counters and only skips the ring write.
+		//
+		// Pi-hole sinkhole short-circuit: when the upstream returned a
+		// no-destination answer (NXDOMAIN / NOERROR-empty / 0.0.0.0|::), the
+		// FMW routing decision is moot — the client got an "address not
+		// found". Label the row "blocked" so the user sees the real outcome
+		// instead of the misleading "tunnel"/"direct" that would have applied
+		// to a real answer. CDN-skip + ipset logic are also moot here (no IP
+		// to add); fall through to a single TraceEntry with Dst="" + 0.0.0.0
+		// for the NXDOMAIN/empty case so the trace doesn't say "ждём
+		// трафика…" for a query that already completed.
+		if sinkholed {
+			if len(ips) == 0 {
+				traceAppend(TraceEntry{Src: srcIP, Kind: "dns", Name: qname, Qtype: qtype, Decision: "blocked", Reason: "pi-hole: домен в блок-листе"})
+				return
+			}
+			for _, ip := range ips {
+				traceAppend(TraceEntry{Src: srcIP, Kind: "dns", Name: qname, Qtype: qtype, Dst: ip, Decision: "blocked", Reason: "pi-hole: домен в блок-листе (null-route)"})
+			}
+			return
+		}
+		dec := svc.routeFor(qname, srcIP)
+		var decision, reason string
+		rule := dec.RuleIdx
+		switch dec.Route {
+		case RouteDirect:
+			decision = "direct"
+			reason = fmt.Sprintf("правило #%d (direct)", rule)
+		case RouteTunnel:
+			decision = "tunnel"
+			reason = fmt.Sprintf("правило #%d (tunnel)", rule)
+		default:
+			switch traceMode {
+			case "exclude", "full":
+				decision, reason = "tunnel", "маршрут по умолчанию через VPN (режим="+traceMode+")"
+			default:
+				decision, reason = "direct", "нет совпадения"
+			}
+		}
+		if len(ips) == 0 {
+			traceAppend(TraceEntry{Src: srcIP, Kind: "dns", Name: qname, Qtype: qtype, Decision: decision, Rule: rule, Reason: reason})
+			return
+		}
+		for _, ip := range ips {
+			d, r := decision, reason
+			rl := rule
+			if decision == "tunnel" {
+				if _, ok := sharedCDNProvider(ip); ok {
+					d, r, rl = "cdn-skip", "общий CDN — IP не добавлен в set", 0
+				}
+			}
+			traceAppend(TraceEntry{Src: srcIP, Kind: "dns", Name: qname, Qtype: qtype, Dst: ip, Decision: d, Rule: rl, Reason: r})
+		}
+	})
+	np.SetOnBlock(func(srcIP, qname string) {
+		// Same as above — let traceAppend gate the ring write; counter ticks always.
+		traceAppend(TraceEntry{Src: srcIP, Kind: "dns", Name: qname, Qtype: "AAAA", Decision: "blocked", Reason: "v6-noleak (FMW tunnel rule, AAAA suppressed → v4 fallback)"})
+	})
+	// AAAA blocker is just a one-line consumer of routeFor — the decision
+	// (block or not) is pre-computed by buildRouteTable from the matched
+	// rule's route + tunnelV6 snapshot, so the hot path never probes live
+	// state and the logic stays consistent with onMatch/onQuery/onHello.
+	// Pass the LAN client IP so source-bound zones evaluate per-device — a
+	// {SourceIPs:[192.168.1.50], Route:tunnel} rule must only suppress AAAA
+	// for THAT device, not the whole LAN.
+	np.SetAAAABlocker(func(srcIP, name string) bool {
+		return svc.routeFor(name, srcIP).BlockAAAA
 	})
 	svc.awgLoadRecent(np) // restore domains seen in a previous run (before matching)
 	np.SetMatchers(ms)    // re-evaluates the loaded cache → re-adds matching domains

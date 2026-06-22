@@ -125,12 +125,16 @@ func (svc *Service) AWG2ClientUp() error {
 }
 
 func (svc *Service) awgEnsureClientUpForRouting(reason string) error {
-	if !svc.awg.Config().Enabled {
+	am := svc.awgActive()
+	if am == nil {
+		return fmt.Errorf("AWG2-сервер не выбран")
+	}
+	if !am.Enabled() {
 		return fmt.Errorf("AWG2-сервер выключен")
 	}
 	if cs := svc.awgClientStatusOS(); cs != nil && cs.IfacePresent {
-		if !svc.awg.Config().Client.Enabled {
-			svc.awg.SetClientEnabled(true)
+		if !am.ClientEnabled() {
+			am.SetClientEnabled(true)
 			svc.route.tunnelUpAt.Store(0)
 			svc.awgSave()
 		}
@@ -138,7 +142,7 @@ func (svc *Service) awgEnsureClientUpForRouting(reason string) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
 	defer cancel()
-	if _, changed, err := svc.awg.EnsureRouterPeer(ctx); err != nil {
+	if _, changed, err := am.EnsureRouterPeer(ctx); err != nil {
 		return err
 	} else if changed {
 		svc.awgSave()
@@ -147,7 +151,7 @@ func (svc *Service) awgEnsureClientUpForRouting(reason string) error {
 	if err := svc.awgClientUpOS(); err != nil {
 		return err
 	}
-	svc.awg.SetClientEnabled(true)
+	am.SetClientEnabled(true)
 	svc.route.tunnelUpAt.Store(0)
 	svc.awgSave()
 	return nil
@@ -157,7 +161,9 @@ func (svc *Service) awgEnsureClientUpForRouting(reason string) error {
 // is about to disappear), clears the autostart flag, then drops the tunnel.
 func (svc *Service) AWG2ClientDown() error {
 	svc.awgTeardownRouting()
-	svc.awg.SetClientEnabled(false)
+	if am := svc.awgActive(); am != nil {
+		am.SetClientEnabled(false)
+	}
 	svc.route.tunnelUpAt.Store(0)
 	svc.awgSave()
 	return svc.awgClientDownOS()
@@ -170,25 +176,46 @@ type awgRouteState struct {
 	rollback    *time.Timer
 	stopRefresh chan struct{}
 	active      bool
-	dnsProxy    *awg.DNSProxy
-	// dnsUpstreamOverride is set when an external service (Pi-hole chain) wants
-	// the DNS proxy to forward elsewhere than awgDNSUpstream. Empty = use default.
-	// The pi-hole module calls SetDNSUpstream() which both updates this and pushes
-	// the new addr into the live DNSProxy without restarting it.
-	dnsUpstreamOverride string
-	// Per-direction domain matchers for the DNS proxy's onMatch callback (lock-free
-	// reads so a DNS answer never blocks on a routing op holding mu). Linux-only use.
-	incMatchers atomic.Pointer[[]awg.DomainMatcher]
-	excMatchers atomic.Pointer[[]awg.DomainMatcher]
-	// Per-source-bound-zone matchers + their per-zone ipset name. The DNS proxy
-	// iterates these per query and routes matched IPs to the right awg2_z<idx>
-	// so CDN destinations tracked for a specific device stay isolated.
-	srcZoneMatchers atomic.Pointer[[]sourceZoneMatchers]
+	dnsProxy *awg.DNSProxy
+	// dnsChainEnabledFlag (atomic.Bool) tracks whether pi-hole sits in front of
+	// our proxy. Read on every firewall-hook re-render (watchdog tick) and on
+	// every DNS-proxy ensure call, so a lock here would contend with apply
+	// paths. Mirror of the bool the pi-hole toggle sets.
+	dnsChainEnabledFlag atomic.Bool
+	// lastHookHash + hookSkipsSinceFull let the watchdog skip the expensive
+	// hook-rerun/route/killswitch/accel/sniff block when the config hasn't
+	// changed. We still force a full re-assertion every 4th tick so a Keenetic
+	// firewall rebuild can't silently strand us without rules for longer than
+	// ~4 minutes. Hot-path reads on the watchdog go through these atomics so
+	// the tick doesn't take route.mu just to read a hash + a counter.
+	lastHookHash       atomic.Pointer[string]
+	hookSkipsSinceFull atomic.Int32
+	// refreshWG tracks the refresh goroutine spawned by awgStartRefresh so
+	// awgTeardownRoutingOS can wait for it to actually exit before removing
+	// firewall rules. Without this, the refresh's pending awgRun calls could
+	// re-install the rules immediately after teardown removed them.
+	refreshWG sync.WaitGroup
+	// First-match-wins ordered zone matchers — single list shared by the DNS
+	// proxy's onMatch and onQuery callbacks AND the SNI sniffer's onHello
+	// callback. Hot-path readers walk this in array order and the FIRST hit
+	// decides tunnel-or-direct. Refreshed atomically on every zones edit; old
+	// subscribers keep their snapshot pointer until the next dereference.
+	//
+	// Replaces the legacy incMatchers/excMatchers/sniMatchers triple — those
+	// pre-bucketed by mode and so lost the per-rule array-order signal, which
+	// is exactly what first-match-wins relies on.
+	orderedMatchers atomic.Pointer[[]orderedZoneMatcher]
+	// routeTable is the unified FMW snapshot consumed by Service.routeFor —
+	// the single decision point for DNS proxy onMatch/onQuery/AAAA-block and
+	// SNI sniffer onHello. Bundles orderedMatchers + source-bound zones +
+	// tunnelV6 snapshot so the hot path doesn't probe live state per query.
+	// The per-source ipset push in onMatch reads source zones from routeTable
+	// too — no parallel srcZoneMatchers atomic anymore.
+	routeTable atomic.Pointer[routeTable]
 
 	// Optional SNI-routing sniffer (reads TLS ClientHellos off the LAN bridges and
 	// routes matched domains' server IPs via the tunnel — beats DoH + CDN rotation).
-	sni         *sniSniffer
-	sniMatchers atomic.Pointer[[]awg.DomainMatcher]
+	sni *sniSniffer
 	// Hot-path cache: dst IPs we've already routed (either by a static ipset rule
 	// or a previous SNI match) — skip the regex/glob matcher loop for them on the
 	// next ClientHello. unix-seconds of insertion; pruned lazily.
@@ -219,7 +246,9 @@ func (svc *Service) TunnelUp() bool {
 		return svc.route.tunnelUpVal.Load()
 	}
 	up := false
-	if svc.awg.Config().Client.Enabled {
+	// Hot path: TunnelUp() runs per Telegram blocked-DC dial. Must go through
+	// awgActive() — a direct svc.awg read torns on a concurrent server swap.
+	if am := svc.awgActive(); am != nil && am.ClientEnabled() {
 		if cs := svc.awgClientStatusOS(); cs != nil && cs.Connected {
 			up = true
 		}
@@ -287,8 +316,12 @@ func (svc *Service) AWG2ApplyRouting() error {
 	if err := svc.awgApplyRoutingOS(); err != nil {
 		return err
 	}
-	cfg := svc.awg.Config()
-	svc.awg.SetRoutingActive(cfg.Routing.Mode != "off")
+	am := svc.awgActive()
+	if am == nil {
+		return fmt.Errorf("AWG2-сервер не выбран")
+	}
+	cfg := am.Config()
+	am.SetRoutingActive(cfg.Routing.Mode != "off")
 	svc.awgSave()
 	return nil
 }
@@ -299,7 +332,9 @@ func (svc *Service) AWG2CommitRouting() error {
 	if err := svc.awgCommitRoutingOS(); err != nil {
 		return err
 	}
-	svc.awg.SetRoutingActive(true)
+	if am := svc.awgActive(); am != nil {
+		am.SetRoutingActive(true)
+	}
 	svc.awgSave()
 	return nil
 }
@@ -307,7 +342,9 @@ func (svc *Service) AWG2CommitRouting() error {
 // AWG2TeardownRouting is the explicit "снять маршрутизацию" action — it clears
 // the committed flag so routing does NOT come back on the next boot.
 func (svc *Service) AWG2TeardownRouting() error {
-	svc.awg.SetRoutingActive(false)
+	if am := svc.awgActive(); am != nil {
+		am.SetRoutingActive(false)
+	}
 	svc.awgSave()
 	return svc.awgTeardownRoutingOS()
 }
@@ -319,7 +356,11 @@ func (svc *Service) awgRepairRouting() { svc.awgRepairRoutingOS() }
 func (svc *Service) awgTeardownRouting() { _ = svc.awgTeardownRoutingOS() }
 
 func (svc *Service) awgRestoreCommittedRoutingAsync(reason string) {
-	cfg := svc.awg.Config()
+	am := svc.awgActive()
+	if am == nil {
+		return
+	}
+	cfg := am.Config()
 	if !awgShouldRestoreRouting(cfg) {
 		return
 	}
@@ -327,7 +368,11 @@ func (svc *Service) awgRestoreCommittedRoutingAsync(reason string) {
 }
 
 func (svc *Service) awgRestoreCommittedRouting(reason string) {
-	cfg := svc.awg.Config()
+	am := svc.awgActive()
+	if am == nil {
+		return
+	}
+	cfg := am.Config()
 	if !awgShouldRestoreRouting(cfg) {
 		return
 	}
@@ -335,7 +380,7 @@ func (svc *Service) awgRestoreCommittedRouting(reason string) {
 		logbuf.Append("awg2", "warn", "автовосстановление маршрутизации после "+reason+": "+err.Error())
 		return
 	}
-	svc.awg.SetRoutingActive(true)
+	am.SetRoutingActive(true)
 	svc.awgSave()
 	logbuf.Append("awg2", "info", "маршрутизация восстановлена после "+reason)
 }
@@ -344,7 +389,11 @@ func (svc *Service) awgReconnectActiveClientAfterDeploy(id string) {
 	if svc.activeServerID() != id {
 		return
 	}
-	cfg := svc.awg.Config()
+	am := svc.awgActive()
+	if am == nil {
+		return
+	}
+	cfg := am.Config()
 	if !cfg.Client.Enabled {
 		return
 	}

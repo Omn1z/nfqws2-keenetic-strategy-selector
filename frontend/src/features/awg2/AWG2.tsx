@@ -13,9 +13,12 @@ import { Field, Input, Select } from "@/components/ui/form";
 import ServerPane from "./ServerPane";
 import PeerShareModal from "./PeerShareModal";
 import RoutingPane from "./RoutingPane";
+import DevicesRoutingPane from "./DevicesRoutingPane";
+import TracePane from "./TracePane";
+import SpeedTestCard from "./SpeedTestCard";
 import type { Awg2ServerSummary, Awg2Status, AwgClientStatus, AwgDeployResult } from "@/types/api";
 
-type Sub = "server" | "routing";
+type Sub = "server" | "routing" | "devices" | "trace";
 type DeployOpts = { quiet?: boolean; skipReload?: boolean };
 
 const human = (n: number) => {
@@ -375,10 +378,17 @@ export default function AWG2() {
       <div className="mb-4 inline-flex overflow-hidden rounded-lg border border-line">
         {seg("server", "Сервер")}
         {seg("routing", "Маршрутизация")}
+        {seg("devices", "Устройства")}
+        {seg("trace", "Трассировка")}
       </div>
 
-      {sub === "server" && <ServerPane st={st} reload={reload} deployActive={() => activeServer ? deployServer(activeServer.id) : Promise.resolve(false)} deploying={!!(activeServer && deploying[activeServer.id])} />}
+      {sub === "server" && <>
+        <SpeedTestCard />
+        <ServerPane st={st} reload={reload} deployActive={() => activeServer ? deployServer(activeServer.id) : Promise.resolve(false)} deploying={!!(activeServer && deploying[activeServer.id])} />
+      </>}
       {sub === "routing" && <RoutingPane st={st} reload={reload} />}
+      {sub === "devices" && <DevicesRoutingPane st={st} reload={reload} />}
+      {sub === "trace" && <TracePane />}
       {clientsOpen && <PeerShareModal st={st} reload={reload} onClose={() => setClientsOpen(false)} />}
       {addOpen && (
         <Modal

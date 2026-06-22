@@ -80,9 +80,6 @@ func sharedCDNProvider(ip string) (string, bool) {
 // log; it spammed dozens of lines per apply and convinced users something was
 // broken. So we now keep ONLY the dedup map (in case future code wants to
 // reason over it) and stay silent in the log.
-func (svc *Service) awgNoteSharedCDNSkip(source, name, ip, provider string) {
-	_ = name
-	_ = provider
-	key := source + "|" + ip
-	svc.route.sharedCDNSkips.LoadOrStore(key, struct{}{})
+func (svc *Service) awgNoteSharedCDNSkip(source, ip string) {
+	svc.route.sharedCDNSkips.LoadOrStore(source+"|"+ip, struct{}{})
 }
