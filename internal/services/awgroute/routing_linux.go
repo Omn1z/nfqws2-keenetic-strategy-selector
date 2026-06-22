@@ -109,19 +109,19 @@ func (svc *Service) awgApplyRoutingOS() error {
 	if awgUsesDNSProxy(&cfg) {
 		awgRestoreSets()
 	}
-	// 1 + 3) batch the endpoint pin + tunnel table + fwmark rule into a single
-	// `ip -force -batch -` invocation. 1 fork instead of 4; -force suppresses
-	// the idempotent "rule exists" error so re-asserts don't abort. We DO check
-	// the err — a fwmark add that silently fails leaves the chain marking but
-	// nothing actually routes through awg0, so the user sees "Применено" while
-	// every packet still leaves the native WAN.
-	if err := awgIpBatch([]string{
-		"route replace " + endpointIP + "/32 via " + gw + " dev " + wandev,
-		"route replace default dev " + awgIface + " table " + awgTable,
-		"rule del fwmark " + awgMarkRule + " table " + awgTable,
-		"rule add fwmark " + awgMarkRule + " table " + awgTable,
-	}); err != nil {
-		return fmt.Errorf("ip route/rule batch: %w", err)
+	// 1 + 3) endpoint pin + tunnel table + fwmark rule. Keep `rule del` out of
+	// checked batches: on a fresh apply it legitimately returns "not found".
+	// We do check the route/rule add path — a failed fwmark rule leaves packets
+	// marked by iptables but still routed through the native WAN.
+	if err := awgRunCheck("ip route replace " + endpointIP + "/32 via " + gw + " dev " + wandev); err != nil {
+		return fmt.Errorf("ip endpoint route: %w", err)
+	}
+	if err := awgRunCheck("ip route replace default dev " + awgIface + " table " + awgTable); err != nil {
+		return fmt.Errorf("ip tunnel route: %w", err)
+	}
+	_, _ = awgRun("while ip rule del fwmark " + awgMarkRule + " table " + awgTable + " 2>/dev/null; do :; done")
+	if err := awgRunCheck("ip rule add fwmark " + awgMarkRule + " table " + awgTable); err != nil {
+		return fmt.Errorf("ip rule: %w", err)
 	}
 	// 3-v6) IPv6 mirror: separate table state (same id is fine — v4 and v6 are
 	// independent), default-route into awg0, fwmark rule. AmneziaWG tunnels both
@@ -184,10 +184,7 @@ func (svc *Service) awgRefreshRoutingOS() error {
 	endpointIP := resolveHostIP(hostOf(cfg.Endpoint))
 	gw, wandev := awgDefaultRoute()
 	if endpointIP != "" && gw != "" && wandev != "" {
-		// Endpoint pin + tunnel table re-assert in one fork (refresh path).
-		awgIpBatch([]string{
-			"route replace " + endpointIP + "/32 via " + gw + " dev " + wandev,
-		})
+		_, _ = awgRun("ip route replace " + endpointIP + "/32 via " + gw + " dev " + wandev)
 	}
 	// A zone/mask edit must drop the IPs learned for the OLD masks — otherwise a
 	// removed domain stays tunneled ("старая зона не выгрузилась"). Flush the dynamic
@@ -206,11 +203,9 @@ func (svc *Service) awgRefreshRoutingOS() error {
 		return err
 	}
 	awgResetSNISet()
-	awgIpBatch([]string{
-		"route replace default dev " + awgIface + " table " + awgTable,
-		"rule del fwmark " + awgMarkRule + " table " + awgTable,
-		"rule add fwmark " + awgMarkRule + " table " + awgTable,
-	})
+	_, _ = awgRun("ip route replace default dev " + awgIface + " table " + awgTable)
+	_, _ = awgRun("while ip rule del fwmark " + awgMarkRule + " table " + awgTable + " 2>/dev/null; do :; done")
+	_, _ = awgRun("ip rule add fwmark " + awgMarkRule + " table " + awgTable)
 	awgApplyKillswitch(r.Killswitch)
 	traceSetEnabled(r.TraceEnabled)
 	dnsOn := svc.awgEnsureDNSProxy(&cfg)

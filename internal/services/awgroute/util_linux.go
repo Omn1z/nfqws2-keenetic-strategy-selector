@@ -4,6 +4,7 @@ package awgroute
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"os/exec"
 	"strconv"
@@ -18,10 +19,9 @@ import (
 // inspection, and hostname → IPv4 resolution.
 
 // awgIpBatch runs every line in script through a single `ip -force -batch -`
-// invocation. One fork instead of N for the consecutive ip route / ip rule
-// commands every apply / refresh / watchdog full-re-assert emits. `-force`
-// makes the batch continue past idempotent "rule already exists" errors so
-// the script doesn't abort mid-stream on a re-assert.
+// invocation. Use it only for command groups where every line is expected to
+// succeed: `ip -force` keeps executing after an error, but the final process
+// status is still non-zero if any line failed.
 //
 // Lines must NOT contain a leading "ip " — the binary is already named on the
 // command line. Empty / blank lines are dropped.
@@ -38,8 +38,27 @@ func awgIpBatch(lines []string) error {
 	if b.Len() == 0 {
 		return nil
 	}
-	_, err := awgRunStdin("ip -force -batch -", b.String())
-	return err
+	out, err := awgRunStdin("ip -force -batch -", b.String())
+	if err != nil {
+		return awgCmdErr("ip -force -batch -", out, err)
+	}
+	return nil
+}
+
+func awgCmdErr(cmd, out string, err error) error {
+	out = strings.TrimSpace(out)
+	if out == "" {
+		return fmt.Errorf("%s: %w", cmd, err)
+	}
+	return fmt.Errorf("%s: %w: %s", cmd, err, out)
+}
+
+func awgRunCheck(cmd string) error {
+	out, err := awgRun(cmd)
+	if err != nil {
+		return awgCmdErr(cmd, out, err)
+	}
+	return nil
 }
 
 func awgRun(cmd string) (string, error) {
@@ -222,8 +241,11 @@ func resolveHostIP(host string) string {
 	if host == "" {
 		return ""
 	}
-	if net.ParseIP(host) != nil {
-		return host
+	if ip := net.ParseIP(host); ip != nil {
+		if v4 := ip.To4(); v4 != nil {
+			return v4.String()
+		}
+		return ""
 	}
 	for _, ip := range resolveDomain(host) {
 		return ip
