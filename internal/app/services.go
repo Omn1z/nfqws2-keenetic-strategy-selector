@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"nfqws2strategy/internal/tools/logbuf"
+	"nfqws2strategy/internal/tools/strs"
 )
 
 // ServiceResult is the outcome of restarting one service (Dashboard restart button).
@@ -60,7 +61,7 @@ func (a *App) restartNfqws2() ServiceResult {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	b, err := exec.CommandContext(ctx, "sh", "-c", script).CombinedOutput()
-	detail := lastLines(strings.TrimSpace(string(b)), 6)
+	detail := strs.LastLines(strings.TrimSpace(string(b)), 6)
 	if err != nil {
 		logbuf.Append("system", "error", "restart nfqws2: "+err.Error())
 		return ServiceResult{Name: "nfqws2", OK: false, Detail: fmt.Sprintf("%s (%v)", detail, err)}
@@ -116,7 +117,7 @@ func (a *App) nfqws2Ctl(action, script string) ServiceResult {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	b, err := exec.CommandContext(ctx, "sh", "-c", script).CombinedOutput()
-	detail := lastLines(strings.TrimSpace(string(b)), 6)
+	detail := strs.LastLines(strings.TrimSpace(string(b)), 6)
 	if err != nil {
 		logbuf.Append("system", "error", "nfqws2 "+action+": "+err.Error())
 		return ServiceResult{Name: "nfqws2", OK: false, Detail: fmt.Sprintf("%s (%v)", detail, err)}
@@ -140,11 +141,3 @@ func (a *App) restartTGWS() ServiceResult {
 	return ServiceResult{Name: "tgws", OK: true, Detail: "перезапущен"}
 }
 
-// lastLines keeps at most the final n lines, for compact UI display.
-func lastLines(s string, n int) string {
-	lines := strings.Split(s, "\n")
-	if len(lines) <= n {
-		return s
-	}
-	return strings.Join(lines[len(lines)-n:], "\n")
-}

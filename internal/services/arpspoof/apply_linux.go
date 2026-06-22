@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"nfqws2strategy/internal/tools/logbuf"
+	"nfqws2strategy/internal/tools/shell"
+	"nfqws2strategy/internal/tools/strs"
 )
 
 const (
@@ -63,8 +65,8 @@ func (s *Service) applyConfigLinux(cfg Config, logAnnounce bool) error {
 			announceARP(name, logAnnounce)
 			continue
 		}
-		if out, err := runShell("ip link set dev " + shellQuote(name) + " address " + shellQuote(cfg.MAC)); err != nil {
-			msg := lastLines(out, 4)
+		if out, err := runShell("ip link set dev " + shell.Quote(name) + " address " + shell.Quote(cfg.MAC)); err != nil {
+			msg := strs.LastLines(out, 4)
 			logbuf.Append("arp-spoofing", "warn", "set "+name+": "+msg)
 			return fmt.Errorf("set %s MAC: %v: %s", name, err, msg)
 		}
@@ -108,8 +110,8 @@ func announceARP(iface string, logAnnounce bool) {
 	}
 	ips := ifaceIPv4Addrs(iface)
 	for _, ip := range ips {
-		_, _ = runShell("arping -q -U -c 3 -I " + shellQuote(iface) + " -s " + shellQuote(ip) + " " + shellQuote(ip))
-		_, _ = runShell("arping -q -A -c 2 -I " + shellQuote(iface) + " -s " + shellQuote(ip) + " " + shellQuote(ip))
+		_, _ = runShell("arping -q -U -c 3 -I " + shell.Quote(iface) + " -s " + shell.Quote(ip) + " " + shell.Quote(ip))
+		_, _ = runShell("arping -q -A -c 2 -I " + shell.Quote(iface) + " -s " + shell.Quote(ip) + " " + shell.Quote(ip))
 	}
 	if logAnnounce && len(ips) > 0 {
 		logbuf.Append("arp-spoofing", "info", "gratuitous ARP sent on "+iface+" for "+strings.Join(ips, ", "))
@@ -117,7 +119,7 @@ func announceARP(iface string, logAnnounce bool) {
 }
 
 func ifaceIPv4Addrs(iface string) []string {
-	out, err := runShell("ip -o -4 addr show dev " + shellQuote(iface) + " | awk '{print $4}' | cut -d/ -f1")
+	out, err := runShell("ip -o -4 addr show dev " + shell.Quote(iface) + " | awk '{print $4}' | cut -d/ -f1")
 	if err != nil || out == "" {
 		return nil
 	}
@@ -146,8 +148,8 @@ func (s *Service) restoreOriginalMACs() error {
 		}
 		current := strings.ToUpper(iface.HardwareAddr.String())
 		if current != mac {
-			if out, err := runShell("ip link set dev " + shellQuote(name) + " address " + shellQuote(mac)); err != nil {
-				msg := lastLines(out, 4)
+			if out, err := runShell("ip link set dev " + shell.Quote(name) + " address " + shell.Quote(mac)); err != nil {
+				msg := strs.LastLines(out, 4)
 				logbuf.Append("arp-spoofing", "warn", "restore "+name+": "+msg)
 				if firstErr == nil {
 					firstErr = fmt.Errorf("restore %s MAC: %v: %s", name, err, msg)
@@ -168,14 +170,3 @@ func runShell(cmd string) (string, error) {
 	return strings.TrimSpace(string(out)), err
 }
 
-func shellQuote(s string) string {
-	return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'"
-}
-
-func lastLines(s string, n int) string {
-	lines := strings.Split(s, "\n")
-	if len(lines) <= n {
-		return s
-	}
-	return strings.Join(lines[len(lines)-n:], "\n")
-}
