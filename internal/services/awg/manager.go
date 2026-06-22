@@ -96,6 +96,7 @@ func (c ServerConfig) clone() ServerConfig {
 	for i, z := range c.Routing.Zones {
 		z.Domains = append([]string{}, z.Domains...)
 		z.IPs = append([]string{}, z.IPs...)
+		z.SourceIPs = append([]string{}, z.SourceIPs...)
 		cp.Routing.Zones[i] = z
 	}
 	return cp

@@ -5,6 +5,7 @@ import (
 
 	"nfqws2strategy/internal/services/awg"
 	"nfqws2strategy/internal/services/awgroute"
+	"nfqws2strategy/internal/services/tunnelroute"
 )
 
 // The AWG2 server manager + the router-side client/split-routing runtime now live
@@ -22,13 +23,33 @@ type (
 func (a *App) AWG2StatusView() AWG2Status           { return a.awgroute.AWG2StatusView() }
 func (a *App) AWG2AddServer(name string) AWG2Status { return a.awgroute.AWG2AddServer(name) }
 func (a *App) AWG2SelectServer(id string) error     { return a.awgroute.AWG2SelectServer(id) }
+func (a *App) AWG2RenameServer(id, name string) error {
+	return a.awgroute.AWG2RenameServer(id, name)
+}
 func (a *App) AWG2SetServerEnabled(id string, enabled bool) error {
-	return a.awgroute.AWG2SetServerEnabled(id, enabled)
+	err := a.awgroute.AWG2SetServerEnabled(id, enabled)
+	if err == nil {
+		a.syncProxyTunnelRoutes(a.proxy.AWGFallback())
+	}
+	return err
 }
 func (a *App) AWG2Import(text, name string) (AWG2Status, error) {
 	return a.awgroute.AWG2Import(text, name)
 }
-func (a *App) AWG2DeleteServer(id string) error         { return a.awgroute.AWG2DeleteServer(id) }
+func (a *App) AWG2CreateWARP(ctx context.Context, opts awgroute.WARPCreateOptions) (AWG2Status, error) {
+	return a.awgroute.AWG2CreateWARP(ctx, opts)
+}
+func (a *App) AWG2DeleteServer(id string) error {
+	ifaces := a.awgroute.ClientIfaces()
+	err := a.awgroute.AWG2DeleteServer(id)
+	if err == nil {
+		for _, iface := range ifaces {
+			tunnelroute.DelTGFrontRoutes(iface)
+		}
+		a.syncProxyTunnelRoutes(a.proxy.AWGFallback())
+	}
+	return err
+}
 func (a *App) AWG2SetConfig(in *awg.ServerConfig) error { return a.awgroute.AWG2SetConfig(in) }
 func (a *App) AWG2Deploy() (awg.DeployResult, error)    { return a.awgroute.AWG2Deploy() }
 func (a *App) AWG2DeployServer(id string) (awg.DeployResult, error) {
@@ -51,34 +72,56 @@ func (a *App) AWG2ClientExport(id, format string) (text, filename, contentType s
 
 func (a *App) AWG2EngineInfo() EngineInfo         { return a.awgroute.AWG2EngineInfo() }
 func (a *App) AWG2InstallEngine() (string, error) { return a.awgroute.AWG2InstallEngine() }
-func (a *App) AWG2ClientUp() error                { return a.awgroute.AWG2ClientUp() }
-func (a *App) AWG2ClientDown() error              { return a.awgroute.AWG2ClientDown() }
+func (a *App) AWG2ClientUp() error {
+	err := a.awgroute.AWG2ClientUp()
+	if err == nil {
+		a.syncProxyTunnelRoutes(a.proxy.AWGFallback())
+	}
+	return err
+}
+func (a *App) AWG2ClientDown() error {
+	err := a.awgroute.AWG2ClientDown()
+	if err == nil {
+		a.syncProxyTunnelRoutes(a.proxy.AWGFallback())
+	}
+	return err
+}
 
 func (a *App) AWG2SetRouting(rc awg.RoutingConfig) error { return a.awgroute.AWG2SetRouting(rc) }
-func (a *App) AWG2ApplyRouting() error                   { return a.awgroute.AWG2ApplyRouting() }
-func (a *App) AWG2CommitRouting() error                  { return a.awgroute.AWG2CommitRouting() }
-func (a *App) AWG2TeardownRouting() error                { return a.awgroute.AWG2TeardownRouting() }
+func (a *App) AWG2SetRoutingRules(rc awg.RoutingConfig) error {
+	err := a.awgroute.AWG2SetRoutingRules(rc)
+	if err == nil {
+		a.syncProxyTunnelRoutes(a.proxy.AWGFallback())
+	}
+	return err
+}
+func (a *App) AWG2ApplyRouting() error    { return a.awgroute.AWG2ApplyRouting() }
+func (a *App) AWG2CommitRouting() error   { return a.awgroute.AWG2CommitRouting() }
+func (a *App) AWG2TeardownRouting() error { return a.awgroute.AWG2TeardownRouting() }
 
-func (a *App) AWG2TraceStatus() awgroute.TraceStatus           { return a.awgroute.TraceStatus() }
-func (a *App) AWG2TraceSnapshot(since int64) []awgroute.TraceEntry { return a.awgroute.TraceSnapshot(since) }
-func (a *App) AWG2TraceSetEnabled(on bool) bool                { return a.awgroute.TraceSetEnabled(on) }
-func (a *App) AWG2TraceClear()                                 { a.awgroute.TraceClear() }
-func (a *App) AWG2TraceCounters() awgroute.TraceCounters       { return a.awgroute.TraceCounters() }
-func (a *App) AWG2InsertTopRule(domain, route, name string) error { return a.awgroute.AWG2InsertTopRule(domain, route, name) }
-func (a *App) AWG2CopyRulesFromServer(fromID string) (int, error) { return a.awgroute.AWG2CopyRulesFromServer(fromID) }
+func (a *App) AWG2TraceStatus() awgroute.TraceStatus { return a.awgroute.TraceStatus() }
+func (a *App) AWG2TraceSnapshot(since int64) []awgroute.TraceEntry {
+	return a.awgroute.TraceSnapshot(since)
+}
+func (a *App) AWG2TraceSetEnabled(on bool) bool          { return a.awgroute.TraceSetEnabled(on) }
+func (a *App) AWG2TraceClear()                           { a.awgroute.TraceClear() }
+func (a *App) AWG2TraceCounters() awgroute.TraceCounters { return a.awgroute.TraceCounters() }
+func (a *App) AWG2InsertTopRule(domain, route, name string) error {
+	return a.awgroute.AWG2InsertTopRule(domain, route, name)
+}
+func (a *App) AWG2CopyRulesFromServer(fromID string) (int, error) {
+	return a.awgroute.AWG2CopyRulesFromServer(fromID)
+}
 func (a *App) AWG2SpeedTest(ctx context.Context, opts awgroute.SpeedTestOptions) awgroute.SpeedTestResult {
 	return a.awgroute.RunSpeedTest(ctx, opts)
 }
 
-// ProxyAWGFallback is the shared "AWG2-as-fallback for the ISP-blocked Telegram DCs"
-// view: the current selection plus the AWG2 servers the proxies may route through.
-type ProxyAWGFallback struct {
-	Value   string                `json:"value"`   // "off" | "auto" | "<server-id>"
-	Servers []awgroute.ServerInfo `json:"servers"` // selectable AWG2 servers ([] not null)
-}
+type ProxyAWGFallback = ProxyTunnelFallback
 
-func (a *App) ProxyAWGFallbackView() ProxyAWGFallback {
-	return ProxyAWGFallback{Value: a.proxy.AWGFallback(), Servers: a.awgroute.Servers()}
-}
+func (a *App) ProxyAWGFallbackView() ProxyAWGFallback { return a.ProxyTunnelFallbackView() }
 
-func (a *App) SetProxyAWGFallback(v string) { a.proxy.SetAWGFallback(v) }
+func (a *App) SetProxyAWGFallback(v string) {
+	v = normalizeTunnelFallbackSel(v)
+	a.proxy.SetAWGFallback(v)
+	a.syncProxyTunnelRoutes(v)
+}

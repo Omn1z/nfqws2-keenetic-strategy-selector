@@ -29,3 +29,4 @@ func (a *App) Nfqws2Version() Nfqws2VersionInfo     { return a.nfqws2.Version() 
 func (a *App) Nfqws2CheckUpdate() Nfqws2VersionInfo { return a.nfqws2.CheckUpdate() }
 func (a *App) Nfqws2Update() (string, error)        { return a.nfqws2.Update() }
 func (a *App) Nfqws2Reload() error                  { return a.nfqws2.Reload() }
+func (a *App) Nfqws2ApplyBypass() error             { return a.nfqws2.ApplyBypass() }

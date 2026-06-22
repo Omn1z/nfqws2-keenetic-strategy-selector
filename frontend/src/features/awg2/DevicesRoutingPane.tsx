@@ -3,39 +3,25 @@ import { api } from "@/lib/api";
 import { cn } from "@/lib/cn";
 import { Card } from "@/components/ui/Card";
 import { Badge } from "@/components/ui/Badge";
-import { Input } from "@/components/ui/form";
+import { Input, Select } from "@/components/ui/form";
 import { toast } from "@/components/ui/Toast";
 import type { Device, Awg2Status, AwgZone, AwgRoutingConfig } from "@/types/api";
 
 /** Device-first view of AWG2 routing: lists every LAN device the router can see
  *  (DHCP + ARP) with a one-click chooser of how its traffic is routed:
  *
- *    «По умолч.»   — no per-device zone; the device follows the global mode.
- *    «Всё через VPN» — creates / activates a source-bound include zone with
- *                       catch-all "*" for this device's IP.
- *    «Всё мимо»     — creates / activates a source-bound exclude zone with no
- *                       domains for this device's IP (firewall: RETURN before
- *                       the global mark, so EVERYTHING from this src goes direct).
+ *    «По умолч.»      — no per-device zone; the device follows global rules.
+ *    «Исключить»      — source-bound direct catch-all.
+ *    «<tunnel label>» — source-bound tunnel catch-all via the selected tunnel.
  *
  *  All changes batch into a single `routing/config` save. Apply runs on save so
  *  the firewall hook re-renders without an explicit step.
  */
 
-type DeviceMode = "default" | "all-vpn" | "all-direct" | "custom";
+type DeviceMode = "default" | "exclude" | "custom" | `tunnel:${string}`;
 
-const MODE_LABEL: Record<DeviceMode, string> = {
-  default:    "По умолчанию",
-  "all-vpn":  "Всё через VPN",
-  "all-direct": "Всё мимо VPN",
-  custom:     "Своя зона",
-};
-
-const MODE_KIND: Record<DeviceMode, "neutral" | "ok" | "warn" | "bad"> = {
-  default:    "neutral",
-  "all-vpn":  "ok",
-  "all-direct": "warn",
-  custom:     "neutral",
-};
+const modeKind = (mode: DeviceMode): "neutral" | "ok" | "warn" | "bad" =>
+  mode === "exclude" ? "warn" : mode.startsWith("tunnel:") ? "ok" : "neutral";
 
 // Zone name prefix the device-tab uses for its auto-managed zones, so we can
 // detect-and-reuse them on the next save instead of bloating the zone list.
@@ -47,13 +33,16 @@ const nameFor = (ip: string) => ZONE_PREFIX + ip;
 
 // detectMode looks at the live routing.zones snapshot and figures out what
 // state the device is currently in. "default" = nothing tied to it.
+const routeOf = (z: AwgZone) => z.route === "direct" || z.mode === "exclude" ? "direct" : "tunnel";
+const isCatchAll = (z: AwgZone) => (z.domains ?? []).includes("*") || (z.ips ?? []).some((ip) => ip === "0.0.0.0/0" || ip === "::/0");
+
 function detectMode(zones: AwgZone[], ip: string): DeviceMode {
   // Find auto-managed zone first.
   const auto = zones.find((z) => z.name === nameFor(ip));
   if (auto) {
     if (!auto.enabled) return "default";
-    if (auto.mode === "include" && (auto.domains?.includes("*") ?? false)) return "all-vpn";
-    if (auto.mode === "exclude" && (auto.domains?.length ?? 0) === 0 && (auto.ips?.length ?? 0) === 0) return "all-direct";
+    if (routeOf(auto) === "tunnel" && isCatchAll(auto)) return auto.tunnel_id ? `tunnel:${auto.tunnel_id}` : "custom";
+    if (routeOf(auto) === "direct" && (auto.domains?.length ?? 0) === 0 && (auto.ips?.length ?? 0) === 0) return "exclude";
     return "custom";
   }
   // Look for any zone (user-named) that owns this IP — treat as custom.
@@ -63,7 +52,7 @@ function detectMode(zones: AwgZone[], ip: string): DeviceMode {
 
 // applyMode returns a NEW zones array with the device's mode set as requested.
 // Idempotent: re-applying the same mode returns the same array (modulo identity).
-function applyMode(zones: AwgZone[], ip: string, mode: DeviceMode): AwgZone[] {
+function applyMode(zones: AwgZone[], ip: string, mode: DeviceMode, fallbackTunnelID: string): AwgZone[] {
   const name = nameFor(ip);
   const without = zones.filter((z) => z.name !== name);
   if (mode === "default") return without; // drop the auto zone entirely
@@ -72,11 +61,17 @@ function applyMode(zones: AwgZone[], ip: string, mode: DeviceMode): AwgZone[] {
     // hand-named zone with this IP. So treat as "no change to auto zone".
     return zones;
   }
-  const z: AwgZone = mode === "all-vpn"
-    ? { name, mode: "include", domains: ["*"], ips: [], source_ips: [ip], enabled: true }
-    : { name, mode: "exclude", domains: [],   ips: [], source_ips: [ip], enabled: true };
+  const tunnelID = mode.startsWith("tunnel:") ? mode.slice("tunnel:".length) : fallbackTunnelID;
+  const z: AwgZone = mode.startsWith("tunnel:")
+    ? { name, tunnel_id: tunnelID, mode: "include", route: "tunnel", domains: ["*"], ips: [], source_ips: [ip], enabled: true }
+    : { name, mode: "exclude", route: "direct", domains: [], ips: [], source_ips: [ip], enabled: true };
   return [...without, z];
 }
+const routingFromStatus = (st: Awg2Status): AwgRoutingConfig => ({
+  ...st.config.routing,
+  mode: st.config.routing?.mode || "zones",
+  zones: st.routing_rules || st.config.routing?.zones || [],
+});
 
 interface Props {
   st: Awg2Status;
@@ -85,7 +80,7 @@ interface Props {
 
 export default function DevicesRoutingPane({ st, reload }: Props) {
   const [devices, setDevices] = useState<Device[]>([]);
-  const [routing, setRouting] = useState<AwgRoutingConfig>(() => st.config.routing);
+  const [routing, setRouting] = useState<AwgRoutingConfig>(() => routingFromStatus(st));
   const [busy, setBusy] = useState(false);
   const [search, setSearch] = useState("");
   // While an autosave is in flight (or a mode click came within ~1 s of the
@@ -93,11 +88,14 @@ export default function DevicesRoutingPane({ st, reload }: Props) {
   // an inflight POST + a status-snapshot tick race, and the user sees their
   // click "snap back" before the save lands.
   const lastEditAt = useRef<number>(0);
+  const tunnels = useMemo(() => (st.servers || []).filter((s) => s.enabled && (s.imported || s.deployed || s.endpoint)), [st.servers]);
+  const defaultTunnelID = tunnels.find((s) => s.connected)?.id || tunnels[0]?.id || st.active_server_id || "";
+  const tunnelByID = useMemo(() => new Map(tunnels.map((s) => [s.id, s] as const)), [tunnels]);
   useEffect(() => {
     if (busy) return;
     if (Date.now() - lastEditAt.current < 1500) return;
-    setRouting(st.config.routing);
-  }, [st.config.routing, busy]);
+    setRouting(routingFromStatus(st));
+  }, [st, busy]);
 
   // Live-poll the device list (same data the Devices tab uses).
   useEffect(() => {
@@ -120,15 +118,11 @@ export default function DevicesRoutingPane({ st, reload }: Props) {
   const onSet = async (ip: string, mode: DeviceMode) => {
     if (busy) return;
     lastEditAt.current = Date.now();
-    const next = { ...routing, zones: applyMode(routing.zones ?? [], ip, mode) };
+    const next = { ...routing, mode: routing.mode === "off" ? "zones" : routing.mode, zones: applyMode(routing.zones ?? [], ip, mode, defaultTunnelID) };
     setRouting(next);
     setBusy(true);
     try {
-      await api("POST", "/api/awg2/routing/config", next);
-      if (next.active) {
-        await api("POST", "/api/awg2/routing/apply", {});
-        await api("POST", "/api/awg2/routing/commit", {});
-      }
+      await api("POST", "/api/awg2/routing/rules", next);
       void reload();
     } catch (e) {
       toast((e as Error).message, "err");
@@ -199,10 +193,10 @@ export default function DevicesRoutingPane({ st, reload }: Props) {
                     {d.established || 0} ESTABL · {d.failing || 0} fail
                   </td>
                   <td className="px-2 py-1.5">
-                    <ModeButtons value={mode} onChange={(m) => onSet(d.ip, m)} />
+                    <DeviceRouteSelect value={mode} tunnels={tunnels} defaultTunnelID={defaultTunnelID} onChange={(m) => onSet(d.ip, m)} />
                   </td>
                   <td className="hidden px-2 py-1.5 text-right md:table-cell">
-                    <Badge kind={MODE_KIND[mode]}>{MODE_LABEL[mode]}</Badge>
+                    <Badge kind={modeKind(mode)}>{modeLabel(mode, tunnelByID)}</Badge>
                   </td>
                 </tr>
               );
@@ -221,30 +215,46 @@ export default function DevicesRoutingPane({ st, reload }: Props) {
   );
 }
 
-function ModeButtons({ value, onChange }: { value: DeviceMode; onChange: (m: DeviceMode) => void }) {
-  // "custom" is read-only — it appears when a user hand-edited a zone with this
-  // source. Don't offer a button for it; we don't manufacture custom zones here.
-  const opts: { v: Exclude<DeviceMode, "custom">; label: string }[] = [
-    { v: "default",    label: "по умолч." },
-    { v: "all-vpn",    label: "всё VPN" },
-    { v: "all-direct", label: "всё мимо" },
-  ];
+function modeLabel(mode: DeviceMode, tunnels: Map<string, { label: string; client_iface?: string }>) {
+  if (mode === "default") return "По умолчанию";
+  if (mode === "exclude") return "Исключить";
+  if (mode === "custom") return "Своя зона";
+  const id = mode.slice("tunnel:".length);
+  const t = tunnels.get(id);
+  return t ? `${t.label}${t.client_iface ? ` · ${t.client_iface}` : ""}` : "Туннель";
+}
+
+function DeviceRouteSelect({
+  value,
+  tunnels,
+  defaultTunnelID,
+  onChange,
+}: {
+  value: DeviceMode;
+  tunnels: { id: string; label: string; client_iface?: string; connected?: boolean }[];
+  defaultTunnelID: string;
+  onChange: (m: DeviceMode) => void;
+}) {
+  const selectValue = value === "custom" ? "custom" : value.startsWith("tunnel:") ? value : value;
   return (
-    <div className="inline-flex overflow-hidden rounded border border-line">
-      {opts.map((o, i) => (
-        <button
-          key={o.v}
-          type="button"
-          onClick={() => onChange(o.v)}
-          className={cn(
-            "px-2 py-1 text-[11px] transition",
-            i > 0 && "border-l border-line",
-            value === o.v ? "bg-accent text-white" : "bg-panel hover:bg-line-soft",
-          )}
-        >
-          {o.label}
-        </button>
+    <Select
+      value={selectValue}
+      onChange={(e) => {
+        const v = e.target.value as DeviceMode;
+        if (v === "custom") return;
+        if (v === "tunnel:" && defaultTunnelID) onChange(`tunnel:${defaultTunnelID}`);
+        else onChange(v);
+      }}
+      className="h-8 min-w-[180px] py-1 text-[12px]"
+    >
+      <option value="default">По умолчанию</option>
+      <option value="exclude">Исключить</option>
+      {tunnels.map((s) => (
+        <option key={s.id} value={`tunnel:${s.id}`}>
+          {s.label}{s.client_iface ? ` · ${s.client_iface}` : ""}{s.connected ? " · connected" : ""}
+        </option>
       ))}
-    </div>
+      {value === "custom" && <option value="custom">Своя зона</option>}
+    </Select>
   );
 }

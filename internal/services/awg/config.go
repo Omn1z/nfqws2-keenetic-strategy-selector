@@ -35,10 +35,11 @@ type ServerConfig struct {
 	Obf   Obfuscation `json:"obf"`   // AmneziaWG 2.0 obfuscation (Interface-level)
 	Peers []Peer      `json:"peers"` // the Keenetic router is conventionally peer #1
 
-	Client     ClientConfig  `json:"client"`      // local-router client bring-up (Part B)
-	Routing    RoutingConfig `json:"routing"`     // local-router split routing (Part C)
-	Interface  string        `json:"interface"`   // server interface name, "awg0"
-	DeployedAt int64         `json:"deployed_at"` // unix seconds; 0 = never deployed
+	Client      ClientConfig  `json:"client"`                 // local-router client bring-up (Part B)
+	Routing     RoutingConfig `json:"routing"`                // local-router split routing (Part C)
+	Interface   string        `json:"interface"`              // server interface name, "awg0"
+	ClientIface string        `json:"client_iface,omitempty"` // local router interface, "awg0"/"awg1"/...
+	DeployedAt  int64         `json:"deployed_at"`            // unix seconds; 0 = never deployed
 }
 
 // Credentials is the VPS SSH connection. Secret fields are REDACTED in API
@@ -108,8 +109,10 @@ type ClientConfig struct {
 // migrate to Route on first read in RouteValue() so both names coexist.
 type Zone struct {
 	Name      string   `json:"name"`
-	Route     string   `json:"route,omitempty"` // "tunnel" | "direct" — new vocabulary
-	Mode      string   `json:"mode,omitempty"`  // legacy: "include" (→ tunnel) | "exclude" (→ direct)
+	TunnelID  string   `json:"tunnel_id,omitempty"` // AWG2 connection used by this rule when Route=="tunnel".
+	Order     int      `json:"order,omitempty"`     // Global routing priority across all tunnels (1 = top).
+	Route     string   `json:"route,omitempty"`     // "tunnel" | "direct" — new vocabulary
+	Mode      string   `json:"mode,omitempty"`      // legacy: "include" (→ tunnel) | "exclude" (→ direct)
 	Domains   []string `json:"domains"`
 	IPs       []string `json:"ips"`
 	SourceIPs []string `json:"source_ips"` // per-source-device filter: if non-empty, the zone applies ONLY to packets from these LAN IPs/CIDRs. Empty = whole LAN (the historical default).
@@ -150,7 +153,7 @@ func (z Zone) IsCatchAll() bool {
 type RoutingConfig struct {
 	Mode         string `json:"mode"` // "off"|"zones" (direction is per-zone)|"full" (route everything)
 	Zones        []Zone `json:"zones"`
-	MTU          int    `json:"mtu"` // awg0 client MTU
+	MTU          int    `json:"mtu"` // legacy; tunnel MTU lives in ServerConfig.MTU
 	Killswitch   bool   `json:"killswitch"`
 	DomainSource string `json:"domain_source"` // "resolve"|"dnsproxy"
 	SNIRouting   bool   `json:"sni_routing"`   // additional: sniff TLS ClientHello SNI and route matched domains' IPs via the tunnel (beats DoH + CDN)
@@ -161,17 +164,18 @@ type RoutingConfig struct {
 // Default returns a ready-to-fill server config with AWG 2.0 defaults.
 func Default() *ServerConfig {
 	return &ServerConfig{
-		Enabled:    true,
-		Conn:       Credentials{Port: 22, User: "root", AuthKind: "password"},
-		Install:    "apt",
-		ListenPort: 51820,
-		Address:    "10.13.13.1/24",
-		Subnet:     "10.13.13.0/24",
-		MTU:        1420,
-		DNS:        "1.1.1.1, 1.0.0.1",
-		Obf:        DefaultObf(),
-		Peers:      []Peer{},
-		Interface:  "awg0",
+		Enabled:     true,
+		Conn:        Credentials{Port: 22, User: "root", AuthKind: "password"},
+		Install:     "apt",
+		ListenPort:  51820,
+		Address:     "10.13.13.1/24",
+		Subnet:      "10.13.13.0/24",
+		MTU:         1420,
+		DNS:         "1.1.1.1, 1.0.0.1",
+		Obf:         DefaultObf(),
+		Peers:       []Peer{},
+		Interface:   "awg0",
+		ClientIface: "awg0",
 		Routing: RoutingConfig{
 			Mode:         "off",
 			Zones:        []Zone{},
@@ -187,17 +191,21 @@ func (c ServerConfig) UseObfuscation() bool {
 
 // Normalize fills zero/blank fields with defaults so a partial config is usable.
 func (c *ServerConfig) Normalize() {
-	if c.Conn.Port == 0 {
-		c.Conn.Port = 22
-	}
-	if c.Conn.User == "" {
-		c.Conn.User = "root"
-	}
-	if c.Conn.AuthKind != "key" {
-		c.Conn.AuthKind = "password"
-	}
 	if c.Install != "userspace" && c.Install != "imported" {
 		c.Install = "apt"
+	}
+	if c.Install == "imported" {
+		c.Conn = Credentials{}
+	} else {
+		if c.Conn.Port == 0 {
+			c.Conn.Port = 22
+		}
+		if c.Conn.User == "" {
+			c.Conn.User = "root"
+		}
+		if c.Conn.AuthKind != "key" {
+			c.Conn.AuthKind = "password"
+		}
 	}
 	if c.Protocol != "wireguard" {
 		c.Protocol = "awg"
@@ -217,7 +225,10 @@ func (c *ServerConfig) Normalize() {
 	if c.Interface == "" {
 		c.Interface = "awg0"
 	}
-	if strings.TrimSpace(c.Endpoint) == "" && strings.TrimSpace(c.Conn.Host) != "" {
+	if c.ClientIface == "" {
+		c.ClientIface = "awg0"
+	}
+	if c.Install != "imported" && strings.TrimSpace(c.Endpoint) == "" && strings.TrimSpace(c.Conn.Host) != "" {
 		c.Endpoint = fmt.Sprintf("%s:%d", strings.TrimSpace(c.Conn.Host), c.ListenPort)
 	}
 	c.Obf.normalize()
@@ -282,17 +293,19 @@ func (c *ServerConfig) Normalize() {
 // Validate returns Russian-language problems with the config (empty = valid).
 func (c *ServerConfig) Validate() []string {
 	var errs []string
-	if strings.TrimSpace(c.Conn.Host) == "" {
-		errs = append(errs, "укажите адрес VPS")
-	}
-	if c.Conn.Port < 1 || c.Conn.Port > 65535 {
-		errs = append(errs, "порт SSH вне диапазона")
-	}
-	if strings.TrimSpace(c.Conn.User) == "" {
-		errs = append(errs, "укажите пользователя SSH")
-	}
-	if c.Conn.AuthKind != "password" && c.Conn.AuthKind != "key" {
-		errs = append(errs, "неизвестный метод авторизации SSH")
+	if c.Install != "imported" {
+		if strings.TrimSpace(c.Conn.Host) == "" {
+			errs = append(errs, "укажите адрес VPS")
+		}
+		if c.Conn.Port < 1 || c.Conn.Port > 65535 {
+			errs = append(errs, "порт SSH вне диапазона")
+		}
+		if strings.TrimSpace(c.Conn.User) == "" {
+			errs = append(errs, "укажите пользователя SSH")
+		}
+		if c.Conn.AuthKind != "password" && c.Conn.AuthKind != "key" {
+			errs = append(errs, "неизвестный метод авторизации SSH")
+		}
 	}
 	if c.Install != "apt" && c.Install != "userspace" && c.Install != "imported" {
 		errs = append(errs, "неизвестный метод установки")

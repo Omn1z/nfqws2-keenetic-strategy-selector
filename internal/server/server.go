@@ -327,8 +327,10 @@ func (s *Server) routes() {
 	m.HandleFunc("GET /api/awg2", s.awg2Status)
 	m.HandleFunc("POST /api/awg2/servers", s.awg2AddServer)
 	m.HandleFunc("POST /api/awg2/import", s.awg2Import)
+	m.HandleFunc("POST /api/awg2/warp", s.awg2CreateWARP)
 	m.HandleFunc("POST /api/awg2/servers/deploy", s.awg2DeployServers)
 	m.HandleFunc("POST /api/awg2/servers/{id}/select", s.awg2SelectServer)
+	m.HandleFunc("POST /api/awg2/servers/{id}/rename", s.awg2RenameServer)
 	m.HandleFunc("POST /api/awg2/servers/{id}/enabled", s.awg2SetServerEnabled)
 	m.HandleFunc("POST /api/awg2/servers/{id}/deploy", s.awg2DeployServer)
 	m.HandleFunc("DELETE /api/awg2/servers/{id}", s.awg2DeleteServer)
@@ -345,6 +347,7 @@ func (s *Server) routes() {
 	m.HandleFunc("POST /api/awg2/routing/apply", s.awg2RoutingApply)
 	m.HandleFunc("POST /api/awg2/routing/commit", s.awg2RoutingCommit)
 	m.HandleFunc("POST /api/awg2/routing/teardown", s.awg2RoutingTeardown)
+	m.HandleFunc("POST /api/awg2/routing/rules", s.awg2RoutingRules)
 	m.HandleFunc("POST /api/awg2/routing/rules/insert-top", s.awg2RulesInsertTop)
 	m.HandleFunc("POST /api/awg2/routing/rules/copy", s.awg2RulesCopy)
 	m.HandleFunc("GET /api/awg2/trace", s.awg2TraceList)
@@ -378,6 +381,7 @@ func (s *Server) routes() {
 	m.HandleFunc("GET /api/nfqws2/update/check", s.nfqws2CheckUpdate)
 	m.HandleFunc("POST /api/nfqws2/update", s.nfqws2Update)
 	m.HandleFunc("POST /api/nfqws2/reload", s.nfqws2Reload)
+	m.HandleFunc("POST /api/nfqws2/bypass/apply", s.nfqws2ApplyBypass)
 	m.HandleFunc("POST /api/nfqws2/start", s.nfqws2StartSvc)
 	m.HandleFunc("POST /api/nfqws2/stop", s.nfqws2StopSvc)
 	m.HandleFunc("GET /api/nfqws2/files", s.nfqws2Files)
@@ -1111,6 +1115,14 @@ func (s *Server) nfqws2Reload(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, map[string]string{"status": "reloaded"})
 }
 
+func (s *Server) nfqws2ApplyBypass(w http.ResponseWriter, r *http.Request) {
+	if err := s.app.Nfqws2ApplyBypass(); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, map[string]string{"status": "applied"})
+}
+
 func (s *Server) nfqws2Files(w http.ResponseWriter, r *http.Request) {
 	files, err := s.app.ListNfqws2Files(r.URL.Query().Get("kind"))
 	if err != nil {
@@ -1208,7 +1220,6 @@ func (s *Server) nfqws2DownloadFile(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Disposition", `attachment; filename="`+safeFile(name, true, "file", 80)+`"`)
 	_, _ = w.Write(data)
 }
-
 
 func (s *Server) startRun(w http.ResponseWriter, r *http.Request) {
 	var req app.RunRequest
@@ -1457,8 +1468,47 @@ func (s *Server) awg2Import(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, st)
 }
 
+func (s *Server) awg2CreateWARP(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Name      string `json:"name"`
+		Endpoint  string `json:"endpoint"`
+		AcceptTOS bool   `json:"accept_tos"`
+	}
+	if err := readJSON(r, &in); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 35*time.Second)
+	defer cancel()
+	st, err := s.app.AWG2CreateWARP(ctx, awgroute.WARPCreateOptions{
+		Name:      in.Name,
+		Endpoint:  in.Endpoint,
+		AcceptTOS: in.AcceptTOS,
+	})
+	if err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, st)
+}
+
 func (s *Server) awg2SelectServer(w http.ResponseWriter, r *http.Request) {
 	if err := s.app.AWG2SelectServer(r.PathValue("id")); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, s.app.AWG2StatusView())
+}
+
+func (s *Server) awg2RenameServer(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Name string `json:"name"`
+	}
+	if err := readJSON(r, &in); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	if err := s.app.AWG2RenameServer(r.PathValue("id"), in.Name); err != nil {
 		httpErr(w, 400, err)
 		return
 	}
@@ -1631,6 +1681,19 @@ func (s *Server) awg2RoutingCommit(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) awg2RoutingTeardown(w http.ResponseWriter, r *http.Request) {
 	if err := s.app.AWG2TeardownRouting(); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, s.app.AWG2StatusView())
+}
+
+func (s *Server) awg2RoutingRules(w http.ResponseWriter, r *http.Request) {
+	var in awg.RoutingConfig
+	if err := readJSON(r, &in); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	if err := s.app.AWG2SetRoutingRules(in); err != nil {
 		httpErr(w, 400, err)
 		return
 	}

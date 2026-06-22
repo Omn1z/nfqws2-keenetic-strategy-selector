@@ -4,7 +4,6 @@ import { toast } from "@/components/ui/Toast";
 import { Card } from "@/components/ui/Card";
 import { Button } from "@/components/ui/Button";
 import { Badge } from "@/components/ui/Badge";
-import { Dropzone } from "@/components/ui/Dropzone";
 import { Field, Input, Select, Textarea } from "@/components/ui/form";
 import type { Awg2Status, AwgServerConfig } from "@/types/api";
 
@@ -47,9 +46,6 @@ export default function ServerPane({ st, reload, deployActive, deploying }: { st
   const [saving, setSaving] = useState(false);
   const [advanced, setAdvanced] = useState(false);
   const [passwordOpen, setPasswordOpen] = useState(false);
-  const [importName, setImportName] = useState("");
-  const [importText, setImportText] = useState("");
-  const [importing, setImporting] = useState(false);
   useEffect(() => {
     setForm(toForm(st.config));
   }, [st.active_server_id, st.config.conn.known_key, st.config.install, st.config.protocol]);
@@ -70,60 +66,8 @@ export default function ServerPane({ st, reload, deployActive, deploying }: { st
     }
   };
 
-  const importProfile = async () => {
-    if (!importText.trim()) {
-      toast("Вставьте .conf/.vpn или выберите файл", "err");
-      return;
-    }
-    setImporting(true);
-    try {
-      await api<Awg2Status>("POST", "/api/awg2/import", { conf: importText, name: importName.trim() });
-      setImportText("");
-      setImportName("");
-      await reload();
-      toast("Профиль импортирован — можно поднимать туннель", "ok");
-    } catch (e) {
-      toast((e as Error).message, "err");
-    } finally {
-      setImporting(false);
-    }
-  };
-
-  const onImportFiles = (files: FileList) => {
-    const f = files.item(0);
-    if (!f) return;
-    void f.text().then((text) => {
-      setImportText(text);
-      if (!importName.trim()) setImportName(f.name.replace(/\.(conf|vpn|txt)$/i, ""));
-    }).catch((e) => toast((e as Error).message, "err"));
-  };
-
   return (
     <>
-      <Card
-        title="Подключиться к существующему серверу"
-        sub=".conf AmneziaWG/WireGuard или .vpn AmneziaVPN"
-        head={<Badge kind="neutral">без SSH-деплоя</Badge>}
-      >
-        <div className="grid gap-3 lg:grid-cols-[minmax(220px,0.8fr)_minmax(280px,1.2fr)]">
-          <div className="space-y-3">
-            <Dropzone accept=".conf,.vpn,.txt" onFiles={onImportFiles}>
-              <div className="text-sm font-semibold">Выберите .conf/.vpn</div>
-              <div className="mt-1 text-xs text-muted">или перетащите файл сюда</div>
-            </Dropzone>
-            <Field label="Название профиля">
-              <Input value={importName} placeholder="AWG Moscow / WireGuard Home" onChange={(e) => setImportName(e.target.value)} />
-            </Field>
-            <Button variant="primary" onClick={importProfile} disabled={importing || !importText.trim()}>
-              {importing ? "Импорт..." : "Импортировать профиль"}
-            </Button>
-          </div>
-          <Field label="Содержимое .conf/.vpn">
-            <Textarea rows={8} value={importText} placeholder={"[Interface]\nPrivateKey = ...\nAddress = ...\n\n[Peer]\nPublicKey = ...\nEndpoint = host:51820\nAllowedIPs = 0.0.0.0/0, ::/0\n\nили vpn://..."} onChange={(e) => setImportText(e.target.value)} />
-          </Field>
-        </div>
-      </Card>
-
       {!imported && (
         <Card
           title="Развертывание VPS"
@@ -158,6 +102,19 @@ export default function ServerPane({ st, reload, deployActive, deploying }: { st
         </Card>
       )}
 
+      <Card
+        title="Параметры интерфейса"
+        sub="локальные параметры клиента на роутере"
+        head={imported ? <Badge kind="neutral">nossh</Badge> : undefined}
+      >
+        <div className="grid gap-3 sm:grid-cols-[120px_auto] sm:items-end">
+          <Field label="MTU">
+            <Input type="number" min={1280} max={1500} value={form.mtu} onChange={(e) => set("mtu", e.target.value)} />
+          </Field>
+          <Button variant="primary" onClick={save} disabled={saving}>{saving ? "Сохранение…" : "Сохранить MTU"}</Button>
+        </div>
+      </Card>
+
       {advanced && !imported && (
       <Card
         title="Сервер (VPS) и SSH"
@@ -190,7 +147,6 @@ export default function ServerPane({ st, reload, deployActive, deploying }: { st
       <Card title="Сеть туннеля">
         <div className="flex flex-wrap gap-4">
           <Field label="UDP-порт" className="w-32 shrink-0"><Input type="number" min={1} max={65535} value={form.listen_port} onChange={(e) => set("listen_port", e.target.value)} /></Field>
-          <Field label="MTU" className="w-28 shrink-0"><Input type="number" min={1280} max={1500} value={form.mtu} onChange={(e) => set("mtu", e.target.value)} /></Field>
           <Field label="WAN-интерфейс" hint="пусто = авто" className="w-40 shrink-0"><Input value={form.wan_iface} placeholder="eth0" onChange={(e) => set("wan_iface", e.target.value)} /></Field>
         </div>
         <div className="flex flex-wrap gap-4">
@@ -205,9 +161,6 @@ export default function ServerPane({ st, reload, deployActive, deploying }: { st
       {plainWG ? (
         <Card title="WireGuard профиль" sub="plain WG: AWG-obfuscation параметры не отправляются">
           <p className="text-xs text-muted">Этот imported-профиль не содержит Jc/Jmin/Jmax/S/H/I параметров, поэтому роутер применяет его как обычный WireGuard based конфиг через тот же userspace-движок.</p>
-          <div className="mt-3 flex flex-wrap items-center gap-2.5">
-            <Button variant="primary" onClick={save} disabled={saving}>{saving ? "Сохранение..." : "Сохранить настройки"}</Button>
-          </div>
         </Card>
       ) : advanced && !imported ? (
       <Card title="Обфускация AmneziaWG 2.0" sub="случайная при первом деплое; должна совпадать у сервера и клиента">

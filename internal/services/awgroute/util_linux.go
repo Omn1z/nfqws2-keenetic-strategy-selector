@@ -252,6 +252,9 @@ func awgMarkCollision() string {
 		if v == ourBit {
 			continue // our own rule from a prior run
 		}
+		if strings.Contains(fields[0], "/"+awgMultiMarkMask) {
+			continue // our multi-tunnel policy rules
+		}
 		if v&ourBit != 0 {
 			return mark
 		}

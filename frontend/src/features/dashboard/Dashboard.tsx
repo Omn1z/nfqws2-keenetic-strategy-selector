@@ -279,7 +279,8 @@ export default function Dashboard() {
   //                          остановлен" placeholder strip from the old layout
   //                          carried zero information and ate vertical space.
   //  Charts: render only after we have at least one delta sample.
-  const liveAwg = (d.awg ?? []).filter((c) => c.state !== "off");
+  const awgConns = d.awg ?? [];
+  const awgConnected = awgConns.filter((c) => c.state === "connected").length;
   const showTgws    = d.tgws.running    || cc.total > 0 || tr.bytes_up > 0 || tr.bytes_down > 0;
   const showSocks5  = d.socks5.running  || sc.total > 0 || str.bytes_up > 0 || str.bytes_down > 0;
   const showNfqws2  = d.nfqws2_running  || !!q;
@@ -289,9 +290,6 @@ export default function Dashboard() {
     showNfqws2  && "nfqws2",
   ].filter(Boolean);
 
-  const awg = liveAwg[0]; // user-facing dashboards only show the active tunnel
-  const awgR = awg ? awgRates[awg.id] : undefined;
-  const awgSt = awg ? (AWG_STATE[awg.state] ?? AWG_STATE.off) : null;
   const hasHistory = hist.length > 1;
 
   return (
@@ -300,8 +298,8 @@ export default function Dashboard() {
           to know whether VPN/WAN/DPI/Маршрутизация are fine. Restart sits at the
           right of the strip — one row, no wasted real estate. */}
       <div className="mb-4 flex flex-wrap items-center gap-2 rounded-lg border border-line bg-panel/40 px-3 py-2">
-        <Pill ok={awg?.state === "connected"} warn={awg?.state === "stale"} bad={!awg || awg.state === "down"}>
-          VPN {awg ? (awgR ? `${human(awgR.rx)}/с ↓` : awgSt?.l) : "нет"}
+        <Pill ok={awgConnected > 0} warn={awgConns.length > 0 && awgConnected === 0} bad={awgConns.length === 0}>
+          VPN {awgConns.length ? `${awgConnected}/${awgConns.length}` : "нет"}
         </Pill>
         <Pill ok={!!wan0r && wan0r.rx > 0} warn={!!wan0 && (!wan0r || wan0r.rx === 0)} bad={!wan0}>
           WAN {wan0r ? `${human(wan0r.rx)}/с ↓` : (wan0?.iface || "нет")}
@@ -318,16 +316,19 @@ export default function Dashboard() {
       {/* HERO 2-up: AWG2 tunnel + WAN. The two "throughput" cards, each with an
           inline mini-sparkline below the Big number so trends read instantly. */}
       <div className="mb-4 grid gap-4 grid-cols-1 lg:grid-cols-2">
-        {awg && awgSt && (
-          <Card title={`AWG2 · ${awg.label || awg.id}`} sub={awg.endpoint || "VPN-туннель"} head={<Badge kind={awgSt.k}>{awgSt.l}</Badge>} className={CARD}>
-            <Big value={awgR ? `${human(awgR.rx)}/с` : "…"} sub="↓ через туннель" />
-            {hasHistory && <Sparkline data={hist.map((s) => s.rx / 1024)} label="" value="" color="var(--c-accent)" />}
-            <Row l="↑ сейчас">{awgR ? `${human(awgR.tx)}/с` : "…"}</Row>
-            <Row l="Хендшейк">{awg.last_handshake ? agoRu(awg.last_handshake) : "—"}</Row>
-            <Row l="Всего ↓ / ↑">{human(awg.rx_bytes)} / {human(awg.tx_bytes)}</Row>
-            <Row l="MTU / адрес">{awg.mtu || "—"} / {awg.address || "—"}</Row>
-          </Card>
-        )}
+        {awgConns.map((awg) => {
+          const awgR = awgRates[awg.id];
+          const awgSt = AWG_STATE[awg.state] ?? AWG_STATE.off;
+          return (
+            <Card key={awg.id} title={`AWG2 · ${awg.label || awg.id}`} sub={awg.endpoint || "VPN-туннель"} head={<Badge kind={awgSt.k}>{awgSt.l}</Badge>} className={CARD}>
+              <Big value={awgR ? `${human(awgR.rx)}/с` : (awg.running ? "…" : "0 B/с")} sub="↓ через туннель" />
+              <Row l="↑ сейчас">{awgR ? `${human(awgR.tx)}/с` : (awg.running ? "…" : "0 B/с")}</Row>
+              <Row l="Хендшейк">{awg.last_handshake ? agoRu(awg.last_handshake) : "—"}</Row>
+              <Row l="Всего ↓ / ↑">{human(awg.rx_bytes)} / {human(awg.tx_bytes)}</Row>
+              <Row l="MTU / адрес">{awg.mtu || "—"} / {awg.address || "—"}</Row>
+            </Card>
+          );
+        })}
         {wan0 && (
           <Card title="WAN" sub={wan0.iface} className={CARD}>
             <Big value={wan0r ? `${human(wan0r.rx)}/с` : "…"} sub="↓ сейчас" />

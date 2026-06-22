@@ -72,9 +72,15 @@ const (
 
 // allowed base extensions per kind (without the leading dot, .gz already stripped).
 var exts = map[string][]string{
-	"conf": {"conf", "conf-opkg", "conf-old", "apk-new"},
-	"list": {"list", "list-opkg", "list-old"},
-	"lua":  {"lua"},
+	"conf":   {"conf", "conf-opkg", "conf-old", "apk-new"},
+	"list":   {"list", "list-opkg", "list-old"},
+	"bypass": {"list"},
+	"lua":    {"lua"},
+}
+
+var bypassFiles = map[string]bool{
+	"nfqueue_bypass_domains.list": true,
+	"nfqueue_bypass_ips.list":     true,
 }
 
 // anchored per-kind validators: stem [A-Za-z0-9_-]+ then one allowed extension.
@@ -97,6 +103,8 @@ func (m *Manager) dir(kind string) (string, bool) {
 		return confDir, true
 	case "list":
 		return confDir + "/lists", true
+	case "bypass":
+		return confDir + "/lists", true
 	case "lua":
 		return m.cfg.LuaDir, true
 	}
@@ -116,6 +124,9 @@ func (m *Manager) resolve(kind, name string) (basePath, base string, err error) 
 	if re == nil || !re.MatchString(base) {
 		return "", "", fmt.Errorf("недопустимое имя файла: %q", name)
 	}
+	if kind == "bypass" && !bypassFiles[base] {
+		return "", "", fmt.Errorf("недопустимый файл NFQUEUE bypass: %q", name)
+	}
 	return dir + "/" + base, base, nil
 }
 
@@ -128,6 +139,8 @@ func isProtected(kind, base string) bool {
 		case "user.list", "auto.list", "exclude.list", "ipset.list", "ipset_exclude.list":
 			return true
 		}
+	case "bypass":
+		return bypassFiles[base]
 	}
 	return false
 }
@@ -159,6 +172,12 @@ func (m *Manager) List(kind string) ([]File, error) {
 		if !re.MatchString(base) {
 			continue
 		}
+		if kind == "list" && bypassFiles[base] {
+			continue
+		}
+		if kind == "bypass" && !bypassFiles[base] {
+			continue
+		}
 		info, ierr := e.Info()
 		if ierr != nil {
 			continue
@@ -186,6 +205,14 @@ func (m *Manager) List(kind string) ([]File, error) {
 		}
 		out = append(out, f)
 	}
+	if kind == "bypass" {
+		for base := range bypassFiles {
+			if _, ok := byBase[base]; ok {
+				continue
+			}
+			out = append(out, File{Name: base, Kind: kind, Protected: true})
+		}
+	}
 	sort.Slice(out, func(i, j int) bool {
 		pi, pj := sortPriority(out[i].Name), sortPriority(out[j].Name)
 		if pi != pj {
@@ -211,6 +238,10 @@ func sortPriority(name string) int {
 		return -61
 	case "ipset_exclude.list":
 		return -60
+	case "nfqueue_bypass_domains.list":
+		return -59
+	case "nfqueue_bypass_ips.list":
+		return -58
 	}
 	switch {
 	case strings.HasSuffix(name, ".conf"):
@@ -371,6 +402,26 @@ func (m *Manager) Bytes(kind, name string) (data []byte, dlName string, err erro
 		return b, base + ".gz", nil
 	}
 	return nil, "", fmt.Errorf("файл не найден: %s", base)
+}
+
+// ApplyBypass rebuilds nfqws2's IPv4 firewall chains and reapplies the
+// out-of-band NFQUEUE bypass rules. Rebuilding first drops stale RETURN rules
+// for entries the user removed from the bypass lists.
+func (m *Manager) ApplyBypass() error {
+	const bypassScript = "/opt/etc/nfqws2/nfqws-bypass.sh"
+	const initScript = "/opt/etc/init.d/S51nfqws2"
+	if _, err := os.Stat(bypassScript); err != nil {
+		return fmt.Errorf("NFQUEUE bypass script not found: %w", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	cmd := initScript + " firewall_iptables && " + bypassScript + " iptables"
+	out, err := exec.CommandContext(ctx, "sh", "-c", cmd).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("NFQUEUE bypass apply failed: %v: %s", err, strings.TrimSpace(string(out)))
+	}
+	logbuf.Append("nfqws2", "info", "NFQUEUE bypass applied")
+	return nil
 }
 
 func opkgBin() string {

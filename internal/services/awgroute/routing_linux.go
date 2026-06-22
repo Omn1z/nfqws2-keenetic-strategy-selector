@@ -143,7 +143,7 @@ func (svc *Service) awgApplyRoutingOS() error {
 	// 5) firewall hook (marking chain + FORWARD/NAT/MSS [+ DNS REDIRECT]) — a Keenetic
 	// ndm netfilter.d hook so it survives the firewall rebuilds that flush foreign
 	// iptables chains; awgWriteHook also applies it immediately.
-	if err := awgWriteHook(awgEffectiveMode(r), endpointIP, wandev, r.MTU, dnsOn, svc.dnsChainEnabled(), awgTunnelV6Reaches(), r.Zones); err != nil {
+	if err := awgWriteHook(awgEffectiveMode(r), endpointIP, wandev, awgTunnelMTU(cfg), dnsOn, svc.dnsChainEnabled(), awgTunnelV6Reaches(), r.Zones); err != nil {
 		return fmt.Errorf("firewall-хук: %w", err)
 	}
 	// 6) disable Keenetic's NAT accelerators — their fast-path silently drops our
@@ -206,7 +206,7 @@ func (svc *Service) awgRefreshRoutingOS() error {
 	traceSetEnabled(r.TraceEnabled)
 	dnsOn := svc.awgEnsureDNSProxy(&cfg)
 	svc.awgEnsureSNISniff(&cfg) // start/stop/refresh the SNI sniffer to match the new zones
-	if err := awgWriteHook(awgEffectiveMode(r), endpointIP, wandev, r.MTU, dnsOn, svc.dnsChainEnabled(), awgTunnelV6Reaches(), r.Zones); err != nil {
+	if err := awgWriteHook(awgEffectiveMode(r), endpointIP, wandev, awgTunnelMTU(cfg), dnsOn, svc.dnsChainEnabled(), awgTunnelV6Reaches(), r.Zones); err != nil {
 		return fmt.Errorf("firewall-хук: %w", err)
 	}
 	awgSetAccel(false)
@@ -285,7 +285,7 @@ func (svc *Service) awgStartRefresh() {
 				_, wandev := awgDefaultRoute()
 				dnsOn := svc.awgEnsureDNSProxy(&c)
 				chainOn := svc.dnsChainEnabled()
-				h := awgHookInputsHash(awgEffectiveMode(c.Routing), endpointIP, wandev, c.Routing.MTU, dnsOn, chainOn, awgTunnelV6Reaches(), c.Routing.Killswitch, svc.zonesRevision.Load())
+				h := awgHookInputsHash(awgEffectiveMode(c.Routing), endpointIP, wandev, awgTunnelMTU(c), dnsOn, chainOn, awgTunnelV6Reaches(), c.Routing.Killswitch, svc.zonesRevision.Load())
 				_, hookMissing := os.Stat(awgHookPath)
 				// Watchdog hot path: avoid route.mu entirely. lastHookHash is an
 				// atomic.Pointer[string] swapped by the most recent re-assert;
@@ -318,7 +318,7 @@ func (svc *Service) awgStartRefresh() {
 				// through here forever, defeating the whole skip cache.
 				svc.route.hookSkipsSinceFull.Store(0)
 				if hookMissing != nil {
-					_ = awgWriteHook(awgEffectiveMode(c.Routing), endpointIP, wandev, c.Routing.MTU, dnsOn, chainOn, awgTunnelV6Reaches(), c.Routing.Zones)
+					_ = awgWriteHook(awgEffectiveMode(c.Routing), endpointIP, wandev, awgTunnelMTU(c), dnsOn, chainOn, awgTunnelV6Reaches(), c.Routing.Zones)
 				} else {
 					_, _ = awgRun("sh " + awgHookPath)
 				}
@@ -388,8 +388,8 @@ func (svc *Service) awgTeardownRoutingOS() error {
 	svc.awgStopSNISniff()      // stop the SNI sniffer (closes its AF_PACKET sockets)
 	awgSetAccel(true)          // restore Keenetic's NAT accelerators (off only while routing active)
 	_ = os.Remove(awgHookPath) // stop Keenetic's ndm from re-adding our rules
-	_, _ = awgRun("iptables -t mangle -D PREROUTING -j " + awgChain + " 2>/dev/null")
-	_, _ = awgRun("iptables -t mangle -D OUTPUT -j " + awgChain + " 2>/dev/null")
+	_, _ = awgRun("while iptables -w -t mangle -D PREROUTING -j " + awgChain + " 2>/dev/null; do :; done")
+	_, _ = awgRun("while iptables -w -t mangle -D OUTPUT -j " + awgChain + " 2>/dev/null; do :; done")
 	_, _ = awgRun("iptables -t mangle -F " + awgChain + " 2>/dev/null")
 	_, _ = awgRun("iptables -t mangle -X " + awgChain + " 2>/dev/null")
 	_, _ = awgRun("ip rule del fwmark " + awgMarkRule + " table " + awgTable + " 2>/dev/null")
@@ -397,9 +397,7 @@ func (svc *Service) awgTeardownRoutingOS() error {
 	_, _ = awgRun("iptables -t nat -D POSTROUTING -o " + awgIface + " -j MASQUERADE 2>/dev/null")
 	mtu := 1280
 	if am := svc.awgActive(); am != nil {
-		if v := am.Config().Routing.MTU; v > 0 {
-			mtu = v
-		}
+		mtu = awgTunnelMTU(am.Config())
 	}
 	mss := strconv.Itoa(mtu - 40)
 	for _, dir := range []string{"-o", "-i"} {
@@ -408,6 +406,7 @@ func (svc *Service) awgTeardownRoutingOS() error {
 	}
 	_, _ = awgRun("iptables -D FORWARD -i " + awgIface + " -j ACCEPT 2>/dev/null")
 	_, _ = awgRun("iptables -D FORWARD -o " + awgIface + " -j ACCEPT 2>/dev/null")
+	_, _ = awgRun(awgMultiSharedCleanupShell())
 	_, _ = awgRun("ipset destroy " + awgSetInc + " 2>/dev/null")
 	_, _ = awgRun("ipset destroy " + awgSetExc + " 2>/dev/null")
 	_, _ = awgRun("ipset destroy " + awgSetSNI + " 2>/dev/null")
@@ -415,8 +414,8 @@ func (svc *Service) awgTeardownRoutingOS() error {
 	// rule + route, per-zone v6 ipsets). Per-zone v4 sets persist across teardown
 	// by design (they're rebuilt by awgBuildSourceSets on next apply), so we leave
 	// the v6 counterparts alone the same way.
-	_, _ = awgRun("ip6tables -t mangle -D PREROUTING -j " + awgChain + "6 2>/dev/null")
-	_, _ = awgRun("ip6tables -t mangle -D OUTPUT -j " + awgChain + "6 2>/dev/null")
+	_, _ = awgRun("while ip6tables -w -t mangle -D PREROUTING -j " + awgChain + "6 2>/dev/null; do :; done")
+	_, _ = awgRun("while ip6tables -w -t mangle -D OUTPUT -j " + awgChain + "6 2>/dev/null; do :; done")
 	_, _ = awgRun("ip6tables -t mangle -F " + awgChain + "6 2>/dev/null")
 	_, _ = awgRun("ip6tables -t mangle -X " + awgChain + "6 2>/dev/null")
 	_, _ = awgRun("ip -6 rule del fwmark " + awgMarkRule + " table " + awgTable + " 2>/dev/null")

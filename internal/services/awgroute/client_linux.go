@@ -24,16 +24,14 @@ import (
 	"nfqws2strategy/internal/tools/logbuf"
 	"nfqws2strategy/internal/tools/shell"
 	"nfqws2strategy/internal/tools/strs"
-	"nfqws2strategy/internal/tools/tgfronts"
 )
 
 const (
-	awgEngineDir  = "/opt/usr/bin"
-	awgClientDir  = "/opt/etc/amnezia/amneziawg"
-	awgClientConf = awgClientDir + "/awg0.conf"
-	awgIface      = "awg0"
-	awgSock       = "/var/run/amneziawg/awg0.sock"
+	awgEngineDir = "/opt/usr/bin"
+	awgClientDir = "/opt/etc/amnezia/amneziawg"
 )
+
+var awgIface = "awg0"
 
 func awgArchSupported(a string) bool {
 	switch a {
@@ -44,6 +42,29 @@ func awgArchSupported(a string) bool {
 }
 
 func awgGoBin() string { return filepath.Join(awgEngineDir, "amneziawg-go") }
+
+func awgClientIface(cfg awg.ServerConfig) string {
+	if iface := strings.TrimSpace(cfg.ClientIface); validAWGClientIfaceName(iface) {
+		return iface
+	}
+	return awgIface
+}
+
+func awgClientConfPath(iface string) string {
+	return filepath.Join(awgClientDir, iface+".conf")
+}
+
+func awgSockPath(iface string) string {
+	return "/var/run/amneziawg/" + iface + ".sock"
+}
+
+func awgSetActiveIfaceOS(iface string) {
+	if validAWGClientIfaceName(iface) {
+		awgIface = iface
+		return
+	}
+	awgIface = "awg0"
+}
 
 func (svc *Service) awgEngineInfoOS() EngineInfo {
 	info := EngineInfo{Arch: runtime.GOARCH, Supported: awgArchSupported(runtime.GOARCH)}
@@ -142,12 +163,15 @@ func extractEngine(data []byte, dir string) error {
 }
 
 func (svc *Service) awgClientUpOS() error {
+	return svc.awgClientUpManagerOS(svc.awgActive())
+}
+
+func (svc *Service) awgClientUpManagerOS(am *awg.Manager) error {
 	if info := svc.awgEngineInfoOS(); !info.Installed {
 		return fmt.Errorf("движок AWG2 не установлен — нажмите «Установить движок»")
 	} else if !info.TunOK {
 		return fmt.Errorf("нет /dev/net/tun — TUN недоступен на этом роутере")
 	}
-	am := svc.awgActive()
 	if am == nil {
 		return fmt.Errorf("AWG2-сервер не выбран")
 	}
@@ -159,33 +183,21 @@ func (svc *Service) awgClientUpOS() error {
 		return fmt.Errorf("у роутер-пира нет приватного ключа — добавьте пир заново")
 	}
 	cfg := am.Config()
-	host, portStr, _ := net.SplitHostPort(strings.TrimSpace(cfg.Endpoint))
-	endpointIP := resolveHostIP(host)
-	port, _ := strconv.Atoi(portStr)
-	if endpointIP == "" || port == 0 {
-		return fmt.Errorf("не удалось разрешить адрес сервера (endpoint)")
-	}
-	setText, err := awg.RenderUAPISet(&cfg, p, endpointIP, port)
-	if err != nil {
-		return err
-	}
+	iface := awgClientIface(cfg)
 	if err := os.MkdirAll(awgClientDir, 0o755); err != nil {
 		return err
 	}
-	_ = writeFile0600(awgClientConf, awg.ClientConf(&cfg, p)) // reference copy
+	_ = writeFile0600(awgClientConfPath(iface), awg.ClientConf(&cfg, p)) // reference copy
 
-	mtu := cfg.Routing.MTU
-	if mtu == 0 {
-		mtu = 1280
-	}
+	mtu := awgTunnelMTU(cfg)
 	// 1) start the userspace daemon (creates the iface + UAPI socket) + bring up
 	script := strings.Join([]string{
 		"mkdir -p /var/run/amneziawg",
-		"ip link show " + awgIface + " >/dev/null 2>&1 || (" + awgGoBin() + " " + awgIface + "; sleep 1)",
-		"ip addr flush dev " + awgIface + " 2>/dev/null || true",
-		awgAddressScript(p.Address),
-		"ip link set " + awgIface + " mtu " + strconv.Itoa(mtu),
-		"ip link set " + awgIface + " up",
+		"ip link show " + iface + " >/dev/null 2>&1 || (" + awgGoBin() + " " + iface + "; sleep 1)",
+		"ip addr flush dev " + iface + " 2>/dev/null || true",
+		awgAddressScript(iface, p.Address),
+		"ip link set " + iface + " mtu " + strconv.Itoa(mtu),
+		"ip link set " + iface + " up",
 		"echo iface-up",
 	}, "\n")
 	ctx, cancel := contextTimeout(30 * time.Second)
@@ -195,57 +207,106 @@ func (svc *Service) awgClientUpOS() error {
 	}
 	// 2) wait for the UAPI socket, then apply the WG + 2.0-obfuscation config
 	for i := 0; i < 20; i++ {
-		if _, e := os.Stat(awgSock); e == nil {
+		if _, e := os.Stat(awgSockPath(iface)); e == nil {
 			break
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
-	resp, err := uapiRequest(setText)
+	if isWARPConfig(cfg) {
+		next, err := svc.awgApplyBestWARPEndpoint(am, cfg, p, iface)
+		if err != nil {
+			return err
+		}
+		if next.Endpoint != cfg.Endpoint {
+			cfg = next
+			_ = writeFile0600(awgClientConfPath(iface), awg.ClientConf(&cfg, p))
+		}
+		logbuf.Append("awg2", "info", "туннель "+iface+" поднят (WARP endpoint auto)")
+		return nil
+	}
+	host, portStr, _ := net.SplitHostPort(strings.TrimSpace(cfg.Endpoint))
+	endpointIP := resolveHostIP(host)
+	port, _ := strconv.Atoi(portStr)
+	if endpointIP == "" || port == 0 {
+		return fmt.Errorf("не удалось разрешить адрес сервера (endpoint)")
+	}
+	if gw, dev := awgDefaultRoute(); dev != "" {
+		_, _ = awgRun(awgEndpointRouteCmd(endpointIP, gw, dev))
+	}
+	setText, err := awg.RenderUAPISet(&cfg, p, endpointIP, port)
+	if err != nil {
+		return err
+	}
+	resp, err := uapiRequestIface(iface, setText)
 	if err != nil {
 		return fmt.Errorf("UAPI: %w", err)
 	}
 	if !strings.Contains(resp, "errno=0") {
 		return fmt.Errorf("UAPI set отклонён: %s", strings.TrimSpace(resp))
 	}
-	logbuf.Append("awg2", "info", "туннель awg0 поднят (конфиг применён по UAPI)")
-	// Route the ISP-blockable Telegram proxy fronts through the tunnel so the
-	// MTProto/SOCKS5 proxies can reach DC1/3/5 while awg0 is up. The proxies only
-	// dial these fronts when TunnelUp() is true, so the route and the dial are gated
-	// together. Harmless if the proxies are disabled (nothing else dials these IPs).
-	for _, ip := range tgfronts.IPs() {
-		_, _ = awgRun("ip route replace " + ip + "/32 dev " + awgIface)
-	}
+	logbuf.Append("awg2", "info", "туннель "+iface+" поднят (конфиг применён по UAPI)")
 	return nil
 }
 
 func (svc *Service) awgClientDownOS() error {
-	// Drop the proxy-front routes first (they point at awg0, about to disappear).
-	for _, ip := range tgfronts.IPs() {
-		_, _ = awgRun("ip route del " + ip + "/32 dev " + awgIface + " 2>/dev/null")
+	return svc.awgClientDownManagerOS(svc.awgActive())
+}
+
+func (svc *Service) awgClientDownManagerOS(am *awg.Manager) error {
+	if am == nil {
+		return fmt.Errorf("AWG2-server is not selected")
 	}
+	iface := awgClientIface(am.Config())
 	script := strings.Join([]string{
-		"ip link set " + awgIface + " down 2>/dev/null || true",
-		"ip link del " + awgIface + " 2>/dev/null || true",
-		"pkill -f '" + awgGoBin() + " " + awgIface + "' 2>/dev/null || true",
-		"rm -f " + awgSock + " 2>/dev/null || true",
+		"ip link set " + iface + " down 2>/dev/null || true",
+		"ip link del " + iface + " 2>/dev/null || true",
+		"pkill -f '" + awgGoBin() + " " + iface + "' 2>/dev/null || true",
+		"rm -f " + awgSockPath(iface) + " 2>/dev/null || true",
 		"echo down",
 	}, "\n")
 	ctx, cancel := contextTimeout(15 * time.Second)
 	defer cancel()
 	out, _ := exec.CommandContext(ctx, "sh", "-c", script).CombinedOutput()
-	logbuf.Append("awg2", "info", "туннель awg0 опущен: "+strs.LastLines(strings.TrimSpace(string(out)), 2))
+	logbuf.Append("awg2", "info", "туннель "+iface+" опущен: "+strs.LastLines(strings.TrimSpace(string(out)), 2))
 	return nil
 }
 
 func (svc *Service) awgClientStatusOS() *ClientStatus {
+	return svc.awgClientStatusManagerOS(svc.awgActive())
+}
+
+func (svc *Service) awgClientStatusManagerOS(am *awg.Manager) *ClientStatus {
+	if am == nil {
+		return nil
+	}
+	cfg := am.Config()
+	st := awgClientStatusIfaceOS(awgClientIface(cfg))
+	if st == nil {
+		return nil
+	}
+	if st.MTU == 0 {
+		st.MTU = awgTunnelMTU(cfg)
+	}
+	if st.Address == "" {
+		for _, p := range cfg.Peers {
+			if p.IsRouter {
+				st.Address = p.Address
+				break
+			}
+		}
+	}
+	return st
+}
+
+func awgClientStatusIfaceOS(iface string) *ClientStatus {
 	st := &ClientStatus{}
-	if exec.Command("ip", "link", "show", awgIface).Run() == nil {
+	if exec.Command("ip", "link", "show", iface).Run() == nil {
 		st.IfacePresent = true
 	}
-	if _, err := os.Stat(awgSock); err != nil {
+	if _, err := os.Stat(awgSockPath(iface)); err != nil {
 		return st
 	}
-	resp, err := uapiRequest("get=1\n\n")
+	resp, err := uapiRequestIface(iface, "get=1\n\n")
 	if err != nil || !strings.Contains(resp, "public_key=") {
 		return st
 	}
@@ -260,7 +321,11 @@ func (svc *Service) awgClientStatusOS() *ClientStatus {
 // socket. Keep the half-close: wireguard-go/amneziawg-go treat EOF on the write
 // side as the unambiguous end-of-request on all builds we target.
 func uapiRequest(req string) (string, error) {
-	conn, err := net.DialTimeout("unix", awgSock, 5*time.Second)
+	return uapiRequestIface(awgIface, req)
+}
+
+func uapiRequestIface(iface, req string) (string, error) {
+	conn, err := net.DialTimeout("unix", awgSockPath(iface), 5*time.Second)
 	if err != nil {
 		return "", err
 	}
@@ -314,14 +379,14 @@ func portOf(endpoint string) int {
 	return 0
 }
 
-func awgAddressScript(addresses string) string {
+func awgAddressScript(iface, addresses string) string {
 	lines := []string{}
 	for _, raw := range strings.Split(addresses, ",") {
 		addr := strings.TrimSpace(raw)
 		if addr == "" {
 			continue
 		}
-		lines = append(lines, "ip addr add "+shell.Quote(addr)+" dev "+awgIface)
+		lines = append(lines, "ip addr add "+shell.Quote(addr)+" dev "+iface)
 	}
 	if len(lines) == 0 {
 		return "true"

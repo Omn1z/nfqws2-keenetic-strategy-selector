@@ -3,6 +3,21 @@
 Все заметные изменения проекта. Формат — [Keep a Changelog](https://keepachangelog.com/ru/),
 версионирование приближено к SemVer.
 
+## [v1.4.0] — 2026-06-22
+### Добавлено
+- **AWG2: WARP-профили из панели.** Добавлено создание WARP-сервера, авто-подбор рабочего Cloudflare endpoint и проверка текущего endpoint перед полным перебором.
+- **AWG2: несколько туннелей и правила маршрутизации.** Добавлены per-tunnel правила, восстановление multi-routing после рестарта и очистка старых shared `iptables` правил без накопления дублей.
+- **NFQWS2: отдельные списки NFQUEUE Bypass.** Вкладка «Списки NFQUEUE Bypass» управляет `nfqueue_bypass_domains.list` и `nfqueue_bypass_ips.list`; применение пересобирает IPv4-цепочки nfqws2 и накладывает `RETURN` до `NFQUEUE`.
+
+### Изменено
+- **AWG2 UI: имя сервера редактируется нажатием по имени.** Отдельная кнопка переименования убрана.
+- **AWG2 UI: MTU вынесен в общие параметры интерфейса.** Настройка доступна для всех профилей, а imported-профили больше не показывают лишнюю карточку настроек туннеля.
+- **Telegram fallback: поддержка tunnel backend.** Выбор фолбэка больше не ограничен только AWG2-идентификаторами.
+
+### Исправлено
+- **REG.RU при включенном NFQWS.** `reg.ru`, `login.reg.ru`, `img.reg.ru` и соседние REG.RU-сети можно вынести в bypass до NFQUEUE, чтобы browser preflight/QUIC/TLS не зависали и не ловили `ERR_CONNECTION_RESET`.
+- **AWG2: route cleanup.** Legacy `AWG2_MARK`/`AWG2_MARK6` hooks и multi-policy правила теперь удаляются циклом, чтобы старые правила не ломали новый маршрут.
+
 ## [v1.3.19] — 2026-06-22
 ### Исправлено
 - **AWG2: `iptables-restore ... failed` больше не ломает full-routing.** Критичная MARK-цепочка теперь устанавливается отдельно от optional `TCPMSS`/`MASQUERADE`/`FORWARD`/comment-правил; если `iptables-restore` на Keenetic не принимает restore-документ, hook применяет тот же mangle-набор обычными `iptables` командами. Это возвращает маркировку LAN-трафика в режиме «весь трафик через VPN».

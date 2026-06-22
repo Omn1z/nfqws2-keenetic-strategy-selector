@@ -5,6 +5,8 @@ package awgroute
 import (
 	"fmt"
 	"runtime"
+
+	"nfqws2strategy/internal/services/awg"
 )
 
 // Non-router stubs (the AWG2 client only runs on the Keenetic router).
@@ -18,10 +20,18 @@ func (svc *Service) awgInstallEngineOS() (string, error) {
 func (svc *Service) awgClientUpOS() error {
 	return fmt.Errorf("туннель доступен только на роутере")
 }
+func (svc *Service) awgClientUpManagerOS(am *awg.Manager) error { return svc.awgClientUpOS() }
 func (svc *Service) awgClientDownOS() error {
 	return fmt.Errorf("туннель доступен только на роутере")
 }
 func (svc *Service) awgClientStatusOS() *ClientStatus { return nil }
+func (svc *Service) awgClientDownManagerOS(am *awg.Manager) error {
+	return svc.awgClientDownOS()
+}
+func (svc *Service) awgClientStatusManagerOS(am *awg.Manager) *ClientStatus {
+	return nil
+}
+func awgSetActiveIfaceOS(iface string) {}
 
 func (svc *Service) awgApplyRoutingOS() error {
 	return fmt.Errorf("маршрутизация доступна только на роутере")

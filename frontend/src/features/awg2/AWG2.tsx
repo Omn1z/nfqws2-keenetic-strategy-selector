@@ -9,17 +9,30 @@ import { Switch } from "@/components/ui/Switch";
 import { toast } from "@/components/ui/Toast";
 import { confirmDialog } from "@/components/ui/Confirm";
 import { Modal } from "@/components/ui/Modal";
-import { Field, Input, Select } from "@/components/ui/form";
+import { Dropzone } from "@/components/ui/Dropzone";
+import { Field, Input, Select, Textarea } from "@/components/ui/form";
 import ServerPane from "./ServerPane";
 import PeerShareModal from "./PeerShareModal";
 import RoutingPane from "./RoutingPane";
 import DevicesRoutingPane from "./DevicesRoutingPane";
 import TracePane from "./TracePane";
 import SpeedTestCard from "./SpeedTestCard";
-import type { Awg2ServerSummary, Awg2Status, AwgClientStatus, AwgDeployResult } from "@/types/api";
+import type { Awg2ServerSummary, Awg2Status, AwgDeployResult } from "@/types/api";
 
 type Sub = "server" | "routing" | "devices" | "trace";
 type DeployOpts = { quiet?: boolean; skipReload?: boolean };
+type NewConnectionMode = "import" | "warp" | "selfhosted";
+
+const emptyNewConnection = () => ({
+  name: "",
+  conf: "",
+  warpEndpoint: "",
+  host: "",
+  port: "22",
+  user: "root",
+  auth: "password",
+  password: "",
+});
 
 const human = (n: number) => {
   if (!n) return "0 B";
@@ -39,17 +52,19 @@ function MiniSpinner() {
 }
 
 function serverLine(srv: Awg2ServerSummary, deploying: boolean) {
-  if (!srv.enabled) return { kind: "neutral" as const, label: "сервер выкл" };
+  if (!srv.enabled) return { kind: "neutral" as const, label: "выкл" };
   if (deploying) return { kind: "warn" as const, label: "деплой..." };
-  if (srv.imported) return { kind: "ok" as const, label: srv.protocol === "wireguard" ? "WG import" : "AWG import" };
+  if (srv.imported) return { kind: "neutral" as const, label: "nossh" };
   if (!srv.deployed) return { kind: "neutral" as const, label: "черновик" };
   if (srv.reachable) return { kind: "ok" as const, label: "сервер online" };
-  return { kind: "warn" as const, label: srv.last_error ? "сервер offline" : "статус ждёт" };
+  return { kind: "warn" as const, label: srv.last_error ? "сервер offline" : "VPS" };
 }
 
-function tunnelLine(srv: Awg2ServerSummary, cl: AwgClientStatus | null) {
+function tunnelLine(srv: Awg2ServerSummary) {
+  const cl = srv.client;
+  if (srv.connected) return { kind: "ok" as const, label: "connected" };
   if (!srv.enabled) return { kind: "neutral" as const, label: "туннель выкл" };
-  if (!srv.active) return { kind: "neutral" as const, label: "туннель не выбран" };
+  if (!srv.deployed && !srv.imported) return { kind: "neutral" as const, label: "черновик" };
   if (!cl?.running) return { kind: "neutral" as const, label: "туннель опущен" };
   if (cl.connected) return { kind: "ok" as const, label: "туннель connected" };
   return { kind: "warn" as const, label: "туннель поднят" };
@@ -62,11 +77,16 @@ export default function AWG2() {
   const [st, setSt] = useState<Awg2Status | null>(null);
   const [deploying, setDeploying] = useState<Record<string, boolean>>({});
   const [toggling, setToggling] = useState<Record<string, boolean>>({});
+  const [selectingID, setSelectingID] = useState("");
   const [selected, setSelected] = useState<Record<string, boolean>>({});
   const [batch, setBatch] = useState<{ done: number; total: number } | null>(null);
   const [addOpen, setAddOpen] = useState(false);
+  const [newMode, setNewMode] = useState<NewConnectionMode>("import");
+  const [renameServer, setRenameServer] = useState<Awg2ServerSummary | null>(null);
+  const [renameName, setRenameName] = useState("");
+  const [renaming, setRenaming] = useState(false);
   const [clientsOpen, setClientsOpen] = useState(false);
-  const [newServer, setNewServer] = useState({ name: "", host: "", port: "22", user: "root", auth: "password", password: "" });
+  const [newConn, setNewConn] = useState(emptyNewConnection);
   const [creating, setCreating] = useState(false);
 
   usePoll(async () => {
@@ -83,7 +103,10 @@ export default function AWG2() {
   const stRef = useRef<Awg2Status | null>(st);
   stRef.current = st;
   useEffect(() => {
-    const tick = () => { if (stRef.current?.deployed) void api("POST", "/api/awg2/status/refresh", {}).catch(() => {}); };
+    const tick = () => {
+      const cur = stRef.current;
+      if (cur?.deployed && cur.config.install !== "imported") void api("POST", "/api/awg2/status/refresh", {}).catch(() => {});
+    };
     tick();
     const id = window.setInterval(tick, 15000);
     return () => window.clearInterval(id);
@@ -94,6 +117,26 @@ export default function AWG2() {
       setSt(await api<Awg2Status>("GET", "/api/awg2"));
     } catch {
       /* ignore */
+    }
+  };
+
+  const openRename = (srv: Awg2ServerSummary) => {
+    setRenameServer(srv);
+    setRenameName(srv.label || "");
+  };
+
+  const submitRename = async () => {
+    if (!renameServer || renaming) return;
+    setRenaming(true);
+    try {
+      const next = await api<Awg2Status>("POST", `/api/awg2/servers/${encodeURIComponent(renameServer.id)}/rename`, { name: renameName.trim() });
+      setSt(next);
+      setRenameServer(null);
+      toast("Имя подключения сохранено", "ok");
+    } catch (e) {
+      toast((e as Error).message, "err");
+    } finally {
+      setRenaming(false);
     }
   };
 
@@ -145,29 +188,86 @@ export default function AWG2() {
     toast(`Деплой завершён: ${ok}/${ids.length}`, ok === ids.length ? "ok" : "err");
   };
 
-  const addServer = async () => {
+  const closeNewConnection = () => {
+    if (creating) return;
+    setAddOpen(false);
+    setNewMode("import");
+    setNewConn(emptyNewConnection());
+  };
+
+  const autoRaiseActiveTunnel = async () => {
+    try {
+      await api("POST", "/api/awg2/client/up", {});
+      return await api<Awg2Status>("GET", "/api/awg2");
+    } catch (e) {
+      toast("Подключение создано, но туннель не поднялся: " + (e as Error).message, "err");
+      return await api<Awg2Status>("GET", "/api/awg2");
+    }
+  };
+
+  const submitNewConnection = async () => {
     if (creating) return;
     setCreating(true);
     try {
-      let next = await api<Awg2Status>("POST", "/api/awg2/servers", { name: newServer.name.trim() });
-      if (newServer.host.trim()) {
+      let next: Awg2Status;
+      if (newMode === "import") {
+        if (!newConn.conf.trim()) {
+          toast("Вставьте .conf/.vpn или выберите файл", "err");
+          return;
+        }
+        next = await api<Awg2Status>("POST", "/api/awg2/import", { conf: newConn.conf, name: newConn.name.trim() });
+        next = await autoRaiseActiveTunnel();
+        toast("Существующее подключение добавлено и поднято", "ok");
+      } else if (newMode === "warp") {
+        next = await api<Awg2Status>("POST", "/api/awg2/warp", {
+          name: newConn.name.trim() || "Cloudflare WARP",
+          endpoint: newConn.warpEndpoint.trim(),
+          accept_tos: true,
+        });
+        next = await autoRaiseActiveTunnel();
+        toast("WARP-подключение создано и поднято", "ok");
+      } else {
+        if (!newConn.name.trim()) {
+          toast("Укажите имя self-hosted сервера", "err");
+          return;
+        }
+        if (!newConn.host.trim()) {
+          toast("Укажите адрес VPS", "err");
+          return;
+        }
+        next = await api<Awg2Status>("POST", "/api/awg2/servers", { name: newConn.name.trim() });
         next = await api<Awg2Status>("POST", "/api/awg2/config", {
           ...next.config,
           conn: {
             ...next.config.conn,
-            host: newServer.host.trim(),
-            port: parseInt(newServer.port, 10) || 22,
-            user: newServer.user.trim() || "root",
-            auth_kind: newServer.auth,
-            password: newServer.auth === "password" ? newServer.password : "",
+            host: newConn.host.trim(),
+            port: parseInt(newConn.port, 10) || 22,
+            user: newConn.user.trim() || "root",
+            auth_kind: newConn.auth,
+            password: newConn.auth === "password" ? newConn.password : "",
           },
         });
+        const id = next.active_server_id;
+        setDeploying((m) => ({ ...m, [id]: true }));
+        let d: { ok: boolean; result: AwgDeployResult; error?: string } = { ok: false, result: {} as AwgDeployResult };
+        try {
+          d = await api<{ ok: boolean; result: AwgDeployResult; error?: string }>("POST", `/api/awg2/servers/${encodeURIComponent(id)}/deploy`, {});
+        } finally {
+          setDeploying((m) => ({ ...m, [id]: false }));
+        }
+        next = await api<Awg2Status>("GET", "/api/awg2");
+        if (d.ok) {
+          next = await autoRaiseActiveTunnel();
+          toast("Self-hosted сервер развёрнут и поднят", "ok");
+        } else {
+          toast("Self-hosted подключение создано, но deploy завершился с ошибкой: " + (d.error || d.result?.error || "см. журнал"), "err");
+        }
       }
       setSt(next);
       setSub("server");
       setAddOpen(false);
-      setNewServer({ name: "", host: "", port: "22", user: "root", auth: "password", password: "" });
-      toast("Сервер AWG2 добавлен", "ok");
+      setNewMode("import");
+      setNewConn(emptyNewConnection());
     } catch (e) {
       toast((e as Error).message, "err");
     } finally {
@@ -175,20 +275,35 @@ export default function AWG2() {
     }
   };
 
+  const onImportFiles = (files: FileList) => {
+    const f = files.item(0);
+    if (!f) return;
+    void f.text().then((text) => {
+      setNewConn((s) => ({
+        ...s,
+        conf: text,
+        name: s.name.trim() ? s.name : f.name.replace(/\.(conf|vpn|txt)$/i, ""),
+      }));
+    }).catch((e) => toast((e as Error).message, "err"));
+  };
+
   const selectServer = async (id: string) => {
-    if (!id || id === st?.active_server_id) return;
-    const srv = st?.servers?.find((s) => s.id === id);
-    if (srv && !srv.enabled) {
-      toast("Сервер выключен — включите его перед выбором", "err");
+    if (!id) return;
+    if (id === st?.active_server_id) {
+      setSub("server");
       return;
     }
+    if (selectingID) return;
+    setSelectingID(id);
     try {
       const next = await api<Awg2Status>("POST", `/api/awg2/servers/${encodeURIComponent(id)}/select`, {});
+      toast("Открыты настройки подключения", "ok");
       setSt(next);
       setSub("server");
-      toast("Сервер AWG2 выбран", "ok");
     } catch (e) {
       toast((e as Error).message, "err");
+    } finally {
+      setSelectingID("");
     }
   };
 
@@ -198,7 +313,7 @@ export default function AWG2() {
     try {
       const next = await api<Awg2Status>("POST", `/api/awg2/servers/${encodeURIComponent(id)}/enabled`, { enabled });
       setSt(next);
-      toast(enabled ? "Сервер включён" : "Сервер выключен", "ok");
+      toast(enabled ? "Подключение включено, туннель поднимается" : "Подключение выключено", "ok");
     } catch (e) {
       toast((e as Error).message, "err");
     } finally {
@@ -250,14 +365,19 @@ export default function AWG2() {
   const dep = st.last_deploy;
   const servers = st.servers ?? [];
   const activeServer = servers.find((s) => s.id === st.active_server_id) ?? servers.find((s) => s.active);
+  const connectedCount = servers.filter((s) => s.connected).length;
+  const enabledCount = servers.filter((s) => s.enabled).length;
   const selectedIDs = servers.filter((s) => selected[s.id]).map((s) => s.id);
   const canDeploySelected = selectedIDs.some((id) => {
     const srv = servers.find((s) => s.id === id);
     return !!srv?.enabled && !srv.imported;
   });
-  const importedActive = st.config.install === "imported";
-  const statusKind = importedActive ? (st.client?.connected ? "ok" : st.client?.running ? "warn" : "neutral") : st.deployed ? (st.status?.up ? "ok" : "warn") : "neutral";
-  const statusText = importedActive ? (st.client?.connected ? "imported · connected" : st.client?.running ? "imported · поднят" : "imported профиль") : st.deployed ? (st.status?.up ? "развёрнут" : "развёрнут (нет связи)") : "не развёрнут";
+  const statusKind = connectedCount > 0 ? "ok" : enabledCount > 0 ? "warn" : "neutral";
+  const statusText = enabledCount > 0 ? `${connectedCount}/${enabledCount} туннелей connected` : "туннели выключены";
+  const newConnectionSubmitLabel =
+    newMode === "import" ? "Добавить подключение" :
+    newMode === "warp" ? "Создать WARP" :
+    "Развернуть сервер";
 
   return (
     <>
@@ -267,7 +387,7 @@ export default function AWG2() {
         head={
           <div className="flex flex-wrap items-center gap-2">
             <Badge kind={statusKind}>{statusText}</Badge>
-            {st.client?.running && <Badge kind={st.client.connected ? "ok" : "warn"}>{st.client.connected ? "туннель connected" : "туннель поднят"}</Badge>}
+            <Badge kind={st.engine.installed ? "ok" : "neutral"}>{st.engine.installed ? "движок установлен" : "движок не установлен"}</Badge>
           </div>
         }
       >
@@ -290,8 +410,8 @@ export default function AWG2() {
 
       <Card
         title="Серверы AWG2"
-        sub="активный сервер владеет пирами, туннелем awg0 и маршрутизацией"
-        head={<Button mini onClick={() => setAddOpen(true)}>Добавить сервер</Button>}
+        sub="self-hosted, WARP и импортированные подключения"
+        head={<Button mini onClick={() => setAddOpen(true)}>Новое подключение</Button>}
       >
         {selectedIDs.length > 0 && (
           <div className="mb-3 flex flex-wrap items-center gap-2 rounded-lg border border-line bg-line-soft px-3 py-2">
@@ -306,13 +426,13 @@ export default function AWG2() {
           {servers.map((srv) => {
             const busy = !!deploying[srv.id];
             const sLine = serverLine(srv, busy);
-            const tLine = tunnelLine(srv, st.client);
+            const tLine = tunnelLine(srv);
+            const cl = srv.client;
             return (
               <div
                 key={srv.id}
                 className={cn(
-                  "min-h-[168px] rounded-lg border p-3 text-[12.5px] transition",
-                  srv.active ? "border-primary bg-primary/10 text-foreground" : "border-line bg-panel text-ink-soft",
+                  "min-h-[168px] rounded-lg border border-line bg-panel p-3 text-[12.5px] text-ink-soft transition",
                   !srv.enabled && "opacity-70",
                   busy && "animate-pulse",
                 )}
@@ -321,31 +441,38 @@ export default function AWG2() {
                   <input
                     type="checkbox"
                     checked={!!selected[srv.id]}
+                    onClick={(e) => e.stopPropagation()}
                     onChange={(e) => setSelected((m) => ({ ...m, [srv.id]: e.target.checked }))}
                     className="mt-1"
                     aria-label="Выбрать сервер"
                   />
-                  <button
-                    type="button"
-                    onClick={() => selectServer(srv.id)}
-                    className="min-w-0 flex-1 text-left outline-none focus-visible:ring-2 focus-visible:ring-ring/40"
-                  >
+                  <div className="min-w-0 flex-1 text-left">
                     <div className="flex min-h-6 items-center gap-2">
-                      <span className="min-w-0 truncate text-[13px] font-semibold text-ink">{srv.label || srv.host || srv.id}</span>
-                      {srv.active && <Badge kind="ok">активен</Badge>}
+                      <button
+                        type="button"
+                        title="Переименовать"
+                        onClick={(e) => { e.stopPropagation(); openRename(srv); }}
+                        className="min-w-0 max-w-full truncate text-left text-[13px] font-semibold text-ink outline-none transition hover:text-accent focus-visible:ring-2 focus-visible:ring-ring/40"
+                      >
+                        {srv.label || srv.host || srv.id}
+                      </button>
+                      {selectingID === srv.id && <Badge kind="warn"><MiniSpinner /> настройки</Badge>}
                     </div>
-                    <div className="mt-0.5 truncate text-[11.5px] text-muted">{srv.endpoint || srv.host || "адрес не задан"}</div>
-                  </button>
-                  <Switch checked={!!srv.enabled} onChange={(v) => toggleServer(srv.id, v)} />
+                    <div className="mt-0.5 truncate text-[11.5px] text-muted">{srv.endpoint || srv.host || "адрес не задан"}{srv.client_iface ? ` · ${srv.client_iface}` : ""}</div>
+                  </div>
+                  <span onClick={(e) => e.stopPropagation()}>
+                    <Switch checked={!!srv.enabled} onChange={(v) => toggleServer(srv.id, v)} />
+                  </span>
                 </div>
 
                 <div className="mt-3 flex flex-wrap gap-1.5">
                   <Badge kind={sLine.kind}>{busy && <MiniSpinner />} {sLine.label}</Badge>
                   <Badge kind={tLine.kind}>{tLine.label}</Badge>
+                  {srv.imported && <Badge kind="neutral">{srv.protocol === "wireguard" ? "WG" : "AWG"}</Badge>}
                 </div>
-                {srv.active && st.client?.running && (
+                {cl?.running && (
                   <div className="mt-2 text-[11.5px] text-muted">
-                    Хендшейк: {ago(st.client.last_handshake)} назад · ↓ {human(st.client.rx_bytes)} / ↑ {human(st.client.tx_bytes)}
+                    Хендшейк: {ago(cl.last_handshake)} назад · ↓ {human(cl.rx_bytes)} / ↑ {human(cl.tx_bytes)} · MTU {cl.mtu || "—"}
                   </div>
                 )}
                 {srv.last_error && <div className="mt-2 line-clamp-2 text-[11px] text-warn" title={srv.last_error}>{srv.last_error}</div>}
@@ -355,24 +482,23 @@ export default function AWG2() {
                   </div>
                 )}
                 <div className="mt-3 flex flex-wrap items-center gap-2">
-                  <Button mini onClick={() => deployServer(srv.id)} disabled={busy || !srv.enabled || srv.imported || !srv.host}>
+                  <Button mini variant="primary" onClick={() => { void selectServer(srv.id); }}>
+                    Настройки
+                  </Button>
+                  <Button mini onClick={(e) => { e.stopPropagation(); void deployServer(srv.id); }} disabled={busy || !srv.enabled || srv.imported || !srv.host}>
                     {busy ? "Деплой..." : srv.deployed ? "Переразвернуть" : "Развернуть"}
                   </Button>
-                  <Button mini onClick={() => { void openClients(srv); }} disabled={!srv.enabled || srv.imported}>
+                  <Button mini onClick={(e) => { e.stopPropagation(); void openClients(srv); }} disabled={!srv.enabled || srv.imported}>
                     Добавить клиента
                   </Button>
-                  {srv.imported && <span className="text-[11px] text-muted">без SSH-деплоя</span>}
+                  <Button mini variant="danger" onClick={(e) => { e.stopPropagation(); void deleteServer(srv.id); }}>
+                    Удалить
+                  </Button>
                 </div>
               </div>
             );
           })}
         </div>
-        {activeServer && (
-          <div className="mt-3 flex flex-wrap items-center gap-2">
-            <Button mini variant="danger" onClick={() => deleteServer(activeServer.id)}>Удалить выбранный</Button>
-            <span className="text-xs text-muted [overflow-wrap:anywhere]">{activeServer.endpoint || activeServer.host || "новый сервер без адреса"}</span>
-          </div>
-        )}
       </Card>
 
       <div className="mb-4 inline-flex overflow-hidden rounded-lg border border-line">
@@ -390,40 +516,106 @@ export default function AWG2() {
       {sub === "devices" && <DevicesRoutingPane st={st} reload={reload} />}
       {sub === "trace" && <TracePane />}
       {clientsOpen && <PeerShareModal st={st} reload={reload} onClose={() => setClientsOpen(false)} />}
+      {renameServer && (
+        <Modal
+          title="Переименовать подключение"
+          onClose={() => !renaming && setRenameServer(null)}
+          actions={<><Button onClick={() => setRenameServer(null)} disabled={renaming}>Отмена</Button><Button variant="primary" onClick={submitRename} disabled={renaming}>{renaming ? "..." : "Сохранить"}</Button></>}
+        >
+          <Field label="Название">
+            <Input value={renameName} autoFocus onChange={(e) => setRenameName(e.target.value)} />
+          </Field>
+        </Modal>
+      )}
       {addOpen && (
         <Modal
-          title="Добавить AWG2 сервер"
-          onClose={() => setAddOpen(false)}
+          title="Новое подключение"
+          onClose={closeNewConnection}
           size="lg"
-          actions={<><Button onClick={() => setAddOpen(false)}>Отмена</Button><Button variant="primary" onClick={addServer} disabled={creating}>{creating ? "..." : "Добавить"}</Button></>}
+          actions={<><Button onClick={closeNewConnection} disabled={creating}>Отмена</Button><Button variant="primary" onClick={submitNewConnection} disabled={creating}>{creating ? "..." : newConnectionSubmitLabel}</Button></>}
         >
           <div className="space-y-3">
+            <div className="grid gap-2 sm:grid-cols-3">
+              {([
+                ["import", "Существующий сервер"],
+                ["warp", "Создать WARP подключение"],
+                ["selfhosted", "Развернуть сервер (Self Hosted)"],
+              ] as const).map(([mode, label]) => (
+                <button
+                  key={mode}
+                  type="button"
+                  onClick={() => setNewMode(mode)}
+                  className={cn(
+                    "min-h-[58px] rounded-lg border px-3 py-2 text-left text-[13px] font-semibold outline-none transition focus-visible:ring-2 focus-visible:ring-ring/40",
+                    newMode === mode ? "border-primary bg-primary/10 text-ink" : "border-line bg-panel text-ink-soft hover:border-accent",
+                  )}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+
             <Field label="Название">
-              <Input value={newServer.name} placeholder="Moscow VPS" onChange={(e) => setNewServer((s) => ({ ...s, name: e.target.value }))} />
+              <Input
+                value={newConn.name}
+                placeholder={newMode === "warp" ? "Cloudflare WARP" : newMode === "selfhosted" ? "Moscow VPS" : "AWG Moscow / WireGuard Home"}
+                onChange={(e) => setNewConn((s) => ({ ...s, name: e.target.value }))}
+              />
             </Field>
-            <div className="grid gap-3 sm:grid-cols-[minmax(180px,1fr)_90px]">
-              <Field label="Адрес VPS">
-                <Input value={newServer.host} placeholder="IP или домен" onChange={(e) => setNewServer((s) => ({ ...s, host: e.target.value }))} />
+
+            {newMode === "import" && (
+              <div className="grid gap-3 lg:grid-cols-[minmax(220px,0.8fr)_minmax(280px,1.2fr)]">
+                <Dropzone accept=".conf,.vpn,.txt" onFiles={onImportFiles}>
+                  <div className="text-sm font-semibold">Выберите .conf/.vpn</div>
+                  <div className="mt-1 text-xs text-muted">или перетащите файл сюда</div>
+                </Dropzone>
+                <Field label="Содержимое .conf/.vpn">
+                  <Textarea
+                    rows={9}
+                    value={newConn.conf}
+                    placeholder={"[Interface]\nPrivateKey = ...\nAddress = ...\n\n[Peer]\nPublicKey = ...\nEndpoint = host:51820\nAllowedIPs = 0.0.0.0/0, ::/0\n\nили vpn://..."}
+                    onChange={(e) => setNewConn((s) => ({ ...s, conf: e.target.value }))}
+                  />
+                </Field>
+              </div>
+            )}
+
+            {newMode === "warp" && (
+              <Field label="Endpoint">
+                <Input
+                  value={newConn.warpEndpoint}
+                  placeholder="auto"
+                  onChange={(e) => setNewConn((s) => ({ ...s, warpEndpoint: e.target.value }))}
+                />
               </Field>
-              <Field label="SSH">
-                <Input type="number" value={newServer.port} onChange={(e) => setNewServer((s) => ({ ...s, port: e.target.value }))} />
-              </Field>
-            </div>
-            <div className="grid gap-3 sm:grid-cols-[140px_150px_minmax(160px,1fr)]">
-              <Field label="Пользователь">
-                <Input value={newServer.user} onChange={(e) => setNewServer((s) => ({ ...s, user: e.target.value }))} />
-              </Field>
-              <Field label="Авторизация">
-                <Select value={newServer.auth} onChange={(e) => setNewServer((s) => ({ ...s, auth: e.target.value }))}>
-                  <option value="password">Пароль</option>
-                  <option value="key">SSH-ключ позже</option>
-                </Select>
-              </Field>
-              <Field label="Пароль SSH" hint="можно оставить пустым">
-                <Input type="password" value={newServer.password} onChange={(e) => setNewServer((s) => ({ ...s, password: e.target.value }))} disabled={newServer.auth !== "password"} />
-              </Field>
-            </div>
-            <p className="text-[11px] text-muted">Остальные параметры берутся автоматически. Тонкие настройки можно раскрыть во вкладке сервера.</p>
+            )}
+
+            {newMode === "selfhosted" && (
+              <>
+                <div className="grid gap-3 sm:grid-cols-[minmax(180px,1fr)_90px]">
+                  <Field label="Адрес VPS">
+                    <Input value={newConn.host} placeholder="IP или домен" onChange={(e) => setNewConn((s) => ({ ...s, host: e.target.value }))} />
+                  </Field>
+                  <Field label="SSH">
+                    <Input type="number" value={newConn.port} onChange={(e) => setNewConn((s) => ({ ...s, port: e.target.value }))} />
+                  </Field>
+                </div>
+                <div className="grid gap-3 sm:grid-cols-[140px_150px_minmax(160px,1fr)]">
+                  <Field label="Пользователь">
+                    <Input value={newConn.user} onChange={(e) => setNewConn((s) => ({ ...s, user: e.target.value }))} />
+                  </Field>
+                  <Field label="Авторизация">
+                    <Select value={newConn.auth} onChange={(e) => setNewConn((s) => ({ ...s, auth: e.target.value }))}>
+                      <option value="password">Пароль</option>
+                      <option value="key">SSH-ключ позже</option>
+                    </Select>
+                  </Field>
+                  <Field label="Пароль SSH" hint="можно оставить пустым">
+                    <Input type="password" value={newConn.password} onChange={(e) => setNewConn((s) => ({ ...s, password: e.target.value }))} disabled={newConn.auth !== "password"} />
+                  </Field>
+                </div>
+              </>
+            )}
           </div>
         </Modal>
       )}

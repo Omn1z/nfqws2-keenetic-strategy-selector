@@ -8,7 +8,7 @@ import { Switch } from "@/components/ui/Switch";
 import { Modal } from "@/components/ui/Modal";
 import { toast } from "@/components/ui/Toast";
 import { confirmDialog } from "@/components/ui/Confirm";
-import type { Awg2Status, AwgZone, AwgRoutingConfig, Device } from "@/types/api";
+import type { Awg2ServerSummary, Awg2Status, AwgZone, AwgRoutingConfig, Device } from "@/types/api";
 
 /** RulesTable replaces the old zone-form layout with a pi-hole-style table:
  *  each rule is one row with its priority (= array index), name, match preview,
@@ -29,6 +29,7 @@ const routeOf = (z: AwgZone): Route =>
 
 const ROUTE_LABEL: Record<Route, string> = { tunnel: "Через VPN", direct: "Мимо VPN" };
 const ROUTE_KIND: Record<Route, "ok" | "warn"> = { tunnel: "ok", direct: "warn" };
+const tunnelLabel = (s?: Awg2ServerSummary) => s ? `${s.label || s.id}${s.client_iface ? ` · ${s.client_iface}` : ""}` : "туннель не выбран";
 
 const zoneLines = (z: AwgZone) => [...(z.domains || []), ...(z.ips || [])];
 const splitRaw = (s: string) => s.split("\n");
@@ -49,6 +50,9 @@ export default function RulesTable({ r, setR, st, reload }: Props) {
   const [copyOpen, setCopyOpen] = useState(false);
 
   const zones = r.zones || [];
+  const tunnels = useMemo(() => (st.servers || []).filter((s) => s.enabled && (s.imported || s.deployed || s.endpoint)), [st.servers]);
+  const defaultTunnelID = tunnels.find((s) => s.connected)?.id || tunnels[0]?.id || st.active_server_id || "";
+  const tunnelByID = useMemo(() => new Map((st.servers || []).map((s) => [s.id, s] as const)), [st.servers]);
 
   // persist runs after every rule action so the table behaves like pi-hole's
   // group/list editor: "delete" actually deletes, "up" actually moves, edits
@@ -60,11 +64,7 @@ export default function RulesTable({ r, setR, st, reload }: Props) {
   // panel access regardless of what the user chose.
   const persist = async (next: AwgRoutingConfig) => {
     try {
-      await api("POST", "/api/awg2/routing/config", next);
-      if (next.mode !== "off") {
-        await api("POST", "/api/awg2/routing/apply", {});
-        await api("POST", "/api/awg2/routing/commit", {});
-      }
+      await api("POST", "/api/awg2/routing/rules", next);
       await reload();
     } catch (e) {
       toast((e as Error).message, "err");
@@ -73,7 +73,7 @@ export default function RulesTable({ r, setR, st, reload }: Props) {
   // applyOp builds the next config from `r`, applies it to local state, then
   // persists. Wrapped so every action is one line.
   const applyOp = (op: (zs: AwgZone[]) => AwgZone[]) => {
-    const nextZones = op(zones);
+    const nextZones = op(zones).map((z, i) => ({ ...z, tunnel_id: z.tunnel_id || defaultTunnelID, order: i + 1 }));
     const next: AwgRoutingConfig = { ...r, zones: nextZones };
     setR(next);
     void persist(next);
@@ -97,6 +97,7 @@ export default function RulesTable({ r, setR, st, reload }: Props) {
   const add = () => {
     const fresh: AwgZone = {
       name: "новое правило",
+      tunnel_id: defaultTunnelID,
       route: "tunnel",
       domains: [],
       ips: [],
@@ -116,7 +117,6 @@ export default function RulesTable({ r, setR, st, reload }: Props) {
         <h3 className="text-[14px] font-semibold">Правила маршрутизации</h3>
         <span className="text-[11px] text-muted">{zones.length} шт. · приоритет сверху вниз</span>
         <div className="ml-auto flex items-center gap-2">
-          <Button mini variant="ghost" onClick={() => setCopyOpen(true)}>← с другого сервера</Button>
           <Button mini variant="primary" onClick={add}>+ правило</Button>
         </div>
       </div>
@@ -127,6 +127,7 @@ export default function RulesTable({ r, setR, st, reload }: Props) {
             <tr>
               <th className="w-[36px] px-2 py-1.5 text-center">#</th>
               <th className="px-2 py-1.5 text-left">Имя</th>
+              <th className="px-2 py-1.5 text-left">Туннель</th>
               <th className="px-2 py-1.5 text-left">Маршрут</th>
               <th className="px-2 py-1.5 text-left">Что матчит</th>
               <th className="hidden px-2 py-1.5 text-left md:table-cell">Источники</th>
@@ -137,7 +138,7 @@ export default function RulesTable({ r, setR, st, reload }: Props) {
           <tbody>
             {zones.length === 0 && (
               <tr>
-                <td colSpan={7} className="px-2 py-6 text-center text-muted">
+                <td colSpan={8} className="px-2 py-6 text-center text-muted">
                   Правил пока нет. Добавьте первое — например, «всё через VPN» (домен <code>*</code>, маршрут «Через VPN»).
                 </td>
               </tr>
@@ -152,6 +153,7 @@ export default function RulesTable({ r, setR, st, reload }: Props) {
                   <td className="px-2 py-1.5">
                     <button type="button" className="text-left font-medium text-ink hover:underline" onClick={() => setEditIdx(i)}>{z.name || "(без имени)"}</button>
                   </td>
+                  <td className="px-2 py-1.5 text-[11px] text-ink-soft">{tunnelLabel(tunnelByID.get(z.tunnel_id || defaultTunnelID))}</td>
                   <td className="px-2 py-1.5"><Badge kind={ROUTE_KIND[route]}>{ROUTE_LABEL[route]}</Badge></td>
                   <td className="px-2 py-1.5 font-mono text-[11px]">
                     {matches.length === 0 ? <span className="text-muted">—</span> : (
@@ -198,6 +200,8 @@ export default function RulesTable({ r, setR, st, reload }: Props) {
       {editIdx !== null && zones[editIdx] && (
         <RuleEditModal
           zone={zones[editIdx]}
+          tunnels={tunnels}
+          defaultTunnelID={defaultTunnelID}
           onClose={() => setEditIdx(null)}
           onSave={(patch) => { setZ(editIdx, patch); setEditIdx(null); }}
         />
@@ -213,8 +217,8 @@ export default function RulesTable({ r, setR, st, reload }: Props) {
   );
 }
 
-function RuleEditModal({ zone, onClose, onSave }: { zone: AwgZone; onClose: () => void; onSave: (patch: Partial<AwgZone>) => void }) {
-  const [z, setZ] = useState<AwgZone>({ ...zone, route: routeOf(zone) });
+function RuleEditModal({ zone, tunnels, defaultTunnelID, onClose, onSave }: { zone: AwgZone; tunnels: Awg2ServerSummary[]; defaultTunnelID: string; onClose: () => void; onSave: (patch: Partial<AwgZone>) => void }) {
+  const [z, setZ] = useState<AwgZone>({ ...zone, tunnel_id: zone.tunnel_id || defaultTunnelID, route: routeOf(zone) });
   const [devices, setDevices] = useState<Device[]>([]);
   useEffect(() => {
     void (async () => {
@@ -232,6 +236,7 @@ function RuleEditModal({ zone, onClose, onSave }: { zone: AwgZone; onClose: () =
     const ips = lines.filter(isIPish);
     onSave({
       name: z.name,
+      tunnel_id: z.tunnel_id || defaultTunnelID,
       route: z.route as Route,
       mode: z.route === "direct" ? "exclude" : "include", // legacy backward compat
       domains,
@@ -251,6 +256,13 @@ function RuleEditModal({ zone, onClose, onSave }: { zone: AwgZone; onClose: () =
       <div className="space-y-3">
         <Field label="Имя">
           <Input value={z.name} onChange={(e) => setZ({ ...z, name: e.target.value })} placeholder="напр. youtube → VPN" />
+        </Field>
+        <Field label="Туннель">
+          <select value={z.tunnel_id || defaultTunnelID} onChange={(e) => setZ({ ...z, tunnel_id: e.target.value })} className="w-full rounded border border-line bg-panel px-2 py-1.5 text-[13px]">
+            {tunnels.map((s) => (
+              <option key={s.id} value={s.id}>{tunnelLabel(s)}{s.connected ? " · connected" : ""}</option>
+            ))}
+          </select>
         </Field>
         <Field label="Маршрут">
           <div className="inline-flex overflow-hidden rounded-md border border-line">
@@ -318,7 +330,7 @@ function CopyFromServerModal({ st, onClose, onCopied }: { st: Awg2Status; onClos
     if (!sel || busy) return;
     if (!(await confirmDialog({
       title: "Перезаписать правила?",
-      body: "Текущие правила активного сервера будут заменены правилами с выбранного. Остальные настройки (MTU, killswitch и т.п.) не трогаются.",
+      body: "Текущие глобальные правила будут заменены правилами с выбранного подключения. Остальные настройки не трогаются.",
       confirmLabel: "Перезаписать",
       danger: true,
     }))) return;

@@ -172,6 +172,7 @@ func awgFirewallHook(mode, endpointIP, wandev string, mtu int, dnsRedirect, chai
 	v4doc.WriteString("*mangle\n")
 	v4doc.WriteString(":" + awgChain + " -\n")
 	v4doc.WriteString("-A " + awgChain + " -m mark --mark 0x20000000/0x20000000 -j RETURN\n")
+	v4doc.WriteString("-A " + awgChain + " -m mark --mark " + awgMarkRule + " -j RETURN\n")
 	for _, ex := range awgExcludes {
 		v4doc.WriteString("-A " + awgChain + " -d " + ex + " -j RETURN\n")
 	}
@@ -239,6 +240,7 @@ func awgFirewallHook(mode, endpointIP, wandev string, mtu int, dnsRedirect, chai
 	v6doc.WriteString("*mangle\n")
 	v6doc.WriteString(":" + awgChain + "6 -\n")
 	v6doc.WriteString("-A " + awgChain + "6 -m mark --mark 0x20000000/0x20000000 -j RETURN\n")
+	v6doc.WriteString("-A " + awgChain + "6 -m mark --mark " + awgMarkRule + " -j RETURN\n")
 	for _, ex := range []string{"::1/128", "fc00::/7", "fe80::/10", "ff00::/8"} {
 		v6doc.WriteString("-A " + awgChain + "6 -d " + ex + " -j RETURN\n")
 	}

@@ -26,7 +26,7 @@ type EngineInfo struct {
 	Error      string `json:"error,omitempty"`
 }
 
-// ClientStatus is the local awg0 tunnel state (from `awg show awg0`).
+// ClientStatus is one local awgN tunnel state (from the userspace UAPI socket).
 type ClientStatus struct {
 	Running       bool   `json:"running"`
 	IfacePresent  bool   `json:"iface_present"`
@@ -41,8 +41,7 @@ type ClientStatus struct {
 }
 
 // AWGConn is one AWG2 tunnel's live state, shaped for the dashboard (state +
-// transfer + stats). Modelled as a list (DashboardConns) so multiple AWG2 servers
-// render uniformly later; today there is the single router client tunnel awg0.
+// transfer + stats).
 type AWGConn struct {
 	ID            string `json:"id"`
 	Label         string `json:"label"`
@@ -61,9 +60,7 @@ type AWGConn struct {
 // no server is configured and nothing is running, so the dashboard hides the card.
 func (svc *Service) DashboardConns() []AWGConn {
 	out := []AWGConn{}
-	cs := svc.awgClientStatus() // nil off-router
 	svc.mu.RLock()
-	activeID := svc.activeID
 	entries := make([]*managedServer, 0, len(svc.order))
 	for _, id := range svc.order {
 		if srv := svc.servers[id]; srv != nil {
@@ -75,12 +72,12 @@ func (svc *Service) DashboardConns() []AWGConn {
 	for _, srv := range entries {
 		cfg := srv.Manager.Config()
 		endpoint := strings.TrimSpace(cfg.Endpoint)
-		isActive := srv.ID == activeID
-		if endpoint == "" && (!isActive || cs == nil || !cs.Running) {
+		cs := svc.awgClientStatusManagerOS(srv.Manager) // nil off-router
+		if endpoint == "" && (cs == nil || !cs.Running) {
 			continue
 		}
 		c := AWGConn{ID: srv.ID, Label: awgServerLabel(srv, cfg), Endpoint: endpoint, State: "off"}
-		if isActive && cs != nil {
+		if cs != nil {
 			c.Connected, c.Running = cs.Connected, cs.Running
 			c.LastHandshake, c.RxBytes, c.TxBytes = cs.LastHandshake, cs.RxBytes, cs.TxBytes
 			c.MTU, c.Address = cs.MTU, cs.Address
@@ -94,7 +91,7 @@ func (svc *Service) DashboardConns() []AWGConn {
 			}
 		}
 		if c.MTU == 0 {
-			c.MTU = cfg.Routing.MTU
+			c.MTU = awgTunnelMTU(cfg)
 		}
 		if c.Address == "" {
 			for _, p := range cfg.Peers {
@@ -107,6 +104,16 @@ func (svc *Service) DashboardConns() []AWGConn {
 		out = append(out, c)
 	}
 	return out
+}
+
+func awgTunnelMTU(cfg awg.ServerConfig) int {
+	if cfg.MTU > 0 {
+		return cfg.MTU
+	}
+	if cfg.Routing.MTU > 0 {
+		return cfg.Routing.MTU
+	}
+	return 1280
 }
 
 // Public app methods (delegating to the OS impl) used by the server handlers.
@@ -132,7 +139,8 @@ func (svc *Service) awgEnsureClientUpForRouting(reason string) error {
 	if !am.Enabled() {
 		return fmt.Errorf("AWG2-сервер выключен")
 	}
-	if cs := svc.awgClientStatusOS(); cs != nil && cs.Running {
+	iface := awgClientIfaceName(am.Config())
+	if cs := svc.awgClientStatusManagerOS(am); cs != nil && cs.Running {
 		if !am.ClientEnabled() {
 			am.SetClientEnabled(true)
 			svc.route.tunnelUpAt.Store(0)
@@ -140,8 +148,8 @@ func (svc *Service) awgEnsureClientUpForRouting(reason string) error {
 		}
 		return nil
 	} else if cs != nil && cs.IfacePresent {
-		logbuf.Append("awg2", "warn", "найден awg0 без живого UAPI — пересоздаю туннель для "+reason)
-		_ = svc.awgClientDownOS()
+		logbuf.Append("awg2", "warn", "найден "+iface+" без живого UAPI — пересоздаю туннель для "+reason)
+		_ = svc.awgClientDownManagerOS(am)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
 	defer cancel()
@@ -150,8 +158,8 @@ func (svc *Service) awgEnsureClientUpForRouting(reason string) error {
 	} else if changed {
 		svc.awgSave()
 	}
-	logbuf.Append("awg2", "info", "туннель awg0 не поднят — поднимаю автоматически для "+reason)
-	if err := svc.awgClientUpOS(); err != nil {
+	logbuf.Append("awg2", "info", "туннель "+iface+" не поднят — поднимаю автоматически для "+reason)
+	if err := svc.awgClientUpManagerOS(am); err != nil {
 		return err
 	}
 	am.SetClientEnabled(true)
@@ -164,12 +172,14 @@ func (svc *Service) awgEnsureClientUpForRouting(reason string) error {
 // is about to disappear), clears the autostart flag, then drops the tunnel.
 func (svc *Service) AWG2ClientDown() error {
 	svc.awgTeardownRouting()
-	if am := svc.awgActive(); am != nil {
+	var am *awg.Manager
+	if active := svc.awgActive(); active != nil {
+		am = active
 		am.SetClientEnabled(false)
 	}
 	svc.route.tunnelUpAt.Store(0)
 	svc.awgSave()
-	return svc.awgClientDownOS()
+	return svc.awgClientDownManagerOS(am)
 }
 
 // awgRouteState holds the split-routing runtime (dead-man's-switch + refresher
@@ -236,6 +246,13 @@ type awgRouteState struct {
 	// the user hasn't touched the zones — which avoids re-warming the geo cache
 	// (~150 MB) and re-running thousands of nslookups for no reason.
 	lastZonesHash atomic.Pointer[string]
+
+	// Multi-tunnel policy has its own lightweight watchdog. The legacy refresh
+	// loop only reasserts AWG2_MARK/table 998 for the active profile; after the
+	// multi-server routing switch the live datapath is AWG2_MULTI + table 901+,
+	// so it must keep its own hook/routes/fastnat state alive.
+	multiStopRefresh chan struct{}
+	multiRefreshWG   sync.WaitGroup
 }
 
 // TunnelUp reports whether the local AWG2 client tunnel is enabled AND connected
@@ -252,7 +269,7 @@ func (svc *Service) TunnelUp() bool {
 	// Hot path: TunnelUp() runs per Telegram blocked-DC dial. Must go through
 	// awgActive() — a direct svc.awg read torns on a concurrent server swap.
 	if am := svc.awgActive(); am != nil && am.ClientEnabled() {
-		if cs := svc.awgClientStatusOS(); cs != nil && cs.Connected {
+		if cs := svc.awgClientStatusManagerOS(am); cs != nil && cs.Connected {
 			up = true
 		}
 	}
@@ -261,20 +278,36 @@ func (svc *Service) TunnelUp() bool {
 	return up
 }
 
+func (svc *Service) tunnelUpForManagedServer(srv *managedServer) bool {
+	if srv == nil || !srv.Manager.Enabled() || !srv.Manager.ClientEnabled() {
+		return false
+	}
+	cs := svc.awgClientStatusManagerOS(srv.Manager)
+	return cs != nil && cs.Connected
+}
+
+func (svc *Service) TunnelUpForServer(id string) bool {
+	id = strings.TrimSpace(id)
+	svc.mu.RLock()
+	srv := svc.servers[id]
+	svc.mu.RUnlock()
+	return svc.tunnelUpForManagedServer(srv)
+}
+
 // ServerInfo describes one selectable AWG2 server for the Telegram-proxy fallback
 // select. The architecture currently has a single server (the awg0 tunnel); the
 // list has one entry when a server endpoint is configured, otherwise none.
 type ServerInfo struct {
-	ID        string `json:"id"`
-	Label     string `json:"label"`
-	Connected bool   `json:"connected"`
+	ID          string `json:"id"`
+	Label       string `json:"label"`
+	ClientIface string `json:"client_iface,omitempty"`
+	Connected   bool   `json:"connected"`
 }
 
 // Servers lists the AWG2 servers available as a Telegram-proxy fallback target
 // (non-nil so it marshals as [] not null).
 func (svc *Service) Servers() []ServerInfo {
 	svc.mu.RLock()
-	activeID := svc.activeID
 	entries := make([]*managedServer, 0, len(svc.order))
 	for _, id := range svc.order {
 		if srv := svc.servers[id]; srv != nil {
@@ -282,7 +315,6 @@ func (svc *Service) Servers() []ServerInfo {
 		}
 	}
 	svc.mu.RUnlock()
-	up := svc.TunnelUp()
 	out := make([]ServerInfo, 0, len(entries))
 	for _, srv := range entries {
 		cfg := srv.Manager.Config()
@@ -293,10 +325,28 @@ func (svc *Service) Servers() []ServerInfo {
 			continue
 		}
 		out = append(out, ServerInfo{
-			ID:        srv.ID,
-			Label:     awgServerLabel(srv, cfg),
-			Connected: srv.ID == activeID && up,
+			ID:          srv.ID,
+			Label:       awgServerLabel(srv, cfg),
+			ClientIface: awgClientIfaceName(cfg),
+			Connected:   svc.tunnelUpForManagedServer(srv),
 		})
+	}
+	return out
+}
+
+func (svc *Service) ClientIfaces() []string {
+	seen := map[string]bool{}
+	out := []string{}
+	for _, srv := range svc.serverSnapshot() {
+		iface := awgClientIfaceName(srv.Manager.Config())
+		if iface == "" || seen[iface] {
+			continue
+		}
+		seen[iface] = true
+		out = append(out, iface)
+	}
+	if !seen["awg0"] {
+		out = append(out, "awg0")
 	}
 	return out
 }
@@ -309,10 +359,49 @@ func (svc *Service) FallbackUp(sel string) bool {
 	case "", "off":
 		return false
 	case "auto":
-		return svc.TunnelUp()
+		for _, srv := range svc.serverSnapshot() {
+			if svc.tunnelUpForManagedServer(srv) {
+				return true
+			}
+		}
+		return false
 	default:
-		return sel == svc.activeServerID() && svc.TunnelUp()
+		return svc.TunnelUpForServer(sel)
 	}
+}
+
+func (svc *Service) FallbackIface(sel string) string {
+	switch sel {
+	case "", "off":
+		return ""
+	case "auto":
+		for _, srv := range svc.serverSnapshot() {
+			if svc.tunnelUpForManagedServer(srv) {
+				return awgClientIfaceName(srv.Manager.Config())
+			}
+		}
+		return ""
+	default:
+		svc.mu.RLock()
+		srv := svc.servers[strings.TrimSpace(sel)]
+		svc.mu.RUnlock()
+		if !svc.tunnelUpForManagedServer(srv) {
+			return ""
+		}
+		return awgClientIfaceName(srv.Manager.Config())
+	}
+}
+
+func (svc *Service) serverSnapshot() []*managedServer {
+	svc.mu.RLock()
+	defer svc.mu.RUnlock()
+	entries := make([]*managedServer, 0, len(svc.order))
+	for _, id := range svc.order {
+		if srv := svc.servers[id]; srv != nil {
+			entries = append(entries, srv)
+		}
+	}
+	return entries
 }
 
 func (svc *Service) AWG2ApplyRouting() error {
@@ -326,6 +415,7 @@ func (svc *Service) AWG2ApplyRouting() error {
 	cfg := am.Config()
 	am.SetRoutingActive(cfg.Routing.Mode != "off")
 	svc.awgSave()
+	svc.awgApplyMultiHostRoutesOS()
 	return nil
 }
 
@@ -339,6 +429,7 @@ func (svc *Service) AWG2CommitRouting() error {
 		am.SetRoutingActive(true)
 	}
 	svc.awgSave()
+	svc.awgApplyMultiHostRoutesOS()
 	return nil
 }
 
@@ -349,6 +440,7 @@ func (svc *Service) AWG2TeardownRouting() error {
 		am.SetRoutingActive(false)
 	}
 	svc.awgSave()
+	svc.awgApplyMultiHostRoutesOS()
 	return svc.awgTeardownRoutingOS()
 }
 
@@ -385,6 +477,7 @@ func (svc *Service) awgRestoreCommittedRouting(reason string) {
 	}
 	am.SetRoutingActive(true)
 	svc.awgSave()
+	svc.awgApplyMultiHostRoutesOS()
 	logbuf.Append("awg2", "info", "маршрутизация восстановлена после "+reason)
 }
 

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"sort"
 	"strings"
 	"time"
 
@@ -27,25 +28,27 @@ type awgPersistedServer struct {
 	Config awg.ServerConfig `json:"config"`
 }
 
-// AWG2ServerSummary is one configured AWG2 server in the selector. Only the
-// active server can own the local router tunnel (awg0), but any server can be
-// selected, edited, deployed, or deleted.
+// AWG2ServerSummary is one configured AWG2 server in the selector. Selecting a
+// server only chooses the profile being edited; local tunnels can stay up in
+// parallel on their own awgN interfaces.
 type AWG2ServerSummary struct {
-	ID           string `json:"id"`
-	Label        string `json:"label"`
-	Host         string `json:"host"`
-	Endpoint     string `json:"endpoint"`
-	Enabled      bool   `json:"enabled"`
-	Imported     bool   `json:"imported"`
-	Protocol     string `json:"protocol"`
-	Active       bool   `json:"active"`
-	Deployed     bool   `json:"deployed"`
-	Connected    bool   `json:"connected"`
-	Reachable    bool   `json:"reachable"`
-	HasPassword  bool   `json:"has_password"`
-	HasKey       bool   `json:"has_key"`
-	HasServerKey bool   `json:"has_server_key"`
-	LastError    string `json:"last_error,omitempty"`
+	ID           string        `json:"id"`
+	Label        string        `json:"label"`
+	Host         string        `json:"host"`
+	Endpoint     string        `json:"endpoint"`
+	ClientIface  string        `json:"client_iface,omitempty"`
+	Client       *ClientStatus `json:"client,omitempty"`
+	Enabled      bool          `json:"enabled"`
+	Imported     bool          `json:"imported"`
+	Protocol     string        `json:"protocol"`
+	Active       bool          `json:"active"`
+	Deployed     bool          `json:"deployed"`
+	Connected    bool          `json:"connected"`
+	Reachable    bool          `json:"reachable"`
+	HasPassword  bool          `json:"has_password"`
+	HasKey       bool          `json:"has_key"`
+	HasServerKey bool          `json:"has_server_key"`
+	LastError    string        `json:"last_error,omitempty"`
 }
 
 type AWG2DeployServerResult struct {
@@ -61,6 +64,7 @@ type AWG2Status struct {
 	Config       awg.ServerConfig    `json:"config"` // redacted (no secrets)
 	ActiveID     string              `json:"active_server_id"`
 	Servers      []AWG2ServerSummary `json:"servers"`
+	RoutingRules []awg.Zone          `json:"routing_rules"`
 	HasPassword  bool                `json:"has_password"`
 	HasKey       bool                `json:"has_key"`
 	HasServerKey bool                `json:"has_server_key"`
@@ -82,12 +86,15 @@ func (svc *Service) initAWG() {
 	}
 	// Bring the local client tunnel up on boot if the user enabled it (best-effort).
 	bootAM := svc.awgActive()
-	if bootAM != nil && bootAM.Config().Client.Enabled {
+	if bootAM != nil && awgShouldAutostartClient(bootAM.Config()) {
 		go func() {
 			if err := svc.awgClientUpOS(); err != nil {
 				log.Printf("awg: client autostart: %v", err)
 				return
 			}
+			bootAM.SetClientEnabled(true)
+			svc.awgSave()
+			svc.awgApplyMultiHostRoutesOS()
 			// Re-apply split-routing if it was committed before (persist across
 			// reboot/panel restart). It was user-confirmed previously, so we apply
 			// AND commit: the apply still arms the ~90s dead-man's switch, the
@@ -107,11 +114,30 @@ func (svc *Service) initAWG() {
 					_ = svc.awgCommitRoutingOS()
 					am.SetRoutingActive(true)
 					svc.awgSave()
+					svc.awgApplyMultiHostRoutesOS()
 					logbuf.Append("awg2", "info", "маршрутизация восстановлена после перезапуска")
 				}
 			}
 		}()
 	}
+	for _, bootSrv := range svc.serverSnapshot() {
+		if bootSrv.ID == svc.activeServerID() || !awgShouldAutostartClient(bootSrv.Manager.Config()) {
+			continue
+		}
+		go func(srv *managedServer) {
+			if err := svc.awgClientUpManagerOS(srv.Manager); err != nil {
+				log.Printf("awg: client autostart %s: %v", srv.ID, err)
+			} else {
+				srv.Manager.SetClientEnabled(true)
+				svc.awgSave()
+				svc.awgApplyMultiHostRoutesOS()
+			}
+		}(bootSrv)
+	}
+}
+
+func awgShouldAutostartClient(c awg.ServerConfig) bool {
+	return c.Enabled && (c.Client.Enabled || awgCanStartLocalClient(c))
 }
 
 func awgShouldRestoreRouting(c awg.ServerConfig) bool {
@@ -180,11 +206,80 @@ func normalizeAWGState(st awgPersisted) awgPersisted {
 		srv.Config.Normalize()
 		out = append(out, srv)
 	}
+	assignAWGClientIfaces(out)
 	st.Servers = out
 	if strings.TrimSpace(st.ActiveID) == "" || !seen[st.ActiveID] {
 		st.ActiveID = st.Servers[0].ID
 	}
 	return st
+}
+
+func assignAWGClientIfaces(entries []awgPersistedServer) {
+	used := map[string]bool{}
+	next := func() string {
+		for i := 0; ; i++ {
+			iface := fmt.Sprintf("awg%d", i)
+			if !used[iface] {
+				used[iface] = true
+				return iface
+			}
+		}
+	}
+	for i := range entries {
+		iface := strings.TrimSpace(entries[i].Config.ClientIface)
+		if !validAWGClientIfaceName(iface) || used[iface] {
+			iface = next()
+		} else {
+			used[iface] = true
+		}
+		entries[i].Config.ClientIface = iface
+	}
+}
+
+func validAWGClientIfaceName(iface string) bool {
+	if len(iface) < 4 || len(iface) > 15 || !strings.HasPrefix(iface, "awg") {
+		return false
+	}
+	for _, r := range iface[3:] {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func awgClientIfaceName(cfg awg.ServerConfig) string {
+	if iface := strings.TrimSpace(cfg.ClientIface); validAWGClientIfaceName(iface) {
+		return iface
+	}
+	return "awg0"
+}
+
+func (svc *Service) nextAWGClientIface() string {
+	svc.mu.RLock()
+	used := map[string]bool{}
+	for _, id := range svc.order {
+		if srv := svc.servers[id]; srv != nil {
+			if iface := strings.TrimSpace(srv.Manager.Config().ClientIface); validAWGClientIfaceName(iface) {
+				used[iface] = true
+			}
+		}
+	}
+	svc.mu.RUnlock()
+	for i := 0; ; i++ {
+		iface := fmt.Sprintf("awg%d", i)
+		if !used[iface] {
+			return iface
+		}
+	}
+}
+
+func (svc *Service) syncActiveAWGIface() {
+	if am := svc.awgActive(); am != nil {
+		awgSetActiveIfaceOS(awgClientIfaceName(am.Config()))
+		return
+	}
+	awgSetActiveIfaceOS("awg0")
 }
 
 func (svc *Service) installAWGState(st awgPersisted) {
@@ -213,6 +308,7 @@ func (svc *Service) installAWGState(st awgPersisted) {
 		svc.awg = servers[svc.activeID].Manager
 	}
 	svc.mu.Unlock()
+	svc.syncActiveAWGIface()
 }
 
 func (svc *Service) snapshotAWGState() awgPersisted {
@@ -281,10 +377,11 @@ func (svc *Service) AWG2StatusView() AWG2Status {
 	am := svc.awgActive()
 	if am == nil {
 		return AWG2Status{
-			ActiveID: svc.activeServerID(),
-			Servers:  svc.awgServerSummaries(),
-			Engine:   svc.AWG2EngineInfo(),
-			Client:   svc.awgClientStatus(),
+			ActiveID:     svc.activeServerID(),
+			Servers:      svc.awgServerSummaries(),
+			RoutingRules: svc.awgRoutingRules(),
+			Engine:       svc.AWG2EngineInfo(),
+			Client:       svc.awgClientStatus(),
 		}
 	}
 	full := am.Config()
@@ -292,6 +389,7 @@ func (svc *Service) AWG2StatusView() AWG2Status {
 		Config:       am.Redacted(),
 		ActiveID:     svc.activeServerID(),
 		Servers:      svc.awgServerSummaries(),
+		RoutingRules: svc.awgRoutingRules(),
 		HasPassword:  strings.TrimSpace(full.Conn.Password) != "",
 		HasKey:       strings.TrimSpace(full.Conn.KeyPEM) != "",
 		HasServerKey: strings.TrimSpace(full.PrivateKey) != "",
@@ -315,7 +413,6 @@ func (svc *Service) awgServerSummaries() []AWG2ServerSummary {
 	}
 	svc.mu.RUnlock()
 
-	connected := svc.TunnelUp()
 	out := make([]AWG2ServerSummary, 0, len(entries))
 	for _, srv := range entries {
 		cfg := srv.Manager.Config()
@@ -325,6 +422,7 @@ func (svc *Service) awgServerSummaries() []AWG2ServerSummary {
 			Label:        awgServerLabel(srv, cfg),
 			Host:         strings.TrimSpace(cfg.Conn.Host),
 			Endpoint:     strings.TrimSpace(cfg.Endpoint),
+			ClientIface:  awgClientIfaceName(cfg),
 			Enabled:      cfg.Enabled,
 			Imported:     cfg.Install == "imported",
 			Protocol:     cfg.Protocol,
@@ -338,8 +436,9 @@ func (svc *Service) awgServerSummaries() []AWG2ServerSummary {
 			sum.Reachable = st.Up || st.Reachable
 			sum.LastError = st.Error
 		}
-		if sum.Active {
-			sum.Connected = connected
+		if cs := svc.awgClientStatusManagerOS(srv.Manager); cs != nil {
+			sum.Client = cs
+			sum.Connected = cs.Connected
 		}
 		out = append(out, sum)
 	}
@@ -362,18 +461,152 @@ func awgServerLabel(srv *managedServer, cfg awg.ServerConfig) string {
 	return "AWG2 " + strings.TrimPrefix(srv.ID, "awg-")
 }
 
+func (svc *Service) awgRoutingRules() []awg.Zone {
+	type item struct {
+		z        awg.Zone
+		fallback int
+	}
+	items := []item{}
+	fallback := 1
+	for _, srv := range svc.serverSnapshot() {
+		cfg := srv.Manager.Config()
+		for _, z := range cfg.Routing.Zones {
+			z.TunnelID = strings.TrimSpace(z.TunnelID)
+			if z.TunnelID == "" {
+				z.TunnelID = srv.ID
+			}
+			if z.Domains == nil {
+				z.Domains = []string{}
+			}
+			if z.IPs == nil {
+				z.IPs = []string{}
+			}
+			if z.SourceIPs == nil {
+				z.SourceIPs = []string{}
+			}
+			if z.Route != "tunnel" && z.Route != "direct" {
+				z.Route = z.RouteValue()
+			}
+			items = append(items, item{z: z, fallback: fallback})
+			fallback++
+		}
+	}
+	sort.SliceStable(items, func(i, j int) bool {
+		oi, oj := items[i].z.Order, items[j].z.Order
+		if oi > 0 && oj > 0 {
+			return oi < oj
+		}
+		if oi > 0 {
+			return true
+		}
+		if oj > 0 {
+			return false
+		}
+		return items[i].fallback < items[j].fallback
+	})
+	out := make([]awg.Zone, 0, len(items))
+	for i, it := range items {
+		z := it.z
+		if z.Order <= 0 {
+			z.Order = i + 1
+		}
+		out = append(out, z)
+	}
+	return out
+}
+
+func (svc *Service) defaultRoutingTunnelID() string {
+	for _, srv := range svc.serverSnapshot() {
+		if svc.tunnelUpForManagedServer(srv) {
+			return srv.ID
+		}
+	}
+	for _, srv := range svc.serverSnapshot() {
+		cfg := srv.Manager.Config()
+		if cfg.Enabled && awgCanStartLocalClient(cfg) {
+			return srv.ID
+		}
+	}
+	if id := strings.TrimSpace(svc.activeServerID()); id != "" {
+		return id
+	}
+	return ""
+}
+
+func (svc *Service) AWG2SetRoutingRules(rc awg.RoutingConfig) error {
+	defaultID := svc.defaultRoutingTunnelID()
+	if defaultID == "" {
+		return fmt.Errorf("AWG2-подключения не найдены")
+	}
+	byID := map[string]*managedServer{}
+	for _, srv := range svc.serverSnapshot() {
+		byID[srv.ID] = srv
+	}
+	part := map[string][]awg.Zone{}
+	for i, z := range rc.Zones {
+		z.TunnelID = strings.TrimSpace(z.TunnelID)
+		if z.TunnelID == "" {
+			z.TunnelID = defaultID
+		}
+		if byID[z.TunnelID] == nil {
+			return fmt.Errorf("туннель для правила %q не найден: %s", z.Name, z.TunnelID)
+		}
+		if z.Route != "tunnel" && z.Route != "direct" {
+			z.Route = z.RouteValue()
+		}
+		if z.Mode != "include" && z.Mode != "exclude" {
+			if z.Route == "direct" {
+				z.Mode = "exclude"
+			} else {
+				z.Mode = "include"
+			}
+		}
+		z.Order = i + 1
+		if z.Domains == nil {
+			z.Domains = []string{}
+		}
+		if z.IPs == nil {
+			z.IPs = []string{}
+		}
+		if z.SourceIPs == nil {
+			z.SourceIPs = []string{}
+		}
+		part[z.TunnelID] = append(part[z.TunnelID], z)
+	}
+	mode := rc.Mode
+	if mode == "" || mode == "include" || mode == "exclude" {
+		mode = "zones"
+	}
+	for _, srv := range svc.serverSnapshot() {
+		cfg := srv.Manager.Config()
+		cfg.Routing.Zones = part[srv.ID]
+		cfg.Routing.Mode = mode
+		cfg.Routing.Killswitch = rc.Killswitch
+		cfg.Routing.DomainSource = rc.DomainSource
+		cfg.Routing.SNIRouting = rc.SNIRouting
+		cfg.Routing.TraceEnabled = rc.TraceEnabled
+		cfg.Routing.Active = mode != "off" && len(cfg.Routing.Zones) > 0
+		if cfg.Routing.MTU == 0 {
+			cfg.Routing.MTU = 1280
+		}
+		if cfg.Routing.DomainSource != "dnsproxy" {
+			cfg.Routing.DomainSource = "resolve"
+		}
+		if err := srv.Manager.SetConfig(&cfg); err != nil {
+			return err
+		}
+	}
+	svc.awgSave()
+	svc.awgApplyMultiHostRoutesOS()
+	return nil
+}
+
 func (svc *Service) AWG2AddServer(name string) AWG2Status {
 	cfg := awg.Default()
+	cfg.ClientIface = svc.nextAWGClientIface()
 	id := "awg-" + storeutil.NewID()
 	srv := &managedServer{ID: id, Name: strings.TrimSpace(name), Manager: awg.NewManager(cfg)}
 	_, _, _ = srv.Manager.EnsureRouterPeerLocal()
-	old := svc.awgActive()
-	if old != nil {
-		_ = svc.awgTeardownRoutingOS()
-		old.SetClientEnabled(false)
-		old.SetRoutingActive(false)
-		_ = svc.awgClientDownOS()
-	}
 
 	svc.mu.Lock()
 	if svc.servers == nil {
@@ -384,6 +617,7 @@ func (svc *Service) AWG2AddServer(name string) AWG2Status {
 	svc.activeID = id
 	svc.awg = srv.Manager
 	svc.mu.Unlock()
+	svc.syncActiveAWGIface()
 
 	svc.route.tunnelUpAt.Store(0)
 	svc.awgSave()
@@ -395,29 +629,34 @@ func (svc *Service) AWG2SelectServer(id string) error {
 	svc.mu.RLock()
 	srv := svc.servers[id]
 	oldID := svc.activeID
-	old := svc.awg
 	svc.mu.RUnlock()
 	if srv == nil {
 		return fmt.Errorf("AWG2-сервер не найден")
 	}
-	if !srv.Manager.Enabled() {
-		return fmt.Errorf("AWG2-сервер выключен")
-	}
 	if id == oldID {
 		return nil
-	}
-	if old != nil {
-		_ = svc.awgTeardownRoutingOS()
-		old.SetClientEnabled(false)
-		old.SetRoutingActive(false)
-		_ = svc.awgClientDownOS()
 	}
 
 	svc.mu.Lock()
 	svc.activeID = id
 	svc.awg = srv.Manager
 	svc.mu.Unlock()
+	svc.syncActiveAWGIface()
 	svc.route.tunnelUpAt.Store(0)
+	svc.awgSave()
+	return nil
+}
+
+func (svc *Service) AWG2RenameServer(id, name string) error {
+	id = strings.TrimSpace(id)
+	svc.mu.Lock()
+	srv := svc.servers[id]
+	if srv == nil {
+		svc.mu.Unlock()
+		return fmt.Errorf("AWG2-сервер не найден")
+	}
+	srv.Name = strings.TrimSpace(name)
+	svc.mu.Unlock()
 	svc.awgSave()
 	return nil
 }
@@ -431,15 +670,30 @@ func (svc *Service) AWG2SetServerEnabled(id string, enabled bool) error {
 	if srv == nil {
 		return fmt.Errorf("AWG2-сервер не найден")
 	}
-	if !enabled && active {
-		_ = svc.awgTeardownRoutingOS()
+	if !enabled {
+		if active {
+			_ = svc.awgTeardownRoutingOS()
+		}
 		srv.Manager.SetClientEnabled(false)
 		srv.Manager.SetRoutingActive(false)
-		_ = svc.awgClientDownOS()
+		_ = svc.awgClientDownManagerOS(srv.Manager)
 		svc.route.tunnelUpAt.Store(0)
 	}
 	srv.Manager.SetEnabled(enabled)
+	if enabled {
+		cfg := srv.Manager.Config()
+		if awgCanStartLocalClient(cfg) {
+			if err := svc.awgClientUpManagerOS(srv.Manager); err != nil {
+				svc.awgSave()
+				svc.awgApplyMultiHostRoutesOS()
+				return err
+			}
+			srv.Manager.SetClientEnabled(true)
+			svc.route.tunnelUpAt.Store(0)
+		}
+	}
 	svc.awgSave()
+	svc.awgApplyMultiHostRoutesOS()
 	if enabled && active && srv.Manager.Config().Routing.Mode != "off" {
 		go func() {
 			if err := svc.awgEnsureClientUpForRouting("включения сервера"); err != nil {
@@ -452,22 +706,29 @@ func (svc *Service) AWG2SetServerEnabled(id string, enabled bool) error {
 	return nil
 }
 
+func awgCanStartLocalClient(cfg awg.ServerConfig) bool {
+	cfg.Normalize()
+	if strings.TrimSpace(cfg.Endpoint) == "" {
+		return false
+	}
+	return cfg.Install == "imported" || cfg.DeployedAt > 0
+}
+
 func (svc *Service) AWG2DeleteServer(id string) error {
 	id = strings.TrimSpace(id)
 	svc.mu.RLock()
 	srv := svc.servers[id]
 	active := id != "" && id == svc.activeID
-	old := svc.awg
 	svc.mu.RUnlock()
 	if srv == nil {
 		return fmt.Errorf("AWG2-сервер не найден")
 	}
-	if active && old != nil {
+	if active {
 		_ = svc.awgTeardownRoutingOS()
-		old.SetClientEnabled(false)
-		old.SetRoutingActive(false)
-		_ = svc.awgClientDownOS()
 	}
+	srv.Manager.SetClientEnabled(false)
+	srv.Manager.SetRoutingActive(false)
+	_ = svc.awgClientDownManagerOS(srv.Manager)
 
 	svc.mu.Lock()
 	delete(svc.servers, id)
@@ -490,12 +751,14 @@ func (svc *Service) AWG2DeleteServer(id string) error {
 		svc.awg = svc.servers[svc.activeID].Manager
 	}
 	svc.mu.Unlock()
+	svc.syncActiveAWGIface()
 	svc.route.tunnelUpAt.Store(0)
 	svc.awgSave()
+	svc.awgApplyMultiHostRoutesOS()
 	return nil
 }
 
-// AWG2InsertTopRule prepends a new rule to the active server's routing.zones
+// AWG2InsertTopRule prepends a new rule to the global routing list
 // (= highest priority). Used by Trace-row quick actions like "always VPN" /
 // "always direct" so the user gets a one-click way from a logged query to a
 // permanent rule. Domain may be a bare hostname or a "domain:foo.com" / "[re]…"
@@ -508,30 +771,39 @@ func (svc *Service) AWG2InsertTopRule(domain, route, name string) error {
 	if domain == "" {
 		return fmt.Errorf("пустой домен")
 	}
-	m := svc.awgActive()
-	if m == nil {
-		return fmt.Errorf("AWG2-сервер не выбран")
+	tunnelID := svc.defaultRoutingTunnelID()
+	if route == "tunnel" && tunnelID == "" {
+		return fmt.Errorf("AWG2-подключения не найдены")
 	}
-	c := m.Config()
 	if name == "" {
 		name = "trace:" + domain
 	}
 	rule := awg.Zone{
-		Name:    name,
-		Route:   route,
-		Domains: []string{domain},
-		Enabled: true,
+		Name:     name,
+		TunnelID: tunnelID,
+		Order:    1,
+		Route:    route,
+		Domains:  []string{domain},
+		Enabled:  true,
 	}
-	c.Routing.Zones = append([]awg.Zone{rule}, c.Routing.Zones...)
-	if err := m.SetConfig(&c); err != nil {
-		return err
+	rules := svc.awgRoutingRules()
+	for i := range rules {
+		rules[i].Order = i + 2
 	}
-	svc.awgSave()
-	// Async refresh — same pattern as AWG2SetRouting. Without this the new rule
-	// is dormant in cfg until the next unrelated zone edit triggers a refresh,
-	// so the Trace-row "always VPN" click reads as broken to the user.
-	go func() { _ = svc.awgRefreshRoutingOS() }()
-	return nil
+	rc := awg.RoutingConfig{Mode: "zones", Zones: append([]awg.Zone{rule}, rules...)}
+	if am := svc.awgActive(); am != nil {
+		cfg := am.Config()
+		rc.Mode = cfg.Routing.Mode
+		rc.MTU = cfg.Routing.MTU
+		rc.Killswitch = cfg.Routing.Killswitch
+		rc.DomainSource = cfg.Routing.DomainSource
+		rc.SNIRouting = cfg.Routing.SNIRouting
+		rc.TraceEnabled = cfg.Routing.TraceEnabled
+	}
+	if rc.Mode == "" || rc.Mode == "off" {
+		rc.Mode = "zones"
+	}
+	return svc.AWG2SetRoutingRules(rc)
 }
 
 // AWG2CopyRulesFromServer overwrites the active server's routing.zones with
@@ -587,6 +859,7 @@ func (svc *Service) AWG2SetConfig(in *awg.ServerConfig) error {
 	in.PrivateKey = cur.PrivateKey
 	in.PublicKey = cur.PublicKey
 	in.DeployedAt = cur.DeployedAt
+	in.ClientIface = cur.ClientIface
 	in.Peers = cur.Peers
 	in.Client = cur.Client
 	in.Routing = cur.Routing
@@ -707,6 +980,9 @@ func (svc *Service) AWG2RefreshStatus() (awg.Status, error) {
 	if m == nil {
 		return awg.Status{}, fmt.Errorf("AWG2-сервер не выбран")
 	}
+	if m.Config().Install == "imported" {
+		return awg.Status{}, nil
+	}
 	svc.statusMu.Lock()
 	cached, cachedErr := svc.statusCached, svc.statusErr
 	if !svc.statusBusy {
@@ -729,6 +1005,9 @@ func (svc *Service) AWG2AddPeer(in awg.Peer) (awg.Peer, error) {
 	if m == nil {
 		return awg.Peer{}, fmt.Errorf("AWG2-сервер не выбран")
 	}
+	if m.Config().Install == "imported" {
+		return awg.Peer{}, fmt.Errorf("imported-профиль не управляет удалённым сервером")
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
 	defer cancel()
 	p, err := m.AddPeer(ctx, in)
@@ -741,6 +1020,9 @@ func (svc *Service) AWG2RemovePeer(id string) error {
 	m := svc.awgActive()
 	if m == nil {
 		return fmt.Errorf("AWG2-сервер не выбран")
+	}
+	if m.Config().Install == "imported" {
+		return fmt.Errorf("imported-профиль не управляет удалённым сервером")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
 	defer cancel()

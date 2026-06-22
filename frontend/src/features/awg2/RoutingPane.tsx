@@ -4,9 +4,8 @@ import { toast } from "@/components/ui/Toast";
 import { confirmDialog } from "@/components/ui/Confirm";
 import { Card } from "@/components/ui/Card";
 import { Button } from "@/components/ui/Button";
-import { Badge } from "@/components/ui/Badge";
 import { Switch } from "@/components/ui/Switch";
-import { Field, Input, Select } from "@/components/ui/form";
+import { Field, Select } from "@/components/ui/form";
 import type { Awg2Status, AwgRoutingConfig, AwgZone } from "@/types/api";
 import RulesTable from "./RulesTable";
 
@@ -27,29 +26,20 @@ const cleanRouting = (rc: AwgRoutingConfig): AwgRoutingConfig => ({
     return { ...z, domains: all.filter((x) => !isIPish(x)), ips: all.filter(isIPish) };
   }),
 });
-const human = (n: number) => {
-  if (!n) return "0 B";
-  const u = ["B", "KB", "MB", "GB", "TB"];
-  let i = 0, v = n;
-  while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
-  return `${v.toFixed(v < 10 && i > 0 ? 1 : 0)} ${u[i]}`;
-};
-const ago = (t: number) => {
-  if (!t) return "—";
-  const s = Math.max(0, Math.floor(Date.now() / 1000) - t);
-  return s < 60 ? `${s} с назад` : s < 3600 ? `${Math.floor(s / 60)} мин назад` : `${Math.floor(s / 3600)} ч назад`;
-};
+const routingFromStatus = (st: Awg2Status): AwgRoutingConfig => ({
+  ...st.config.routing,
+  mode: st.config.routing?.mode || "zones",
+  zones: st.routing_rules || st.config.routing?.zones || [],
+});
 
 export default function RoutingPane({ st, reload }: { st: Awg2Status; reload: () => void }) {
-  const [r, setRState] = useState<AwgRoutingConfig>(() => st.config.routing);
+  const [r, setRState] = useState<AwgRoutingConfig>(() => routingFromStatus(st));
   const [dirty, setDirty] = useState(false);
   const [busy, setBusy] = useState(false);
   const [countdown, setCountdown] = useState(0);
   const timer = useRef<number | null>(null);
   const autoTimer = useRef<number | null>(null);
-  const serverID = st.active_server_id || "";
-  const routingKey = JSON.stringify(st.config.routing || {});
-  const lastServerIDRef = useRef(serverID);
+  const routingKey = JSON.stringify({ routing: st.config.routing || {}, rules: st.routing_rules || [] });
   // Suppress poll-driven resync for a brief window after a save. Otherwise the
   // parent's 2.5s usePoll can race with our local markSaved: a poll fetched at
   // the same time as POST may have captured pre-save state, and its setSt then
@@ -58,18 +48,10 @@ export default function RoutingPane({ st, reload }: { st: Awg2Status; reload: ()
   const savedAtRef = useRef(0);
   useEffect(() => () => { if (timer.current) window.clearInterval(timer.current); if (autoTimer.current) window.clearTimeout(autoTimer.current); }, []);
   useEffect(() => {
-    if (lastServerIDRef.current !== serverID) {
-      // User switched to a different AWG server — its routing config is wholly
-      // different, force-reset whatever was in flight.
-      lastServerIDRef.current = serverID;
-      setRState(st.config.routing);
-      setDirty(false);
-      return;
-    }
     if (dirty) return;
     if (Date.now() - savedAtRef.current < 3000) return;
-    setRState(st.config.routing);
-  }, [routingKey, serverID, dirty, st.config.routing]);
+    setRState(routingFromStatus(st));
+  }, [routingKey, dirty, st]);
   const setR = (next: AwgRoutingConfig | ((prev: AwgRoutingConfig) => AwgRoutingConfig)) => {
     setDirty(true);
     setRState(next);
@@ -81,11 +63,10 @@ export default function RoutingPane({ st, reload }: { st: Awg2Status; reload: ()
   };
 
   const eng = st.engine;
-  const cl = st.client;
   // Routing is "active" once committed; while active, saving zones/masks/killswitch
   // applies to the live tunnel immediately (the backend refreshes membership without
   // a dead-man's switch — it can't cut panel access).
-  const active = !!st.config.routing.active && r.mode !== "off";
+  const active = r.mode !== "off" && (r.zones || []).some((z) => z.enabled);
 
   const post = async (path: string, body: unknown, ok: string, after?: () => void, savedRouting?: AwgRoutingConfig) => {
     setBusy(true);
@@ -93,6 +74,8 @@ export default function RoutingPane({ st, reload }: { st: Awg2Status; reload: ()
     catch (e) { toast((e as Error).message, "err"); }
     finally { setBusy(false); }
   };
+  const saveRules = (nextRouting: AwgRoutingConfig, ok: string, after?: () => void) =>
+    post("/api/awg2/routing/rules", nextRouting, ok, after, nextRouting);
 
   const install = async () => {
     if (!(await confirmDialog({ title: "Установить движок AmneziaWG?", body: "Скачает нашу сборку amneziawg-go + awg и установит на роутер (нужен интернет).", confirmLabel: "Установить" }))) return;
@@ -104,14 +87,6 @@ export default function RoutingPane({ st, reload }: { st: Awg2Status; reload: ()
     } catch (e) { toast((e as Error).message, "err"); } finally { setBusy(false); }
   };
 
-  const startCountdown = () => {
-    setCountdown(90);
-    if (timer.current) window.clearInterval(timer.current);
-    timer.current = window.setInterval(() => setCountdown((c) => {
-      if (c <= 1) { if (timer.current) window.clearInterval(timer.current); return 0; }
-      return c - 1;
-    }), 1000);
-  };
   const stopCountdown = () => { setCountdown(0); if (timer.current) window.clearInterval(timer.current); if (autoTimer.current) { window.clearTimeout(autoTimer.current); autoTimer.current = null; } };
 
   const applyRouting = async () => {
@@ -124,29 +99,17 @@ export default function RoutingPane({ st, reload }: { st: Awg2Status; reload: ()
     setBusy(true);
     try {
       const nextRouting = cleanRouting(r);
-      await api("POST", "/api/awg2/routing/config", nextRouting);
+      await api("POST", "/api/awg2/routing/rules", nextRouting);
       markSaved(nextRouting);
-      await api("POST", "/api/awg2/routing/apply", {});
-      toast("Применено — подтверждаю автоматически…", "ok");
-      startCountdown();
+      toast("Правила применены", "ok");
       await reload();
-      // Auto-confirm shortly after: the panel is reached by LAN IP regardless of
-      // routing (LAN/private/self are always excluded from the tunnel), so a config
-      // change can't cut panel access. If it somehow did, this commit POST fails and
-      // the 90s dead-man's switch still rolls everything back.
-      if (autoTimer.current) window.clearTimeout(autoTimer.current);
-      autoTimer.current = window.setTimeout(() => {
-        void api("POST", "/api/awg2/routing/commit", {})
-          .then(() => { stopCountdown(); toast("Подтверждено", "ok"); void reload(); })
-          .catch(() => { /* unreachable → dead-man's switch rolls back */ });
-      }, 5000);
     } catch (e) { toast((e as Error).message, "err"); } finally { setBusy(false); }
   };
-  const commit = () => post("/api/awg2/routing/commit", {}, "Подтверждено — авто-откат отменён", stopCountdown);
+  const commit = () => stopCountdown();
 
   const teardown = () => {
     const nextRouting = cleanRouting({ ...r, mode: "off" });
-    void post("/api/awg2/routing/config", nextRouting, "Маршрутизация снята", stopCountdown, nextRouting);
+    void saveRules(nextRouting, "Маршрутизация снята", stopCountdown);
   };
 
   const setZone = (i: number, patch: Partial<AwgZone>) => setR((p) => ({ ...p, zones: p.zones.map((z, j) => (j === i ? { ...z, ...patch } : z)) }));
@@ -157,40 +120,20 @@ export default function RoutingPane({ st, reload }: { st: Awg2Status; reload: ()
 
   return (
     <>
-      <Card
-        title="Движок и туннель на роутере"
-        sub="userspace amneziawg-go (наша сборка)"
-        head={
-          <div className="flex flex-wrap items-center gap-2">
-            <Badge kind={eng.installed ? "ok" : "neutral"}>{eng.installed ? "движок установлен" : "движок не установлен"}</Badge>
-            {cl?.running && <Badge kind={cl.connected ? "ok" : "warn"}>{cl.connected ? "туннель подключён" : "туннель поднят"}</Badge>}
-          </div>
-        }
-      >
+      {!eng.installed && (
+      <Card title="Движок AmneziaWG" sub="нужен для поднятия локальных awgN-интерфейсов">
         {!eng.supported ? (
           <p className="text-xs text-bad">Для архитектуры {eng.arch} готовой сборки движка нет.</p>
-        ) : !eng.installed ? (
+        ) : (
           <div className="flex flex-wrap items-center gap-3">
             <Button variant="primary" onClick={install} disabled={busy}>Установить движок</Button>
             {!eng.tun_ok && <span className="text-xs text-warn">⚠ /dev/net/tun не найден — при установке будет попытка загрузить модуль</span>}
           </div>
-        ) : (
-          <>
-            <div className="flex flex-wrap items-center gap-3">
-              {cl?.running
-                ? <Button onClick={() => post("/api/awg2/client/down", {}, "Туннель опущен")} disabled={busy}>Опустить туннель</Button>
-                : <Button variant="primary" onClick={() => post("/api/awg2/client/up", {}, "Туннель поднят")} disabled={busy}>Поднять туннель</Button>}
-              <span className="text-xs text-muted">движок {eng.awg_version || "ok"}{cl?.running ? ` · ${cl.endpoint || ""}` : ""}</span>
-            </div>
-            {cl?.running && (
-              <p className="mt-2 text-xs text-muted">Хендшейк: {ago(cl.last_handshake)} · ↑ {human(cl.tx_bytes)} / ↓ {human(cl.rx_bytes)} · MTU {cl.mtu || "—"}</p>
-            )}
-            {!st.deployed && <p className="mt-1 text-[11px] text-warn">Сервер ещё не развёрнут — разверните его и добавьте этот роутер как пир (вкладка «Клиенты»).</p>}
-          </>
         )}
       </Card>
+      )}
 
-      <Card title="Сплит-маршрутизация" sub="как делить трафик между туннелем и прямым выходом">
+      <Card title="Сплит-маршрутизация" sub="локальные правила на роутере, независимо от настроек подключений">
         <div className="flex flex-wrap gap-4">
           <Field label="Режим" className="min-w-[280px] flex-1">
             <Select value={r.mode === "include" || r.mode === "exclude" ? "zones" : r.mode} onChange={(e) => setR({ ...r, mode: e.target.value })}>
@@ -199,7 +142,6 @@ export default function RoutingPane({ st, reload }: { st: Awg2Status; reload: ()
               <option value="full">Весь трафик — через VPN</option>
             </Select>
           </Field>
-          <Field label="MTU туннеля" className="w-28 shrink-0"><Input type="number" min={1280} max={1420} value={String(r.mtu || 1376)} onChange={(e) => setR({ ...r, mtu: parseInt(e.target.value, 10) || 1376 })} /></Field>
         </div>
         <div className="mt-1 flex items-center gap-4"><Switch checked={!!r.killswitch} onChange={(v) => setR({ ...r, killswitch: v })} label="Эксклюзивный маршрут (kill-switch): если туннель недоступен — сайты из зон НЕ открываются" /></div>
         <p className="mt-0.5 text-[11px] text-muted">Включено — трафик зон идёт только через туннель; упал туннель → соединения нет (без утечки в обычный канал). Выключено — при недоступном туннеле сайты зон открываются обычным прямым соединением.</p>
@@ -214,16 +156,15 @@ export default function RoutingPane({ st, reload }: { st: Awg2Status; reload: ()
           {r.mode === "off" ? (
             <Button variant="primary" onClick={teardown} disabled={busy}>Снять маршрутизацию</Button>
           ) : active ? (
-            <Button variant="primary" onClick={() => { const nextRouting = cleanRouting(r); void post("/api/awg2/routing/config", nextRouting, "Сохранено и применено к туннелю", undefined, nextRouting); }} disabled={busy}>Сохранить и применить</Button>
+            <Button variant="primary" onClick={() => { const nextRouting = cleanRouting(r); void saveRules(nextRouting, "Сохранено и применено"); }} disabled={busy}>Сохранить и применить</Button>
           ) : (
             <>
-              <Button onClick={() => { const nextRouting = cleanRouting(r); void post("/api/awg2/routing/config", nextRouting, "Маршрутизация сохранена", undefined, nextRouting); }} disabled={busy}>Сохранить</Button>
-              <Button variant="primary" onClick={applyRouting} disabled={busy || !cl?.running}>Применить</Button>
+              <Button onClick={() => { const nextRouting = cleanRouting(r); void saveRules(nextRouting, "Маршрутизация сохранена"); }} disabled={busy}>Сохранить</Button>
+              <Button variant="primary" onClick={applyRouting} disabled={busy}>Применить</Button>
             </>
           )}
           {countdown > 0 && <Button variant="primary" onClick={commit} disabled={busy}>✓ Подтвердить ({countdown}с)</Button>}
           {countdown > 0 && <span className="text-xs font-medium text-warn">← нажмите, иначе авто-откат</span>}
-          {!cl?.running && r.mode !== "off" && !active && <span className="text-xs text-muted">сначала поднимите туннель</span>}
         </div>
         {active
           ? <p className="mt-2 text-[11px] font-medium text-ok">● Маршрутизация активна — правки режима, зон, масок и kill-switch применяются к туннелю сразу при сохранении.</p>

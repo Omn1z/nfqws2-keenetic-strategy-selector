@@ -45,8 +45,8 @@ const DECISION: Record<TraceEntry["decision"], { k: "ok" | "neutral" | "bad" | "
 // Sort-arrow glyph for a column header. Inactive columns show a neutral pair.
 const sortGlyph = (key: SortKey, k: SortKey, d: SortDir) => (k === key ? (d === "asc" ? " ▲" : " ▼") : " ⇅");
 
-// quickRule POSTs a "domain:<name>" rule to the top of the active server's
-// rules. Returns when the backend has persisted, so the caller can refresh.
+// quickRule POSTs a "domain:<name>" rule to the top of the global routing list.
+// Returns when the backend has persisted, so the caller can refresh.
 async function quickRule(name: string, route: "tunnel" | "direct") {
   const domain = "domain:" + name.replace(/^domain:|^full:/, "");
   await api("POST", "/api/awg2/routing/rules/insert-top", {

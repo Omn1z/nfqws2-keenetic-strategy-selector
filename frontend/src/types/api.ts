@@ -312,9 +312,9 @@ export interface Socks5Status {
   link: string;
 }
 
-// Shared "route the ISP-blocked Telegram DCs (1/3/5) via AWG2" selection for both
-// proxies. value: "off" | "auto" | "<server-id>".
-export interface AwgFallbackServer { id: string; label: string; connected: boolean }
+// Shared "route the ISP-blocked Telegram DCs (1/3/5) via a tunnel backend" selection
+// for both proxies. value: "off" | "auto" | "<awg-server-id>" | "awg:<id>".
+export interface AwgFallbackServer { id: string; label: string; client_iface?: string; connected: boolean }
 export interface AwgFallbackView { value: string; servers: AwgFallbackServer[] }
 
 // ---- AWG2 (AmneziaWG 2.0). Secret fields (password/key_pem/key_pass/private_key/psk)
@@ -341,6 +341,8 @@ export interface AwgPeer {
  *  still accepted by the backend for backward compat. Always write `route`. */
 export interface AwgZone {
   name: string;
+  tunnel_id?: string;
+  order?: number;
   route?: "tunnel" | "direct";
   mode?: string; // legacy: "include"|"exclude"
   domains: string[];
@@ -373,6 +375,7 @@ export interface AwgServerConfig {
   client: AwgClientConfig;
   routing: AwgRoutingConfig;
   interface: string;
+  client_iface?: string;
   deployed_at: number;
 }
 export interface AwgStep { name: string; ok: boolean; detail: string }
@@ -396,6 +399,8 @@ export interface AwgClientStatus {
 }
 export interface Awg2ServerSummary {
   id: string; label: string; host: string; endpoint: string;
+  client_iface?: string;
+  client?: AwgClientStatus | null;
   enabled: boolean; imported: boolean; protocol: string;
   active: boolean; deployed: boolean; connected: boolean; reachable: boolean;
   has_password: boolean; has_key: boolean; has_server_key: boolean; last_error?: string;
@@ -407,6 +412,7 @@ export interface Awg2Status {
   config: AwgServerConfig; // redacted (no secrets)
   active_server_id: string;
   servers: Awg2ServerSummary[];
+  routing_rules?: AwgZone[];
   has_password: boolean;
   has_key: boolean;
   has_server_key: boolean;
@@ -668,7 +674,7 @@ export interface InstallResult {
 }
 
 // NFQWS2 engine file management + version.
-export type Nfqws2Kind = "conf" | "list" | "lua";
+export type Nfqws2Kind = "conf" | "list" | "lua" | "bypass";
 
 export interface Nfqws2File {
   name: string;

@@ -16,17 +16,10 @@ func (svc *Service) AWG2Import(text, name string) (AWG2Status, error) {
 	if err != nil {
 		return svc.AWG2StatusView(), err
 	}
+	cfg.ClientIface = svc.nextAWGClientIface()
 
 	id := "awg-" + storeutil.NewID()
 	srv := &managedServer{ID: id, Name: strings.TrimSpace(name), Manager: awg.NewManager(cfg)}
-
-	old := svc.awg
-	if old != nil {
-		_ = svc.awgTeardownRoutingOS()
-		old.SetClientEnabled(false)
-		old.SetRoutingActive(false)
-		_ = svc.awgClientDownOS()
-	}
 
 	svc.mu.Lock()
 	if svc.servers == nil {
@@ -37,6 +30,7 @@ func (svc *Service) AWG2Import(text, name string) (AWG2Status, error) {
 	svc.activeID = id
 	svc.awg = srv.Manager
 	svc.mu.Unlock()
+	svc.syncActiveAWGIface()
 
 	svc.route.tunnelUpAt.Store(0)
 	svc.awgSave()

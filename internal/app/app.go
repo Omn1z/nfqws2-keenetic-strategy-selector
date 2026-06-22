@@ -98,7 +98,7 @@ func New(cfg *config.Config) (*App, error) {
 	a.proxy = proxy.New(st)
 	a.portfwd = portforward.New(cfg, st)
 	a.arpspoof = arpspoof.New(cfg, st)
-	a.awgroute = awgroute.New(cfg, st)                    // creates the manager; may autostart the tunnel + re-apply committed routing
+	a.awgroute = awgroute.New(cfg, st) // creates the manager; may autostart the tunnel + re-apply committed routing
 	// Apply trace policy as soon as the AWG service exists: "always" turns
 	// recording on right away, "off" pins it off; "auto" leaves it to the
 	// TracePane mount/unmount lifecycle. saveSettings already ran in initAuth.
@@ -109,7 +109,8 @@ func New(cfg *config.Config) (*App, error) {
 		a.awgroute.TraceSetEnabled(false)
 	}
 	a.monitor = monitor.New(cfg, st, a.proxy, a.awgroute) // dashboard reads the proxy + AWG2 tunnel status
-	a.proxy.SetAWGFallbackProbe(a.awgroute.FallbackUp)    // Telegram proxies route ISP-blocked DC1/3/5 via the selected AWG2 server while it is up
+	a.proxy.SetAWGFallbackProbe(a.proxyTunnelFallbackUp)  // Telegram proxies route ISP-blocked DC1/3/5 via the selected tunnel backend while it is up
+	a.syncProxyTunnelRoutes(a.proxy.AWGFallback())
 	a.initDNS()
 	// Repair any sandbox state leaked by a previous unclean exit (stale STRAT_*
 	// iptables chains / orphaned test nfqws2 children). Without this a killed run
