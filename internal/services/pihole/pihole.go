@@ -20,7 +20,9 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"os"
 	"os/exec"
+	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -35,11 +37,9 @@ const (
 	DefaultDNSPort = 5353
 	DefaultUIPort  = 8053
 
-	// USB-anchored config root. OPA authz on the bundled dockerd only allows
-	// bind mounts from /mnt/usb-*; storing pi-hole data on the same USB volume
-	// where docker's image store lives is the obvious "everything-in-one-place"
-	// choice.
-	DefaultDataRoot = "/mnt/usb-b23e7f6e/mi_docker/pihole"
+	// USB-anchored config root: see discoverDataRoot for runtime discovery
+	// (/mnt/usb-<id>/mi_docker/pihole). OPA authz on the bundled dockerd only
+	// allows bind mounts from /mnt/usb-*.
 
 	// Pi-hole's stats endpoint; we use it for the dashboard summary.
 	statsPath = "/api/stats/summary"
@@ -57,15 +57,34 @@ type Config struct {
 }
 
 // Default returns a sensible Config for this router. Users can tweak via API.
+// The USB path is discovered at runtime (/mnt/usb-<id>/mi_docker/pihole), so a
+// fresh install on a different router doesn't inherit anyone else's hardcoded id.
 func Default() Config {
 	return Config{
 		Password:        "root",
 		DNSPort:         DefaultDNSPort,
 		UIPort:          DefaultUIPort,
-		DataRoot:        DefaultDataRoot,
+		DataRoot:        discoverDataRoot(),
 		Timezone:        "Europe/Moscow",
 		DNSChainEnabled: false,
 	}
+}
+
+// discoverDataRoot walks /mnt/usb-* and returns the first dir whose
+// mi_docker/pihole sibling looks usable. Falls back to a generic placeholder
+// so the field is never empty (the UI will show it and the user can fix it).
+func discoverDataRoot() string {
+	ents, _ := os.ReadDir("/mnt")
+	for _, e := range ents {
+		if !e.IsDir() || !strings.HasPrefix(e.Name(), "usb-") {
+			continue
+		}
+		base := "/mnt/" + e.Name() + "/mi_docker"
+		if fi, err := os.Stat(base); err == nil && fi.IsDir() {
+			return base + "/pihole"
+		}
+	}
+	return "/mnt/usb/mi_docker/pihole"
 }
 
 // Status is the live container view shown to the UI.
@@ -102,9 +121,15 @@ type Service struct {
 	dockerBin string
 	cfg       Config
 
-	mu      sync.Mutex
-	sid     string // pi-hole session id; valid until pi-hole expires it (~5 min idle)
-	sidAt   time.Time
+	mu    sync.Mutex
+	sid   string // pi-hole session id; valid until pi-hole expires it (~5 min idle)
+	sidAt time.Time
+
+	// http is a per-Service client with keep-alive tuned for the FTL local API.
+	// http.DefaultClient opens a fresh socket every call + has no timeout, so a
+	// hung FTL would hang Dashboard polls indefinitely. Reusing the client lets
+	// the kernel keep the TCP socket warm across Stats / SetUpstreams / auth.
+	http *http.Client
 
 	// onChainChange is called when the user toggles DNS chain integration; the
 	// awgroute service uses it to re-apply the DNS proxy upstream.
@@ -122,7 +147,7 @@ func New(cfg Config) *Service {
 		cfg.UIPort = DefaultUIPort
 	}
 	if cfg.DataRoot == "" {
-		cfg.DataRoot = DefaultDataRoot
+		cfg.DataRoot = discoverDataRoot()
 	}
 	if cfg.Timezone == "" {
 		cfg.Timezone = "Europe/Moscow"
@@ -130,17 +155,39 @@ func New(cfg Config) *Service {
 	if cfg.Password == "" {
 		cfg.Password = "root"
 	}
-	return &Service{dockerBin: discoverDockerBin(), cfg: cfg}
+	return &Service{
+		dockerBin: discoverDockerBin(),
+		cfg:       cfg,
+		http: &http.Client{
+			Timeout: 10 * time.Second,
+			Transport: &http.Transport{
+				// Loopback talk only — FTL is 127.0.0.1:8053. Keep a small pool of
+				// reusable conns so the typical poll-every-N-sec dashboard doesn't
+				// keep TCP-handshaking to the same port.
+				MaxIdleConns:        4,
+				MaxIdleConnsPerHost: 4,
+				IdleConnTimeout:     90 * time.Second,
+				DisableCompression:  true,
+			},
+		},
+	}
 }
 
-// discoverDockerBin finds the docker CLI; the bundled one isn't in PATH.
+// discoverDockerBin finds the docker CLI; the bundled one isn't in PATH and
+// lives under /mnt/usb-<id>/mi_docker/docker-binaries/docker — the <id> varies
+// per router. Walk /mnt/usb-* first, then fall back to PATH.
 func discoverDockerBin() string {
-	candidates := []string{
-		"/mnt/usb-b23e7f6e/mi_docker/docker-binaries/docker",
-		"/opt/bin/docker",
-		"docker",
+	ents, _ := os.ReadDir("/mnt")
+	for _, e := range ents {
+		if !e.IsDir() || !strings.HasPrefix(e.Name(), "usb-") {
+			continue
+		}
+		cand := "/mnt/" + e.Name() + "/mi_docker/docker-binaries/docker"
+		if _, err := os.Stat(cand); err == nil {
+			return cand
+		}
 	}
-	for _, p := range candidates {
+	for _, p := range []string{"/opt/bin/docker", "docker"} {
 		if _, err := exec.LookPath(p); err == nil {
 			return p
 		}
@@ -297,7 +344,33 @@ func (s *Service) Install(ctx context.Context) (string, error) {
 	// if iptables fails, the container still runs.
 	openLANPort(ctx, cfg.UIPort)
 	log.WriteString(fmt.Sprintf("opened firewall: tcp/%d\n", cfg.UIPort))
+	// FTL writes pihole.toml ~10s after first start. Apply the add-subnet
+	// patch as soon as it appears so a fresh user gets the EDNS Client Subnet
+	// directive without having to restart the selector after Install. Runs
+	// async so the UI's "Install" button doesn't block on it.
+	s.ApplyPersistentPatchesWhenReady()
 	return log.String(), nil
+}
+
+// ApplyPersistentPatchesWhenReady polls for pihole.toml (created by FTL on
+// first start) for up to 60s, then runs EnsureAddSubnet. Idempotent. Safe to
+// call repeatedly — both the wait and the patch no-op when not needed.
+func (s *Service) ApplyPersistentPatchesWhenReady() {
+	cfg := s.Config()
+	if cfg.DataRoot == "" {
+		return
+	}
+	toml := cfg.DataRoot + "/etc/pihole.toml"
+	go func() {
+		deadline := time.Now().Add(60 * time.Second)
+		for time.Now().Before(deadline) {
+			if _, err := os.Stat(toml); err == nil {
+				_ = s.EnsureAddSubnet()
+				return
+			}
+			time.Sleep(2 * time.Second)
+		}
+	}()
 }
 
 // openLANPort allows TCP traffic from br-lan (the LAN bridge) to the pi-hole
@@ -336,6 +409,69 @@ func (s *Service) EnsureFirewall() {
 	openLANPort(ctx, s.Config().UIPort)
 }
 
+// EnsureAddSubnet makes pi-hole's bundled dnsmasq copy the original client IP
+// into the EDNS0 Client Subnet option of every upstream query. Our :5354
+// proxy parses it back out — without this, the trace log shows every query
+// as "src=127.0.0.1" because pi-hole hides the real LAN client behind its
+// own socket.
+//
+// Pi-hole v6 ignores /etc/dnsmasq.d/*.conf unless `misc.etc_dnsmasq_d = true`,
+// and the recommended escape hatch for arbitrary directives is
+// `misc.dnsmasq_lines = ["add-subnet=32,128"]` in /etc/pihole/pihole.toml.
+// We patch that array in place (preserves any other lines the user added)
+// then trigger a DNS restart so FTL re-reads its config.
+//
+// Idempotent: a re-run with the directive already present is a no-op.
+func (s *Service) EnsureAddSubnet() error {
+	const directive = "add-subnet=32,128"
+	cfg := s.Config()
+	if cfg.DataRoot == "" {
+		return fmt.Errorf("DataRoot not set")
+	}
+	tomlPath := cfg.DataRoot + "/etc/pihole.toml"
+	raw, err := os.ReadFile(tomlPath)
+	if err != nil {
+		return fmt.Errorf("read %s: %w", tomlPath, err)
+	}
+	if strings.Contains(string(raw), directive) {
+		return nil // already applied
+	}
+	// Find the `dnsmasq_lines = [...]` line and append our directive inside the
+	// array. Pi-hole writes the array on a single line so this regex is enough;
+	// fall back to a no-op if the layout changed in a future pi-hole release.
+	re := regexp.MustCompile(`(?m)^(\s*dnsmasq_lines\s*=\s*\[)([^\]]*)(\])`)
+	m := re.FindSubmatchIndex(raw)
+	if m == nil {
+		return fmt.Errorf("dnsmasq_lines key not found in %s", tomlPath)
+	}
+	inner := strings.TrimSpace(string(raw[m[4]:m[5]]))
+	var patched []byte
+	if inner == "" {
+		patched = append(patched, raw[:m[4]]...)
+		patched = append(patched, []byte(` "`+directive+`" `)...)
+		patched = append(patched, raw[m[5]:]...)
+	} else {
+		patched = append(patched, raw[:m[5]]...)
+		patched = append(patched, []byte(`, "`+directive+`"`)...)
+		patched = append(patched, raw[m[5]:]...)
+	}
+	if err := os.WriteFile(tomlPath, patched, 0o644); err != nil {
+		return fmt.Errorf("write %s: %w", tomlPath, err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	// `restartdns` re-execs pihole-FTL with the patched config (reloaddns only
+	// SIGHUPs and doesn't pick up new dnsmasq_lines). MUST use s.dockerBin —
+	// on Xiaomi router docker isn't in PATH (lives under /mnt/usb-*/mi_docker/),
+	// so "docker exec" silently ENOENTs and FTL never picks up the patched
+	// add-subnet=32,128 → trace log shows 127.0.0.1 as the client of every
+	// query until the user reboots.
+	if out, err := exec.CommandContext(ctx, s.dockerBin, "exec", ContainerName, "pihole", "restartdns").CombinedOutput(); err != nil {
+		return fmt.Errorf("pihole restartdns: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
 // EnsureRunning is the boot-time recovery hook. If the user had pi-hole
 // installed before a reboot, their expectation is that it just comes back —
 // not that they have to click "Install" again. So:
@@ -360,7 +496,8 @@ func (s *Service) EnsureRunning() {
 		if !st.Installed && st.State == "" {
 			return // never installed; respect user's explicit choice
 		}
-		// Reinstall path: rm stale (if any) + run.
+		// Reinstall path: rm stale (if any) + run. Install() already kicks off
+		// the persistent-patch wait async, so we don't need to repeat it here.
 		if _, err := s.Install(ctx); err == nil {
 			openLANPort(ctx, s.Config().UIPort)
 		}
@@ -412,6 +549,15 @@ func (s *Service) Upgrade(ctx context.Context) (string, error) {
 	return log.String(), err
 }
 
+// invalidateSession drops the cached SID. Called when FTL replies 401 to a
+// request we'd considered valid — otherwise the next 4 minutes of polls would
+// keep failing until our 4-min TTL bumps the SID. Cheap reset under the lock.
+func (s *Service) invalidateSession() {
+	s.mu.Lock()
+	s.sid, s.sidAt = "", time.Time{}
+	s.mu.Unlock()
+}
+
 // ensureSession (re)authenticates against pi-hole's REST API when our cached
 // session id is missing or stale. Pi-hole v6 sessions expire ~5 min idle.
 func (s *Service) ensureSession(ctx context.Context) error {
@@ -428,7 +574,7 @@ func (s *Service) ensureSession(ctx context.Context) error {
 	req, _ := http.NewRequestWithContext(ctx, http.MethodPost,
 		fmt.Sprintf("http://127.0.0.1:%d%s", port, authPath), bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := s.http.Do(req)
 	if err != nil {
 		return err
 	}
@@ -468,13 +614,16 @@ func (s *Service) Stats(ctx context.Context) Stats {
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet,
 		fmt.Sprintf("http://127.0.0.1:%d%s", port, statsPath), nil)
 	req.Header.Set("X-FTL-SID", sid)
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := s.http.Do(req)
 	if err != nil {
 		st.Error = err.Error()
 		return st
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
+		if resp.StatusCode == 401 {
+			s.invalidateSession()
+		}
 		st.Error = fmt.Sprintf("HTTP %d", resp.StatusCode)
 		return st
 	}
@@ -560,12 +709,15 @@ func (s *Service) SetUpstreams(ctx context.Context, upstreams []string) error {
 		fmt.Sprintf("http://127.0.0.1:%d/api/config", port), bytes.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-FTL-SID", sid)
-	resp, err := http.DefaultClient.Do(req)
+	resp, err := s.http.Do(req)
 	if err != nil {
 		return err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
+		if resp.StatusCode == 401 {
+			s.invalidateSession()
+		}
 		return fmt.Errorf("set upstreams: HTTP %d", resp.StatusCode)
 	}
 	return nil
