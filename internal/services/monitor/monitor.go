@@ -78,6 +78,9 @@ type DashboardView struct {
 
 	// Top-talking LAN devices by bytes (sum of up+down). Capped to 8.
 	TopDevices []netmon.Device `json:"top_devices"`
+
+	// AWG2 trace counters (lifetime totals; UI computes RPS by diffing samples).
+	TraceCounters awgroute.TraceCounters `json:"trace_counters"`
 }
 
 // Dashboard assembles the home view. The TG WS card works on any platform; the
@@ -88,6 +91,7 @@ func (s *Service) Dashboard(host string) DashboardView {
 	d.TGWS = s.proxy.TGWSStatusFor(host)
 	d.Socks5 = s.proxy.Socks5StatusFor(host)
 	d.AWG = s.awg.DashboardConns()
+	d.TraceCounters = s.awg.TraceCounters()
 	d.MainQueue = s.cfg.MainQueue
 	d.Conns.ByProto = map[string]int{}
 
@@ -95,7 +99,11 @@ func (s *Service) Dashboard(host string) DashboardView {
 		d.Conntrack.Count = cur
 		d.Conntrack.Max = limit
 	}
-	if conns, err := netmon.Conntrack(); err == nil {
+	// /proc/net/nf_conntrack is 5-10 MB on a busy router; parsing it twice per
+	// dashboard tick (once for byProto+failing, once for GroupDevices) costs
+	// real CPU. Read once, share across both passes.
+	conns, connsErr := netmon.Conntrack()
+	if connsErr == nil {
 		d.Conns.Total = len(conns)
 		for _, c := range conns {
 			d.Conns.ByProto[c.Proto]++
@@ -127,9 +135,10 @@ func (s *Service) Dashboard(host string) DashboardView {
 
 	// System + top-talking devices (best-effort; empty on non-Linux dev box).
 	d.System = netmon.System()
-	if conns, err := netmon.Conntrack(); err == nil {
+	if connsErr == nil {
 		arp, _ := netmon.ARP()
-		devs := netmon.GroupDevices(conns, arp)
+		ndp, _ := netmon.NDP()
+		devs := netmon.GroupDevices(conns, arp, ndp)
 		// Sort by total bytes (up+down) descending and keep at most 8 for the dashboard.
 		sort.Slice(devs, func(i, j int) bool {
 			return devs[i].BytesUp+devs[i].BytesDown > devs[j].BytesUp+devs[j].BytesDown
@@ -168,5 +177,6 @@ func (s *Service) DeviceActivity() (DeviceActivityView, error) {
 		return DeviceActivityView{}, err
 	}
 	arp, _ := netmon.ARP() // best-effort: enriches MAC/bridge, not required
-	return DeviceActivityView{Devices: netmon.GroupDevices(conns, arp)}, nil
+	ndp, _ := netmon.NDP() // best-effort: source of v6 addrs (link-local)
+	return DeviceActivityView{Devices: netmon.GroupDevices(conns, arp, ndp)}, nil
 }
