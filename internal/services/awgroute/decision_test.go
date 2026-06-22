@@ -102,20 +102,19 @@ func TestRouteFor(t *testing.T) {
 			RouteUnknown, false, 0,
 		},
 
-		// (f) Source-bound zone wins over global for matching srcIP, leaves
-		// global decision alone for non-matching srcIP.
+		// (f) A source-bound rule placed at the TOP fires for its device under
+		// first-match-wins (priority = UI order). yandex.ru from .106 hits the
+		// source rule at row #0 before the later RU-direct rule; tunnel +
+		// !tunnelV6 → block AAAA.
 		{
 			"source-bound tunnel rule fires for matching src",
 			[]awg.Zone{
-				// Note source-bound zones come AFTER catch-all here but
-				// effectiveZones preserves them; routeFor walks source-bound
-				// FIRST.
+				srcZone("kids", "include", "192.168.31.106", "*"),
 				zone("ru", "exclude", true, "domain:yandex.ru"),
 				zone("all", "include", true, "*"),
-				srcZone("kids", "include", "192.168.31.106", "*"),
 			},
 			false, "yandex.ru", "192.168.31.106",
-			RouteTunnel, true, 3, // source-bound wins; tunnel + !tunnelV6 → block AAAA
+			RouteTunnel, true, 1, // source-bound at row #0 wins
 		},
 		{
 			"source-bound zone does NOT apply to other LAN clients",
