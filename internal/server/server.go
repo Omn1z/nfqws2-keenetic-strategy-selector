@@ -2,7 +2,9 @@
 package server
 
 import (
+	"bytes"
 	"compress/gzip"
+	"context"
 	"embed"
 	"encoding/json"
 	"errors"
@@ -10,13 +12,17 @@ import (
 	"io/fs"
 	"log"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
 	"nfqws2strategy/internal/app"
 	"nfqws2strategy/internal/services/arpspoof"
 	"nfqws2strategy/internal/services/awg"
+	"nfqws2strategy/internal/services/awgroute"
 	"nfqws2strategy/internal/services/portforward"
 	"nfqws2strategy/internal/services/strategy/core/catalog"
 	"nfqws2strategy/internal/services/tgws"
@@ -127,14 +133,16 @@ func (s *Server) getSystemSettings(w http.ResponseWriter, r *http.Request) {
 		"auth_forced_off":   s.app.AuthForcedOff(),
 		"logging_enabled":   s.app.LoggingEnabled(),
 		"http_logs_enabled": s.app.HTTPLogsEnabled(),
+		"trace_mode":        s.app.TraceMode(),
 	})
 }
 
 func (s *Server) setSystemSettings(w http.ResponseWriter, r *http.Request) {
 	var in struct {
-		AuthEnabled     *bool `json:"auth_enabled"`
-		LoggingEnabled  *bool `json:"logging_enabled"`
-		HTTPLogsEnabled *bool `json:"http_logs_enabled"`
+		AuthEnabled     *bool   `json:"auth_enabled"`
+		LoggingEnabled  *bool   `json:"logging_enabled"`
+		HTTPLogsEnabled *bool   `json:"http_logs_enabled"`
+		TraceMode       *string `json:"trace_mode"`
 	}
 	if err := readJSON(r, &in); err != nil {
 		httpErr(w, 400, err)
@@ -158,7 +166,74 @@ func (s *Server) setSystemSettings(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if in.TraceMode != nil {
+		if err := s.app.SetTraceMode(*in.TraceMode); err != nil {
+			httpErr(w, 500, err)
+			return
+		}
+	}
 	s.getSystemSettings(w, r)
+}
+
+// backupDownload streams a sealed backup straight to the client — no disk
+// write on the router. No body needed: the seal key lives inside the binary.
+func (s *Server) backupDownload(w http.ResponseWriter, r *http.Request) {
+	// Build into a buffer first so we can fail with JSON before sending the
+	// binary stream (otherwise the browser shows a broken download).
+	var buf bytes.Buffer
+	name, _, err := s.app.BackupBuild(&buf)
+	if err != nil {
+		httpErr(w, 500, err)
+		return
+	}
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Content-Length", strconv.Itoa(buf.Len()))
+	w.Header().Set("Content-Disposition", `attachment; filename="`+name+`"`)
+	_, _ = io.Copy(w, &buf)
+}
+
+// backupRestore accepts a multipart upload (file), validates MD5 + GCM,
+// extracts onto disk, then trusts the user to /api/system/restart.
+// Body: multipart/form-data { archive: file }.
+func (s *Server) backupRestore(w http.ResponseWriter, r *http.Request) {
+	// Cap the request body BEFORE multipart parsing so a hostile upload can't
+	// OOM the router. 300 MB ceiling = our 256 MB plaintext cap + multipart
+	// overhead.
+	r.Body = http.MaxBytesReader(w, r.Body, 300*1024*1024)
+	if err := r.ParseMultipartForm(32 << 20); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	file, _, err := r.FormFile("archive")
+	if err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	defer file.Close()
+	n, err := s.app.BackupRestore(file)
+	if err != nil {
+		// 400 for corruption / not-a-backup / tampered — these are user errors.
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"restored": n})
+}
+
+// restartSelector replies immediately, then a few hundred ms later sends SIGTERM
+// to the running selector process. PID 1 (or /data/xmir-init.sh from the init
+// script's keep-alive loop) picks it up and re-execs the binary. The client
+// shows a brief "selector перезапускается" toast and reloads after the gap.
+func (s *Server) restartSelector(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, 200, map[string]string{"status": "restarting"})
+	go func() {
+		time.Sleep(400 * time.Millisecond)
+		// SIGTERM lets the binary's deferred cleanups (logbuf flush, AWG
+		// state save) actually run. xmir-init.sh respawns within ~6s.
+		p, err := os.FindProcess(os.Getpid())
+		if err == nil {
+			_ = p.Signal(syscall.SIGTERM)
+		}
+	}()
 }
 
 func (s *Server) routes() {
@@ -180,6 +255,9 @@ func (s *Server) routes() {
 	m.HandleFunc("GET /api/system/settings", s.getSystemSettings)
 	m.HandleFunc("POST /api/system/settings", s.setSystemSettings)
 	m.HandleFunc("POST /api/services/restart", s.restartServices)
+	m.HandleFunc("POST /api/system/restart", s.restartSelector)
+	m.HandleFunc("POST /api/system/backup", s.backupDownload)
+	m.HandleFunc("POST /api/system/restore", s.backupRestore)
 	m.HandleFunc("GET /api/port-forwarding", s.getPortForwarding)
 	m.HandleFunc("POST /api/port-forwarding/rules", s.savePortForwardingRule)
 	m.HandleFunc("POST /api/port-forwarding/rules/{id}/enabled", s.setPortForwardingRuleEnabled)
@@ -267,6 +345,13 @@ func (s *Server) routes() {
 	m.HandleFunc("POST /api/awg2/routing/apply", s.awg2RoutingApply)
 	m.HandleFunc("POST /api/awg2/routing/commit", s.awg2RoutingCommit)
 	m.HandleFunc("POST /api/awg2/routing/teardown", s.awg2RoutingTeardown)
+	m.HandleFunc("POST /api/awg2/routing/rules/insert-top", s.awg2RulesInsertTop)
+	m.HandleFunc("POST /api/awg2/routing/rules/copy", s.awg2RulesCopy)
+	m.HandleFunc("GET /api/awg2/trace", s.awg2TraceList)
+	m.HandleFunc("GET /api/awg2/trace/status", s.awg2TraceStatus)
+	m.HandleFunc("POST /api/awg2/trace/enabled", s.awg2TraceSetEnabled)
+	m.HandleFunc("POST /api/awg2/trace/clear", s.awg2TraceClear)
+	m.HandleFunc("POST /api/awg2/speedtest", s.awg2SpeedTest)
 
 	m.HandleFunc("POST /api/apply", s.applyStrategy)
 
@@ -344,8 +429,9 @@ func (s *Server) serveIndex(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 	if strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
 		w.Header().Set("Content-Encoding", "gzip")
-		gz := gzip.NewWriter(w)
-		defer gz.Close()
+		gz := gzipWriterPool.Get().(*gzip.Writer)
+		gz.Reset(w)
+		defer func() { _ = gz.Close(); gzipWriterPool.Put(gz) }()
 		_, _ = gz.Write(b)
 		return
 	}
@@ -435,7 +521,7 @@ func (s *Server) downloadPcap(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "application/vnd.tcpdump.pcap")
-	w.Header().Set("Content-Disposition", `attachment; filename="`+name+`"`)
+	w.Header().Set("Content-Disposition", `attachment; filename="`+safeFile(name, true, "file", 80)+`"`)
 	http.ServeFile(w, r, path)
 }
 
@@ -597,11 +683,11 @@ func (s *Server) exportStrategy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if strings.TrimSpace(in.Args) == "" {
-		httpErr(w, 400, &simpleErr{"empty strategy args"})
+		httpErr(w, 400, errors.New("empty strategy args"))
 		return
 	}
 	w.Header().Set("Content-Type", "application/zip")
-	w.Header().Set("Content-Disposition", `attachment; filename="`+safeFile(in.Name)+`.zip"`)
+	w.Header().Set("Content-Disposition", `attachment; filename="`+safeFile(in.Name, false, "strategy", 60)+`.zip"`)
 	_ = s.app.ExportStrategyZip(in.Name, in.L7, in.Args, w)
 }
 
@@ -629,12 +715,16 @@ func (s *Server) importStrategy(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, st)
 }
 
-// safeFile sanitizes a user-provided name for use in a Content-Disposition filename.
-func safeFile(s string) string {
+// safeFile sanitizes a user-provided name for a Content-Disposition filename.
+// keepDot=true preserves "." (used for filenames like "user.list"); false maps it
+// to "_" (used for strategy names where the extension is fixed by the caller).
+func safeFile(s string, keepDot bool, fallback string, max int) string {
 	var b strings.Builder
 	for _, r := range s {
 		switch {
 		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_':
+			b.WriteRune(r)
+		case keepDot && r == '.':
 			b.WriteRune(r)
 		default:
 			b.WriteByte('_')
@@ -642,10 +732,10 @@ func safeFile(s string) string {
 	}
 	out := b.String()
 	if out == "" {
-		out = "strategy"
+		out = fallback
 	}
-	if len(out) > 60 {
-		out = out[:60]
+	if len(out) > max {
+		out = out[:max]
 	}
 	return out
 }
@@ -909,7 +999,7 @@ func (s *Server) uploadGeo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer f.Close()
-	data, err := io.ReadAll(io.LimitReader(f, 48<<20))
+	data, err := io.ReadAll(io.LimitReader(f, 16<<20))
 	if err != nil {
 		httpErr(w, 400, err)
 		return
@@ -1115,31 +1205,10 @@ func (s *Server) nfqws2DownloadFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Content-Type", "application/octet-stream")
-	w.Header().Set("Content-Disposition", `attachment; filename="`+safeDispoName(name)+`"`)
+	w.Header().Set("Content-Disposition", `attachment; filename="`+safeFile(name, true, "file", 80)+`"`)
 	_, _ = w.Write(data)
 }
 
-// safeDispoName sanitizes a filename for a Content-Disposition header while
-// PRESERVING dots — unlike safeFile, which maps "." to "_" (mangling user.list).
-func safeDispoName(s string) string {
-	var b strings.Builder
-	for _, r := range s {
-		switch {
-		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_', r == '.':
-			b.WriteRune(r)
-		default:
-			b.WriteByte('_')
-		}
-	}
-	out := b.String()
-	if out == "" {
-		out = "file"
-	}
-	if len(out) > 80 {
-		out = out[:80]
-	}
-	return out
-}
 
 func (s *Server) startRun(w http.ResponseWriter, r *http.Request) {
 	var req app.RunRequest
@@ -1502,7 +1571,7 @@ func (s *Server) awg2PeerConfig(w http.ResponseWriter, r *http.Request) {
 		contentType = "text/plain; charset=utf-8"
 	}
 	w.Header().Set("Content-Type", contentType)
-	w.Header().Set("Content-Disposition", `attachment; filename="`+safeDispoName(name)+`"`)
+	w.Header().Set("Content-Disposition", `attachment; filename="`+safeFile(name, true, "file", 80)+`"`)
 	_, _ = w.Write([]byte(text))
 }
 
@@ -1566,6 +1635,122 @@ func (s *Server) awg2RoutingTeardown(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, 200, s.app.AWG2StatusView())
+}
+
+// awg2RulesInsertTop adds a new rule at the head of the routing.zones array
+// (= highest priority). Backs the Trace-row «Всегда VPN / Всегда мимо» quick
+// actions. Body: {domain, route, name?}.
+func (s *Server) awg2RulesInsertTop(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Domain string `json:"domain"`
+		Route  string `json:"route"`
+		Name   string `json:"name"`
+	}
+	if err := readJSON(r, &in); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	if err := s.app.AWG2InsertTopRule(in.Domain, in.Route, in.Name); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, s.app.AWG2StatusView())
+}
+
+// awg2RulesCopy overwrites the active server's rules with another server's
+// rules. Body: {from_server_id}. Other settings (mode/MTU/killswitch/etc) on
+// the destination stay untouched.
+func (s *Server) awg2RulesCopy(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		FromServerID string `json:"from_server_id"`
+	}
+	if err := readJSON(r, &in); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	n, err := s.app.AWG2CopyRulesFromServer(in.FromServerID)
+	if err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"copied": n, "status": s.app.AWG2StatusView()})
+}
+
+func (s *Server) awg2TraceStatus(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, 200, s.app.AWG2TraceStatus())
+}
+
+func (s *Server) awg2TraceList(w http.ResponseWriter, r *http.Request) {
+	since, _ := strconv.ParseInt(r.URL.Query().Get("since"), 10, 64)
+	writeJSON(w, 200, map[string]any{
+		"status":  s.app.AWG2TraceStatus(),
+		"entries": s.app.AWG2TraceSnapshot(since),
+	})
+}
+
+func (s *Server) awg2TraceSetEnabled(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Enabled bool `json:"enabled"`
+	}
+	if err := readJSON(r, &in); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	s.app.AWG2TraceSetEnabled(in.Enabled)
+	writeJSON(w, 200, s.app.AWG2TraceStatus())
+}
+
+func (s *Server) awg2TraceClear(w http.ResponseWriter, r *http.Request) {
+	s.app.AWG2TraceClear()
+	writeJSON(w, 200, s.app.AWG2TraceStatus())
+}
+
+// awg2SpeedTest runs the two-sample throughput probe and STREAMS progress as
+// NDJSON. Each progress tick (~250 ms) writes one JSON-encoded SpeedEvent +
+// '\n'. Final line is {phase:"result", result:{...}}. The UI parses lines as
+// they arrive so the user sees live MB/s instead of staring at a frozen button.
+//
+// URL + size + timeout come from the request body so the user can pick a 1GB
+// sample for a more accurate number, or point at their own endpoint.
+func (s *Server) awg2SpeedTest(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		URL       string `json:"url"`
+		MaxBytes  int64  `json:"max_bytes"`
+		TimeoutMS int    `json:"timeout_ms"`
+	}
+	if err := readJSON(r, &in); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	url, err := awgroute.ValidateSpeedTestURL(in.URL)
+	if err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	if in.MaxBytes <= 0 {
+		in.MaxBytes = 10 * 1024 * 1024
+	}
+	if in.TimeoutMS <= 0 {
+		in.TimeoutMS = 15000
+	}
+	// 1GB at slow direct speeds can take a while; cap context generously.
+	ctx, cancel := context.WithTimeout(r.Context(), time.Duration(in.TimeoutMS)*2*time.Millisecond+10*time.Second)
+	defer cancel()
+
+	w.Header().Set("Content-Type", "application/x-ndjson")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("X-Accel-Buffering", "no") // prevent buffering by reverse proxies
+	w.WriteHeader(200)
+	_ = awgroute.JSONLine(w, map[string]any{"phase": "init", "url": url, "max_bytes": in.MaxBytes})
+
+	s.app.AWG2SpeedTest(ctx, awgroute.SpeedTestOptions{
+		URL:      url,
+		MaxBytes: in.MaxBytes,
+		Timeout:  time.Duration(in.TimeoutMS) * time.Millisecond,
+		OnEvent: func(evt awgroute.SpeedEvent) {
+			_ = awgroute.JSONLine(w, evt)
+		},
+	})
 }
 
 func (s *Server) nfqws2StartSvc(w http.ResponseWriter, r *http.Request) {
@@ -1664,16 +1849,45 @@ type apiError struct {
 	Error string `json:"error"`
 }
 
-var errNotFound = &simpleErr{"not found"}
+var errNotFound = errors.New("not found")
 
-type simpleErr struct{ s string }
+// gzipWriterPool reuses gzip.Writer instances. A fresh gzip.Writer has a 64 KiB
+// internal buffer + DEFLATE state allocated on every NewWriter call; pooling
+// flips that into reuse across requests.
+var gzipWriterPool = sync.Pool{
+	New: func() interface{} { return gzip.NewWriter(io.Discard) },
+}
 
-func (e *simpleErr) Error() string { return e.s }
+// jsonEncoderPool reuses encoder + scratch buffer across API responses.
+// Without pooling, every writeJSON allocated json.NewEncoder (small object)
+// PLUS the encoder's internal buffer (grows to fit the response) on every call —
+// per Dashboard refresh that's 20-50 short-lived allocs. Pool keeps them warm.
+type jsonEncoderEntry struct {
+	buf *bytes.Buffer
+	enc *json.Encoder
+}
+
+var jsonEncoderPool = sync.Pool{
+	New: func() interface{} {
+		buf := bytes.NewBuffer(make([]byte, 0, 4096))
+		enc := json.NewEncoder(buf)
+		enc.SetEscapeHTML(false) // shaves a pass over the output for our trusted callers
+		return &jsonEncoderEntry{buf: buf, enc: enc}
+	},
+}
 
 func writeJSON(w http.ResponseWriter, code int, v any) {
+	e := jsonEncoderPool.Get().(*jsonEncoderEntry)
+	e.buf.Reset()
+	if err := e.enc.Encode(v); err != nil {
+		jsonEncoderPool.Put(e)
+		http.Error(w, "encode error", http.StatusInternalServerError)
+		return
+	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(code)
-	_ = json.NewEncoder(w).Encode(v)
+	_, _ = w.Write(e.buf.Bytes())
+	jsonEncoderPool.Put(e)
 }
 
 func httpErr(w http.ResponseWriter, code int, err error) {
@@ -1687,10 +1901,18 @@ func readJSON(r *http.Request, v any) error {
 
 func (s *Server) logging(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Short-circuit BEFORE the time.Now() syscall when we know we won't log
+		// the request. Previously time.Now ran on every static asset / WS
+		// upgrade / non-API hit — vDSO is fast but adds up at high request
+		// rates (e.g. dashboard streams). Saves a syscall per non-logged
+		// request.
+		path := r.URL.Path
+		if !s.app.HTTPLogsEnabled() || len(path) < 4 || path[:4] != "/api" {
+			next.ServeHTTP(w, r)
+			return
+		}
 		start := time.Now()
 		next.ServeHTTP(w, r)
-		if s.app.HTTPLogsEnabled() && r.URL.Path != "/" && len(r.URL.Path) >= 4 && r.URL.Path[:4] == "/api" {
-			log.Printf("%s %s %s", r.Method, r.URL.Path, time.Since(start).Round(time.Millisecond))
-		}
+		log.Printf("%s %s %s", r.Method, path, time.Since(start).Round(time.Millisecond))
 	})
 }

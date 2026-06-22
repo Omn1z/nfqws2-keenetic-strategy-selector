@@ -53,7 +53,8 @@ type App struct {
 	sessions         *auth.Sessions
 	authEnabled      bool
 	loggingDisabled  bool
-	httpLogsDisabled bool // suppress the per-request HTTP access log line
+	httpLogsDisabled bool   // suppress the per-request HTTP access log line
+	traceMode        string // "off" | "auto" | "always"
 	selfUpdateMu     sync.Mutex
 	selfUpdate       SelfUpdateStatus
 
@@ -98,6 +99,15 @@ func New(cfg *config.Config) (*App, error) {
 	a.portfwd = portforward.New(cfg, st)
 	a.arpspoof = arpspoof.New(cfg, st)
 	a.awgroute = awgroute.New(cfg, st)                    // creates the manager; may autostart the tunnel + re-apply committed routing
+	// Apply trace policy as soon as the AWG service exists: "always" turns
+	// recording on right away, "off" pins it off; "auto" leaves it to the
+	// TracePane mount/unmount lifecycle. saveSettings already ran in initAuth.
+	switch a.TraceMode() {
+	case "always":
+		a.awgroute.TraceSetEnabled(true)
+	case "off":
+		a.awgroute.TraceSetEnabled(false)
+	}
 	a.monitor = monitor.New(cfg, st, a.proxy, a.awgroute) // dashboard reads the proxy + AWG2 tunnel status
 	a.proxy.SetAWGFallbackProbe(a.awgroute.FallbackUp)    // Telegram proxies route ISP-blocked DC1/3/5 via the selected AWG2 server while it is up
 	a.initDNS()
@@ -134,6 +144,10 @@ func (a *App) initPihole() {
 	// fw3 wipes our LAN-input rule on every reboot — re-apply at boot so the
 	// admin UI (port {ui_port}) stays reachable from the LAN without user action.
 	a.pihole.EnsureFirewall()
+	// Push add-subnet=32,128 into pi-hole's dnsmasq so the AWG2 trace log can
+	// show real LAN client IPs instead of pi-hole's 127.0.0.1 (it's the only
+	// peer our :5354 sees otherwise). Silent best-effort.
+	_ = a.pihole.EnsureAddSubnet()
 	// The bundled xiaomi-docker leaves a stale containerd shim directory on
 	// reboot, so a plain "--restart unless-stopped" doesn't actually bring the
 	// container back. Recover by remove+run if the container is in a bad state.
@@ -150,12 +164,30 @@ func (a *App) initPihole() {
 		} else {
 			_ = a.pihole.SetUpstreams(ctx, nil) // restore FTL defaults
 		}
+		// Flip the iptables REDIRECT target so toggling actually removes pi-hole
+		// from the data plane (not just from its upstream role) when disabled.
+		a.awgroute.SetDNSChainEnabled(enabled)
 	})
 	// Apply the persisted state at boot so a chain-enabled config survives reboot.
+	a.awgroute.SetDNSChainEnabled(cfg.DNSChainEnabled)
 	if cfg.DNSChainEnabled {
-		ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
-		defer cancel()
-		_ = a.pihole.SetUpstreams(ctx, []string{awgroute.DNSProxyUpstreamAddr()})
+		// Run async with backoff — EnsureRunning() above can take 1-3 min on a
+		// cold start (image pull/extract), and FTL's :8053 isn't listening
+		// until well after that. A single synchronous SetUpstreams here would
+		// just hit "connection refused", swallow the error, and leave the
+		// persisted chain state silently NOT applied until the user toggles
+		// the UI by hand. Retry every 5s for ~5 min instead.
+		go func() {
+			for delay, total := 5*time.Second, time.Duration(0); total < 5*time.Minute; total += delay {
+				time.Sleep(delay)
+				ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+				err := a.pihole.SetUpstreams(ctx, []string{awgroute.DNSProxyUpstreamAddr()})
+				cancel()
+				if err == nil {
+					return
+				}
+			}
+		}()
 	}
 }
 

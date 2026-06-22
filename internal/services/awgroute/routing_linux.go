@@ -62,10 +62,20 @@ const (
 	// directly (preserving client src IP in its query log). Pi-hole then forwards
 	// to our proxy on awgDNSPort as its upstream. Mirrors pihole.DefaultDNSPort.
 	awgPiholeDNSPort = "5353"
+
+	// awgV6LeakComment tags ip6tables FORWARD REJECT rules added by the firewall
+	// hook to block native v6 leaks for "everything via VPN" sources (see the
+	// catch-all-include block in awgFirewallHook). The teardown / re-render path
+	// uses the comment to flush stale rules even after MAC changes.
+	awgV6LeakComment = "awg2-v6-noleak"
 )
 
 func (svc *Service) awgApplyRoutingOS() error {
-	cfg := svc.awg.Config()
+	am := svc.awgActive()
+	if am == nil {
+		return fmt.Errorf("AWG2-сервер не выбран")
+	}
+	cfg := am.Config()
 	r := cfg.Routing
 	if r.Mode == "off" {
 		return svc.awgTeardownRoutingOS()
@@ -87,7 +97,6 @@ func (svc *Service) awgApplyRoutingOS() error {
 		return fmt.Errorf("не удалось определить маршрут по умолчанию")
 	}
 	// 1) pin the endpoint via the ORIGINAL gateway first (prevents the WG loop)
-	_, _ = awgRun("ip route replace " + endpointIP + "/32 via " + gw + " dev " + wandev)
 	// 2) ipset membership — force=true so a user-triggered apply always rebuilds
 	if err := svc.awgBuildSetsForce(&cfg, true); err != nil {
 		return err
@@ -100,11 +109,19 @@ func (svc *Service) awgApplyRoutingOS() error {
 	if awgUsesDNSProxy(&cfg) {
 		awgRestoreSets()
 	}
-	// 3) tunnel table + fwmark rule (survive Keenetic reloads on their own)
-	_, _ = awgRun("ip route replace default dev " + awgIface + " table " + awgTable)
-	_, _ = awgRun("ip rule del fwmark " + awgMarkRule + " table " + awgTable + " 2>/dev/null")
-	if _, err := awgRun("ip rule add fwmark " + awgMarkRule + " table " + awgTable); err != nil {
-		return fmt.Errorf("ip rule: %w", err)
+	// 1 + 3) batch the endpoint pin + tunnel table + fwmark rule into a single
+	// `ip -force -batch -` invocation. 1 fork instead of 4; -force suppresses
+	// the idempotent "rule exists" error so re-asserts don't abort. We DO check
+	// the err — a fwmark add that silently fails leaves the chain marking but
+	// nothing actually routes through awg0, so the user sees "Применено" while
+	// every packet still leaves the native WAN.
+	if err := awgIpBatch([]string{
+		"route replace " + endpointIP + "/32 via " + gw + " dev " + wandev,
+		"route replace default dev " + awgIface + " table " + awgTable,
+		"rule del fwmark " + awgMarkRule + " table " + awgTable,
+		"rule add fwmark " + awgMarkRule + " table " + awgTable,
+	}); err != nil {
+		return fmt.Errorf("ip route/rule batch: %w", err)
 	}
 	// 3-v6) IPv6 mirror: separate table state (same id is fine — v4 and v6 are
 	// independent), default-route into awg0, fwmark rule. AmneziaWG tunnels both
@@ -120,6 +137,7 @@ func (svc *Service) awgApplyRoutingOS() error {
 	// 4) domain-mask DNS proxy (optional, domain_source=="dnsproxy"). Start it
 	// BEFORE the hook so the hook's DNS REDIRECT is only installed once the proxy
 	// is actually listening (never blackhole LAN DNS).
+	traceSetEnabled(r.TraceEnabled)
 	dnsOn := svc.awgEnsureDNSProxy(&cfg)
 	// 4b) optional SNI-routing sniffer (no-op unless sni_routing is on + include mode):
 	// learns matched domains' server IPs off the TLS handshake into awg2_sni.
@@ -127,7 +145,7 @@ func (svc *Service) awgApplyRoutingOS() error {
 	// 5) firewall hook (marking chain + FORWARD/NAT/MSS [+ DNS REDIRECT]) — a Keenetic
 	// ndm netfilter.d hook so it survives the firewall rebuilds that flush foreign
 	// iptables chains; awgWriteHook also applies it immediately.
-	if err := awgWriteHook(awgEffectiveMode(r), endpointIP, r.MTU, dnsOn, r.Zones); err != nil {
+	if err := awgWriteHook(awgEffectiveMode(r), endpointIP, wandev, r.MTU, dnsOn, svc.dnsChainEnabled(), awgTunnelV6Reaches(), r.Zones); err != nil {
 		return fmt.Errorf("firewall-хук: %w", err)
 	}
 	// 6) disable Keenetic's NAT accelerators — their fast-path silently drops our
@@ -148,7 +166,11 @@ func (svc *Service) awgApplyRoutingOS() error {
 // ranges, the router itself and the VPN endpoint are always excluded from the
 // tunnel in every mode, so the panel stays reachable by its LAN IP throughout.
 func (svc *Service) awgRefreshRoutingOS() error {
-	cfg := svc.awg.Config()
+	am := svc.awgActive()
+	if am == nil {
+		return fmt.Errorf("AWG2-сервер не выбран")
+	}
+	cfg := am.Config()
 	r := cfg.Routing
 	if r.Mode == "off" {
 		return svc.awgTeardownRoutingOS()
@@ -160,8 +182,12 @@ func (svc *Service) awgRefreshRoutingOS() error {
 		}
 	}
 	endpointIP := resolveHostIP(hostOf(cfg.Endpoint))
-	if gw, wandev := awgDefaultRoute(); endpointIP != "" && gw != "" && wandev != "" {
-		_, _ = awgRun("ip route replace " + endpointIP + "/32 via " + gw + " dev " + wandev)
+	gw, wandev := awgDefaultRoute()
+	if endpointIP != "" && gw != "" && wandev != "" {
+		// Endpoint pin + tunnel table re-assert in one fork (refresh path).
+		awgIpBatch([]string{
+			"route replace " + endpointIP + "/32 via " + gw + " dev " + wandev,
+		})
 	}
 	// A zone/mask edit must drop the IPs learned for the OLD masks — otherwise a
 	// removed domain stays tunneled ("старая зона не выгрузилась"). Flush the dynamic
@@ -180,13 +206,16 @@ func (svc *Service) awgRefreshRoutingOS() error {
 		return err
 	}
 	awgResetSNISet()
-	_, _ = awgRun("ip route replace default dev " + awgIface + " table " + awgTable)
-	_, _ = awgRun("ip rule del fwmark " + awgMarkRule + " table " + awgTable + " 2>/dev/null")
-	_, _ = awgRun("ip rule add fwmark " + awgMarkRule + " table " + awgTable + " 2>/dev/null")
+	awgIpBatch([]string{
+		"route replace default dev " + awgIface + " table " + awgTable,
+		"rule del fwmark " + awgMarkRule + " table " + awgTable,
+		"rule add fwmark " + awgMarkRule + " table " + awgTable,
+	})
 	awgApplyKillswitch(r.Killswitch)
+	traceSetEnabled(r.TraceEnabled)
 	dnsOn := svc.awgEnsureDNSProxy(&cfg)
 	svc.awgEnsureSNISniff(&cfg) // start/stop/refresh the SNI sniffer to match the new zones
-	if err := awgWriteHook(awgEffectiveMode(r), endpointIP, r.MTU, dnsOn, r.Zones); err != nil {
+	if err := awgWriteHook(awgEffectiveMode(r), endpointIP, wandev, r.MTU, dnsOn, svc.dnsChainEnabled(), awgTunnelV6Reaches(), r.Zones); err != nil {
 		return fmt.Errorf("firewall-хук: %w", err)
 	}
 	awgSetAccel(false)
@@ -206,8 +235,15 @@ func (svc *Service) awgArmRollback(d time.Duration) {
 	}
 	svc.route.active = true
 	svc.route.rollback = time.AfterFunc(d, func() {
+		defer func() {
+			if r := recover(); r != nil {
+				logbuf.Append("awg2", "warn", fmt.Sprintf("rollback panic: %v", r))
+			}
+		}()
 		logbuf.Append("awg2", "error", "маршрутизация не подтверждена вовремя — авто-откат")
-		svc.awg.SetRoutingActive(false)
+		if am := svc.awgActive(); am != nil {
+			am.SetRoutingActive(false)
+		}
 		svc.awgSave()
 		_ = svc.awgTeardownRoutingOS()
 	})
@@ -226,7 +262,9 @@ func (svc *Service) awgStartRefresh() {
 	stop := make(chan struct{})
 	svc.route.stopRefresh = stop
 	svc.route.mu.Unlock()
+	svc.route.refreshWG.Add(1)
 	go func() {
+		defer svc.route.refreshWG.Done()
 		t := time.NewTicker(60 * time.Second)
 		defer t.Stop()
 		ticks := 0
@@ -235,14 +273,61 @@ func (svc *Service) awgStartRefresh() {
 			case <-stop:
 				return
 			case <-t.C:
-				c := svc.awg.Config()
+				// Snapshot the active manager pointer once per tick so a
+				// concurrent server-swap can't change svc.awg out from under us
+				// mid-tick (would leave the hook + routes installed for the
+				// old server's mode/endpoint/MTU).
+				am := svc.awgActive()
+				if am == nil {
+					continue
+				}
+				c := am.Config()
 				if c.Routing.Mode == "off" {
 					continue
 				}
-				// re-assert the firewall hook: rewrite the file if Keenetic/anything
-				// removed it, otherwise just re-run it (fast, idempotent).
-				if _, err := os.Stat(awgHookPath); err != nil {
-					_ = awgWriteHook(awgEffectiveMode(c.Routing), resolveHostIP(hostOf(c.Endpoint)), c.Routing.MTU, svc.awgEnsureDNSProxy(&c), c.Routing.Zones)
+				// Hash the inputs that drive the firewall hook. When unchanged AND we
+				// did a full re-assert recently, skip the expensive block (hook + route
+				// + killswitch + accel + sniff) — saves ~4 forks/tick on stable config.
+				// Force a full re-assert every 4th tick (≈ every 4 min) anyway so a
+				// Keenetic firewall rebuild can't strand us silently for long.
+				endpointIP := resolveHostIP(hostOf(c.Endpoint))
+				_, wandev := awgDefaultRoute()
+				dnsOn := svc.awgEnsureDNSProxy(&c)
+				chainOn := svc.dnsChainEnabled()
+				h := awgHookInputsHash(awgEffectiveMode(c.Routing), endpointIP, wandev, c.Routing.MTU, dnsOn, chainOn, awgTunnelV6Reaches(), c.Routing.Killswitch, svc.zonesRevision.Load())
+				_, hookMissing := os.Stat(awgHookPath)
+				// Watchdog hot path: avoid route.mu entirely. lastHookHash is an
+				// atomic.Pointer[string] swapped by the most recent re-assert;
+				// hookSkipsSinceFull is an atomic.Int32 we tick or reset here.
+				var prev string
+				if p := svc.route.lastHookHash.Load(); p != nil {
+					prev = *p
+				}
+				same := prev == h && hookMissing == nil
+				if !same {
+					svc.route.lastHookHash.Store(&h)
+					svc.route.hookSkipsSinceFull.Store(0)
+				}
+				skips := int(svc.route.hookSkipsSinceFull.Load())
+				if same && skips < 3 {
+					// Cheap path: nothing changed and we re-asserted within the last
+					// 3 ticks. Still advance the tick counter for the persistence cadence
+					// below so seen domains/sets get snapshotted on schedule.
+					svc.route.hookSkipsSinceFull.Add(1)
+					ticks++
+					if ticks%5 == 0 && awgUsesDNSProxy(&c) {
+						awgSaveSets()
+						svc.awgSaveRecent()
+					}
+					continue
+				}
+				// Full re-assertion (hash changed, hook missing, or backstop fired).
+				// Reset the skip counter so the next 3 ticks take the cheap path
+				// again — otherwise once skips hits 3 every subsequent tick falls
+				// through here forever, defeating the whole skip cache.
+				svc.route.hookSkipsSinceFull.Store(0)
+				if hookMissing != nil {
+					_ = awgWriteHook(awgEffectiveMode(c.Routing), endpointIP, wandev, c.Routing.MTU, dnsOn, chainOn, awgTunnelV6Reaches(), c.Routing.Zones)
 				} else {
 					_, _ = awgRun("sh " + awgHookPath)
 				}
@@ -302,6 +387,11 @@ func (svc *Service) awgTeardownRoutingOS() error {
 	}
 	svc.route.active = false
 	svc.route.mu.Unlock()
+	// Wait for any in-flight refresh goroutine to actually exit before we tear
+	// the firewall rules down — without this its pending awgRun calls would
+	// re-install the rules immediately after teardown removed them, leaving
+	// us with a stale "off" state in svc.route but rules still on the host.
+	svc.route.refreshWG.Wait()
 
 	svc.awgStopDNSProxy()      // stop the domain-mask proxy + remove its LAN :53 REDIRECT
 	svc.awgStopSNISniff()      // stop the SNI sniffer (closes its AF_PACKET sockets)
@@ -314,9 +404,11 @@ func (svc *Service) awgTeardownRoutingOS() error {
 	_, _ = awgRun("ip rule del fwmark " + awgMarkRule + " table " + awgTable + " 2>/dev/null")
 	_, _ = awgRun("ip route flush table " + awgTable + " 2>/dev/null")
 	_, _ = awgRun("iptables -t nat -D POSTROUTING -o " + awgIface + " -j MASQUERADE 2>/dev/null")
-	mtu := svc.awg.Config().Routing.MTU
-	if mtu <= 0 {
-		mtu = 1280
+	mtu := 1280
+	if am := svc.awgActive(); am != nil {
+		if v := am.Config().Routing.MTU; v > 0 {
+			mtu = v
+		}
 	}
 	mss := strconv.Itoa(mtu - 40)
 	for _, dir := range []string{"-o", "-i"} {
@@ -344,9 +436,24 @@ func (svc *Service) awgTeardownRoutingOS() error {
 	}
 	_, _ = awgRun("ip6tables -D FORWARD -i " + awgIface + " -j ACCEPT 2>/dev/null")
 	_, _ = awgRun("ip6tables -D FORWARD -o " + awgIface + " -j ACCEPT 2>/dev/null")
+	// Strip any leftover v6-noleak rules so disabling split-routing fully restores
+	// native v6 for previously-tunneled devices. Comment-tagged rules vary in
+	// shape (REJECT vs ACCEPT, with/without --match-set), so delete by line
+	// number in reverse — comment-only -D would fail to find them.
+	_, _ = awgRun("for n in $(ip6tables -L FORWARD --line-numbers 2>/dev/null | awk '/" + awgV6LeakComment + "/ {print $1}' | sort -rn); do ip6tables -D FORWARD \"$n\" 2>/dev/null; done")
 	logbuf.Append("awg2", "info", "маршрутизация снята")
 	return nil
 }
 
 // awgRepairRoutingOS removes any leaked AWG2 routing state on startup (idempotent).
 func (svc *Service) awgRepairRoutingOS() { _ = svc.awgTeardownRoutingOS() }
+
+// awgHookInputsHash fingerprints every input that the watchdog uses to decide
+// whether the firewall hook + supporting state needs re-asserting. Zones are
+// represented by the monotonic zonesRevision counter (bumped on every config
+// edit via awgSave) instead of json.Marshal+sha256(zones) — at 30k entries the
+// hash burned several MB of allocs every 60s for the same comparison a counter
+// does in 16 bytes.
+func awgHookInputsHash(mode, endpointIP, wandev string, mtu int, dnsRedirect, chainEnabled, tunnelV6, killswitch bool, zonesRev int64) string {
+	return fmt.Sprintf("%s|%s|%s|%d|%t|%t|%t|%t|%d", mode, endpointIP, wandev, mtu, dnsRedirect, chainEnabled, tunnelV6, killswitch, zonesRev)
+}

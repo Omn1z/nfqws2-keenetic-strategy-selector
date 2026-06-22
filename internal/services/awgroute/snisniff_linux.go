@@ -5,7 +5,6 @@ package awgroute
 import (
 	"fmt"
 	"net"
-	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -28,7 +27,6 @@ import (
 
 const (
 	awgSetSNI = "awg2_sni"     // hash:ip with a TTL — SNI-learned server IPs
-	awgSNITTL = 3600           // seconds a learned IP stays routed (refreshed on re-sight)
 	ethPAll   = uint16(0x0003) // ETH_P_ALL
 	soAttachF = 26             // SO_ATTACH_FILTER
 )
@@ -68,25 +66,27 @@ var sniBPF = []bpfInsn{
 	{0x06, 0, 0, 0x00000000}, // 10: ret #0
 }
 
-// awgEnsureSNISniff starts/refreshes the SNI sniffer when SNI-routing is enabled
-// and there is at least one global zone (include OR exclude) with domain matchers.
+// awgEnsureSNISniff starts/refreshes the SNI sniffer when SNI-routing is
+// enabled and there is at least one ordered zone matcher (covers both
+// directions — first-match-wins, so the walk order is what matters, not the
+// per-direction bucket counts).
 //
-// Why exclude direction matters: with mode=exclude (whitelist-VPN, carve-out RU)
-// many RU sites are Cloudflare-fronted (gismeteo, gosuslugi-backed CDNs, comss,
-// etc.). The shared-CDN guard in DNS-proxy refuses to add their Cloudflare IPs
-// to awg2_exc (otherwise we'd route every unrelated *.com on the same IP direct
-// too). Same with browser DoH/DoT — the proxy never sees the query at all.
-// In both cases the only place we can recover the destination is the TLS
-// ClientHello on the actual connection: read its SNI and, if it matches the
-// exclude zone, drop the destination IP into awg2_exc on the fly.
-//
-// For include direction we still feed awg2_sni (separate set, hash:ip w/ TTL).
+// Why SNI matters: with mode=exclude/full many RU sites are Cloudflare-fronted
+// (gismeteo, gosuslugi-backed CDNs, comss). The shared-CDN guard in DNS-proxy
+// refuses to add their Cloudflare IPs to awg2_exc (else every unrelated *.com
+// on the same IP would route direct too). Same with browser DoH/DoT — the
+// proxy never sees the query. In both cases the only place we can recover
+// the destination is the TLS ClientHello: read its SNI and, if a rule fires,
+// drop the dst IP into the right set on the fly.
 func (svc *Service) awgEnsureSNISniff(cfg *awg.ServerConfig) bool {
-	inc := svc.awgZoneMatchersByMode(cfg, "include")
-	exc := svc.awgZoneMatchersByMode(cfg, "exclude")
+	ordered := svc.awgZoneMatchersOrdered(cfg)
 	eff := awgEffectiveMode(cfg.Routing)
+	anyMatcher := 0
+	for _, zm := range ordered {
+		anyMatcher += zm.Matchers.Len()
+	}
 	want := cfg.Routing.SNIRouting &&
-		((eff == "include" && len(inc) > 0) || (eff == "exclude" && len(exc) > 0) || (eff == "full" && len(exc) > 0))
+		(eff == "include" || eff == "exclude" || eff == "full") && anyMatcher > 0
 	svc.route.mu.Lock()
 	s := svc.route.sni
 	svc.route.mu.Unlock()
@@ -96,8 +96,12 @@ func (svc *Service) awgEnsureSNISniff(cfg *awg.ServerConfig) bool {
 		}
 		return false
 	}
-	svc.route.sniMatchers.Store(&inc) // lock-free read in the hot path (include direction)
-	svc.route.excMatchers.Store(&exc) // exclude matchers are already used by the DNS proxy too
+	// Share the same ordered atomic with the DNS proxy — single publish point.
+	svc.route.orderedMatchers.Store(&ordered)
+	// Republish the unified routeTable; short-circuits to the cached snapshot
+	// when inputs match (typical on a single apply where DNS proxy ensure
+	// fires right before us with the same cfg + tunnelV6).
+	_ = svc.republishRouteTable(cfg, awgTunnelV6Reaches())
 	// Zone edits / new matchers may flip earlier decisions, so the short-circuit
 	// cache has to be re-learned from scratch. Cheap (single Range + Delete).
 	svc.route.sniSeen.Range(func(k, _ any) bool {
@@ -117,36 +121,40 @@ func (svc *Service) awgEnsureSNISniff(cfg *awg.ServerConfig) bool {
 			}
 			svc.route.sniSeen.Delete(dstIP)
 		}
-		// Exclude wins on overlap (matches the DNS proxy + iptables semantics).
-		if e := svc.route.excMatchers.Load(); e != nil && awg.MatchAny(*e, sni) {
-			// We deliberately do NOT consult sharedCDNProvider here — the whole
-			// point of SNI is to carve out the SHARED CDN IP for this specific
-			// hostname, knowing the same IP also serves unrelated names. That's
-			// safe because awg2_exc only causes a RETURN (no marking); other
-			// sites on the same CDN IP that don't match an exclude rule never
-			// get into awg2_exc here.
-			suffix := ""
-			if isIPv6(dstIP) {
-				suffix = "_6"
-			}
-			_, _ = awgRun("ipset add " + awgSetExc + suffix + " " + dstIP + " -exist")
-			svc.route.sniSeen.Store(dstIP, now)
-			return
-		}
-		m := svc.route.sniMatchers.Load()
-		if m == nil || !awg.MatchAny(*m, sni) {
-			return
-		}
-		if provider, ok := sharedCDNProvider(dstIP); ok {
-			svc.awgNoteSharedCDNSkip("sni", sni, dstIP, provider)
-			return
-		}
+		// Unified FMW decision via routeFor — same path DNS proxy uses. No
+		// srcIP here because TLS ClientHello sniffing happens at the bridge
+		// without conntrack reverse-mapping; treat as global lookup.
+		dec := svc.routeFor(sni, "")
+		matchedIdx := dec.RuleIdx - 1
 		suffix := ""
 		if isIPv6(dstIP) {
 			suffix = "_6"
 		}
-		_, _ = awgRun("ipset add " + awgSetSNI + suffix + " " + dstIP + " timeout " + strconv.Itoa(awgSNITTL) + " -exist")
-		svc.route.sniSeen.Store(dstIP, now)
+		switch dec.Route {
+		case RouteDirect:
+			// We deliberately do NOT consult sharedCDNProvider here — the whole
+			// point of SNI is to carve out the SHARED CDN IP for this specific
+			// hostname, knowing the same IP also serves unrelated names. That's
+			// safe because awg2_exc only causes a RETURN (no marking); other
+			// sites on the same CDN IP that don't match a direct rule never
+			// get into awg2_exc here.
+			ipsetAddAsync(awgSetExc+suffix, dstIP)
+			svc.route.sniSeen.Store(dstIP, now)
+			traceAppend(TraceEntry{Kind: "sni", Name: sni, Dst: dstIP, Decision: "direct", Rule: matchedIdx + 1,
+				Reason: fmt.Sprintf("правило #%d (direct, SNI carve-out)", matchedIdx+1)})
+		case RouteTunnel:
+			if _, ok := sharedCDNProvider(dstIP); ok {
+				svc.awgNoteSharedCDNSkip("sni", dstIP)
+				traceAppend(TraceEntry{Kind: "sni", Name: sni, Dst: dstIP, Decision: "cdn-skip", Reason: "общий CDN — IP не маршрутизирован"})
+				return
+			}
+			ipsetAddAsyncTTL(awgSetSNI+suffix, dstIP, awgSNITTL)
+			svc.route.sniSeen.Store(dstIP, now)
+			traceAppend(TraceEntry{Kind: "sni", Name: sni, Dst: dstIP, Decision: "tunnel", Rule: matchedIdx + 1,
+				Reason: fmt.Sprintf("правило #%d (tunnel) → awg2_sni", matchedIdx+1)})
+		default:
+			traceAppend(TraceEntry{Kind: "sni", Name: sni, Dst: dstIP, Decision: "direct", Reason: "нет совпадения"})
+		}
 	})
 	if err := ns.start(); err != nil {
 		logbuf.Append("awg2", "warn", "SNI-маршрутизация: сниффер не запустился: "+err.Error())
@@ -225,6 +233,13 @@ func (s *sniSniffer) stop() {
 }
 
 func (s *sniSniffer) readLoop(fd int, stopCh chan struct{}) {
+	// Recover so a nil-deref in the s.onHello -> routeFor path (e.g. routeTable
+	// is briefly nil during a re-publish) doesn't crash the whole daemon.
+	defer func() {
+		if r := recover(); r != nil {
+			logbuf.Append("awg2", "warn", fmt.Sprintf("sni-sniff readLoop panic: %v", r))
+		}
+	}()
 	buf := make([]byte, 2048) // a ClientHello fits one frame; bigger ones are simply missed
 	for {
 		n, _, err := syscall.Recvfrom(fd, buf, 0)

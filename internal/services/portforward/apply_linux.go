@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"nfqws2strategy/internal/tools/logbuf"
+	"nfqws2strategy/internal/tools/shell"
+	"nfqws2strategy/internal/tools/strs"
 )
 
 const (
@@ -36,9 +38,9 @@ func (s *Service) applyRules(rules []Rule) error {
 	if err := os.WriteFile(hookPath, []byte(s.firewallHook(enabled)), 0o755); err != nil {
 		return err
 	}
-	out, err := runShell("sh " + shellQuote(hookPath))
+	out, err := runShell("sh " + shell.Quote(hookPath))
 	if err != nil {
-		msg := lastLines(out, 3)
+		msg := strs.LastLines(out, 3)
 		logbuf.Append("port-forwarding", "warn", "firewall hook: "+msg)
 		return fmt.Errorf("apply port forwarding: %v: %s", err, msg)
 	}
@@ -100,7 +102,7 @@ func cleanupRules() error {
 	}, "\n")
 	out, err := runShell(script)
 	if err != nil {
-		msg := lastLines(out, 3)
+		msg := strs.LastLines(out, 3)
 		logbuf.Append("port-forwarding", "warn", "cleanup: "+msg)
 		return fmt.Errorf("cleanup port forwarding: %v: %s", err, msg)
 	}
@@ -128,7 +130,7 @@ func ifaceArg(iface string) string {
 	if iface == "" {
 		return ""
 	}
-	return "-i " + shellQuote(iface) + " "
+	return "-i " + shell.Quote(iface) + " "
 }
 
 func portSpec(r Range) string {
@@ -136,10 +138,6 @@ func portSpec(r Range) string {
 		return strconv.Itoa(r.Start)
 	}
 	return strconv.Itoa(r.Start) + ":" + strconv.Itoa(r.End)
-}
-
-func shellQuote(s string) string {
-	return "'" + strings.ReplaceAll(s, "'", "'\"'\"'") + "'"
 }
 
 func shellComment(s string) string {
@@ -156,12 +154,4 @@ func runShell(cmd string) (string, error) {
 	defer cancel()
 	out, err := exec.CommandContext(ctx, "sh", "-c", cmd).CombinedOutput()
 	return strings.TrimSpace(string(out)), err
-}
-
-func lastLines(s string, n int) string {
-	lines := strings.Split(s, "\n")
-	if len(lines) <= n {
-		return s
-	}
-	return strings.Join(lines[len(lines)-n:], "\n")
 }

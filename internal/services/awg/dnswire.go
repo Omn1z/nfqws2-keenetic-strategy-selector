@@ -56,6 +56,47 @@ func questionName(msg []byte) (string, bool) {
 }
 
 // answerIPs returns all A/AAAA addresses from a DNS response message.
+// isSinkholeResponse reports whether the upstream's reply is a "no destination"
+// answer — Pi-hole / ad-blocker / domain-blocked-by-policy. Three shapes count:
+//
+//  1. RCODE = NXDOMAIN (rcode 3) — Pi-hole default reply for a blocked name.
+//  2. RCODE = NOERROR (rcode 0) with ANCOUNT = 0 — "domain exists but no record
+//     of this type" (also matches Pi-hole when the upstream returns an empty
+//     NOERROR for a sinkholed domain via its `BLOCKINGMODE=NXDOMAIN-EMPTY`
+//     fallback).
+//  3. RCODE = NOERROR with every A == 0.0.0.0 and every AAAA == :: — Pi-hole's
+//     `BLOCKINGMODE=NULL` mode where it answers with the null route.
+//
+// Header-only checks for (1) and (2) cost nothing; case (3) reuses the existing
+// answerIPs walker. Used by the trace layer to label the row "blocked" rather
+// than the misleading routing decision ("tunnel"/"direct") that would have
+// applied if the answer wasn't a sinkhole.
+func isSinkholeResponse(msg []byte) bool {
+	if len(msg) < 12 {
+		return false
+	}
+	rcode := msg[3] & 0x0F
+	if rcode == 3 { // NXDOMAIN — case 1
+		return true
+	}
+	if rcode != 0 {
+		return false // SERVFAIL / REFUSED / etc. — not a sinkhole, propagate as-is
+	}
+	if msg[6] == 0 && msg[7] == 0 { // NOERROR + ANCOUNT=0 — case 2
+		return true
+	}
+	ips := answerIPs(msg)
+	if len(ips) == 0 {
+		return false
+	}
+	for _, ip := range ips { // case 3 — all null-route
+		if ip != "0.0.0.0" && ip != "::" {
+			return false
+		}
+	}
+	return true
+}
+
 func answerIPs(msg []byte) []string {
 	if len(msg) < 12 {
 		return nil
@@ -169,6 +210,102 @@ func toLower(s string) string {
 		return s
 	}
 	return string(b)
+}
+
+// parseECSFromQuery walks the Additional section for an OPT pseudo-record
+// (RFC 6891) and within it for the EDNS0 Client Subnet option (RFC 7871,
+// code 8). Returns the client IP string when found.
+//
+// Why we need this: pi-hole sits in front of our proxy (LAN :53 → pi-hole →
+// 127.0.0.1:5354). From the proxy's socket perspective every query arrives
+// from localhost, so the trace log would show "src=127.0.0.1" for everything.
+// Pi-hole, when configured with `add-subnet=32,128`, copies the original
+// client IP into the OPT record's Client Subnet option, and this parser
+// recovers it. When the option isn't present we return ("", false) and the
+// caller falls back to the socket peer.
+func parseECSFromQuery(msg []byte) (string, bool) {
+	if len(msg) < 12 {
+		return "", false
+	}
+	qd := int(msg[4])<<8 | int(msg[5])
+	an := int(msg[6])<<8 | int(msg[7])
+	ns := int(msg[8])<<8 | int(msg[9])
+	ar := int(msg[10])<<8 | int(msg[11])
+	if ar == 0 {
+		return "", false
+	}
+	pos := 12
+	// Skip QD entries (name + qtype + qclass).
+	for i := 0; i < qd; i++ {
+		_, np, ok := readName(msg, pos)
+		if !ok {
+			return "", false
+		}
+		pos = np + 4
+		if pos > len(msg) {
+			return "", false
+		}
+	}
+	// Skip AN + NS RRs (name + 10-byte header + rdlength).
+	for i := 0; i < an+ns; i++ {
+		_, np, ok := readName(msg, pos)
+		if !ok {
+			return "", false
+		}
+		pos = np
+		if pos+10 > len(msg) {
+			return "", false
+		}
+		rdlen := int(msg[pos+8])<<8 | int(msg[pos+9])
+		pos += 10 + rdlen
+		if pos > len(msg) {
+			return "", false
+		}
+	}
+	// Walk AR looking for OPT (type 41).
+	for i := 0; i < ar; i++ {
+		_, np, ok := readName(msg, pos)
+		if !ok {
+			return "", false
+		}
+		pos = np
+		if pos+10 > len(msg) {
+			return "", false
+		}
+		rtype := int(msg[pos])<<8 | int(msg[pos+1])
+		rdlen := int(msg[pos+8])<<8 | int(msg[pos+9])
+		body := pos + 10
+		next := body + rdlen
+		if next > len(msg) {
+			return "", false
+		}
+		if rtype == 41 {
+			for op := body; op+4 <= next; {
+				optCode := int(msg[op])<<8 | int(msg[op+1])
+				optLen := int(msg[op+2])<<8 | int(msg[op+3])
+				if op+4+optLen > next {
+					break
+				}
+				if optCode == 8 && optLen >= 4 {
+					family := int(msg[op+4])<<8 | int(msg[op+5])
+					addrBytes := optLen - 4
+					switch {
+					case family == 1 && addrBytes >= 1 && addrBytes <= 4:
+						ip := make(net.IP, 4)
+						copy(ip, msg[op+8:op+8+addrBytes])
+						return ip.String(), true
+					case family == 2 && addrBytes >= 1 && addrBytes <= 16:
+						ip := make(net.IP, 16)
+						copy(ip, msg[op+8:op+8+addrBytes])
+						return ip.String(), true
+					}
+				}
+				op += 4 + optLen
+			}
+		}
+		pos = next
+	}
+	return "", false
 }
 
 func readTCPMsg(c net.Conn) ([]byte, error) {

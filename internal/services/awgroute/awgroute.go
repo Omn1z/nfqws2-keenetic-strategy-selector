@@ -81,8 +81,8 @@ func (svc *Service) initAWG() {
 		svc.awgSave()
 	}
 	// Bring the local client tunnel up on boot if the user enabled it (best-effort).
-	cfg := svc.awg.Config()
-	if cfg.Client.Enabled {
+	bootAM := svc.awgActive()
+	if bootAM != nil && bootAM.Config().Client.Enabled {
 		go func() {
 			if err := svc.awgClientUpOS(); err != nil {
 				log.Printf("awg: client autostart: %v", err)
@@ -92,14 +92,20 @@ func (svc *Service) initAWG() {
 			// reboot/panel restart). It was user-confirmed previously, so we apply
 			// AND commit: the apply still arms the ~90s dead-man's switch, the
 			// commit disarms it, so a misapply still auto-rolls-back.
-			c := svc.awg.Config()
+			// Snapshot the manager via awgActive(): the user may have selected a
+			// different server between boot and this goroutine waking up.
+			am := svc.awgActive()
+			if am == nil {
+				return
+			}
+			c := am.Config()
 			if awgShouldRestoreRouting(c) {
 				time.Sleep(4 * time.Second) // let the handshake settle + startup repair finish
 				if err := svc.awgApplyRoutingOS(); err != nil {
 					log.Printf("awg: routing auto-apply: %v", err)
 				} else {
 					_ = svc.awgCommitRoutingOS()
-					svc.awg.SetRoutingActive(true)
+					am.SetRoutingActive(true)
 					svc.awgSave()
 					logbuf.Append("awg2", "info", "маршрутизация восстановлена после перезапуска")
 				}
@@ -117,6 +123,9 @@ func (svc *Service) awgSave() {
 	if err := svc.store.SaveSecret(awgConfigFile, &state); err != nil {
 		log.Printf("awg: save config failed: %v", err)
 	}
+	// Bump on every persisted edit so the expand-entries cache + watchdog
+	// short-circuit pick up zones changes without us tracking each callsite.
+	svc.BumpZonesRevision()
 }
 
 func (svc *Service) loadAWGState() awgPersisted {
@@ -265,18 +274,30 @@ func (svc *Service) activeServerID() string {
 func (svc *Service) StopAWG() {}
 
 // AWG2StatusView returns the redacted config + presence flags + last deploy/status.
+// All four accessor reads (Config/Redacted/LastDeploy/LastStatus) must hit the
+// SAME Manager — pin via awgActive() so a concurrent SelectServer/DeleteServer
+// can't tear the snapshot into a Frankenstein of two servers.
 func (svc *Service) AWG2StatusView() AWG2Status {
-	full := svc.awg.Config()
+	am := svc.awgActive()
+	if am == nil {
+		return AWG2Status{
+			ActiveID: svc.activeServerID(),
+			Servers:  svc.awgServerSummaries(),
+			Engine:   svc.AWG2EngineInfo(),
+			Client:   svc.awgClientStatus(),
+		}
+	}
+	full := am.Config()
 	return AWG2Status{
-		Config:       svc.awg.Redacted(),
+		Config:       am.Redacted(),
 		ActiveID:     svc.activeServerID(),
 		Servers:      svc.awgServerSummaries(),
 		HasPassword:  strings.TrimSpace(full.Conn.Password) != "",
 		HasKey:       strings.TrimSpace(full.Conn.KeyPEM) != "",
 		HasServerKey: strings.TrimSpace(full.PrivateKey) != "",
 		Deployed:     full.DeployedAt > 0,
-		LastDeploy:   svc.awg.LastDeploy(),
-		Status:       svc.awg.LastStatus(),
+		LastDeploy:   am.LastDeploy(),
+		Status:       am.LastStatus(),
 		Endpoint:     full.Endpoint,
 		Engine:       svc.AWG2EngineInfo(),
 		Client:       svc.awgClientStatus(),
@@ -346,7 +367,7 @@ func (svc *Service) AWG2AddServer(name string) AWG2Status {
 	id := "awg-" + storeutil.NewID()
 	srv := &managedServer{ID: id, Name: strings.TrimSpace(name), Manager: awg.NewManager(cfg)}
 	_, _, _ = srv.Manager.EnsureRouterPeerLocal()
-	old := svc.awg
+	old := svc.awgActive()
 	if old != nil {
 		_ = svc.awgTeardownRoutingOS()
 		old.SetClientEnabled(false)
@@ -379,7 +400,7 @@ func (svc *Service) AWG2SelectServer(id string) error {
 	if srv == nil {
 		return fmt.Errorf("AWG2-сервер не найден")
 	}
-	if !srv.Manager.Config().Enabled {
+	if !srv.Manager.Enabled() {
 		return fmt.Errorf("AWG2-сервер выключен")
 	}
 	if id == oldID {
@@ -474,10 +495,80 @@ func (svc *Service) AWG2DeleteServer(id string) error {
 	return nil
 }
 
+// AWG2InsertTopRule prepends a new rule to the active server's routing.zones
+// (= highest priority). Used by Trace-row quick actions like "always VPN" /
+// "always direct" so the user gets a one-click way from a logged query to a
+// permanent rule. Domain may be a bare hostname or a "domain:foo.com" / "[re]…"
+// pattern; route is "tunnel" | "direct".
+func (svc *Service) AWG2InsertTopRule(domain, route, name string) error {
+	if route != "tunnel" && route != "direct" {
+		return fmt.Errorf("route must be tunnel|direct")
+	}
+	domain = strings.TrimSpace(domain)
+	if domain == "" {
+		return fmt.Errorf("пустой домен")
+	}
+	m := svc.awgActive()
+	if m == nil {
+		return fmt.Errorf("AWG2-сервер не выбран")
+	}
+	c := m.Config()
+	if name == "" {
+		name = "trace:" + domain
+	}
+	rule := awg.Zone{
+		Name:    name,
+		Route:   route,
+		Domains: []string{domain},
+		Enabled: true,
+	}
+	c.Routing.Zones = append([]awg.Zone{rule}, c.Routing.Zones...)
+	if err := m.SetConfig(&c); err != nil {
+		return err
+	}
+	svc.awgSave()
+	// Async refresh — same pattern as AWG2SetRouting. Without this the new rule
+	// is dormant in cfg until the next unrelated zone edit triggers a refresh,
+	// so the Trace-row "always VPN" click reads as broken to the user.
+	go func() { _ = svc.awgRefreshRoutingOS() }()
+	return nil
+}
+
+// AWG2CopyRulesFromServer overwrites the active server's routing.zones with
+// the rules from `fromServerID`. The other settings (mode/MTU/killswitch/etc.)
+// stay untouched on the destination. Returns the count copied.
+func (svc *Service) AWG2CopyRulesFromServer(fromServerID string) (int, error) {
+	dst := svc.awgActive()
+	if dst == nil {
+		return 0, fmt.Errorf("AWG2-сервер не выбран")
+	}
+	svc.mu.RLock()
+	srv := svc.servers[fromServerID]
+	svc.mu.RUnlock()
+	if srv == nil {
+		return 0, fmt.Errorf("сервер-источник не найден: %s", fromServerID)
+	}
+	srcCfg := srv.Manager.Config()
+	dstCfg := dst.Config()
+	dstCfg.Routing.Zones = make([]awg.Zone, len(srcCfg.Routing.Zones))
+	copy(dstCfg.Routing.Zones, srcCfg.Routing.Zones)
+	if err := dst.SetConfig(&dstCfg); err != nil {
+		return 0, err
+	}
+	svc.awgSave()
+	// Async refresh — see AWG2InsertTopRule comment.
+	go func() { _ = svc.awgRefreshRoutingOS() }()
+	return len(dstCfg.Routing.Zones), nil
+}
+
 // AWG2SetConfig applies editable settings from the form, preserving generated
 // keys, peers, routing/client sub-state, and blank-sent secrets.
 func (svc *Service) AWG2SetConfig(in *awg.ServerConfig) error {
-	cur := svc.awg.Config()
+	m := svc.awgActive()
+	if m == nil {
+		return fmt.Errorf("AWG2-сервер не выбран")
+	}
+	cur := m.Config()
 	if strings.TrimSpace(in.Conn.Password) == "" {
 		in.Conn.Password = cur.Conn.Password
 	}
@@ -502,7 +593,7 @@ func (svc *Service) AWG2SetConfig(in *awg.ServerConfig) error {
 	if !sameSSHIdentity(in.Conn, cur.Conn) {
 		in.Conn.KnownKey = "" // re-pin TOFU for a new host
 	}
-	if err := svc.awg.SetConfig(in); err != nil {
+	if err := m.SetConfig(in); err != nil {
 		return err
 	}
 	svc.awgSave()
@@ -595,7 +686,7 @@ func (svc *Service) deployServer(srv *managedServer) (awg.DeployResult, error) {
 		sctx, scancel := context.WithTimeout(context.Background(), 25*time.Second)
 		_, _ = srv.Manager.Status(sctx)
 		scancel()
-		if srv.ID == svc.activeServerID() && srv.Manager.Config().Client.Enabled {
+		if srv.ID == svc.activeServerID() && srv.Manager.ClientEnabled() {
 			go svc.awgReconnectActiveClientAfterDeploy(srv.ID)
 		}
 	}
@@ -605,35 +696,73 @@ func (svc *Service) deployServer(srv *managedServer) (awg.DeployResult, error) {
 	return res, err
 }
 
+// AWG2RefreshStatus returns the last-known server Status instantly and kicks
+// off a background refresh if one isn't already in flight. It does NOT block
+// on the upstream Status() call, which can take 15-25 s when the VPS is slow.
+// Previously this handler hung the HTTP listener long enough for the xmir-init
+// watchdog to declare :8090 dead and restart the whole selector — which broke
+// pi-hole DNS for ~5 s every restart and killed live Discord/voice calls.
 func (svc *Service) AWG2RefreshStatus() (awg.Status, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
-	defer cancel()
-	return svc.awg.Status(ctx)
+	m := svc.awgActive()
+	if m == nil {
+		return awg.Status{}, fmt.Errorf("AWG2-сервер не выбран")
+	}
+	svc.statusMu.Lock()
+	cached, cachedErr := svc.statusCached, svc.statusErr
+	if !svc.statusBusy {
+		svc.statusBusy = true
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+			defer cancel()
+			st, err := m.Status(ctx)
+			svc.statusMu.Lock()
+			svc.statusCached, svc.statusErr, svc.statusTs, svc.statusBusy = st, err, time.Now(), false
+			svc.statusMu.Unlock()
+		}()
+	}
+	svc.statusMu.Unlock()
+	return cached, cachedErr
 }
 
 func (svc *Service) AWG2AddPeer(in awg.Peer) (awg.Peer, error) {
+	m := svc.awgActive()
+	if m == nil {
+		return awg.Peer{}, fmt.Errorf("AWG2-сервер не выбран")
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
 	defer cancel()
-	p, err := svc.awg.AddPeer(ctx, in)
+	p, err := m.AddPeer(ctx, in)
 	svc.awgSave()
 	p.PrivateKey, p.PSK = "", "" // never return secrets to the client
 	return p, err
 }
 
 func (svc *Service) AWG2RemovePeer(id string) error {
+	m := svc.awgActive()
+	if m == nil {
+		return fmt.Errorf("AWG2-сервер не выбран")
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
 	defer cancel()
-	err := svc.awg.RemovePeer(ctx, id)
+	err := m.RemovePeer(ctx, id)
 	svc.awgSave()
 	return err
 }
 
 func (svc *Service) AWG2ClientConfig(id string) (text, filename string, err error) {
-	return svc.awg.ClientConfig(id)
+	m := svc.awgActive()
+	if m == nil {
+		return "", "", fmt.Errorf("AWG2-сервер не выбран")
+	}
+	return m.ClientConfig(id)
 }
 
 func (svc *Service) AWG2ClientExport(id, format string) (text, filename, contentType string, err error) {
-	return svc.awg.ClientExport(id, format)
+	am := svc.awgActive()
+	if am == nil {
+		return "", "", "", fmt.Errorf("AWG2-сервер не выбран")
+	}
+	return am.ClientExport(id, format)
 }
 
 // AWG2SetRouting persists the split-routing config (mode/zones/mtu/etc.) and — when
@@ -643,9 +772,13 @@ func (svc *Service) AWG2ClientExport(id, format string) (text, filename, content
 // mode changes never affect panel reachability (LAN/private/self/endpoint are always
 // excluded from the tunnel). Switching the mode to «off» tears routing down.
 func (svc *Service) AWG2SetRouting(rc awg.RoutingConfig) error {
-	svc.awg.SetRouting(rc)
+	m := svc.awgActive()
+	if m == nil {
+		return fmt.Errorf("AWG2-сервер не выбран")
+	}
+	m.SetRouting(rc)
 	svc.awgSave()
-	cfg := svc.awg.Config()
+	cfg := m.Config()
 	if !cfg.Routing.Active {
 		return nil // not active yet — user activates with «Применить»
 	}

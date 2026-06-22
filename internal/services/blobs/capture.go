@@ -13,6 +13,7 @@ import (
 
 	"nfqws2strategy/internal/tools/logbuf"
 	"nfqws2strategy/internal/tools/store"
+	"nfqws2strategy/internal/tools/strs"
 	"nfqws2strategy/internal/tools/tcpdump"
 	"nfqws2strategy/internal/tools/tlsblob"
 )
@@ -72,7 +73,7 @@ func (s *Service) StartBlobCapture(ip string, seconds int) (*BlobCapture, error)
 
 func (s *Service) runBlobCapture(c *BlobCapture) {
 	bin := tcpdump.Path()
-	logbuf.Append("blobcap", "info", fmt.Sprintf("blobcap %s: захват ClientHello %s на %s, %dс", short(c.ID), c.IP, c.Iface, c.Seconds))
+	logbuf.Append("blobcap", "info", fmt.Sprintf("blobcap %s: захват ClientHello %s на %s, %dс", strs.Short(c.ID), c.IP, c.Iface, c.Seconds))
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(c.Seconds+3)*time.Second)
 	defer cancel()
 	// -G N -W 1 autostops after N seconds and writes a single file.
@@ -92,7 +93,7 @@ func (s *Service) runBlobCapture(c *BlobCapture) {
 			c.ElapsedMs = time.Since(start).Milliseconds()
 			c.Status = "done"
 		})
-		logbuf.Append("blobcap", "info", fmt.Sprintf("blobcap %s: готово — 0 ClientHello (нет трафика)", short(c.ID)))
+		logbuf.Append("blobcap", "info", fmt.Sprintf("blobcap %s: готово — 0 ClientHello (нет трафика)", strs.Short(c.ID)))
 		return
 	}
 	cands, perr := tlsblob.ParsePcapClientHellos(data)
@@ -105,7 +106,7 @@ func (s *Service) runBlobCapture(c *BlobCapture) {
 		c.ElapsedMs = time.Since(start).Milliseconds()
 		c.Status = "done"
 	})
-	logbuf.Append("blobcap", "info", fmt.Sprintf("blobcap %s: готово — %d ClientHello", short(c.ID), len(cands)))
+	logbuf.Append("blobcap", "info", fmt.Sprintf("blobcap %s: готово — %d ClientHello", strs.Short(c.ID), len(cands)))
 }
 
 func (s *Service) setBlobCap(mut func()) {
@@ -172,12 +173,4 @@ func (s *Service) GenerateBlob(sni string, alpn []string, minVer uint16, name st
 		return "", err
 	}
 	return s.SaveBlob(name, data)
-}
-
-// short truncates an id for log lines.
-func short(id string) string {
-	if len(id) > 6 {
-		return id[:6]
-	}
-	return id
 }

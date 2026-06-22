@@ -93,7 +93,7 @@ func TestGroupDevices(t *testing.T) {
 		t.Fatalf("err: %v", err)
 	}
 	arp := []ARPEntry{} // exercise the conntrack-mac fallback path
-	devs := GroupDevices(conns, arp)
+	devs := GroupDevices(conns, arp, nil)
 
 	// Expect 3 LAN devices: .151 (2 working tcp), .127 (1 working icmp), .50 (1
 	// failing tcp). The ipv6 link-local and the loopback rows are excluded.
@@ -127,7 +127,7 @@ func TestGroupDevicesARPFallback(t *testing.T) {
 	const row = `ipv4 2 tcp 6 100 ESTABLISHED src=192.168.3.200 dst=8.8.8.8 sport=12345 dport=443 packets=1 bytes=60 src=8.8.8.8 dst=192.168.3.200 sport=443 dport=12345 packets=1 bytes=60 [ASSURED] mark=0 nomac slan use=2`
 	conns, _ := ParseConntrack(strings.NewReader(row))
 	arp, _ := ParseARP(strings.NewReader("IP address       HW type     Flags       HW address            Mask     Device\n192.168.3.200    0x1         0x2         AA:BB:CC:00:11:22     *        br0"))
-	devs := GroupDevices(conns, arp)
+	devs := GroupDevices(conns, arp, nil)
 	if len(devs) != 1 {
 		t.Fatalf("want 1 device, got %d", len(devs))
 	}

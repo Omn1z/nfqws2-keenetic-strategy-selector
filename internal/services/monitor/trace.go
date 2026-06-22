@@ -10,6 +10,7 @@ import (
 	"nfqws2strategy/internal/tools/logbuf"
 	"nfqws2strategy/internal/tools/netmon"
 	"nfqws2strategy/internal/tools/store"
+	"nfqws2strategy/internal/tools/strs"
 )
 
 const (
@@ -112,7 +113,7 @@ func (s *Service) runTrace(t *Trace) {
 	seen := map[string]*cstate{}
 	start := time.Now()
 	deadline := start.Add(time.Duration(t.Seconds) * time.Second)
-	logbuf.Append("trace", "info", fmt.Sprintf("trace %s: старт отслеживания %s на %d с", short(t.ID), t.IP, t.Seconds))
+	logbuf.Append("trace", "info", fmt.Sprintf("trace %s: старт отслеживания %s на %d с", strs.Short(t.ID), t.IP, t.Seconds))
 
 	tick := time.NewTicker(traceInterval)
 	defer tick.Stop()
@@ -200,13 +201,5 @@ func (s *Service) runTrace(t *Trace) {
 		}
 	}
 	s.traceMu.Unlock()
-	logbuf.Append("trace", "info", fmt.Sprintf("trace %s: готово — %d соединений, %d с проблемами, %d событий", short(t.ID), len(seen), dropped, len(t.Events)))
-}
-
-// short truncates an id for log lines (shared with pcap.go in this package).
-func short(id string) string {
-	if len(id) > 6 {
-		return id[:6]
-	}
-	return id
+	logbuf.Append("trace", "info", fmt.Sprintf("trace %s: готово — %d соединений, %d с проблемами, %d событий", strs.Short(t.ID), len(seen), dropped, len(t.Events)))
 }

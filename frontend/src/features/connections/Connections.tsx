@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { api } from "@/lib/api";
 import { cn } from "@/lib/cn";
 import { usePoll } from "@/lib/hooks";
@@ -10,7 +10,7 @@ import { fieldCls } from "@/components/ui/form";
 import { Pager, pageSlice } from "@/components/ui/Pager";
 import { EmptyRow, SortTh, TableWrap, nextSort, tableCls, tdCls } from "@/components/ui/Table";
 import type { Sort } from "@/components/ui/Table";
-import type { Conn } from "@/types/api";
+import type { Conn, Device } from "@/types/api";
 
 const sortVal = (c: Conn, k: string): string | number => {
   switch (k) {
@@ -33,6 +33,25 @@ export default function Connections() {
   const [sort, setSort] = useState<Sort>({ key: "bytes", dir: -1 });
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState("50");
+  // ip → hostname map, built from /api/devices (covers v4 + every v6 from NDP).
+  const [ipToHost, setIpToHost] = useState<Record<string, string>>({});
+  useEffect(() => {
+    const refresh = async () => {
+      try {
+        const v = await api<{ devices: Device[] }>("GET", "/api/devices");
+        const map: Record<string, string> = {};
+        for (const d of v.devices ?? []) {
+          if (!d.hostname) continue;
+          if (d.ip) map[d.ip] = d.hostname;
+          for (const v6 of d.ipv6 ?? []) map[v6] = d.hostname;
+        }
+        setIpToHost(map);
+      } catch { /* keep last */ }
+    };
+    void refresh();
+    const t = window.setInterval(() => void refresh(), 15_000);
+    return () => window.clearInterval(t);
+  }, []);
 
   usePoll(async () => {
     try { const v = await api<{ items: Conn[] }>("GET", "/api/connections"); setConns(v.items ?? []); setLoaded(true); } catch { /* keep last */ }
@@ -43,7 +62,7 @@ export default function Connections() {
     .filter((c) => {
       if (failOnly && !connFailing(c)) return false;
       if (!f) return true;
-      return [c.proto, c.state, c.src, c.dst, String(c.dport || ""), c.zone].some((x) => x.toLowerCase().includes(f));
+      return [c.proto, c.state, c.src, c.dst, String(c.dport || ""), c.zone, ipToHost[c.src] ?? ""].some((x) => x.toLowerCase().includes(f));
     })
     .sort((a, b) => {
       const va = sortVal(a, sort.key), vb = sortVal(b, sort.key);
@@ -94,7 +113,14 @@ export default function Connections() {
                 <tr key={`${c.proto}|${c.src}|${c.sport}|${c.dst}|${c.dport}|${i}`} className="hover:bg-line-soft">
                   <td className={tdCls}>{c.proto}</td>
                   <td className={tdCls}><span className={cn("inline-block whitespace-nowrap rounded-full px-2 py-0.5 text-[11px] font-semibold", chip)}>{label}</span></td>
-                  <td className={cn(tdCls, "font-mono")}>{c.src}</td>
+                  <td className={tdCls}>
+                    {(() => {
+                      const host = ipToHost[c.src];
+                      return host
+                        ? <span title={c.src}><b className="text-ink">{host}</b> <span className="text-[10px] text-muted">{c.src.includes(":") ? "v6" : "v4"}</span></span>
+                        : <span className="font-mono">{c.src}</span>;
+                    })()}
+                  </td>
                   <td className={cn(tdCls, "font-mono")}>{c.dst}</td>
                   <td className={cn(tdCls, "tabular-nums")}>{c.dport || "—"}</td>
                   <td className={cn(tdCls, "whitespace-nowrap tabular-nums")}>{human(c.bytes + c.reply_bytes)}</td>

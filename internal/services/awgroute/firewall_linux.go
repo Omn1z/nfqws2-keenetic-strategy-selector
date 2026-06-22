@@ -11,6 +11,7 @@ import (
 
 	"nfqws2strategy/internal/services/awg"
 	"nfqws2strategy/internal/tools/logbuf"
+	"nfqws2strategy/internal/tools/strs"
 )
 
 // The netfilter / iptables half of split-routing: the marking chain + FORWARD/NAT/
@@ -38,17 +39,23 @@ var awgAccelSysctls = []string{
 // awgSetAccel toggles Keenetic's NAT accelerators (off while tunnel routing is
 // active). Disabling also flushes already-accelerated flows so existing
 // connections re-evaluate the route.
+//
+// Batched into ONE sysctl -w invocation. The previous form forked 4-5 times
+// per call — every watchdog tick (60s) on the IPQ9554 burned ~50-150 ms on
+// idempotent writes. Single fork now.
 func awgSetAccel(on bool) {
 	v := "0"
 	if on {
 		v = "1"
 	}
+	var args []string
 	for _, s := range awgAccelSysctls {
-		_, _ = awgRun("sysctl -w " + s + "=" + v + " 2>/dev/null")
+		args = append(args, "-w", s+"="+v)
 	}
 	if !on {
-		_, _ = awgRun("sysctl -w net.core.swnat_reset=1 2>/dev/null")
+		args = append(args, "-w", "net.core.swnat_reset=1")
 	}
+	_, _ = awgRun("sysctl " + strings.Join(args, " ") + " 2>/dev/null")
 }
 
 // awgApplyKillswitch toggles the "Эксклюзивный маршрут" blackhole in the tunnel
@@ -74,7 +81,7 @@ func awgApplyKillswitch(on bool) {
 // (-i awg0) the PMTU clamp resolves to the LAN MTU (1500), not the tunnel, so it
 // fails to shrink client→server segments and oversized uploads (large cookies,
 // speed-test POSTs) blackhole → pages "load then stall/RESET".
-func awgFirewallHook(mode, endpointIP string, mtu int, dnsRedirect bool, zones []awg.Zone) string {
+func awgFirewallHook(mode, endpointIP, wandev string, mtu int, dnsRedirect, chainEnabled, tunnelV6 bool, zones []awg.Zone) string {
 	if mtu <= 0 {
 		mtu = 1280
 	}
@@ -83,35 +90,62 @@ func awgFirewallHook(mode, endpointIP string, mtu int, dnsRedirect bool, zones [
 	if p, err := strconv.Atoi(awgDNSPort); err == nil {
 		dnsPortHex = fmt.Sprintf("%04X", p)
 	}
-	ap := func(table, chain, rule string) string {
-		b := "iptables -t " + table + " "
-		return b + "-C " + chain + " " + rule + " 2>/dev/null || " + b + "-A " + chain + " " + rule + "\n"
-	}
-	ins := func(table, chain, rule string) string {
-		b := "iptables -t " + table + " "
-		return b + "-C " + chain + " " + rule + " 2>/dev/null || " + b + "-I " + chain + " 1 " + rule + "\n"
-	}
+	// Every iptables rule we install carries the `awg2-*` comment marker that
+	// identifies it as ours. The cleanup loop at the top of the script wipes
+	// any rule with such a comment from every shared chain we touch (mangle
+	// PREROUTING/OUTPUT/FORWARD, nat PREROUTING/POSTROUTING, filter FORWARD)
+	// in both v4 and v6, then the restore docs at the end re-create them.
+	// Net: one fork per family for the restore + 12 cleanup forks per re-run
+	// (most are no-op listings on a fresh ndm re-render), down from ~24 forks
+	// of -C/-A pairs that did the same job.
+	//
+	// Comment markers (12 chars max — older Linux iptables truncated longer
+	// strings):
+	//
+	//   awg2-jump      mangle PREROUTING/OUTPUT  → -j AWG2_MARK(6)
+	//   awg2-mss       mangle FORWARD            → TCPMSS clamp
+	//   awg2-nat       nat POSTROUTING           → -j MASQUERADE
+	//   awg2-fwd       filter FORWARD            → -i/-o awg0 ACCEPT
+	//   awg2-dns       nat PREROUTING            → :53 REDIRECT
+	//   awg2-v6-noleak filter FORWARD            → v6 leak prevent (existing)
+	cm := func(tag string) string { return ` -m comment --comment "` + tag + `"` }
 	var s strings.Builder
+	s.Grow(64 << 10)
 	s.WriteString("#!/bin/sh\n")
 	s.WriteString("# AWG2 split-routing firewall hook — managed by nfqws2-strategy. DO NOT EDIT.\n")
 	s.WriteString("# Keenetic re-runs netfilter.d/* after every firewall rebuild (which flushes\n")
 	s.WriteString("# foreign iptables chains); this restores the AWG2 marking + FORWARD/NAT/MSS.\n")
-	// The hook now installs BOTH iptables and ip6tables state in one run, so we no
-	// longer bail out when ndm invokes it for the ip6tables family — that earlier
-	// guard would have skipped the v6 chain entirely.
 	s.WriteString("ip link show " + awgIface + " >/dev/null 2>&1 || exit 0\n")
 	s.WriteString("ipset create " + awgSetInc + " hash:net family inet -exist 2>/dev/null\n")
 	s.WriteString("ipset create " + awgSetExc + " hash:net family inet -exist 2>/dev/null\n")
-	// SNI-learned server IPs (short-lived); always created so the include rule below
-	// loads even when SNI-routing is off (then the set is simply empty = no matches).
 	s.WriteString("ipset create " + awgSetSNI + " hash:ip family inet timeout " + strconv.Itoa(awgSNITTL) + " -exist 2>/dev/null\n")
-	s.WriteString("iptables -t mangle -N " + awgChain + " 2>/dev/null\n")
-	s.WriteString("iptables -t mangle -F " + awgChain + "\n")
+	// Cleanup-by-comment: wipe any stale awg2-* rule from every shared chain
+	// we'll re-populate below. Necessary because iptables-restore --noflush
+	// APPENDS to shared chains (it does not deduplicate), so without this the
+	// hook would pile up duplicate jumps/ACCEPTs on every ndm re-run.
+	// Delete by line number in reverse so indexes don't shift mid-loop.
+	s.WriteString("for fam in iptables ip6tables; do\n")
+	s.WriteString("  for tc in 'mangle PREROUTING' 'mangle OUTPUT' 'mangle FORWARD' 'nat PREROUTING' 'nat POSTROUTING' 'filter FORWARD'; do\n")
+	s.WriteString("    set -- $tc\n")
+	s.WriteString("    tbl=$1; chn=$2\n")
+	s.WriteString("    for n in $(\"$fam\" -t \"$tbl\" -L \"$chn\" --line-numbers 2>/dev/null | awk '/awg2-/ {print $1}' | sort -rn); do\n")
+	s.WriteString("      \"$fam\" -t \"$tbl\" -D \"$chn\" \"$n\" 2>/dev/null\n")
+	s.WriteString("    done\n")
+	s.WriteString("  done\n")
+	s.WriteString("done\n")
+
+	// v4doc / v6doc are the *mangle table documents we'll feed to
+	// iptables-restore --noflush. They declare our user chain with a flush
+	// (`:CHAIN -`) so the chain is wiped clean before our rules go in.
+	var v4doc, v6doc strings.Builder
+	v4doc.WriteString("*mangle\n")
+	v4doc.WriteString(":" + awgChain + " -\n")
+	v4doc.WriteString("-A " + awgChain + " -m mark --mark 0x20000000/0x20000000 -j RETURN\n")
 	for _, ex := range awgExcludes {
-		s.WriteString("iptables -t mangle -A " + awgChain + " -d " + ex + " -j RETURN\n")
+		v4doc.WriteString("-A " + awgChain + " -d " + ex + " -j RETURN\n")
 	}
 	if endpointIP != "" {
-		s.WriteString("iptables -t mangle -A " + awgChain + " -d " + endpointIP + "/32 -j RETURN\n")
+		v4doc.WriteString("-A " + awgChain + " -d " + endpointIP + "/32 -j RETURN\n")
 	}
 	// Per-source-device routing. Zones with `source_ips` apply ONLY to packets
 	// from those LAN IPs/CIDRs and are isolated from the global ipsets/mode (see
@@ -119,43 +153,44 @@ func awgFirewallHook(mode, endpointIP string, mtu int, dnsRedirect bool, zones [
 	//
 	// Each source-bound zone owns a per-zone ipset awg2_z<idx> (built in
 	// sets_linux.go awgBuildSourceSets) populated with the zone's destinations
-	// (resolved domains + IPs/CIDRs). The rule shape depends on whether the zone
-	// has destinations:
-	//   include + destinations  →  -s SRC -m set --match-set SET dst -j MARK
-	//                              (only those destinations tunnel for this source)
-	//   include + (no dests)    →  -s SRC -j MARK
-	//                              (whole-source tunnel; respects awg2_exc below)
-	//   exclude + destinations  →  -s SRC -m set --match-set SET dst -j RETURN
-	//                              (those destinations bypass for this source)
-	//   exclude + (no dests)    →  -s SRC -j RETURN
-	//                              (whole-source bypass; sources go direct)
+	// (resolved domains + IPs/CIDRs). The rule shape depends on whether the
+	// zone has destinations:
+	//   tunnel + destinations  →  -s SRC -m set --match-set SET dst -j MARK
+	//   tunnel + (no dests)    →  -s SRC -j MARK
+	//   direct + destinations  →  -s SRC -m set --match-set SET dst -j RETURN
+	//   direct + (no dests)    →  -s SRC -j RETURN
 	//
-	// Order matters: exclude RETURNs come FIRST so a destination listed in an
-	// exclude carve-out wins over the broader include MARK for the same source.
-	emitSourceRule := func(z awg.Zone, idx int, target string) {
+	// First-match-wins: chain order = config order. Single pass over
+	// sourceBoundZones in array order — the first source-bound zone whose
+	// (SRC, dst set) matches a packet decides. The previous two-pass form
+	// emitted RETURNs before MARKs unconditionally, which hard-coded "direct
+	// always wins" and contradicted the user's stated array priority.
+	// emitSrcRule writes one source-bound-zone rule into the given iptables doc.
+	// Family-agnostic: the caller passes the chain name, the destination set name
+	// (already family-suffixed), and the source-selector clause ("-s 1.2.3.4" for
+	// v4, "-m mac --mac-source aa:bb:..." for v6) — that's the only thing that
+	// differs between the v4 and v6 mirrors. Used by both passes below.
+	emitSrcRule := func(doc *strings.Builder, chain, srcSel, dstSet, target string, hasDsts bool) {
+		if hasDsts {
+			doc.WriteString("-A " + chain + " " + srcSel +
+				" -m set --match-set " + dstSet + " dst -j " + target + "\n")
+		} else {
+			doc.WriteString("-A " + chain + " " + srcSel + " -j " + target + "\n")
+		}
+	}
+	sb := sourceBoundZones(zones)
+	for i, z := range sb {
+		target := "MARK --set-xmark " + awgMarkRule
+		if z.RouteValue() == "direct" {
+			target = "RETURN"
+		}
 		hasDsts := len(z.Domains) > 0 || len(z.IPs) > 0
 		for _, src := range z.SourceIPs {
 			src = strings.TrimSpace(src)
 			if src == "" {
 				continue
 			}
-			if hasDsts {
-				s.WriteString("iptables -t mangle -A " + awgChain + " -s " + src +
-					" -m set --match-set " + sourceZoneSetName(idx) + " dst -j " + target + "\n")
-			} else {
-				s.WriteString("iptables -t mangle -A " + awgChain + " -s " + src + " -j " + target + "\n")
-			}
-		}
-	}
-	sb := sourceBoundZones(zones)
-	for i, z := range sb {
-		if z.Mode == "exclude" {
-			emitSourceRule(z, i, "RETURN")
-		}
-	}
-	for i, z := range sb {
-		if z.Mode == "include" {
-			emitSourceRule(z, i, "MARK --set-xmark "+awgMarkRule)
+			emitSrcRule(&v4doc, awgChain, "-s "+src, sourceZoneSetName(i), target, hasDsts)
 		}
 	}
 	// IPv6 mirror of the per-source rules. Mangle chain AWG2_MARK6 has its own
@@ -169,40 +204,88 @@ func awgFirewallHook(mode, endpointIP string, mtu int, dnsRedirect bool, zones [
 	s.WriteString("ipset create " + awgSetInc + "_6 hash:net family inet6 -exist 2>/dev/null\n")
 	s.WriteString("ipset create " + awgSetExc + "_6 hash:net family inet6 -exist 2>/dev/null\n")
 	s.WriteString("ipset create " + awgSetSNI + "_6 hash:ip family inet6 timeout " + strconv.Itoa(awgSNITTL) + " -exist 2>/dev/null\n")
-	s.WriteString("ip6tables -t mangle -N " + awgChain + "6 2>/dev/null\n")
-	s.WriteString("ip6tables -t mangle -F " + awgChain + "6\n")
+
+	v6doc.WriteString("*mangle\n")
+	v6doc.WriteString(":" + awgChain + "6 -\n")
+	v6doc.WriteString("-A " + awgChain + "6 -m mark --mark 0x20000000/0x20000000 -j RETURN\n")
 	for _, ex := range []string{"::1/128", "fc00::/7", "fe80::/10", "ff00::/8"} {
-		s.WriteString("ip6tables -t mangle -A " + awgChain + "6 -d " + ex + " -j RETURN\n")
+		v6doc.WriteString("-A " + awgChain + "6 -d " + ex + " -j RETURN\n")
 	}
-	emitSourceRule6 := func(z awg.Zone, idx int, target string) {
+	// Read the neighbour table ONCE for all per-source IPv6 emits instead of
+	// forking `ip neigh show <ip>` per source IP per zone. The previous form
+	// could fork 20+ times per hook generation; now it's a single fork.
+	macBatch := lookupMACBatch()
+	// First-match-wins for v6: same single-pass over sb in array order. Reuses
+	// emitSrcRule with the v6 chain name and a MAC-based source selector
+	// (IPv6 source addresses rotate under SLAAC + temporary addresses; the MAC
+	// is stable).
+	for i, z := range sb {
+		target := "MARK --set-xmark " + awgMarkRule
+		if z.RouteValue() == "direct" {
+			target = "RETURN"
+		}
 		hasDsts := len(z.Domains) > 0 || len(z.IPs) > 0
 		for _, src := range z.SourceIPs {
 			src = strings.TrimSpace(src)
 			if src == "" {
 				continue
 			}
-			mac := lookupMAC(src)
+			mac := macBatch[src]
 			if mac == "" {
 				continue // MAC not in neighbour cache yet — watchdog re-renders
 			}
-			if hasDsts {
-				s.WriteString("ip6tables -t mangle -A " + awgChain + "6 -m mac --mac-source " + mac +
-					" -m set --match-set " + sourceZoneSetName6(idx) + " dst -j " + target + "\n")
-			} else {
-				s.WriteString("ip6tables -t mangle -A " + awgChain + "6 -m mac --mac-source " + mac + " -j " + target + "\n")
+			emitSrcRule(&v6doc, awgChain+"6", "-m mac --mac-source "+mac, sourceZoneSetName6(i), target, hasDsts)
+		}
+	}
+	// IPv6 leak prevention — collected into v6FilterExtras and emitted into
+	// the v6doc *filter section below (NOT *mangle — REJECT is a filter
+	// target). The generic `awg2-*` cleanup loop at the top of the script
+	// already wipes any prior copy of these rules.
+	//
+	// When the tunnel carries IPv6, all of this is skipped — the mark→table
+	// 998 path moves v6 into the tunnel like v4 and there's no leak.
+	var v6FilterExtras strings.Builder
+	if !tunnelV6 {
+	// Per-MAC REJECT for source-bound catch-all-include zones (per-device
+	// "all via VPN"). Each goes into v6doc *filter as `-I FORWARD 1` so the
+	// per-MAC REJECTs sit on top of the awg2_exc_6 carve-out (the device
+	// wants EVERYTHING via VPN, no carve-out applies to it).
+	for _, z := range sb {
+		if z.RouteValue() != "tunnel" || !zoneHasCatchAll(z) {
+			continue
+		}
+		for _, src := range z.SourceIPs {
+			src = strings.TrimSpace(src)
+			if src == "" {
+				continue
 			}
+			mac := macBatch[src]
+			if mac == "" {
+				continue // MAC not in neighbour cache — watchdog re-renders
+			}
+			v6FilterExtras.WriteString("-I FORWARD 1 -m mac --mac-source " + mac + cm(awgV6LeakComment) +
+				" -j REJECT --reject-with icmp6-adm-prohibited\n")
 		}
 	}
-	for i, z := range sb {
-		if z.Mode == "exclude" {
-			emitSourceRule6(z, i, "RETURN")
+	// Global v6 leak prevention: when the effective mode is full or exclude (= all
+	// traffic should ride the tunnel except specific carve-outs), every v6 packet
+	// leaving via the WAN device must be REJECTed — the tunnel is v4-only, so v6
+	// would otherwise go native WAN.
+	//
+	// EMISSION ORDER IS REVERSED on purpose: each `-I FORWARD 1` lands at
+	// slot 1 and pushes previous rule 1 down to 2. To end up with chain
+	// order ACCEPT@1 (carve-out, exclude mode only) then REJECT@2, we emit
+	// REJECT FIRST (lands at 1) and ACCEPT SECOND (lands at 1, bumps REJECT
+	// to 2). Do not "fix" this ordering — it is load-bearing.
+	if wandev != "" && (mode == "full" || mode == "exclude") {
+		v6FilterExtras.WriteString("-I FORWARD 1 -o " + wandev + cm(awgV6LeakComment) +
+			" -j REJECT --reject-with icmp6-adm-prohibited\n")
+		if mode == "exclude" {
+			v6FilterExtras.WriteString("-I FORWARD 1 -o " + wandev + " -m set --match-set " + awgSetExc + "_6 dst" +
+				cm(awgV6LeakComment) + " -j ACCEPT\n")
 		}
 	}
-	for i, z := range sb {
-		if z.Mode == "include" {
-			emitSourceRule6(z, i, "MARK --set-xmark "+awgMarkRule)
-		}
-	}
+	} // end if !tunnelV6
 	// mode here is the EFFECTIVE direction derived from the per-zone settings
 	// (awgEffectiveMode): "include" = whitelist (only include-zones tunnel),
 	// "exclude" = blacklist (everything except exclude-zones), "full" = everything,
@@ -211,56 +294,92 @@ func awgFirewallHook(mode, endpointIP string, mtu int, dnsRedirect bool, zones [
 	case "include":
 		// exclude-zones bypass FIRST (carve-out: they win over an overlapping include
 		// CIDR), then include-zones go through the tunnel.
-		s.WriteString("iptables -t mangle -A " + awgChain + " -m set --match-set " + awgSetExc + " dst -j RETURN\n")
-		s.WriteString("iptables -t mangle -A " + awgChain + " -m set --match-set " + awgSetInc + " dst -j MARK --set-xmark " + awgMarkRule + "\n")
+		v4doc.WriteString("-A " + awgChain + " -m set --match-set " + awgSetExc + " dst -j RETURN\n")
+		v4doc.WriteString("-A " + awgChain + " -m set --match-set " + awgSetInc + " dst -j MARK --set-xmark " + awgMarkRule + "\n")
 		// SNI-learned IPs (awg2_sni) ride the same whitelist as awg2_inc — placed after
 		// the exclude RETURN so an excluded domain still wins even if SNI saw it.
-		s.WriteString("iptables -t mangle -A " + awgChain + " -m set --match-set " + awgSetSNI + " dst -j MARK --set-xmark " + awgMarkRule + "\n")
+		v4doc.WriteString("-A " + awgChain + " -m set --match-set " + awgSetSNI + " dst -j MARK --set-xmark " + awgMarkRule + "\n")
 	case "exclude":
-		s.WriteString("iptables -t mangle -A " + awgChain + " -m set ! --match-set " + awgSetExc + " dst -j MARK --set-xmark " + awgMarkRule + "\n")
+		v4doc.WriteString("-A " + awgChain + " -m set ! --match-set " + awgSetExc + " dst -j MARK --set-xmark " + awgMarkRule + "\n")
 	case "full":
-		s.WriteString("iptables -t mangle -A " + awgChain + " -j MARK --set-xmark " + awgMarkRule + "\n")
+		v4doc.WriteString("-A " + awgChain + " -j MARK --set-xmark " + awgMarkRule + "\n")
 	}
 	// Global IPv6 mode rules — mirror of the v4 switch above, against the v6
 	// ipsets. Without this an exclude/full mode covers only IPv4 traffic and
 	// the LAN's v6 (which Linux prefers when AAAA exists) silently leaks out
 	// the native WAN route. The v6 SNI sniffer / DNS proxy populate awg2_*_6.
-	switch mode {
-	case "include":
-		s.WriteString("ip6tables -t mangle -A " + awgChain + "6 -m set --match-set " + awgSetExc + "_6 dst -j RETURN\n")
-		s.WriteString("ip6tables -t mangle -A " + awgChain + "6 -m set --match-set " + awgSetInc + "_6 dst -j MARK --set-xmark " + awgMarkRule + "\n")
-		s.WriteString("ip6tables -t mangle -A " + awgChain + "6 -m set --match-set " + awgSetSNI + "_6 dst -j MARK --set-xmark " + awgMarkRule + "\n")
-	case "exclude":
-		s.WriteString("ip6tables -t mangle -A " + awgChain + "6 -m set ! --match-set " + awgSetExc + "_6 dst -j MARK --set-xmark " + awgMarkRule + "\n")
-	case "full":
-		s.WriteString("ip6tables -t mangle -A " + awgChain + "6 -j MARK --set-xmark " + awgMarkRule + "\n")
+	//
+	// Gated on `tunnelV6`. When the tunnel CANNOT carry v6 (VPS-side v6 SNAT is
+	// missing/broken, or the upstream provider blackholes), marking v6 packets
+	// into the tunnel routes them via awg0, where they exit BEFORE the FORWARD
+	// `-o eth3` leak-prevent REJECT can see them — they then silently blackhole
+	// at the VPS. Skipping the global MARK keeps v6 on its native default
+	// (eth3), where the REJECT block above ALREADY catches non-RU and the
+	// awg2_exc_6 ACCEPT lets RU through → Happy Eyeballs falls back to v4 in
+	// ~100ms instead of stalling on a tunnel that can't return.
+	if tunnelV6 {
+		switch mode {
+		case "include":
+			v6doc.WriteString("-A " + awgChain + "6 -m set --match-set " + awgSetExc + "_6 dst -j RETURN\n")
+			v6doc.WriteString("-A " + awgChain + "6 -m set --match-set " + awgSetInc + "_6 dst -j MARK --set-xmark " + awgMarkRule + "\n")
+			v6doc.WriteString("-A " + awgChain + "6 -m set --match-set " + awgSetSNI + "_6 dst -j MARK --set-xmark " + awgMarkRule + "\n")
+		case "exclude":
+			v6doc.WriteString("-A " + awgChain + "6 -m set ! --match-set " + awgSetExc + "_6 dst -j MARK --set-xmark " + awgMarkRule + "\n")
+		case "full":
+			v6doc.WriteString("-A " + awgChain + "6 -j MARK --set-xmark " + awgMarkRule + "\n")
+		}
 	}
-	s.WriteString(ap("mangle", "PREROUTING", "-j "+awgChain))
-	s.WriteString(ap("mangle", "OUTPUT", "-j "+awgChain))
-	// IPv6 jumps + FORWARD/NAT. Mirror of the v4 wiring above; ip6tables matches
-	// on its own table even though the chain name AWG2_MARK6 differs.
-	ap6 := func(table, chain, rule string) string {
-		b := "ip6tables -t " + table + " "
-		return b + "-C " + chain + " " + rule + " 2>/dev/null || " + b + "-A " + chain + " " + rule + "\n"
+	// Shared-chain rules — emitted into the SAME restore docs as our user
+	// chain rules above. The cleanup loop at the top of the script wiped
+	// any prior copy via the `awg2-*` comment markers, so these -A/-I lines
+	// land cleanly without duplicates. v4 and v6 mirror each other; the v6
+	// shape gates parts that depend on tunnelV6 (skipping v6 leak prevent
+	// when the tunnel actually carries v6).
+	mssRule := func(direction string) string {
+		// `-o awg0` and `-i awg0` MSS-clamp both directions to mtu-40. Comment
+		// marker `awg2-mss` so cleanup can identify ours.
+		return "-" + direction + " " + awgIface + " -p tcp --tcp-flags SYN,RST SYN" + cm("awg2-mss") + " -j TCPMSS --set-mss " + mss
 	}
-	ins6 := func(table, chain, rule string) string {
-		b := "ip6tables -t " + table + " "
-		return b + "-C " + chain + " " + rule + " 2>/dev/null || " + b + "-I " + chain + " 1 " + rule + "\n"
-	}
-	s.WriteString(ap6("mangle", "PREROUTING", "-j "+awgChain+"6"))
-	s.WriteString(ap6("mangle", "OUTPUT", "-j "+awgChain+"6"))
-	s.WriteString(ap6("nat", "POSTROUTING", "-o "+awgIface+" -j MASQUERADE"))
-	s.WriteString(ap6("mangle", "FORWARD", "-o "+awgIface+" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "+mss))
-	s.WriteString(ap6("mangle", "FORWARD", "-i "+awgIface+" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "+mss))
-	s.WriteString(ins6("filter", "FORWARD", "-i "+awgIface+" -j ACCEPT"))
-	s.WriteString(ins6("filter", "FORWARD", "-o "+awgIface+" -j ACCEPT"))
-	// NAT for LAN clients + MSS clamp + allow forwarding LAN<->tunnel. Keenetic's
-	// FORWARD policy is DROP and doesn't know awg0, so the ACCEPTs go at the TOP.
-	s.WriteString(ap("nat", "POSTROUTING", "-o "+awgIface+" -j MASQUERADE"))
-	s.WriteString(ap("mangle", "FORWARD", "-o "+awgIface+" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "+mss))
-	s.WriteString(ap("mangle", "FORWARD", "-i "+awgIface+" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "+mss))
-	s.WriteString(ins("filter", "FORWARD", "-i "+awgIface+" -j ACCEPT"))
-	s.WriteString(ins("filter", "FORWARD", "-o "+awgIface+" -j ACCEPT"))
+	// v4 mangle (jumps + MSS clamp) + nat (MASQUERADE) + filter (FORWARD ACCEPT)
+	v4doc.WriteString("-A PREROUTING" + cm("awg2-jump") + " -j " + awgChain + "\n")
+	v4doc.WriteString("-A OUTPUT" + cm("awg2-jump") + " -j " + awgChain + "\n")
+	v4doc.WriteString("-A FORWARD " + mssRule("o") + "\n")
+	v4doc.WriteString("-A FORWARD " + mssRule("i") + "\n")
+	v4doc.WriteString("COMMIT\n")
+	v4doc.WriteString("*nat\n")
+	v4doc.WriteString("-A POSTROUTING -o " + awgIface + cm("awg2-nat") + " -j MASQUERADE\n")
+	v4doc.WriteString("COMMIT\n")
+	v4doc.WriteString("*filter\n")
+	v4doc.WriteString("-I FORWARD 1 -i " + awgIface + cm("awg2-fwd") + " -j ACCEPT\n")
+	v4doc.WriteString("-I FORWARD 1 -o " + awgIface + cm("awg2-fwd") + " -j ACCEPT\n")
+	v4doc.WriteString("COMMIT\n")
+	// v6 mirror — same shape.
+	v6doc.WriteString("-A PREROUTING" + cm("awg2-jump") + " -j " + awgChain + "6\n")
+	v6doc.WriteString("-A OUTPUT" + cm("awg2-jump") + " -j " + awgChain + "6\n")
+	v6doc.WriteString("-A FORWARD " + mssRule("o") + "\n")
+	v6doc.WriteString("-A FORWARD " + mssRule("i") + "\n")
+	v6doc.WriteString("COMMIT\n")
+	v6doc.WriteString("*nat\n")
+	v6doc.WriteString("-A POSTROUTING -o " + awgIface + cm("awg2-nat") + " -j MASQUERADE\n")
+	v6doc.WriteString("COMMIT\n")
+	v6doc.WriteString("*filter\n")
+	v6doc.WriteString("-I FORWARD 1 -i " + awgIface + cm("awg2-fwd") + " -j ACCEPT\n")
+	v6doc.WriteString("-I FORWARD 1 -o " + awgIface + cm("awg2-fwd") + " -j ACCEPT\n")
+	// v6FilterExtras: the noleak ACCEPT/REJECT pair (and per-MAC REJECTs)
+	// collected earlier — emitted into the *filter section, NOT *mangle,
+	// because REJECT is a filter target.
+	v6doc.WriteString(v6FilterExtras.String())
+	v6doc.WriteString("COMMIT\n")
+	// Single iptables-restore / ip6tables-restore invocation drops the whole
+	// multi-table document atomically: AWG2_MARK gets flushed + repopulated,
+	// shared chains get their jumps/ACCEPTs/MASQUERADE re-installed, all in
+	// one syscall per family.
+	s.WriteString("iptables-restore --noflush <<'AWGV4'\n")
+	s.WriteString(v4doc.String())
+	s.WriteString("AWGV4\n")
+	s.WriteString("ip6tables-restore --noflush <<'AWGV6'\n")
+	s.WriteString(v6doc.String())
+	s.WriteString("AWGV6\n")
 	if dnsRedirect {
 		// Domain-mask DNS interception: redirect LAN :53 to Pi-hole (:5353), which
 		// then forwards to our DNS proxy (:5354) as its upstream. Pi-hole sees the
@@ -272,10 +391,17 @@ func awgFirewallHook(mode, endpointIP string, mtu int, dnsRedirect bool, zones [
 		// pi-hole and pi-hole then can't reach upstream. Check /proc/net/udp +
 		// /proc/net/udp6 (Go's 0.0.0.0:5354 listener appears as ":::14EA" on this
 		// kernel via dual-stack — invisible to a v4-only grep).
+		// Port depends on chain mode. Chain on → pi-hole sits in front, REDIRECT
+		// to its FTL port (clients visible in pi-hole's per-client log). Chain off
+		// → REDIRECT straight to our proxy, pi-hole is out of the path entirely.
+		redirectPort := awgDNSPort
+		if chainEnabled {
+			redirectPort = awgPiholeDNSPort
+		}
 		s.WriteString("if grep -qi ':" + dnsPortHex + " ' /proc/net/udp /proc/net/udp6 2>/dev/null; then\n")
 		s.WriteString("  for br in $(ls /sys/class/net/ 2>/dev/null | grep '^br'); do\n")
 		for _, proto := range []string{"udp", "tcp"} {
-			r := "-i $br -p " + proto + " --dport 53 -j REDIRECT --to-ports " + awgPiholeDNSPort
+			r := "-i $br -p " + proto + " --dport 53 -j REDIRECT --to-ports " + redirectPort
 			s.WriteString("    iptables -t nat -C PREROUTING " + r + " 2>/dev/null || iptables -t nat -A PREROUTING " + r + "\n")
 			// iOS prefers IPv6 DNS when RA advertises RDNSS; without v6 REDIRECT
 			// queries hit the host's native dnsmasq and bypass the chain.
@@ -288,15 +414,15 @@ func awgFirewallHook(mode, endpointIP string, mtu int, dnsRedirect bool, zones [
 
 // awgWriteHook writes the netfilter.d hook for the given mode/endpoint and runs
 // it once immediately (applying the rules now, not just on the next ndm rebuild).
-func awgWriteHook(mode, endpointIP string, mtu int, dnsRedirect bool, zones []awg.Zone) error {
+func awgWriteHook(mode, endpointIP, wandev string, mtu int, dnsRedirect, chainEnabled, tunnelV6 bool, zones []awg.Zone) error {
 	if err := os.MkdirAll(filepath.Dir(awgHookPath), 0o755); err != nil {
 		return err
 	}
-	if err := os.WriteFile(awgHookPath, []byte(awgFirewallHook(mode, endpointIP, mtu, dnsRedirect, zones)), 0o755); err != nil {
+	if err := os.WriteFile(awgHookPath, []byte(awgFirewallHook(mode, endpointIP, wandev, mtu, dnsRedirect, chainEnabled, tunnelV6, zones)), 0o755); err != nil {
 		return err
 	}
 	if out, err := awgRun("sh " + awgHookPath); err != nil {
-		logbuf.Append("awg2", "warn", "firewall-хук: "+lastLines(out, 2))
+		logbuf.Append("awg2", "warn", "firewall-хук: "+strs.LastLines(out, 2))
 	}
 	return nil
 }

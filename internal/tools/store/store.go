@@ -37,7 +37,7 @@ func (s *Store) Path(rel string) string { return filepath.Join(s.dir, rel) }
 func (s *Store) Save(rel string, v any) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.saveLocked(rel, v)
+	return s.saveLocked(rel, v, 0o644)
 }
 
 // SaveSecret marshals v as indented JSON and writes it atomically with 0600
@@ -45,25 +45,13 @@ func (s *Store) Save(rel string, v any) error {
 func (s *Store) SaveSecret(rel string, v any) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	full := filepath.Join(s.dir, rel)
-	if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
+	if err := s.saveLocked(rel, v, 0o600); err != nil {
 		return err
 	}
-	b, err := json.MarshalIndent(v, "", "  ")
-	if err != nil {
-		return err
-	}
-	tmp := full + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o600); err != nil {
-		return err
-	}
-	if err := os.Rename(tmp, full); err != nil {
-		return err
-	}
-	return os.Chmod(full, 0o600)
+	return os.Chmod(filepath.Join(s.dir, rel), 0o600)
 }
 
-func (s *Store) saveLocked(rel string, v any) error {
+func (s *Store) saveLocked(rel string, v any, mode os.FileMode) error {
 	full := filepath.Join(s.dir, rel)
 	if err := os.MkdirAll(filepath.Dir(full), 0o755); err != nil {
 		return err
@@ -73,7 +61,7 @@ func (s *Store) saveLocked(rel string, v any) error {
 		return err
 	}
 	tmp := full + ".tmp"
-	if err := os.WriteFile(tmp, b, 0o644); err != nil {
+	if err := os.WriteFile(tmp, b, mode); err != nil {
 		return err
 	}
 	return os.Rename(tmp, full)

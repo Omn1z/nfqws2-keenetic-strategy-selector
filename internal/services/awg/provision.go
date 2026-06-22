@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"strings"
+
+	"nfqws2strategy/internal/tools/strs"
 )
 
 // Step is one provisioning step shown in the deploy log.
@@ -45,7 +47,7 @@ func Deploy(ctx context.Context, r runner, c *ServerConfig, progress func(Step))
 	}
 	step := func(name, cmd string) (string, bool) {
 		out, errOut, err := r.Run(ctx, cmd)
-		detail := lastLinesAWG(strings.TrimSpace(out)+"\n"+strings.TrimSpace(errOut), 6)
+		detail := strs.LastLines(strings.TrimSpace(out+"\n"+errOut), 6)
 		if err != nil && strings.TrimSpace(detail) == "" {
 			detail = err.Error()
 		}
@@ -161,18 +163,6 @@ else
 fi
 %[2]s
 echo bring-up-done`, iface, serverPostUpCommands(c.Subnet, c.WANIface, iface))
-}
-
-func lastLinesAWG(s string, n int) string {
-	s = strings.TrimSpace(s)
-	if s == "" {
-		return ""
-	}
-	lines := strings.Split(s, "\n")
-	if len(lines) <= n {
-		return strings.Join(lines, "\n")
-	}
-	return strings.Join(lines[len(lines)-n:], "\n")
 }
 
 func firstField(s string) string {

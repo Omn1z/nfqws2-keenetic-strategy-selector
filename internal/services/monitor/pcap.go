@@ -14,6 +14,7 @@ import (
 
 	"nfqws2strategy/internal/tools/logbuf"
 	"nfqws2strategy/internal/tools/store"
+	"nfqws2strategy/internal/tools/strs"
 	"nfqws2strategy/internal/tools/tcpdump"
 )
 
@@ -76,7 +77,7 @@ var (
 
 func (s *Service) runPcap(p *Pcap) {
 	bin := tcpdump.Path()
-	logbuf.Append("pcap", "info", fmt.Sprintf("pcap %s: захват %s на %s, %dс", short(p.ID), p.IP, p.Iface, p.Seconds))
+	logbuf.Append("pcap", "info", fmt.Sprintf("pcap %s: захват %s на %s, %dс", strs.Short(p.ID), p.IP, p.Iface, p.Seconds))
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(p.Seconds+3)*time.Second)
 	defer cancel()
 	// -G N -W 1 autostops after N seconds and writes a single file.
@@ -109,7 +110,7 @@ func (s *Service) runPcap(p *Pcap) {
 				p.ElapsedMs = time.Since(start).Milliseconds()
 				p.Status = "done"
 			})
-			logbuf.Append("pcap", "info", fmt.Sprintf("pcap %s: готово — %d пакетов, %d отброшено, %d Б", short(p.ID), p.Packets, p.Dropped, p.SizeBytes))
+			logbuf.Append("pcap", "info", fmt.Sprintf("pcap %s: готово — %d пакетов, %d отброшено, %d Б", strs.Short(p.ID), p.Packets, p.Dropped, p.SizeBytes))
 			return
 		case <-tick.C:
 			if fi, e := os.Stat(p.file); e == nil {
@@ -149,5 +150,5 @@ func (s *Service) PcapFile(id string) (path, name string, ok bool) {
 	if !found || p.Status != "done" {
 		return "", "", false
 	}
-	return p.file, fmt.Sprintf("pcap-%s-%s.pcap", p.IP, short(p.ID)), true
+	return p.file, fmt.Sprintf("pcap-%s-%s.pcap", p.IP, strs.Short(p.ID)), true
 }

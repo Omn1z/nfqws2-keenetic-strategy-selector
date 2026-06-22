@@ -6,13 +6,18 @@ import (
 	"nfqws2strategy/internal/services/awg"
 )
 
+// awgSNITTL is the seconds a SNI-learned IP stays in awg2_sni / sniSeen before
+// re-sight refreshes it. Lives here (tag-free) so the cross-platform cache
+// sweeper in service.go can use it without depending on the linux file.
+const awgSNITTL = 3600
+
 // sourceZoneMatchers is the compiled matcher set for one source-bound zone +
 // the ipset its matches must land in. The DNS proxy / SNI sniffer iterate this
 // slice for each name they see and add the resolved IP to the right per-zone
 // ipset, so CDN-served destinations stay routed correctly as they rotate.
 // Defined in a tag-free file so it's visible to client.go (non-linux too).
 type sourceZoneMatchers struct {
-	Matchers []awg.DomainMatcher
+	Matchers *awg.MatcherSet
 	SetName  string
 }
 

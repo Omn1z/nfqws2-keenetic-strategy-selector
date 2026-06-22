@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -27,6 +28,15 @@ func defaultDialer(ctx context.Context, cred Credentials) (runner, string, error
 
 // Manager owns the AWG2 server config + peers and the SSH-driven operations
 // against the VPS. Methods are safe for concurrent use.
+//
+// The two hottest read paths — Telegram-proxy FallbackUp / awgroute TunnelUp —
+// only need to know "is the client autostart on?" and "is the profile
+// enabled?". Going through Config() (which locks + deep-clones the whole
+// ServerConfig with Peers/Zones/Domains/IPs) for one bool is wasteful when
+// the Telegram path runs that check per blocked-DC dial. We mirror the two
+// bools into atomic.Bool fields that hot paths read with one Load(), no lock,
+// no allocation. Writers (SetConfig/SetClientEnabled/SetEnabled) keep the
+// mirror in sync under m.mu.
 type Manager struct {
 	mu         sync.Mutex
 	cfg        *ServerConfig
@@ -34,12 +44,25 @@ type Manager struct {
 	lastStatus *Status
 	deploying  bool
 	dial       Dialer
+
+	clientEnabled atomic.Bool // mirror of cfg.Client.Enabled — hot-path Telegram + awgroute
+	enabled       atomic.Bool // mirror of cfg.Enabled
 }
 
 func NewManager(cfg *ServerConfig) *Manager {
 	cfg.Normalize()
-	return &Manager{cfg: cfg, dial: defaultDialer}
+	m := &Manager{cfg: cfg, dial: defaultDialer}
+	m.clientEnabled.Store(cfg.Client.Enabled)
+	m.enabled.Store(cfg.Enabled)
+	return m
 }
+
+// ClientEnabled is the hot-path read for "should the local router come up as
+// an AWG client?". One atomic.Load — zero lock, zero clone.
+func (m *Manager) ClientEnabled() bool { return m.clientEnabled.Load() }
+
+// Enabled is the hot-path read for "is this server profile selectable?".
+func (m *Manager) Enabled() bool { return m.enabled.Load() }
 
 // PeerStatus is a peer's live state parsed from `awg show <iface> dump`.
 type PeerStatus struct {
@@ -112,6 +135,10 @@ func (m *Manager) SetConfig(in *ServerConfig) error {
 	m.mu.Lock()
 	m.cfg = in
 	m.mu.Unlock()
+	// Mirror the hot-path booleans under the lock-free atomics so subsequent
+	// ClientEnabled() / Enabled() reads see the swap atomically.
+	m.clientEnabled.Store(in.Client.Enabled)
+	m.enabled.Store(in.Enabled)
 	return nil
 }
 
@@ -131,6 +158,7 @@ func (m *Manager) SetClientEnabled(v bool) {
 	m.mu.Lock()
 	m.cfg.Client.Enabled = v
 	m.mu.Unlock()
+	m.clientEnabled.Store(v)
 }
 
 // SetEnabled toggles the profile availability flag used by the server selector.
@@ -138,6 +166,7 @@ func (m *Manager) SetEnabled(v bool) {
 	m.mu.Lock()
 	m.cfg.Enabled = v
 	m.mu.Unlock()
+	m.enabled.Store(v)
 }
 
 // SetRoutingActive marks split-routing as committed/active, persisted so the

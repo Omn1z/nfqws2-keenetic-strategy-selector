@@ -97,16 +97,53 @@ type ClientConfig struct {
 	PeerID  string `json:"peer_id"` // which Peer represents this router
 }
 
-// Zone is a named group of domains/IPs for split routing. Each zone carries its
-// own direction: Mode "include" routes its members THROUGH the tunnel, "exclude"
-// keeps them DIRECT (bypass) — exclude wins on overlap (carve-out).
+// Zone (rendered in the UI as «Правило») is a named match-list for split
+// routing. Each rule carries its own Route — "tunnel" pushes its members
+// THROUGH the VPN, "direct" keeps them on the native WAN. The order of the
+// Zones slice IS the priority: when a name matches several rules, the FIRST
+// matching rule's route wins (the array is walked top-to-bottom and the
+// decision short-circuits at the first hit).
+//
+// Mode is the legacy field name. Old configs use "include"/"exclude"; we
+// migrate to Route on first read in RouteValue() so both names coexist.
 type Zone struct {
 	Name      string   `json:"name"`
-	Mode      string   `json:"mode"` // "include" (→ tunnel) | "exclude" (→ direct/bypass)
+	Route     string   `json:"route,omitempty"` // "tunnel" | "direct" — new vocabulary
+	Mode      string   `json:"mode,omitempty"`  // legacy: "include" (→ tunnel) | "exclude" (→ direct)
 	Domains   []string `json:"domains"`
 	IPs       []string `json:"ips"`
 	SourceIPs []string `json:"source_ips"` // per-source-device filter: if non-empty, the zone applies ONLY to packets from these LAN IPs/CIDRs. Empty = whole LAN (the historical default).
 	Enabled   bool     `json:"enabled"`
+}
+
+// RouteValue returns the rule's effective route in the new vocabulary,
+// migrating the legacy Mode field when Route is empty. "tunnel" / "direct".
+func (z Zone) RouteValue() string {
+	if z.Route == "tunnel" || z.Route == "direct" {
+		return z.Route
+	}
+	if z.Mode == "exclude" {
+		return "direct"
+	}
+	return "tunnel"
+}
+
+// IsCatchAll reports whether this zone matches every name/IP — a bare "*" in
+// Domains or "0.0.0.0/0" / "::/0" in IPs. Under first-match-wins a catch-all
+// rule shadows every rule after it in the array.
+func (z Zone) IsCatchAll() bool {
+	for _, d := range z.Domains {
+		if s := strings.TrimSpace(d); s == "*" {
+			return true
+		}
+	}
+	for _, ip := range z.IPs {
+		switch strings.TrimSpace(ip) {
+		case "0.0.0.0/0", "::/0":
+			return true
+		}
+	}
+	return false
 }
 
 // RoutingConfig controls the local-router split routing (Part C).
@@ -117,6 +154,7 @@ type RoutingConfig struct {
 	Killswitch   bool   `json:"killswitch"`
 	DomainSource string `json:"domain_source"` // "resolve"|"dnsproxy"
 	SNIRouting   bool   `json:"sni_routing"`   // additional: sniff TLS ClientHello SNI and route matched domains' IPs via the tunnel (beats DoH + CDN)
+	TraceEnabled bool   `json:"trace_enabled"` // per-flow trace log (DNS + SNI) — off by default; flip from UI when debugging
 	Active       bool   `json:"active"`        // committed → re-apply on boot (set on commit, cleared on explicit teardown)
 }
 

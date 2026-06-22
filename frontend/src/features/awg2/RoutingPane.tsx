@@ -1,61 +1,21 @@
 import { useEffect, useRef, useState } from "react";
 import { api } from "@/lib/api";
-import { cn } from "@/lib/cn";
 import { toast } from "@/components/ui/Toast";
 import { confirmDialog } from "@/components/ui/Confirm";
 import { Card } from "@/components/ui/Card";
 import { Button } from "@/components/ui/Button";
 import { Badge } from "@/components/ui/Badge";
 import { Switch } from "@/components/ui/Switch";
-import { Field, Input, Select, Textarea } from "@/components/ui/form";
-import type { Awg2Status, AwgRoutingConfig, AwgZone, Device } from "@/types/api";
+import { Field, Input, Select } from "@/components/ui/form";
+import type { Awg2Status, AwgRoutingConfig, AwgZone } from "@/types/api";
+import RulesTable from "./RulesTable";
 
-// DevicePicker fetches the live device list (DHCP leases + ARP cache, same data
-// the Devices tab shows) so the user can click a hostname instead of typing the
-// IP. Picking a device appends its LAN IP to the zone's source_ips; the v6 path
-// auto-derives from the MAC at apply time (see firewall_linux.go), so one click
-// covers both families.
-function DevicePicker({ onPick }: { onPick: (ip: string) => void }) {
-  const [devices, setDevices] = useState<Device[]>([]);
-  const [open, setOpen] = useState(false);
-  useEffect(() => {
-    if (!open) return;
-    void (async () => {
-      try {
-        const v = await api<{ devices: Device[] }>("GET", "/api/devices");
-        setDevices((v.devices ?? []).filter((d) => d.ip));
-      } catch (e) { toast((e as Error).message, "err"); }
-    })();
-  }, [open]);
-  return (
-    <span className="relative inline-block">
-      <Button mini onClick={() => setOpen((v) => !v)}>+ из списка</Button>
-      {open && (
-        <div className="absolute left-0 top-full z-10 mt-1 max-h-72 w-72 overflow-y-auto rounded-lg border border-line bg-panel p-1 text-xs shadow-lg">
-          {devices.length === 0 ? (
-            <div className="px-2 py-1 text-muted">Загрузка...</div>
-          ) : devices.map((d) => (
-            <button key={d.mac + d.ip} type="button" onClick={() => { onPick(d.ip); setOpen(false); }} className="block w-full rounded px-2 py-1 text-left hover:bg-line-soft">
-              {d.hostname && <b className="text-ink">{d.hostname} </b>}
-              <span className="font-mono">{d.ip}</span>
-              {!d.hostname && <span className="ml-2 text-muted">{d.mac}</span>}
-            </button>
-          ))}
-        </div>
-      )}
-    </span>
-  );
-}
 
-// One combined list per zone: domains/masks AND IPv4/IPv6/CIDR in the same box.
+// One combined list per rule: domains/masks AND IPv4/IPv6/CIDR in the same box.
 // During editing everything lives in z.domains; on save we split IP/CIDR lines into
 // z.ips and keep the rest in z.domains (the backend routes ips via ipset and
 // domains/masks via the DNS proxy).
 const zoneLines = (z: AwgZone) => [...(z.domains || []), ...(z.ips || [])];
-const toLines = (a: string[]) => (a || []).join("\n");
-// Keep raw lines while editing (don't trim/drop blanks — that fights the cursor
-// and blocks pressing Enter). Clean (trim + drop empties) only when saving.
-const splitRaw = (s: string) => s.split("\n");
 const cleanArr = (a: string[]) => (a || []).map((x) => x.trim()).filter(Boolean);
 const isIPish = (s: string) =>
   /^(\d{1,3}\.){3}\d{1,3}(\/\d{1,2})?$/.test(s) || // IPv4 / CIDR
@@ -184,56 +144,16 @@ export default function RoutingPane({ st, reload }: { st: Awg2Status; reload: ()
   };
   const commit = () => post("/api/awg2/routing/commit", {}, "Подтверждено — авто-откат отменён", stopCountdown);
 
-  // Save + apply + commit when the tunnel is ALREADY active. No confirm dialog
-  // and no 90s dead-man's countdown — the panel can't lose itself because
-  // LAN/private/self are always excluded from the tunnel, so re-applying live
-  // zones can't cut access. The previous behaviour (POST only /routing/config)
-  // was wrong: the backend persists the new config but doesn't rebuild ipsets
-  // until /apply, so zone edits silently never took effect.
-  const applyRoutingLive = async () => {
-    setBusy(true);
-    try {
-      const nextRouting = cleanRouting(r);
-      await api("POST", "/api/awg2/routing/config", nextRouting);
-      markSaved(nextRouting);
-      await api("POST", "/api/awg2/routing/apply", {});
-      // Commit immediately — there's no need for the dead-man's switch because
-      // the tunnel is already up; this is a refresh, not a cut-over.
-      await api("POST", "/api/awg2/routing/commit", {});
-      toast("Зоны применены к туннелю", "ok");
-      await reload();
-    } catch (e) {
-      toast((e as Error).message, "err");
-    } finally {
-      setBusy(false);
-    }
-  };
   const teardown = () => {
     const nextRouting = cleanRouting({ ...r, mode: "off" });
     void post("/api/awg2/routing/config", nextRouting, "Маршрутизация снята", stopCountdown, nextRouting);
   };
 
   const setZone = (i: number, patch: Partial<AwgZone>) => setR((p) => ({ ...p, zones: p.zones.map((z, j) => (j === i ? { ...z, ...patch } : z)) }));
-  const addZone = () => setR((p) => ({ ...p, zones: [...(p.zones || []), { name: "новая зона", mode: "include", domains: [], ips: [], source_ips: [], enabled: true }] }));
-  const delZone = (i: number) => setR((p) => ({ ...p, zones: p.zones.filter((_, j) => j !== i) }));
-
-  // Per-zone Include/Exclude picker: each zone routes its own members THROUGH the
-  // tunnel (include) or DIRECT/bypass (exclude). The base for everything else is
-  // derived on the backend: any include-zone → whitelist (only includes via VPN,
-  // excludes carve out); only exclude-zones → blacklist (everything via VPN except).
-  const zoneSeg = (i: number, z: AwgZone, m: "include" | "exclude", label: string, hint: string) => (
-    <button
-      type="button"
-      title={hint}
-      onClick={() => setZone(i, { mode: m })}
-      className={cn(
-        "border-r border-line px-2.5 py-1 text-xs outline-none transition last:border-r-0 focus-visible:relative focus-visible:ring-2 focus-visible:ring-ring/40",
-        (z.mode || "include") === m ? "bg-accent text-white" : "bg-panel text-ink-soft hover:bg-line-soft",
-      )}
-    >
-      {label}
-    </button>
-  );
+  // Per-zone editor lives in RulesTable now — the legacy zone-form +
+  // include/exclude segment was replaced by a pi-hole-style table. setZone is
+  // kept for any in-place tweaks (the table calls it from row controls).
+  void setZone;
 
   return (
     <>
@@ -310,39 +230,8 @@ export default function RoutingPane({ st, reload }: { st: Awg2Status; reload: ()
           : <p className="mt-2 text-[11px] text-muted">Локальная сеть, приватные адреса и адрес сервера VPN всегда идут в обход туннеля. Первое применение защищено авто-откатом: если панель станет недоступна — маршрутизация откатится сама.</p>}
       </Card>
 
-      <Card title="Зоны" sub="что заводить в туннель — домены, маски и IP в одном списке" head={<Button mini onClick={addZone}>Добавить зону</Button>}>
-        <p className="mb-2 text-[11px] text-muted"><b>Включить</b> — зона идёт через VPN; <b>Исключить</b> — мимо VPN (напрямую). Есть хоть одна «Включить» → через туннель идут только include-зоны (exclude вырезаются); только «Исключить» → через туннель идёт всё, кроме них. <b>Звёздочка <code>*</code> отдельной строкой во «Включить»-зоне = весь трафик через VPN</b> — надёжно, на уровне файрвола (работает для всех сайтов, не зависит от DNS); вместе с «Исключить»-зоной = всё, кроме неё. В список можно вписывать вперемешку: домены/маски, IPv4 и подсети (напр. <b>104.18.0.0/16</b>); IPv6 принимается, но в туннель пока не маршрутизируется.</p>
-        {(r.zones || []).length === 0 ? (
-          <p className="text-xs text-muted">Зон нет. Добавьте зону и впишите домены (напр. youtube.com), маски (ip*) и/или IP/подсети — всё в одном списке.</p>
-        ) : (
-          (r.zones || []).map((z, i) => (
-            <div key={i} className="mb-3 rounded-lg border border-line p-2.5">
-              <div className="mb-2 flex flex-wrap items-center gap-3">
-                <Input className="w-44" value={z.name} onChange={(e) => setZone(i, { name: e.target.value })} />
-                <div className="inline-flex overflow-hidden rounded-md border border-line" role="group" aria-label="Режим зоны">
-                  {zoneSeg(i, z, "include", "Включить", "Зона идёт через VPN (туннель)")}
-                  {zoneSeg(i, z, "exclude", "Исключить", "Зона идёт мимо VPN (напрямую)")}
-                </div>
-                <Switch checked={z.enabled} onChange={(v) => setZone(i, { enabled: v })} label="вкл" />
-                <Button mini onClick={() => delZone(i)}>Удалить</Button>
-              </div>
-              <Field label="Домены, маски и IP — всё в одном списке (по строке)" hint={"Префиксы xray-стиля: domain:vk.com (суффикс), full:exact.com (точный), geosite:cn / geoip:cn (категория из загруженного geosite.dat/geoip.dat), regexp:^.*\\.foo$ (Go regex), keyword:foo (substring), list:user (читает /opt/etc/nfqws2/lists/user.list). Без префикса работает по-старому."}>
-                <Textarea rows={6} value={toLines(zoneLines(z))} placeholder={"youtube.com\n*ip*\ndomain:vk.com\ngeosite:cn\nregexp:^.*\\.googlevideo\\.com$\nlist:user\n104.18.0.0/16"} onChange={(e) => setZone(i, { domains: splitRaw(e.target.value), ips: [] })} />
-              </Field>
-              <Field label="Источники (LAN IP/CIDR — пусто = вся сеть)" hint={"Если задано, зона применяется ТОЛЬКО к пакетам от этих устройств (IPv4 — по адресу, IPv6 — по MAC из ARP-кэша). Семантика для source-зоны: include + пустые домены = ВЕСЬ трафик источников в туннель; include + домены = только эти домены в туннель для этих источников; exclude + домены = эти домены идут direct ДЛЯ ЭТИХ источников (carve-out поверх include). Order: exclude перебивает include. Source-зоны не влияют на других пользователей сети."}>
-                <div className="flex items-start gap-2">
-                  <Textarea rows={2} className="flex-1" value={toLines(z.source_ips || [])} placeholder={"192.168.31.243\n192.168.31.100"} onChange={(e) => setZone(i, { source_ips: splitRaw(e.target.value) })} />
-                  <DevicePicker onPick={(ip) => {
-                    const cur = (z.source_ips || []).map((s) => s.trim()).filter(Boolean);
-                    if (cur.includes(ip)) return;
-                    setZone(i, { source_ips: [...cur, ip] });
-                  }} />
-                </div>
-              </Field>
-            </div>
-          ))
-        )}
-        {(r.zones || []).length > 0 && <Button variant="primary" onClick={() => { if (!active) { void applyRouting(); } else { void applyRoutingLive(); } }} disabled={busy}>Сохранить и применить зоны</Button>}
+      <Card title="Правила" sub="приоритет сверху вниз — первое совпадение определяет маршрут · применяются автоматически">
+        <RulesTable r={r} setR={setRState} st={st} reload={reload} />
       </Card>
     </>
   );

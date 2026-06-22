@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"golang.org/x/crypto/ssh"
+
+	"nfqws2strategy/internal/tools/shell"
 )
 
 // Client is a minimal SSH client (one connection, sequential commands). It is
@@ -108,7 +110,7 @@ func (c *Client) Put(ctx context.Context, p string, mode uint32, data []byte) er
 	sess.Stdin = bytes.NewReader(data)
 	var errb bytes.Buffer
 	sess.Stderr = &errb
-	cmd := fmt.Sprintf(`p=%s; mkdir -p "$(dirname "$p")" && umask 077 && cat > "$p" && chmod %o "$p"`, shellQuote(p), mode)
+	cmd := fmt.Sprintf(`p=%s; mkdir -p "$(dirname "$p")" && umask 077 && cat > "$p" && chmod %o "$p"`, shell.Quote(p), mode)
 	done := make(chan error, 1)
 	go func() { done <- sess.Run(cmd) }()
 	select {
@@ -128,8 +130,4 @@ func (c *Client) Close() error {
 		return c.cli.Close()
 	}
 	return nil
-}
-
-func shellQuote(s string) string {
-	return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 }

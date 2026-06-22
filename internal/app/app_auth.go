@@ -14,9 +14,16 @@ const (
 )
 
 type settings struct {
-	AuthEnabled      bool `json:"auth_enabled"`
-	LoggingDisabled  bool `json:"logging_disabled"`
-	HTTPLogsDisabled bool `json:"http_logs_disabled"`
+	AuthEnabled      bool   `json:"auth_enabled"`
+	LoggingDisabled  bool   `json:"logging_disabled"`
+	HTTPLogsDisabled bool   `json:"http_logs_disabled"`
+	// TraceMode is the AWG2 per-flow trace recording policy:
+	//   "off"    — never record; counters still tick (dashboard RPS stays alive).
+	//   "auto"   — record only while a client (TracePane) is viewing the log.
+	//   "always" — record continuously.
+	// "auto" is the default — costs nothing when nobody is looking and Just
+	// Works when the user opens the tab.
+	TraceMode string `json:"trace_mode"`
 }
 
 // initAuth loads system settings (auth default enabled, logging default on).
@@ -29,15 +36,54 @@ func (a *App) initAuth() {
 	if os.Getenv("N2S_NOAUTH") == "1" {
 		s.AuthEnabled = false
 	}
+	if s.TraceMode == "" {
+		s.TraceMode = "auto"
+	}
 	a.authEnabled = s.AuthEnabled
 	a.loggingDisabled = s.LoggingDisabled
 	a.httpLogsDisabled = s.HTTPLogsDisabled
+	a.traceMode = s.TraceMode
 	logbuf.SetEnabled(!s.LoggingDisabled)
 }
 
 // saveSettings persists the current toggles (call with a.mu held).
 func (a *App) saveSettings() error {
-	return a.store.Save(settingsFile, settings{AuthEnabled: a.authEnabled, LoggingDisabled: a.loggingDisabled, HTTPLogsDisabled: a.httpLogsDisabled})
+	return a.store.Save(settingsFile, settings{
+		AuthEnabled:      a.authEnabled,
+		LoggingDisabled:  a.loggingDisabled,
+		HTTPLogsDisabled: a.httpLogsDisabled,
+		TraceMode:        a.traceMode,
+	})
+}
+
+// TraceMode returns the persisted recording policy (off|auto|always).
+func (a *App) TraceMode() string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.traceMode == "" {
+		return "auto"
+	}
+	return a.traceMode
+}
+
+// SetTraceMode persists the policy and pushes it to the AWG route service.
+// "always" → flip the ring on immediately; "off" → flip it off; "auto" lets
+// the frontend tab control it (mount-on / unmount-off).
+func (a *App) SetTraceMode(mode string) error {
+	if mode != "off" && mode != "auto" && mode != "always" {
+		mode = "auto"
+	}
+	a.mu.Lock()
+	a.traceMode = mode
+	err := a.saveSettings()
+	a.mu.Unlock()
+	switch mode {
+	case "always":
+		a.awgroute.TraceSetEnabled(true)
+	case "off":
+		a.awgroute.TraceSetEnabled(false)
+	}
+	return err
 }
 
 func (a *App) AuthEnabled() bool {

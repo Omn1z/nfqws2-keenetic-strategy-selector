@@ -106,7 +106,13 @@ func (a *App) executeBlockCheck(ctx context.Context, bc *BlockCheck, targets []s
 		sandboxes[w] = sb
 	}
 	defer func() {
+		// Slots can stay nil if a later worker's RulesUpExcludeOnly returned an
+		// error (we abort the loop after rolling back earlier ones, then fall
+		// through to this defer). Skip nils so we don't nil-deref on cleanup.
 		for _, sb := range sandboxes {
+			if sb == nil {
+				continue
+			}
 			sb.RulesDown()
 		}
 	}()

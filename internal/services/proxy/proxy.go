@@ -178,19 +178,12 @@ func (s *Service) TGWSSetConfig(in *tgws.Config) error {
 	return nil
 }
 
-func (s *Service) TGWSStart() error {
-	cur := s.tgws.Config()
-	cur.Enabled = true
-	if err := s.tgws.SetConfig(&cur); err != nil {
-		return err
-	}
-	s.tgwsSave()
-	return nil
-}
+func (s *Service) TGWSStart() error { return s.tgwsSetEnabled(true) }
+func (s *Service) TGWSStop() error  { return s.tgwsSetEnabled(false) }
 
-func (s *Service) TGWSStop() error {
+func (s *Service) tgwsSetEnabled(enabled bool) error {
 	cur := s.tgws.Config()
-	cur.Enabled = false
+	cur.Enabled = enabled
 	if err := s.tgws.SetConfig(&cur); err != nil {
 		return err
 	}
@@ -267,19 +260,12 @@ func (s *Service) Socks5SetConfig(in *tgws.Socks5Config) error {
 	return nil
 }
 
-func (s *Service) Socks5Start() error {
-	cur := s.socks5.Config()
-	cur.Enabled = true
-	if err := s.socks5.SetConfig(&cur); err != nil {
-		return err
-	}
-	s.socks5Save()
-	return nil
-}
+func (s *Service) Socks5Start() error { return s.socks5SetEnabled(true) }
+func (s *Service) Socks5Stop() error  { return s.socks5SetEnabled(false) }
 
-func (s *Service) Socks5Stop() error {
+func (s *Service) socks5SetEnabled(enabled bool) error {
 	cur := s.socks5.Config()
-	cur.Enabled = false
+	cur.Enabled = enabled
 	if err := s.socks5.SetConfig(&cur); err != nil {
 		return err
 	}
