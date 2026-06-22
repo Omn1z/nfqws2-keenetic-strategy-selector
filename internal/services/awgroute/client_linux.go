@@ -4,7 +4,6 @@ package awgroute
 
 import (
 	"archive/tar"
-	"bufio"
 	"bytes"
 	"compress/gzip"
 	"context"
@@ -19,7 +18,6 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"nfqws2strategy/internal/services/awg"
@@ -221,7 +219,6 @@ func (svc *Service) awgClientUpOS() error {
 }
 
 func (svc *Service) awgClientDownOS() error {
-	awgCloseUAPI()
 	// Drop the proxy-front routes first (they point at awg0, about to disappear).
 	for _, ip := range tgfronts.IPs() {
 		_, _ = awgRun("ip route del " + ip + "/32 dev " + awgIface + " 2>/dev/null")
@@ -236,7 +233,6 @@ func (svc *Service) awgClientDownOS() error {
 	ctx, cancel := contextTimeout(15 * time.Second)
 	defer cancel()
 	out, _ := exec.CommandContext(ctx, "sh", "-c", script).CombinedOutput()
-	awgCloseUAPI()
 	logbuf.Append("awg2", "info", "туннель awg0 опущен: "+strs.LastLines(strings.TrimSpace(string(out)), 2))
 	return nil
 }
@@ -260,87 +256,27 @@ func (svc *Service) awgClientStatusOS() *ClientStatus {
 	return st
 }
 
-// UAPI shared persistent connection state. amneziawg-go's IpcHandle (inherited
-// from wireguard-go) loops reading `op\n` requests on the socket until EOF — it
-// supports multiple operations per connection. The previous code did
-// `CloseWrite` after each request which forced single-shot semantics: every
-// Status/probe paid for a fresh dial + connect syscall. Holding one connection
-// open and serializing requests under a mutex eliminates that overhead
-// (typical Dashboard tick: ~5 UAPI calls — used to be ~5 syscall storms, now 1
-// dial amortized across the process lifetime).
-var (
-	uapiMu     sync.Mutex
-	uapiConn   *net.UnixConn
-	uapiReader *bufio.Reader
-)
-
-func awgCloseUAPI() {
-	uapiMu.Lock()
-	defer uapiMu.Unlock()
-	if uapiConn != nil {
-		_ = uapiConn.Close()
-	}
-	uapiConn = nil
-	uapiReader = nil
-}
-
-// uapiRequest sends a UAPI request over the amneziawg-go unix socket and
-// returns the response (up to the `errno=N\n\n` terminator). Auto-redials on
-// any I/O error so a daemon restart or transient blip is invisible to callers.
+// uapiRequest sends one UAPI request over a short-lived amneziawg-go unix
+// socket. Keep the half-close: wireguard-go/amneziawg-go treat EOF on the write
+// side as the unambiguous end-of-request on all builds we target.
 func uapiRequest(req string) (string, error) {
-	uapiMu.Lock()
-	defer uapiMu.Unlock()
-
-	var lastErr error
-	for attempt := 0; attempt < 2; attempt++ {
-		if uapiConn == nil {
-			raw, err := net.DialTimeout("unix", awgSock, 5*time.Second)
-			if err != nil {
-				lastErr = err
-				continue
-			}
-			uc, ok := raw.(*net.UnixConn)
-			if !ok {
-				_ = raw.Close()
-				lastErr = fmt.Errorf("uapi: dial returned non-unix conn")
-				continue
-			}
-			uapiConn = uc
-			uapiReader = bufio.NewReader(uapiConn)
-		}
-		resp, err := uapiCallLocked(req)
-		if err == nil {
-			return resp, nil
-		}
-		// Connection died mid-call. Close + clear so the next attempt redials.
-		_ = uapiConn.Close()
-		uapiConn = nil
-		uapiReader = nil
-		lastErr = err
-	}
-	return "", lastErr
-}
-
-// uapiCallLocked must be called with uapiMu held and uapiConn/uapiReader set.
-// Reads the response until the blank-line terminator (\n\n) so the connection
-// can be reused for the next call. Cap at 64 KiB defensively.
-func uapiCallLocked(req string) (string, error) {
-	_ = uapiConn.SetDeadline(time.Now().Add(8 * time.Second))
-	if _, err := io.WriteString(uapiConn, req); err != nil {
+	conn, err := net.DialTimeout("unix", awgSock, 5*time.Second)
+	if err != nil {
 		return "", err
 	}
-	var sb strings.Builder
-	for sb.Len() < 64<<10 {
-		line, err := uapiReader.ReadString('\n')
-		if err != nil {
-			return "", err
-		}
-		if line == "\n" || line == "\r\n" {
-			return sb.String(), nil
-		}
-		sb.WriteString(line)
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(8 * time.Second))
+	if _, err := io.WriteString(conn, req); err != nil {
+		return "", err
 	}
-	return "", fmt.Errorf("uapi: response exceeds 64 KiB cap")
+	if uc, ok := conn.(*net.UnixConn); ok {
+		_ = uc.CloseWrite()
+	}
+	data, err := io.ReadAll(io.LimitReader(conn, 64<<10))
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
 }
 
 // ---- helpers ----
