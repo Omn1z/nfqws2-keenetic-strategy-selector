@@ -1,6 +1,8 @@
 package app
 
 import (
+	"context"
+
 	"nfqws2strategy/internal/services/awg"
 	"nfqws2strategy/internal/services/awgroute"
 )
@@ -56,6 +58,17 @@ func (a *App) AWG2SetRouting(rc awg.RoutingConfig) error { return a.awgroute.AWG
 func (a *App) AWG2ApplyRouting() error                   { return a.awgroute.AWG2ApplyRouting() }
 func (a *App) AWG2CommitRouting() error                  { return a.awgroute.AWG2CommitRouting() }
 func (a *App) AWG2TeardownRouting() error                { return a.awgroute.AWG2TeardownRouting() }
+
+func (a *App) AWG2TraceStatus() awgroute.TraceStatus           { return a.awgroute.TraceStatus() }
+func (a *App) AWG2TraceSnapshot(since int64) []awgroute.TraceEntry { return a.awgroute.TraceSnapshot(since) }
+func (a *App) AWG2TraceSetEnabled(on bool) bool                { return a.awgroute.TraceSetEnabled(on) }
+func (a *App) AWG2TraceClear()                                 { a.awgroute.TraceClear() }
+func (a *App) AWG2TraceCounters() awgroute.TraceCounters       { return a.awgroute.TraceCounters() }
+func (a *App) AWG2InsertTopRule(domain, route, name string) error { return a.awgroute.AWG2InsertTopRule(domain, route, name) }
+func (a *App) AWG2CopyRulesFromServer(fromID string) (int, error) { return a.awgroute.AWG2CopyRulesFromServer(fromID) }
+func (a *App) AWG2SpeedTest(ctx context.Context, opts awgroute.SpeedTestOptions) awgroute.SpeedTestResult {
+	return a.awgroute.RunSpeedTest(ctx, opts)
+}
 
 // ProxyAWGFallback is the shared "AWG2-as-fallback for the ISP-blocked Telegram DCs"
 // view: the current selection plus the AWG2 servers the proxies may route through.

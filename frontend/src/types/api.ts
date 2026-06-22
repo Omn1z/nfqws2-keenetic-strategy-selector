@@ -164,6 +164,7 @@ export interface Conn {
 
 export interface Device {
   ip: string;
+  ipv6?: string[]; // every v6 address (global + link-local) the same MAC was seen using
   mac: string;
   hostname?: string;
   iface: string;
@@ -334,7 +335,19 @@ export interface AwgPeer {
   address: string; allowed_ips: string; keepalive: number;
   is_router: boolean; has_private: boolean; created_at: number;
 }
-export interface AwgZone { name: string; mode: string; domains: string[]; ips: string[]; source_ips?: string[]; enabled: boolean }
+/** A routing rule (UI: «Правило»). Order in the parent zones[] array IS its
+ *  priority — the first matching rule wins. `route` is the new vocabulary
+ *  ("tunnel" / "direct"); `mode` ("include" / "exclude") is the legacy field
+ *  still accepted by the backend for backward compat. Always write `route`. */
+export interface AwgZone {
+  name: string;
+  route?: "tunnel" | "direct";
+  mode?: string; // legacy: "include"|"exclude"
+  domains: string[];
+  ips: string[];
+  source_ips?: string[];
+  enabled: boolean;
+}
 export interface AwgRoutingConfig {
   mode: string; zones: AwgZone[]; mtu: number; killswitch: boolean; domain_source: string;
   sni_routing?: boolean;
@@ -503,6 +516,16 @@ export interface Dashboard {
   wan: IfaceBytes[];
   system: SystemStats;
   top_devices: Device[];
+  trace_counters: TraceCounters;
+}
+
+export interface TraceCounters {
+  dns: number;
+  sni: number;
+  tunnel: number;
+  direct: number;
+  blocked: number;
+  cdn_skip: number;
 }
 
 export interface ConnectionsView {
@@ -559,6 +582,7 @@ export interface SystemSettings {
   auth_forced_off: boolean;
   logging_enabled: boolean;
   http_logs_enabled: boolean;
+  trace_mode: "off" | "auto" | "always";
 }
 
 export interface BlobCapture {
