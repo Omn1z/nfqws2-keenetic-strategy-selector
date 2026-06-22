@@ -96,7 +96,8 @@ type IfaceBytes struct {
 // is the reply direction. Counters go stale under hardware offload, so these
 // are display-only and never used for routing decisions.
 type Device struct {
-	IP          string   `json:"ip"`
+	IP          string   `json:"ip"`            // primary v4 address (or first v6 if no v4)
+	IPv6        []string `json:"ipv6,omitempty"` // every v6 address seen for this MAC (global + link-local)
 	MAC         string   `json:"mac"`
 	Hostname    string   `json:"hostname"` // best-effort from DHCP leases; "" when unknown
 	Iface       string   `json:"iface"`
