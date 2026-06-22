@@ -132,13 +132,16 @@ func (svc *Service) awgEnsureClientUpForRouting(reason string) error {
 	if !am.Enabled() {
 		return fmt.Errorf("AWG2-сервер выключен")
 	}
-	if cs := svc.awgClientStatusOS(); cs != nil && cs.IfacePresent {
+	if cs := svc.awgClientStatusOS(); cs != nil && cs.Running {
 		if !am.ClientEnabled() {
 			am.SetClientEnabled(true)
 			svc.route.tunnelUpAt.Store(0)
 			svc.awgSave()
 		}
 		return nil
+	} else if cs != nil && cs.IfacePresent {
+		logbuf.Append("awg2", "warn", "найден awg0 без живого UAPI — пересоздаю туннель для "+reason)
+		_ = svc.awgClientDownOS()
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 40*time.Second)
 	defer cancel()
@@ -176,7 +179,7 @@ type awgRouteState struct {
 	rollback    *time.Timer
 	stopRefresh chan struct{}
 	active      bool
-	dnsProxy *awg.DNSProxy
+	dnsProxy    *awg.DNSProxy
 	// dnsChainEnabledFlag (atomic.Bool) tracks whether pi-hole sits in front of
 	// our proxy. Read on every firewall-hook re-render (watchdog tick) and on
 	// every DNS-proxy ensure call, so a lock here would contend with apply

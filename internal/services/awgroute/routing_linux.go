@@ -80,10 +80,8 @@ func (svc *Service) awgApplyRoutingOS() error {
 	if r.Mode == "off" {
 		return svc.awgTeardownRoutingOS()
 	}
-	if cs := svc.awgClientStatusOS(); cs == nil || !cs.IfacePresent {
-		if err := svc.awgEnsureClientUpForRouting("применения маршрутизации"); err != nil {
-			return fmt.Errorf("туннель awg0 не поднят — автоподнятие не удалось: %w", err)
-		}
+	if err := svc.awgEnsureClientUpForRouting("применения маршрутизации"); err != nil {
+		return fmt.Errorf("туннель awg0 не поднят — автоподнятие не удалось: %w", err)
 	}
 	if other := awgMarkCollision(); other != "" {
 		return fmt.Errorf("на роутере уже есть ip rule с пересекающейся fwmark (%s) — применение отменено во избежание конфликта с policy-routing роутера", other)
@@ -175,11 +173,9 @@ func (svc *Service) awgRefreshRoutingOS() error {
 	if r.Mode == "off" {
 		return svc.awgTeardownRoutingOS()
 	}
-	if cs := svc.awgClientStatusOS(); cs == nil || !cs.IfacePresent {
-		if err := svc.awgEnsureClientUpForRouting("обновления зон"); err != nil {
-			logbuf.Append("awg2", "warn", "зоны сохранены, но туннель не поднялся автоматически: "+err.Error())
-			return err
-		}
+	if err := svc.awgEnsureClientUpForRouting("обновления зон"); err != nil {
+		logbuf.Append("awg2", "warn", "зоны сохранены, но туннель не поднялся автоматически: "+err.Error())
+		return err
 	}
 	endpointIP := resolveHostIP(hostOf(cfg.Endpoint))
 	gw, wandev := awgDefaultRoute()

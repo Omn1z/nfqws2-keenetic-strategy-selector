@@ -221,6 +221,7 @@ func (svc *Service) awgClientUpOS() error {
 }
 
 func (svc *Service) awgClientDownOS() error {
+	awgCloseUAPI()
 	// Drop the proxy-front routes first (they point at awg0, about to disappear).
 	for _, ip := range tgfronts.IPs() {
 		_, _ = awgRun("ip route del " + ip + "/32 dev " + awgIface + " 2>/dev/null")
@@ -235,6 +236,7 @@ func (svc *Service) awgClientDownOS() error {
 	ctx, cancel := contextTimeout(15 * time.Second)
 	defer cancel()
 	out, _ := exec.CommandContext(ctx, "sh", "-c", script).CombinedOutput()
+	awgCloseUAPI()
 	logbuf.Append("awg2", "info", "туннель awg0 опущен: "+strs.LastLines(strings.TrimSpace(string(out)), 2))
 	return nil
 }
@@ -251,9 +253,9 @@ func (svc *Service) awgClientStatusOS() *ClientStatus {
 	if err != nil || !strings.Contains(resp, "public_key=") {
 		return st
 	}
-	st.Running = true
 	u := awg.ParseUAPIGet(resp)
 	st.LastHandshake, st.RxBytes, st.TxBytes, st.Endpoint = u.LastHandshake, u.RxBytes, u.TxBytes, u.Endpoint
+	st.Running = st.Endpoint != ""
 	st.Connected = u.LastHandshake > 0 && time.Now().Unix()-u.LastHandshake < 180
 	return st
 }
@@ -271,6 +273,16 @@ var (
 	uapiConn   *net.UnixConn
 	uapiReader *bufio.Reader
 )
+
+func awgCloseUAPI() {
+	uapiMu.Lock()
+	defer uapiMu.Unlock()
+	if uapiConn != nil {
+		_ = uapiConn.Close()
+	}
+	uapiConn = nil
+	uapiReader = nil
+}
 
 // uapiRequest sends a UAPI request over the amneziawg-go unix socket and
 // returns the response (up to the `errno=N\n\n` terminator). Auto-redials on
