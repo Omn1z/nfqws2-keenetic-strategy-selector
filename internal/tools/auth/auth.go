@@ -80,7 +80,30 @@ type Sessions struct {
 }
 
 func NewSessions(ttl time.Duration) *Sessions {
-	return &Sessions{m: map[string]time.Time{}, ttl: ttl}
+	s := &Sessions{m: map[string]time.Time{}, ttl: ttl}
+	// Lazy delete in Valid() only fires when a token is actually checked again.
+	// Sweeper removes expired tokens that were issued but never used so the map
+	// can't grow unbounded across long uptimes (router runs for weeks).
+	go s.sweep()
+	return s
+}
+
+// sweep periodically walks the session map and removes expired tokens. Runs
+// forever (paired with the process lifetime — Sessions has no Close()).
+func (s *Sessions) sweep() {
+	defer func() { _ = recover() }() // never let a panic in here crash the process
+	t := time.NewTicker(5 * time.Minute)
+	defer t.Stop()
+	for range t.C {
+		now := time.Now()
+		s.mu.Lock()
+		for tok, exp := range s.m {
+			if now.After(exp) {
+				delete(s.m, tok)
+			}
+		}
+		s.mu.Unlock()
+	}
 }
 
 func (s *Sessions) New() string {

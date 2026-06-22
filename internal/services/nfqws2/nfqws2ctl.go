@@ -32,6 +32,7 @@ import (
 
 	"nfqws2strategy/internal/tools/config"
 	"nfqws2strategy/internal/tools/logbuf"
+	"nfqws2strategy/internal/tools/strs"
 )
 
 // Manager owns the nfqws2 engine's on-disk files + package version/update/reload.
@@ -404,7 +405,11 @@ func (m *Manager) CheckUpdate() VersionInfo {
 		info.Error = "repo not configured"
 		return info
 	}
-	req, _ := http.NewRequest("GET", "https://api.github.com/repos/"+m.cfg.Nfqws2Repo+"/releases/latest", nil)
+	req, err := http.NewRequest("GET", "https://api.github.com/repos/"+m.cfg.Nfqws2Repo+"/releases/latest", nil)
+	if err != nil {
+		info.Error = err.Error()
+		return info
+	}
 	req.Header.Set("User-Agent", "nfqws2-strategy")
 	req.Header.Set("Accept", "application/vnd.github+json")
 	resp, err := (&http.Client{Timeout: 12 * time.Second}).Do(req)
@@ -441,10 +446,10 @@ func (m *Manager) Update() (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 600*time.Second)
 	defer cancel()
 	out, err := exec.CommandContext(ctx, "sh", "-c", script).CombinedOutput()
-	detail := lastLines(strings.TrimSpace(string(out)), 20)
+	detail := strs.LastLines(strings.TrimSpace(string(out)), 20)
 	if err != nil {
 		logbuf.Append("nfqws2", "error", "opkg upgrade: "+err.Error())
-		return detail, fmt.Errorf("%s (%v)", lastLines(detail, 4), err)
+		return detail, fmt.Errorf("%s (%v)", strs.LastLines(detail, 4), err)
 	}
 	logbuf.Append("nfqws2", "info", "opkg upgrade: готово")
 	return detail, nil
@@ -482,11 +487,3 @@ func readPid() (int, error) {
 	return pid, nil
 }
 
-// lastLines keeps at most the final n lines, for compact UI display.
-func lastLines(s string, n int) string {
-	lines := strings.Split(s, "\n")
-	if len(lines) <= n {
-		return s
-	}
-	return strings.Join(lines[len(lines)-n:], "\n")
-}

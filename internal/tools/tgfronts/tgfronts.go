@@ -29,15 +29,6 @@ func FrontForDC(dc int) (string, bool) {
 	return ip, ok
 }
 
-// IPs returns the distinct front IPs to route through the tunnel (deduped).
-func IPs() []string {
-	seen := map[string]bool{}
-	out := make([]string, 0, len(byDC))
-	for _, ip := range byDC {
-		if !seen[ip] {
-			seen[ip] = true
-			out = append(out, ip)
-		}
-	}
-	return out
-}
+// IPs returns the distinct front IPs to route through the tunnel.
+// DC1 and DC3 share the same front, so only DC1 and DC5 are listed.
+func IPs() []string { return []string{byDC[1], byDC[5]} }

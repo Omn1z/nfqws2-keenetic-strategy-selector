@@ -9,3 +9,4 @@
 # React/Vite frontend deps (source + package-lock are committed; the built
 # single-file internal/server/web/index.html is committed and embedded).
 /frontend/node_modules/
+build/

@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"strconv"
 	"syscall"
 	"time"
@@ -20,6 +21,29 @@ import (
 	"nfqws2strategy/internal/tools/logbuf"
 	"nfqws2strategy/internal/tools/probe"
 )
+
+func init() {
+	// Router-side runtime tuning. BE7000 has ~800 MiB RAM shared with vendor
+	// daemons + Docker + pi-hole — Go's default GC pacing (GOGC=100, no soft
+	// memory ceiling) is happy to keep doubling the heap, which on a router can
+	// trigger OOM-kill cascades. Two knobs:
+	//
+	//   GOMEMLIMIT=250MiB — soft ceiling. The runtime starts GC'ing harder as
+	//   the heap approaches this; on a process that idles around 50-100 MiB
+	//   live this keeps peak well under control without throttling normal ops.
+	//
+	//   GOGC=75 — slightly more aggressive than default (100). Costs a bit of
+	//   CPU but trims tail-allocation spikes a router can't afford.
+	//
+	// Both are overridable via env vars (debug.Set* honours envs), so a future
+	// dev who needs different limits can just export them.
+	if v, ok := os.LookupEnv("GOMEMLIMIT"); !ok || v == "" {
+		debug.SetMemoryLimit(250 << 20)
+	}
+	if v, ok := os.LookupEnv("GOGC"); !ok || v == "" {
+		debug.SetGCPercent(75)
+	}
+}
 
 // version is set at build time via -ldflags "-X main.version=...".
 var version = "dev"

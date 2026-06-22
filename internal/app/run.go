@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -38,14 +39,6 @@ type RunRequest struct {
 type runJob struct {
 	strat catalog.Strategy
 	dns   *dns.Server
-}
-
-// dnsLabel is the (id, display name) for a DNS choice; nil = the system resolver.
-func dnsLabel(d *dns.Server) (id, name string) {
-	if d == nil {
-		return "", "Системный"
-	}
-	return d.ID, d.Name
 }
 
 // runDNSChoices maps selected server ids to DNS choices. Empty selection (or an
@@ -119,8 +112,8 @@ func (a *App) GetRun(id string) (*Run, bool) {
 	// Snapshot under the lock: workers append to the live run concurrently, so the
 	// caller must not encode the original slices.
 	cp := *r
-	cp.Results = append([]StrategyResult(nil), r.Results...)
-	cp.Baseline = append([]TargetCheck(nil), r.Baseline...)
+	cp.Results = slices.Clone(r.Results)
+	cp.Baseline = slices.Clone(r.Baseline)
 	return &cp, true
 }
 
@@ -500,7 +493,10 @@ func classifyProbe(host string, r probe.Result) TargetCheck {
 
 func (a *App) testStrategy(ctx context.Context, sb *engine.Sandbox, pr *probe.Prober, job runJob, targets []string, resolver *dns.Resolver) StrategyResult {
 	s := job.strat
-	dnsID, dnsName := dnsLabel(job.dns)
+	dnsID, dnsName := "", "Системный"
+	if job.dns != nil {
+		dnsID, dnsName = job.dns.ID, job.dns.Name
+	}
 	res := StrategyResult{StrategyID: s.ID, Name: s.Name, ArgLine: s.ArgLine, L7: s.L7, DNS: dnsName, DNSID: dnsID, TargetsTotal: len(targets)}
 	// Resolve targets through this job's DNS (nil = system resolver). The worker
 	// runs one job at a time, so mutating the shared prober here is safe.
@@ -513,7 +509,11 @@ func (a *App) testStrategy(ctx context.Context, sb *engine.Sandbox, pr *probe.Pr
 		pr.Resolve = nil
 	}
 	if err := sb.StartNfqws(nil, s.Args()); err != nil {
-		res.Error = firstLine(err.Error())
+		e := err.Error()
+		if i := strings.IndexByte(e, '\n'); i >= 0 {
+			e = e[:i]
+		}
+		res.Error = e
 		return res
 	}
 	defer sb.StopNfqws()
@@ -625,9 +625,3 @@ func sortResults(rs []StrategyResult) {
 	})
 }
 
-func firstLine(s string) string {
-	if i := strings.IndexByte(s, '\n'); i >= 0 {
-		return s[:i]
-	}
-	return s
-}
