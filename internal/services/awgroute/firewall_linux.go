@@ -162,6 +162,13 @@ func awgFirewallHook(mode, endpointIP, wandev string, mtu int, dnsRedirect, chai
 	s.WriteString("    done\n")
 	s.WriteString("  done\n")
 	s.WriteString("done\n")
+	// Older builds appended un-commented PREROUTING/OUTPUT jumps via
+	// iptables-restore --noflush. Remove them explicitly so every hook run
+	// leaves exactly one jump per chain instead of growing the hot path forever.
+	s.WriteString("for chn in PREROUTING OUTPUT; do\n")
+	s.WriteString("  while iptables -w -t mangle -D \"$chn\" -j " + awgChain + " 2>/dev/null; do :; done\n")
+	s.WriteString("  while ip6tables -w -t mangle -D \"$chn\" -j " + awgChain + "6 2>/dev/null; do :; done\n")
+	s.WriteString("done\n")
 
 	// v4doc / v6doc are the critical *mangle table documents we'll feed to
 	// iptables-restore --noflush. Keep them limited to MARK classification and

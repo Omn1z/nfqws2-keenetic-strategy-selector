@@ -25,9 +25,10 @@ func TestMultiFirewallHookWaitsForXtablesLock(t *testing.T) {
 		"IPTABLES_RESTORE='iptables-restore --noflush'",
 		"iptables-restore -w 5 --noflush",
 		"$IPTABLES_RESTORE <<'AWGMV4'",
-		"iptables -w -t mangle -A PREROUTING -j AWG2_MULTI",
+		"iptables -w -t mangle -I PREROUTING 1 -j AWG2_MULTI",
 		"iptables -w -t nat -A POSTROUTING -o awg0 -j MASQUERADE",
 		"iptables -w -t mangle -A FORWARD -o awg0",
+		"-A AWG2_MULTI -s 192.168.3.151 -m set --match-set awgm_000 dst -j ACCEPT",
 	} {
 		if !strings.Contains(hook, want) {
 			t.Fatalf("multi hook misses %q:\n%s", want, hook)

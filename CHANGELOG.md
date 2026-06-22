@@ -3,6 +3,18 @@
 Все заметные изменения проекта. Формат — [Keep a Changelog](https://keepachangelog.com/ru/),
 версионирование приближено к SemVer.
 
+## [v1.4.1] — 2026-06-23
+### Добавлено
+- **AWG2 Trace: реальные flow-события из conntrack.** Трассировка больше не зависит только от DNS/SNI runtime и показывает TCP/UDP/QUIC/ICMP соединения, порты, state/event, bytes/reply_bytes, matched rule и tunnel iface.
+- **AWG2 Trace: host-аннотации для IP-only flow.** DNS/SNI события подпитывают IP→host cache, а для encrypted-DNS/QUIC сценариев flow trace добирает PTR, поэтому `yandex.ru`/`ya.ru` снова ищутся по имени.
+
+### Изменено
+- **AWG2 Trace UI: мультиселект типов.** Фильтр «Тип» теперь позволяет включать любую комбинацию `DNS`, `SNI`, `Flow`; шумный `Flow` можно отключить, оставив только DNS/SNI.
+
+### Исправлено
+- **AWG2 multi-routing: трафик туннеля не уходит дальше в NFQUEUE.** `AWG2_MULTI` теперь ставится первым, а matched tunnel-пакеты после `MARK` завершаются `ACCEPT`, что убирает лишнюю обработку NFQWS и снижает задержки upload/Telegram.
+- **AWG2: очистка legacy routing runtime перед multi-policy.** Старые `AWG2_MARK` hooks и runtime DNS/SNI-процессы больше не мешают новому multi-policy режиму.
+
 ## [v1.4.0] — 2026-06-22
 ### Добавлено
 - **AWG2: WARP-профили из панели.** Добавлено создание WARP-сервера, авто-подбор рабочего Cloudflare endpoint и проверка текущего endpoint перед полным перебором.

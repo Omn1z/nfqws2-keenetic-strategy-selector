@@ -1,6 +1,8 @@
 package awgroute
 
 import (
+	"net"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -14,19 +16,32 @@ import (
 // persisted to disk, so a selector restart clears it.
 
 const traceRingCap = 5000
+const traceHostTTL = 30 * time.Minute
 
 // TraceEntry is one routed-traffic event. Field names are short because they
 // are serialized to JSON on every API hit (the ring can hold thousands).
 type TraceEntry struct {
-	TS       int64  `json:"ts"`              // unix-nanoseconds; 0 for empty slot
-	Src      string `json:"src,omitempty"`   // LAN client IP ("" = router-local / SNI without src)
-	Kind     string `json:"kind"`            // "dns" | "sni"
-	Name     string `json:"name"`            // qname or SNI hostname
-	Qtype    string `json:"qtype,omitempty"` // "A" | "AAAA" | "" for non-DNS
-	Dst      string `json:"dst,omitempty"`   // resolved IP / SNI destination
-	Decision string `json:"decision"`        // "tunnel" | "direct" | "blocked" | "cdn-skip"
-	Rule     int    `json:"rule,omitempty"`  // 1-based index of the matched rule (0 = no rule, default route)
-	Reason   string `json:"reason,omitempty"`
+	TS          int64  `json:"ts"`                     // unix-nanoseconds; 0 for empty slot
+	Src         string `json:"src,omitempty"`          // LAN client IP ("" = router-local / SNI without src)
+	Kind        string `json:"kind"`                   // "dns" | "sni" | "flow"
+	Name        string `json:"name"`                   // qname, SNI hostname or flow class
+	Qtype       string `json:"qtype,omitempty"`        // "A" | "AAAA" | "" for non-DNS
+	Dst         string `json:"dst,omitempty"`          // resolved IP / SNI destination / flow destination
+	Decision    string `json:"decision"`               // "tunnel" | "direct" | "blocked" | "cdn-skip"
+	Rule        int    `json:"rule,omitempty"`         // 1-based index of the matched rule (0 = no rule, default route)
+	Reason      string `json:"reason,omitempty"`       // one-line diagnostic
+	Proto       string `json:"proto,omitempty"`        // flow: tcp | udp | icmp | ...
+	Sport       int    `json:"sport,omitempty"`        // flow source port
+	Dport       int    `json:"dport,omitempty"`        // flow destination port
+	State       string `json:"state,omitempty"`        // flow TCP state
+	Event       string `json:"event,omitempty"`        // flow: new | unreplied | replied | gone
+	Packets     int64  `json:"packets,omitempty"`      // original direction packets
+	Bytes       int64  `json:"bytes,omitempty"`        // original direction bytes
+	ReplyBytes  int64  `json:"reply_bytes,omitempty"`  // reply direction bytes
+	Unreplied   bool   `json:"unreplied,omitempty"`    // flow has no reply yet
+	Assured     bool   `json:"assured,omitempty"`      // conntrack saw a confirmed flow
+	TunnelID    string `json:"tunnel_id,omitempty"`    // matched tunnel id, if any
+	TunnelIface string `json:"tunnel_iface,omitempty"` // matched tunnel interface, if any
 }
 
 type traceRing struct {
@@ -40,6 +55,7 @@ type traceRing struct {
 	// signal). Polled-then-delta'd by the UI to compute requests/sec.
 	cntDNS     atomic.Uint64
 	cntSNI     atomic.Uint64
+	cntFlow    atomic.Uint64
 	cntTunnel  atomic.Uint64
 	cntDirect  atomic.Uint64
 	cntBlocked atomic.Uint64
@@ -50,6 +66,13 @@ var awgTrace = func() *traceRing {
 	r := &traceRing{entries: make([]TraceEntry, traceRingCap)}
 	return r
 }()
+
+type traceHostRecord struct {
+	name string
+	exp  int64
+}
+
+var traceHostCache sync.Map // ip string -> traceHostRecord
 
 // traceEnabled is the hot-path check. One atomic load. Inlinable.
 func traceEnabled() bool { return awgTrace.enabled.Load() }
@@ -65,8 +88,12 @@ func traceAppend(e TraceEntry) {
 	switch e.Kind {
 	case "dns":
 		awgTrace.cntDNS.Add(1)
+		traceRememberHost(e.Dst, e.Name)
 	case "sni":
 		awgTrace.cntSNI.Add(1)
+		traceRememberHost(e.Dst, e.Name)
+	case "flow":
+		awgTrace.cntFlow.Add(1)
 	}
 	switch e.Decision {
 	case "tunnel":
@@ -88,6 +115,35 @@ func traceAppend(e TraceEntry) {
 	awgTrace.entries[awgTrace.next] = e
 	awgTrace.next = (awgTrace.next + 1) % traceRingCap
 	awgTrace.mu.Unlock()
+}
+
+func traceRememberHost(ip, name string) {
+	ip = net.ParseIP(ip).String()
+	if ip == "<nil>" {
+		return
+	}
+	name = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(name)), ".")
+	if name == "" || net.ParseIP(name) != nil {
+		return
+	}
+	traceHostCache.Store(ip, traceHostRecord{name: name, exp: time.Now().Add(traceHostTTL).UnixNano()})
+}
+
+func traceHostForIP(ip string) string {
+	ip = net.ParseIP(ip).String()
+	if ip == "<nil>" {
+		return ""
+	}
+	v, ok := traceHostCache.Load(ip)
+	if !ok {
+		return ""
+	}
+	rec, ok := v.(traceHostRecord)
+	if !ok || rec.exp <= time.Now().UnixNano() {
+		traceHostCache.Delete(ip)
+		return ""
+	}
+	return rec.name
 }
 
 // traceSnapshot returns entries newer than `since` (nanoseconds), in time
@@ -150,6 +206,7 @@ func (svc *Service) TraceClear() { traceClear() }
 type TraceCounters struct {
 	DNS     uint64 `json:"dns"`
 	SNI     uint64 `json:"sni"`
+	Flow    uint64 `json:"flow"`
 	Tunnel  uint64 `json:"tunnel"`
 	Direct  uint64 `json:"direct"`
 	Blocked uint64 `json:"blocked"`
@@ -161,6 +218,7 @@ func (svc *Service) TraceCounters() TraceCounters {
 	return TraceCounters{
 		DNS:     awgTrace.cntDNS.Load(),
 		SNI:     awgTrace.cntSNI.Load(),
+		Flow:    awgTrace.cntFlow.Load(),
 		Tunnel:  awgTrace.cntTunnel.Load(),
 		Direct:  awgTrace.cntDirect.Load(),
 		Blocked: awgTrace.cntBlocked.Load(),

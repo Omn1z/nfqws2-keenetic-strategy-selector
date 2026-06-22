@@ -114,6 +114,7 @@ func New(cfg *config.Config, st *store.Store) *Service {
 	svc := &Service{cfg: cfg, store: st}
 	svc.initAWG()
 	go svc.awgRouteCacheSweeper()
+	go svc.awgFlowTraceLoop()
 	return svc
 }
 

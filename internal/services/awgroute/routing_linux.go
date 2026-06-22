@@ -366,7 +366,7 @@ func (svc *Service) awgCommitRoutingOS() error {
 	return nil
 }
 
-func (svc *Service) awgTeardownRoutingOS() error {
+func (svc *Service) awgStopLegacyRoutingRuntimeOS() {
 	svc.route.mu.Lock()
 	if svc.route.rollback != nil {
 		svc.route.rollback.Stop()
@@ -378,6 +378,10 @@ func (svc *Service) awgTeardownRoutingOS() error {
 	}
 	svc.route.active = false
 	svc.route.mu.Unlock()
+}
+
+func (svc *Service) awgTeardownRoutingOS() error {
+	svc.awgStopLegacyRoutingRuntimeOS()
 	// Wait for any in-flight refresh goroutine to actually exit before we tear
 	// the firewall rules down — without this its pending awgRun calls would
 	// re-install the rules immediately after teardown removed them, leaving

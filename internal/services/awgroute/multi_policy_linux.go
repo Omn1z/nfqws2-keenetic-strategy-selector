@@ -368,15 +368,15 @@ func awgMultiFirewallHook(tunnels []awgMultiTunnel, rules []awgMultiRule) string
 				continue
 			}
 			doc.WriteString("-A " + awgMultiChain + match + " -j MARK --set-xmark " + r.Tunnel.Mark + "/" + awgMultiMarkMask + "\n")
-			doc.WriteString("-A " + awgMultiChain + match + " -j RETURN\n")
+			doc.WriteString("-A " + awgMultiChain + match + " -j ACCEPT\n")
 		}
 	}
 	doc.WriteString("COMMIT\n")
 	s.WriteString("$IPTABLES_RESTORE <<'AWGMV4'\n")
 	s.WriteString(doc.String())
 	s.WriteString("AWGMV4\n")
-	s.WriteString("iptables -w -t mangle -A PREROUTING -j " + awgMultiChain + "\n")
-	s.WriteString("iptables -w -t mangle -A OUTPUT -j " + awgMultiChain + "\n")
+	s.WriteString("iptables -w -t mangle -I PREROUTING 1 -j " + awgMultiChain + "\n")
+	s.WriteString("iptables -w -t mangle -I OUTPUT 1 -j " + awgMultiChain + "\n")
 	for _, t := range tunnels {
 		mss := t.MTU - 40
 		if mss <= 0 {
@@ -428,6 +428,10 @@ func awgMultiRuleMatches(r awgMultiRule) []string {
 }
 
 func (svc *Service) awgClearLegacyPolicyOS() {
+	svc.awgStopLegacyRoutingRuntimeOS()
+	svc.route.refreshWG.Wait()
+	svc.awgStopDNSProxy()
+	svc.awgStopSNISniff()
 	_ = os.Remove(awgHookPath)
 	_, _ = awgRun("while iptables -w -t mangle -D PREROUTING -j " + awgChain + " 2>/dev/null; do :; done")
 	_, _ = awgRun("while iptables -w -t mangle -D OUTPUT -j " + awgChain + " 2>/dev/null; do :; done")

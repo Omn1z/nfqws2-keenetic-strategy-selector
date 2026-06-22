@@ -528,6 +528,7 @@ export interface Dashboard {
 export interface TraceCounters {
   dns: number;
   sni: number;
+  flow: number;
   tunnel: number;
   direct: number;
   blocked: number;
