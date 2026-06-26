@@ -22,12 +22,26 @@ const (
 	warpDefaultDNS    = "1.1.1.1, 1.0.0.1"
 	warpDefaultMTU    = 1280
 	warpDefaultName   = "Cloudflare WARP"
-	warpDefaultEP     = "162.159.193.1:2408"
+	warpDefaultEP     = "188.114.97.100:2408"
 	warpDefaultModel  = "Keenetic"
 	warpPeerPublicKey = "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo="
 	warpDefaultI1     = "<b 0x494e56495445207369703a626f624062696c6f78692e636f6d205349502f322e300d0a5669613a205349502f322e302f55445020706333332e61746c616e74612e636f6d3b6272616e63683d7a39684734624b3737366173646864730d0a4d61782d466f7277617264733a2037300d0a546f3a20426f62203c7369703a626f624062696c6f78692e636f6d3e0d0a46726f6d3a20416c696365203c7369703a616c6963654061746c616e74612e636f6d3e3b7461673d313932383330313737340d0a43616c6c2d49443a20613834623463373665363637313040706333332e61746c616e74612e636f6d0d0a435365713a2033313431353920494e564954450d0a436f6e746163743a203c7369703a616c69636540706333332e61746c616e74612e636f6d3e0d0a436f6e74656e742d547970653a206170706c69636174696f6e2f7364700d0a436f6e74656e742d4c656e6774683a20300d0a0d0a>"
 	warpDefaultI2     = "<b 0x5349502f322e302031303020547279696e670d0a5669613a205349502f322e302f55445020706333332e61746c616e74612e636f6d3b6272616e63683d7a39684734624b3737366173646864730d0a546f3a20426f62203c7369703a626f624062696c6f78692e636f6d3e0d0a46726f6d3a20416c696365203c7369703a616c6963654061746c616e74612e636f6d3e3b7461673d313932383330313737340d0a43616c6c2d49443a20613834623463373665363637313040706333332e61746c616e74612e636f6d0d0a435365713a2033313431353920494e564954450d0a436f6e74656e742d4c656e6774683a20300d0a0d0a>"
 )
+
+var warpBootstrapEndpoints = []string{
+	"188.114.97.100:2408",
+	"188.114.96.100:2408",
+	"162.159.193.1:2408",
+	"162.159.192.1:2408",
+	"162.159.193.10:2408",
+	"162.159.195.100:2408",
+	"162.159.195.250:2408",
+	"162.159.195.50:2408",
+	"162.159.193.100:2408",
+	"162.159.195.1:2408",
+	"engage.cloudflareclient.com:2408",
+}
 
 type WARPCreateOptions struct {
 	Name      string
@@ -270,6 +284,60 @@ func warpEndpointCandidates(current string) []string {
 			out = append(out, ep)
 		}
 	}
+	return out
+}
+
+func (svc *Service) awgPrioritizedWARPEndpointCandidates(current string, ranked []string) []string {
+	return prioritizeWARPEndpoints(current, svc.awgKnownWARPEndpoints(), ranked)
+}
+
+func (svc *Service) awgKnownWARPEndpoints() []string {
+	out := []string{}
+	for _, srv := range svc.serverSnapshot() {
+		cfg := srv.Manager.Config()
+		if !isWARPConfig(cfg) {
+			continue
+		}
+		out = append(out, cfg.Endpoint)
+		if cs := svc.awgClientStatusManagerOS(srv.Manager); cs != nil {
+			out = append(out, cs.Endpoint)
+		}
+	}
+	return out
+}
+
+func prioritizeWARPEndpoints(current string, known, ranked []string) []string {
+	current = normalizeWARPEndpoint(current)
+	out := []string{}
+	seen := map[string]bool{}
+	add := func(endpoint string) {
+		endpoint = normalizeWARPEndpoint(endpoint)
+		if endpoint == "" {
+			return
+		}
+		key := strings.ToLower(endpoint)
+		if seen[key] {
+			return
+		}
+		seen[key] = true
+		out = append(out, endpoint)
+	}
+
+	// Non-default ports are usually explicit/manual. Keep them first, then try
+	// throughput-proven WARP seeds before RTT-only ranking.
+	if current != "" && !strings.HasSuffix(current, ":2408") {
+		add(current)
+	}
+	for _, endpoint := range warpBootstrapEndpoints {
+		add(endpoint)
+	}
+	for _, endpoint := range ranked {
+		add(endpoint)
+	}
+	for _, endpoint := range known {
+		add(endpoint)
+	}
+	add(current)
 	return out
 }
 

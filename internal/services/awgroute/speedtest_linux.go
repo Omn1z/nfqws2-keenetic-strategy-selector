@@ -26,7 +26,14 @@ func (svc *Service) RunSpeedTest(ctx context.Context, opts SpeedTestOptions) Spe
 	}
 	res := SpeedTestResult{Sample: opts.URL}
 
-	tunIface := awgIface // "awg0"
+	tunIface, err := ValidateSpeedTestIface(opts.Iface)
+	if err != nil {
+		res.Err = err.Error()
+		return res
+	}
+	if tunIface == "" {
+		tunIface = awgIface // active tunnel by default
+	}
 	_, wanDev := awgDefaultRoute()
 	if wanDev == "" {
 		res.Err = "не найден WAN-интерфейс (ip route show default пусто)"

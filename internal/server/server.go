@@ -1778,6 +1778,7 @@ func (s *Server) awg2TraceClear(w http.ResponseWriter, r *http.Request) {
 func (s *Server) awg2SpeedTest(w http.ResponseWriter, r *http.Request) {
 	var in struct {
 		URL       string `json:"url"`
+		Iface     string `json:"iface"`
 		MaxBytes  int64  `json:"max_bytes"`
 		TimeoutMS int    `json:"timeout_ms"`
 	}
@@ -1786,6 +1787,11 @@ func (s *Server) awg2SpeedTest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	url, err := awgroute.ValidateSpeedTestURL(in.URL)
+	if err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	iface, err := awgroute.ValidateSpeedTestIface(in.Iface)
 	if err != nil {
 		httpErr(w, 400, err)
 		return
@@ -1808,6 +1814,7 @@ func (s *Server) awg2SpeedTest(w http.ResponseWriter, r *http.Request) {
 
 	s.app.AWG2SpeedTest(ctx, awgroute.SpeedTestOptions{
 		URL:      url,
+		Iface:    iface,
 		MaxBytes: in.MaxBytes,
 		Timeout:  time.Duration(in.TimeoutMS) * time.Millisecond,
 		OnEvent: func(evt awgroute.SpeedEvent) {

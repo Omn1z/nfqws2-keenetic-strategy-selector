@@ -20,7 +20,7 @@ import (
 
 const (
 	warpEndpointAttemptLimit = 16
-	warpEndpointProbeWait    = 2300 * time.Millisecond
+	warpEndpointProbeWait    = 1800 * time.Millisecond
 )
 
 type warpEndpointScore struct {
@@ -33,32 +33,11 @@ func (svc *Service) awgApplyBestWARPEndpoint(am *awg.Manager, cfg awg.ServerConf
 	current := normalizeWARPEndpoint(cfg.Endpoint)
 	failures := []string{}
 	attempts := 0
-	if current != "" {
-		attempts++
-		next, ok, err := svc.awgTryWARPEndpoint(am, cfg, p, iface, current, 1, 1)
-		if ok {
-			return next, nil
-		}
-		if err != nil {
-			failures = append(failures, err.Error())
-		}
-	}
 
 	candidates := svc.awgRankWARPEndpointCandidates(cfg.Endpoint)
-	if current != "" {
-		filtered := candidates[:0]
-		for _, endpoint := range candidates {
-			if normalizeWARPEndpoint(endpoint) != current {
-				filtered = append(filtered, endpoint)
-			}
-		}
-		candidates = filtered
-	}
+	candidates = svc.awgPrioritizedWARPEndpointCandidates(current, candidates)
 	if len(candidates) == 0 {
-		if attempts == 0 {
-			return cfg, nil
-		}
-		return cfg, fmt.Errorf("WARP endpoint: no fresh handshake after %d probe: %s", attempts, strings.Join(failures, "; "))
+		return cfg, nil
 	}
 	if len(candidates) > warpEndpointAttemptLimit {
 		candidates = candidates[:warpEndpointAttemptLimit]
@@ -80,7 +59,9 @@ func (svc *Service) awgApplyBestWARPEndpoint(am *awg.Manager, cfg awg.ServerConf
 	if detail == "" {
 		detail = "no candidates"
 	}
-	return cfg, fmt.Errorf("WARP endpoint: no fresh handshake after %d probes: %s", attempts, detail)
+	err := fmt.Errorf("WARP endpoint: no fresh handshake after %d probes: %s", attempts, detail)
+	logbuf.Append("awg2", "warn", err.Error())
+	return cfg, err
 }
 
 func (svc *Service) awgTryWARPEndpoint(am *awg.Manager, cfg awg.ServerConfig, p awg.Peer, iface, endpoint string, idx, total int) (awg.ServerConfig, bool, error) {
@@ -117,7 +98,8 @@ func (svc *Service) awgTryWARPEndpoint(am *awg.Manager, cfg awg.ServerConfig, p 
 	if !awgWaitEndpointHandshake(iface, ip, port, start, warpEndpointProbeWait) {
 		return cfg, false, fmt.Errorf("%s: no handshake", selectedEndpoint)
 	}
-	if strings.TrimSpace(cfg.Endpoint) != selectedEndpoint {
+	endpointChanged := strings.TrimSpace(cfg.Endpoint) != selectedEndpoint
+	if endpointChanged {
 		if err := am.SetConfig(&next); err != nil {
 			return cfg, false, err
 		}
@@ -163,13 +145,13 @@ func (svc *Service) awgRankWARPEndpointCandidates(current string) []string {
 		if a.ok != b.ok {
 			return a.ok
 		}
-		if a.ok && b.ok && a.rtt != b.rtt {
-			return a.rtt < b.rtt
-		}
 		_, ap, _ := splitHostPortDefault(candidates[i], 2408)
 		_, bp, _ := splitHostPortDefault(candidates[j], 2408)
 		if warpPortRank(ap) != warpPortRank(bp) {
 			return warpPortRank(ap) < warpPortRank(bp)
+		}
+		if a.ok && b.ok && a.rtt != b.rtt {
+			return a.rtt < b.rtt
 		}
 		return order[candidates[i]] < order[candidates[j]]
 	})

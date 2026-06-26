@@ -31,7 +31,8 @@ func (svc *Service) awgClientDownManagerOS(am *awg.Manager) error {
 func (svc *Service) awgClientStatusManagerOS(am *awg.Manager) *ClientStatus {
 	return nil
 }
-func awgSetActiveIfaceOS(iface string) {}
+func awgSetActiveIfaceOS(iface string)                    {}
+func (svc *Service) awgDisableLegacyExternalWatchdogsOS() {}
 
 func (svc *Service) awgApplyRoutingOS() error {
 	return fmt.Errorf("маршрутизация доступна только на роутере")

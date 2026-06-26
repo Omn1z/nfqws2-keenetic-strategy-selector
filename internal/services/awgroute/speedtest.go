@@ -2,7 +2,9 @@ package awgroute
 
 import (
 	"encoding/json"
+	"fmt"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -27,6 +29,7 @@ func JSONLine(w http.ResponseWriter, v any) error {
 // SpeedTestOptions are the per-run inputs (set via the HTTP handler).
 type SpeedTestOptions struct {
 	URL      string
+	Iface    string
 	MaxBytes int64
 	Timeout  time.Duration
 	OnEvent  func(evt SpeedEvent)
@@ -59,4 +62,20 @@ type SpeedSample struct {
 	RxBytesPerSec float64 `json:"rx_bytes_per_sec"`
 	HTTPStatus    int     `json:"http_status"`
 	Error         string  `json:"error,omitempty"`
+}
+
+func ValidateSpeedTestIface(iface string) (string, error) {
+	iface = strings.TrimSpace(iface)
+	if iface == "" {
+		return "", nil
+	}
+	if len(iface) < 4 || len(iface) > 15 || !strings.HasPrefix(iface, "awg") {
+		return "", fmt.Errorf("invalid AWG interface")
+	}
+	for _, r := range iface[3:] {
+		if r < '0' || r > '9' {
+			return "", fmt.Errorf("invalid AWG interface")
+		}
+	}
+	return iface, nil
 }

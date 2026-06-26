@@ -148,8 +148,19 @@ func (m *Manager) SetConfig(in *ServerConfig) error {
 func (m *Manager) SetRouting(rc RoutingConfig) {
 	m.mu.Lock()
 	rc.Active = m.cfg.Routing.Active // managed by commit/teardown, not the form — preserve it
+	rc.Normalize()
 	m.cfg.Routing = rc
-	m.cfg.Normalize()
+	m.mu.Unlock()
+}
+
+// SetRoutingState updates only the split-routing config and its committed/active
+// bit. It deliberately avoids full ServerConfig validation: WARP/imported
+// profiles do not have VPS SSH credentials, but their rules still need edits.
+func (m *Manager) SetRoutingState(rc RoutingConfig, active bool) {
+	m.mu.Lock()
+	rc.Active = active
+	rc.Normalize()
+	m.cfg.Routing = rc
 	m.mu.Unlock()
 }
 

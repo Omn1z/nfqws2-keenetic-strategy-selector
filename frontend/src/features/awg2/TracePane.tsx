@@ -36,6 +36,7 @@ type TraceEntry = {
 type TraceStatus = { enabled: boolean; count: number; cap: number };
 type TraceListResp = { status: TraceStatus; entries: TraceEntry[] };
 type TraceKind = TraceEntry["kind"];
+type TraceMode = "off" | "auto" | "always";
 type SortKey = "ts" | "kind" | "name" | "src" | "dst" | "decision";
 type SortDir = "asc" | "desc";
 
@@ -45,6 +46,11 @@ const TRACE_KIND_OPTIONS: { value: TraceKind; label: string }[] = [
   { value: "sni", label: "SNI" },
 ];
 const ALL_TRACE_KINDS = TRACE_KIND_OPTIONS.map((o) => o.value);
+const TRACE_MODE_OPTIONS: { value: TraceMode; label: string; title: string }[] = [
+  { value: "off", label: "Выкл", title: "Не писать события в буфер трассировки" },
+  { value: "auto", label: "Авто", title: "Писать, пока открыта вкладка трассировки" },
+  { value: "always", label: "Всегда", title: "Писать трассировку постоянно" },
+];
 
 const pad = (n: number, w = 2) => String(n).padStart(w, "0");
 const fmtTime = (tsNs: number) => {
@@ -117,7 +123,8 @@ export default function TracePane() {
   //            disable on unmount; survives a Refresh)
   //   always — recording stays on; this pane just watches the ring
   // We fetch the mode on mount and act accordingly.
-  const [mode, setMode] = useState<"off" | "auto" | "always" | null>(null);
+  const [mode, setMode] = useState<TraceMode | null>(null);
+  const [modeBusy, setModeBusy] = useState(false);
   // Tracks whether WE flipped recording on, so the unmount cleanup only
   // turns it off in the auto case (and leaves it on if global mode is "always").
   const weEnabledRef = useRef<boolean>(false);
@@ -160,6 +167,34 @@ export default function TracePane() {
     }
   };
 
+  const applyTraceMode = async (nextMode: TraceMode) => {
+    if (modeBusy) return;
+    setModeBusy(true);
+    try {
+      const sys = await api<{ trace_mode: TraceMode }>("POST", "/api/system/settings", { trace_mode: nextMode });
+      const effectiveMode = sys.trace_mode || nextMode;
+      setMode(effectiveMode);
+
+      if (effectiveMode === "auto") {
+        const nextStatus = await api<TraceStatus>("POST", "/api/awg2/trace/enabled", { enabled: true });
+        weEnabledRef.current = true;
+        setStatus(nextStatus);
+        toast("Трассировка включена до закрытия вкладки", "ok");
+        void fetchOnce();
+        return;
+      }
+
+      weEnabledRef.current = false;
+      const nextStatus = await api<TraceStatus>("GET", "/api/awg2/trace/status");
+      setStatus(nextStatus);
+      toast(effectiveMode === "always" ? "Трассировка пишет постоянно" : "Трассировка выключена", "ok");
+    } catch (e) {
+      toast((e as Error).message, "err");
+    } finally {
+      setModeBusy(false);
+    }
+  };
+
   // Mount: read the global mode; if "auto" and recording is currently off,
   // turn it on (and remember WE did → flip back off on unmount). "off" and
   // "always" are pass-through: we don't touch the recording flag.
@@ -167,7 +202,7 @@ export default function TracePane() {
     let cancelled = false;
     (async () => {
       try {
-        const sys = await api<{ trace_mode: "off" | "auto" | "always" }>("GET", "/api/system/settings");
+        const sys = await api<{ trace_mode: TraceMode }>("GET", "/api/system/settings");
         if (cancelled) return;
         setMode(sys.trace_mode);
         const s = await api<TraceStatus>("GET", "/api/awg2/trace/status");
@@ -284,8 +319,7 @@ export default function TracePane() {
         </div>
       </div>
 
-      {/* Sub-header: clear + global type filters. Recording mode lives in the
-          global system settings — show only its current effective state here. */}
+      {/* Sub-header: recording mode, clear and filters. */}
       <div className="flex flex-wrap items-center gap-3 py-3">
         <span className={cn(
           "rounded px-2 py-0.5 text-[11px] font-medium",
@@ -296,6 +330,25 @@ export default function TracePane() {
           {mode === "always"  && "режим: всегда писать"}
           {mode === null      && "режим: …"}
         </span>
+        <span className="text-[12px] text-muted">Запись:</span>
+        <div className="inline-flex h-7 overflow-hidden rounded border border-line">
+          {TRACE_MODE_OPTIONS.map((opt) => (
+            <button
+              key={opt.value}
+              type="button"
+              title={opt.title}
+              aria-pressed={mode === opt.value}
+              disabled={modeBusy || mode === null}
+              onClick={() => void applyTraceMode(opt.value)}
+              className={cn(
+                "border-r border-line px-2 text-[12px] last:border-r-0 disabled:cursor-wait disabled:opacity-60",
+                mode === opt.value ? "bg-accent text-white" : "bg-panel text-ink-soft hover:bg-line-soft hover:text-ink",
+              )}
+            >
+              {opt.label}
+            </button>
+          ))}
+        </div>
         <Button mini variant="ghost" onClick={onClear}>Очистить</Button>
         <span className="ml-2 text-[12px] text-muted">Тип:</span>
         <details className="relative">
@@ -364,7 +417,7 @@ export default function TracePane() {
             {slice.length === 0 && (
               <tr>
                 <td colSpan={9} className="px-2 py-6 text-center text-muted">
-                  {status?.enabled ? "Ждём трафика…" : "Запись выключена. Нажми «Включить запись» сверху."}
+                  {status?.enabled ? "Ждём трафика…" : "Запись выключена. Выбери «Авто» или «Всегда» в переключателе записи сверху."}
                 </td>
               </tr>
             )}

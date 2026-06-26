@@ -179,7 +179,7 @@ func Default() *ServerConfig {
 		Routing: RoutingConfig{
 			Mode:         "off",
 			Zones:        []Zone{},
-			MTU:          1280, // AmneziaWG over a real internet path: safe MTU (avoids PMTU blackhole)
+			MTU:          1420,
 			DomainSource: "resolve",
 		},
 	}
@@ -253,40 +253,47 @@ func (c *ServerConfig) Normalize() {
 			}
 		}
 	}
-	if c.Routing.Mode == "" {
-		c.Routing.Mode = "off"
+	c.Routing.Normalize()
+}
+
+// Normalize fills zero/blank routing-only fields without touching the owning
+// server connection. Route edits must be valid even for imported/WARP profiles
+// that intentionally do not have VPS SSH credentials.
+func (r *RoutingConfig) Normalize() {
+	if r.Mode == "" {
+		r.Mode = "off"
 	}
-	if c.Routing.MTU == 0 {
-		c.Routing.MTU = 1280
+	if r.MTU == 0 {
+		r.MTU = 1420
 	}
-	if c.Routing.DomainSource != "dnsproxy" {
-		c.Routing.DomainSource = "resolve"
+	if r.DomainSource != "dnsproxy" {
+		r.DomainSource = "resolve"
 	}
-	if c.Routing.Zones == nil {
-		c.Routing.Zones = []Zone{}
+	if r.Zones == nil {
+		r.Zones = []Zone{}
 	}
-	for i := range c.Routing.Zones {
-		if c.Routing.Zones[i].Domains == nil {
-			c.Routing.Zones[i].Domains = []string{}
+	for i := range r.Zones {
+		if r.Zones[i].Domains == nil {
+			r.Zones[i].Domains = []string{}
 		}
-		if c.Routing.Zones[i].IPs == nil {
-			c.Routing.Zones[i].IPs = []string{}
+		if r.Zones[i].IPs == nil {
+			r.Zones[i].IPs = []string{}
 		}
 		// Per-zone include/exclude: a zone with no explicit mode inherits the OLD
 		// global routing mode (pre-migration), defaulting to include.
-		if c.Routing.Zones[i].Mode != "include" && c.Routing.Zones[i].Mode != "exclude" {
-			if c.Routing.Mode == "exclude" {
-				c.Routing.Zones[i].Mode = "exclude"
+		if r.Zones[i].Mode != "include" && r.Zones[i].Mode != "exclude" {
+			if r.Mode == "exclude" {
+				r.Zones[i].Mode = "exclude"
 			} else {
-				c.Routing.Zones[i].Mode = "include"
+				r.Zones[i].Mode = "include"
 			}
 		}
 	}
-	// The global include/exclude is gone — direction is per-zone now; an old global
+	// The global include/exclude is gone - direction is per-zone now; an old global
 	// include/exclude collapses to "zones" (the per-zone derivation). Migrate AFTER
 	// the zone loop so zones inherit the old global value first.
-	if c.Routing.Mode == "include" || c.Routing.Mode == "exclude" {
-		c.Routing.Mode = "zones"
+	if r.Mode == "include" || r.Mode == "exclude" {
+		r.Mode = "zones"
 	}
 }
 

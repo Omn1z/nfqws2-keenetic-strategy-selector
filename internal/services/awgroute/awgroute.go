@@ -79,6 +79,7 @@ type AWG2Status struct {
 // initAWG loads the persisted AWG2 config (or defaults). It NEVER auto-deploys —
 // provisioning a remote VPS is always an explicit user action.
 func (svc *Service) initAWG() {
+	svc.awgDisableLegacyExternalWatchdogsOS()
 	state := svc.loadAWGState()
 	svc.installAWGState(state)
 	if svc.ensureRouterPeersLocal() {
@@ -137,7 +138,7 @@ func (svc *Service) initAWG() {
 }
 
 func awgShouldAutostartClient(c awg.ServerConfig) bool {
-	return c.Enabled && (c.Client.Enabled || awgCanStartLocalClient(c))
+	return c.Enabled && c.Client.Enabled && awgCanStartLocalClient(c)
 }
 
 func awgShouldRestoreRouting(c awg.ServerConfig) bool {
@@ -203,6 +204,7 @@ func normalizeAWGState(st awgPersisted) awgPersisted {
 		seen[id] = true
 		srv.ID = id
 		srv.Name = strings.TrimSpace(srv.Name)
+		repairImportedInstallMarker(&srv.Config)
 		srv.Config.Normalize()
 		out = append(out, srv)
 	}
@@ -212,6 +214,25 @@ func normalizeAWGState(st awgPersisted) awgPersisted {
 		st.ActiveID = st.Servers[0].ID
 	}
 	return st
+}
+
+func repairImportedInstallMarker(cfg *awg.ServerConfig) {
+	if cfg == nil || cfg.Install == "imported" {
+		return
+	}
+	if strings.TrimSpace(cfg.Conn.Host) != "" || strings.TrimSpace(cfg.Endpoint) == "" {
+		return
+	}
+	if strings.TrimSpace(cfg.PrivateKey) != "" {
+		return
+	}
+	for _, p := range cfg.Peers {
+		if p.IsRouter && strings.TrimSpace(p.PrivateKey) != "" {
+			cfg.Install = "imported"
+			cfg.Conn = awg.Credentials{}
+			return
+		}
+	}
 }
 
 func assignAWGClientIfaces(entries []awgPersistedServer) {
@@ -579,22 +600,14 @@ func (svc *Service) AWG2SetRoutingRules(rc awg.RoutingConfig) error {
 	}
 	for _, srv := range svc.serverSnapshot() {
 		cfg := srv.Manager.Config()
-		cfg.Routing.Zones = part[srv.ID]
-		cfg.Routing.Mode = mode
-		cfg.Routing.Killswitch = rc.Killswitch
-		cfg.Routing.DomainSource = rc.DomainSource
-		cfg.Routing.SNIRouting = rc.SNIRouting
-		cfg.Routing.TraceEnabled = rc.TraceEnabled
-		cfg.Routing.Active = mode != "off" && len(cfg.Routing.Zones) > 0
-		if cfg.Routing.MTU == 0 {
-			cfg.Routing.MTU = 1280
-		}
-		if cfg.Routing.DomainSource != "dnsproxy" {
-			cfg.Routing.DomainSource = "resolve"
-		}
-		if err := srv.Manager.SetConfig(&cfg); err != nil {
-			return err
-		}
+		next := cfg.Routing
+		next.Zones = part[srv.ID]
+		next.Mode = mode
+		next.Killswitch = rc.Killswitch
+		next.DomainSource = rc.DomainSource
+		next.SNIRouting = rc.SNIRouting
+		next.TraceEnabled = rc.TraceEnabled
+		srv.Manager.SetRoutingState(next, mode != "off" && len(next.Zones) > 0)
 	}
 	svc.awgSave()
 	svc.awgApplyMultiHostRoutesOS()
@@ -841,6 +854,7 @@ func (svc *Service) AWG2SetConfig(in *awg.ServerConfig) error {
 		return fmt.Errorf("AWG2-сервер не выбран")
 	}
 	cur := m.Config()
+	oldMTU := awgTunnelMTU(cur)
 	if strings.TrimSpace(in.Conn.Password) == "" {
 		in.Conn.Password = cur.Conn.Password
 	}
@@ -870,6 +884,17 @@ func (svc *Service) AWG2SetConfig(in *awg.ServerConfig) error {
 		return err
 	}
 	svc.awgSave()
+	next := m.Config()
+	if awgTunnelMTU(next) != oldMTU {
+		if cs := svc.awgClientStatusManagerOS(m); cs != nil && cs.Running {
+			if err := svc.awgClientUpManagerOS(m); err != nil {
+				logbuf.Append("awg2", "warn", "MTU saved, but live tunnel refresh failed: "+err.Error())
+			} else {
+				logbuf.Append("awg2", "info", fmt.Sprintf("MTU updated live for %s: %d", awgClientIfaceName(next), awgTunnelMTU(next)))
+			}
+		}
+		svc.awgApplyMultiHostRoutesOS()
+	}
 	return nil
 }
 

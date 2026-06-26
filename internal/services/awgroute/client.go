@@ -136,6 +136,13 @@ func (svc *Service) awgEnsureClientUpForRouting(reason string) error {
 	if am == nil {
 		return fmt.Errorf("AWG2-сервер не выбран")
 	}
+	return svc.awgEnsureClientManagerUpForRouting(am, reason)
+}
+
+func (svc *Service) awgEnsureClientManagerUpForRouting(am *awg.Manager, reason string) error {
+	if am == nil {
+		return fmt.Errorf("AWG2-server is not selected")
+	}
 	if !am.Enabled() {
 		return fmt.Errorf("AWG2-сервер выключен")
 	}

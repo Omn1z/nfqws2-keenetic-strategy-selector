@@ -68,3 +68,32 @@ func TestWARPEndpointCandidatesIncludeKnownIngressPools(t *testing.T) {
 		}
 	}
 }
+
+func TestPrioritizeWARPEndpointsUsesThroughputSeedsBeforeRanked(t *testing.T) {
+	got := prioritizeWARPEndpoints(
+		warpDefaultEP,
+		[]string{"188.114.97.100:2408"},
+		[]string{"162.159.192.64:2408", "188.114.97.100:2408"},
+	)
+	if len(got) == 0 || got[0] != "188.114.97.100:2408" {
+		t.Fatalf("first endpoint = %q, want throughput-proven seed; all=%v", got[:min(len(got), 4)], got)
+	}
+	seen := map[string]bool{}
+	for _, ep := range got {
+		if seen[ep] {
+			t.Fatalf("duplicate endpoint %q in %v", ep, got)
+		}
+		seen[ep] = true
+	}
+}
+
+func TestPrioritizeWARPEndpointsKeepsManualNonDefaultPortFirst(t *testing.T) {
+	got := prioritizeWARPEndpoints(
+		"188.114.96.250:8886",
+		[]string{"188.114.97.100:2408"},
+		[]string{"162.159.193.100:2408", "188.114.96.250:8886"},
+	)
+	if len(got) == 0 || got[0] != "188.114.96.250:8886" {
+		t.Fatalf("endpoint order = %v", got[:min(len(got), 4)])
+	}
+}

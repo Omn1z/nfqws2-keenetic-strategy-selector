@@ -16,7 +16,7 @@ import PeerShareModal from "./PeerShareModal";
 import RoutingPane from "./RoutingPane";
 import DevicesRoutingPane from "./DevicesRoutingPane";
 import TracePane from "./TracePane";
-import SpeedTestCard from "./SpeedTestCard";
+import { SpeedTestPanel } from "./SpeedTestCard";
 import type { Awg2ServerSummary, Awg2Status, AwgDeployResult } from "@/types/api";
 
 type Sub = "server" | "routing" | "devices" | "trace";
@@ -88,6 +88,7 @@ export default function AWG2() {
   const [clientsOpen, setClientsOpen] = useState(false);
   const [newConn, setNewConn] = useState(emptyNewConnection);
   const [creating, setCreating] = useState(false);
+  const [speedServer, setSpeedServer] = useState<Awg2ServerSummary | null>(null);
 
   usePoll(async () => {
     try {
@@ -491,6 +492,9 @@ export default function AWG2() {
                   <Button mini onClick={(e) => { e.stopPropagation(); void openClients(srv); }} disabled={!srv.enabled || srv.imported}>
                     Добавить клиента
                   </Button>
+                  <Button mini onClick={(e) => { e.stopPropagation(); setSpeedServer(srv); }} disabled={!srv.client_iface || !srv.client?.running}>
+                    Замер
+                  </Button>
                   <Button mini variant="danger" onClick={(e) => { e.stopPropagation(); void deleteServer(srv.id); }}>
                     Удалить
                   </Button>
@@ -509,13 +513,24 @@ export default function AWG2() {
       </div>
 
       {sub === "server" && <>
-        <SpeedTestCard />
         <ServerPane st={st} reload={reload} deployActive={() => activeServer ? deployServer(activeServer.id) : Promise.resolve(false)} deploying={!!(activeServer && deploying[activeServer.id])} />
       </>}
       {sub === "routing" && <RoutingPane st={st} reload={reload} />}
       {sub === "devices" && <DevicesRoutingPane st={st} reload={reload} />}
       {sub === "trace" && <TracePane />}
       {clientsOpen && <PeerShareModal st={st} reload={reload} onClose={() => setClientsOpen(false)} />}
+      {speedServer && (
+        <Modal
+          title={`Замер скорости: ${speedServer.label || speedServer.host || speedServer.id}`}
+          onClose={() => setSpeedServer(null)}
+          size="lg"
+        >
+          <SpeedTestPanel
+            serverLabel={speedServer.label || speedServer.host || speedServer.id}
+            tunnelIface={speedServer.client_iface || ""}
+          />
+        </Modal>
+      )}
       {renameServer && (
         <Modal
           title="Переименовать подключение"

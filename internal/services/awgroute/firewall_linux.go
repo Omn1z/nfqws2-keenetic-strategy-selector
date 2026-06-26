@@ -27,13 +27,15 @@ var awgExcludes = []string{"127.0.0.0/8", "10.0.0.0/8", "172.16.0.0/12", "192.16
 // policy routing: the accelerated fast-path silently DROPS forwarded tunnel
 // segments, causing heavy TCP retransmits + exponential backoff (1→2→4→8s) — the
 // router's own traffic is fine but LAN devices crawl and Wi-Fi dies. We turn them
-// off while routing is active and back on at teardown. The hardware PPE for
-// normal LAN↔WAN traffic (net.hwnat.ppe_enabled) is left untouched.
+// off while routing is active and back on at teardown.
 var awgAccelSysctls = []string{
 	"net.netfilter.nf_conntrack_fastnat",
 	"net.netfilter.nf_conntrack_fastroute",
+	"net.netfilter.nf_conntrack_fastnat_xfrm",
+	"net.netfilter.nf_conntrack_fastpath_esp",
 	"net.core.swnat",
 	"net.hwnat.extif_offload",
+	"net.hwnat.ppe_enabled",
 }
 
 // awgSetAccel toggles Keenetic's NAT accelerators (off while tunnel routing is
@@ -47,6 +49,11 @@ func awgSetAccel(on bool) {
 	v := "0"
 	if on {
 		v = "1"
+	}
+	if on {
+		_, _ = awgRun("ndmc -c 'ppe hardware' >/dev/null 2>&1; ndmc -c 'ppe software' >/dev/null 2>&1; true")
+	} else {
+		_, _ = awgRun("ndmc -c 'no ppe hardware' >/dev/null 2>&1; ndmc -c 'no ppe software' >/dev/null 2>&1; true")
 	}
 	var args []string
 	for _, s := range awgAccelSysctls {

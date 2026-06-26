@@ -178,6 +178,22 @@ func (svc *Service) awgBuildMultiPolicy() ([]awgMultiRule, []awgMultiTunnel) {
 		}
 		out = append(out, r)
 	}
+	// Multi-policy owns the shared firewall rules for every awgN interface while
+	// any multi rule exists. Keep NAT/FORWARD/MSS alive for active tunnels even
+	// when the current rule set happens to target a different tunnel; otherwise
+	// the cleanup step below removes the legacy awg0 rules and LAN traffic through
+	// the active server loses the exact fast-path/MTU guardrails the old datapath
+	// installed.
+	for _, srv := range svc.serverSnapshot() {
+		if srv == nil {
+			continue
+		}
+		cfg := srv.Manager.Config()
+		if !cfg.Enabled || cfg.Routing.Mode == "off" || !cfg.Routing.Active {
+			continue
+		}
+		_ = getTunnel(srv)
+	}
 	tunnels := make([]awgMultiTunnel, 0, len(tunnelOrder))
 	for _, id := range tunnelOrder {
 		if t := tunnelByID[id]; t != nil {
@@ -325,6 +341,8 @@ func (svc *Service) awgInstallMultiRoutes(tunnels []awgMultiTunnel) error {
 	gw, wandev := awgDefaultRoute()
 	var firstErr error
 	for _, t := range tunnels {
+		awgTuneClientKernelBuffers()
+		_, _ = awgRun("ip link set " + t.Iface + " qlen " + strconv.Itoa(awgClientTxQueueLen) + " 2>/dev/null")
 		if t.EndpointIP != "" && wandev != "" {
 			if err := awgRunCheck(awgEndpointRouteCmd(t.EndpointIP, gw, wandev)); err != nil {
 				logbuf.Append("awg2", "warn", "multi-routing: endpoint route "+t.EndpointIP+": "+err.Error())
