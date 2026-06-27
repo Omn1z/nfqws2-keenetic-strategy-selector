@@ -514,6 +514,7 @@ func (a *App) testStrategy(ctx context.Context, sb *engine.Sandbox, pr *probe.Pr
 	}
 	if err := sb.StartNfqws(nil, s.Args()); err != nil {
 		res.Error = firstLine(err.Error())
+		res.EngineLog = sb.Diagnostics()
 		return res
 	}
 	defer sb.StopNfqws()

@@ -76,6 +76,7 @@ export interface StrategyResult {
   coefficient: number;
   success: boolean;
   error?: string;
+  engine_log?: string;
 }
 
 export interface Run {

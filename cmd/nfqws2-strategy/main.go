@@ -221,6 +221,7 @@ func cmdSelftest(args []string) {
 
 	if err := sb.StartNfqws(nil, strat.Args()); err != nil {
 		fmt.Fprintln(os.Stderr, "start nfqws:", err)
+		fmt.Fprintln(os.Stderr, sb.Diagnostics())
 		os.Exit(1)
 	}
 
