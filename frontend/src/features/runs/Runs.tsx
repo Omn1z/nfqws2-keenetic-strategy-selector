@@ -55,6 +55,12 @@ function RunLog({ results, status, done, total }: { results: StrategyResult[]; s
           return (
             <div key={i} className={cn("whitespace-pre-wrap [overflow-wrap:anywhere]", cls)}>
               <span className="font-semibold">{mark}</span> {r.name || r.strategy_id} — {tail}
+              {r.engine_log && (
+                <details className="mt-0.5">
+                  <summary className="cursor-pointer text-ink-soft select-none">лог движка</summary>
+                  <pre className="mt-1 overflow-auto rounded border border-line bg-base p-2 text-[11px] text-ink-soft">{r.engine_log}</pre>
+                </details>
+              )}
             </div>
           );
         })}

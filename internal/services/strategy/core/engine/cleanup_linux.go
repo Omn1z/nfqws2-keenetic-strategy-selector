@@ -10,14 +10,14 @@ import (
 	"syscall"
 )
 
-// orphanMarker is the per-sandbox writeable-dir prefix passed to every test
-// nfqws2 child (--writeable=/tmp/nfqws2-strategy/wN). It is unique to this tester
+// orphanMarker is the per-sandbox writable-dir prefix passed to every test
+// nfqws2 child (--writable=/tmp/nfqws2-strategy/wN). It is unique to this tester
 // and never used by the main nfqws2 service, so matching on it cannot kill the
 // live DPI-bypass process.
 const orphanMarker = "/tmp/nfqws2-strategy/"
 
 // killOrphanedNfqws SIGKILLs any leftover test nfqws2 children from a previous
-// unclean exit, identified by the writeable-dir argument in their cmdline.
+// unclean exit, identified by the writable-dir argument in their cmdline.
 func killOrphanedNfqws() {
 	entries, err := os.ReadDir("/proc")
 	if err != nil {

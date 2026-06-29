@@ -514,6 +514,7 @@ func (a *App) testStrategy(ctx context.Context, sb *engine.Sandbox, pr *probe.Pr
 			e = e[:i]
 		}
 		res.Error = e
+		res.EngineLog = sb.Diagnostics()
 		return res
 	}
 	defer sb.StopNfqws()

@@ -4,7 +4,7 @@
 package engine
 
 import (
-	"bufio"
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -20,6 +20,7 @@ import (
 const (
 	procMark = "0x40000000/0x40000000" // nfqws marks its own generated packets
 	exclMark = "0x20000000/0x20000000" // main nfqws chains RETURN on this connmark
+	noExit   = -2                      // s.lastExit sentinel: process has not exited yet
 )
 
 // Sandbox is one isolated test slot (one worker).
@@ -31,9 +32,12 @@ type Sandbox struct {
 	PortHi int
 	wrDir  string
 
-	mu  sync.Mutex
-	cmd *exec.Cmd
-	log strings.Builder
+	mu       sync.Mutex
+	cmd      *exec.Cmd
+	done     chan struct{} // closed when cmd exits; owned by the single Wait goroutine
+	logPath  string        // file the engine's stdout/stderr is captured to (race-free vs a pipe)
+	lastArgs []string      // full argv (binary + args) of the most recent launch, for diagnostics
+	lastExit int           // exit code of the most recent launch; noExit while running, -1 if signalled
 }
 
 func NewSandbox(cfg *config.Config, worker int) *Sandbox {
@@ -139,84 +143,234 @@ func (s *Sandbox) RulesDown() {
 
 // StartNfqws launches a dedicated nfqws2 child bound to this sandbox's queue,
 // loaded with the shared base args, any extra args (e.g. run-selected blobs),
-// then the strategy args. It returns once the queue is bound or after a timeout.
+// then the strategy args. It returns once the queue is actually bound in the
+// kernel, or after a timeout.
+//
+// Readiness is detected by watching /proc/net/netfilter/nfnetlink_queue for our
+// queue number rather than by parsing the child's log: the engine's startup
+// output varies by version and may be block-buffered down the pipe (so nothing
+// flushes for seconds), which previously produced spurious "nfqws start timeout"
+// with an empty log even though the engine was running. The child's output is
+// still captured for diagnostics, and an early exit (e.g. bad args) is reported
+// immediately instead of waiting out the full timeout.
 func (s *Sandbox) StartNfqws(extraArgs, strategyArgs []string) error {
 	s.StopNfqws()
 	if err := os.MkdirAll(s.wrDir, 0o755); err != nil {
 		return err
 	}
-	args := []string{fmt.Sprintf("--qnum=%d", s.QNum), "--writeable=" + s.wrDir}
+	args := []string{fmt.Sprintf("--qnum=%d", s.QNum), "--writable=" + s.wrDir}
 	args = append(args, s.cfg.BaseArgs...)
 	args = append(args, extraArgs...)
 	args = append(args, strategyArgs...)
+	// The sandbox engine must run in the foreground so we own its lifetime and can
+	// read its output; a --daemon in the base args would fork and the launched PID
+	// would exit immediately (false "exited before binding").
+	args = stripDaemon(args)
 
-	cmd := exec.Command(s.cfg.NfqwsBin, args...)
-	pr, pw, err := os.Pipe()
+	// Capture stdout/stderr to a file rather than a pipe: a fast-exiting child
+	// (e.g. an arg error) can leave its message unread in a pipe when we look,
+	// whereas the file holds it regardless of timing.
+	logPath := s.wrDir + "/launch.log"
+	lf, err := os.Create(logPath)
 	if err != nil {
 		return err
 	}
-	cmd.Stdout = pw
-	cmd.Stderr = pw
+
+	cmd := exec.Command(s.cfg.NfqwsBin, args...)
+	cmd.Stdout = lf
+	cmd.Stderr = lf
 	if err := cmd.Start(); err != nil {
-		pw.Close()
-		pr.Close()
+		lf.Close()
 		return err
 	}
-	pw.Close() // parent's copy; child keeps its dup
+	lf.Close() // the child inherited its own fd
 
+	done := make(chan struct{})
 	s.mu.Lock()
 	s.cmd = cmd
-	s.log.Reset()
+	s.done = done
+	s.logPath = logPath
+	s.lastArgs = append([]string{s.cfg.NfqwsBin}, args...)
+	s.lastExit = noExit
 	s.mu.Unlock()
 
-	var once sync.Once
-	ready := make(chan struct{})
+	// Single owner of cmd.Wait: records the exit code and signals both the
+	// readiness loop and Stop.
 	go func() {
-		sc := bufio.NewScanner(pr)
-		for sc.Scan() {
-			line := sc.Text()
-			s.mu.Lock()
-			s.log.WriteString(line)
-			s.log.WriteByte('\n')
-			s.mu.Unlock()
-			if strings.Contains(line, "setting copy_packet mode") {
-				once.Do(func() { close(ready) })
-			}
+		st, _ := cmd.Process.Wait()
+		s.mu.Lock()
+		if st != nil {
+			s.lastExit = st.ExitCode()
 		}
-		pr.Close()
+		s.mu.Unlock()
+		close(done)
 	}()
 
-	select {
-	case <-ready:
-		return nil
-	case <-time.After(10 * time.Second):
-		s.StopNfqws()
-		return fmt.Errorf("nfqws start timeout; log:\n%s", s.Log())
+	deadline := time.Now().Add(10 * time.Second)
+	exited := false
+	doneCh := done
+	for {
+		if s.queueBound() {
+			return nil
+		}
+		select {
+		case <-doneCh:
+			// The process is gone. If it exited cleanly the engine may have
+			// double-forked despite stripDaemon, so keep polling for the queue
+			// until the deadline; a non-zero exit is a real failure, report it now.
+			if s.queueBound() {
+				return nil
+			}
+			if code := s.exitCode(); code != 0 {
+				return fmt.Errorf("nfqws exited (code %d) before binding queue %d", code, s.QNum)
+			}
+			exited = true
+			doneCh = nil
+		case <-time.After(50 * time.Millisecond):
+		}
+		if time.Now().After(deadline) {
+			s.StopNfqws()
+			if exited {
+				return fmt.Errorf("nfqws exited before binding queue %d", s.QNum)
+			}
+			return fmt.Errorf("nfqws start timeout (queue %d not bound)", s.QNum)
+		}
 	}
+}
+
+// stripDaemon removes daemonize flags so the sandbox engine stays in the
+// foreground under our control.
+func stripDaemon(args []string) []string {
+	out := args[:0:0]
+	for _, a := range args {
+		if a == "--daemon" || a == "-D" {
+			continue
+		}
+		out = append(out, a)
+	}
+	return out
+}
+
+// exitCode returns the recorded exit code of the most recent launch (noExit if
+// it is still running, -1 if it was terminated by a signal).
+func (s *Sandbox) exitCode() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.lastExit
+}
+
+// queueBound reports whether this sandbox's NFQUEUE number is currently bound by
+// a listener in the kernel (i.e. the child nfqws2 has created and configured it).
+func (s *Sandbox) queueBound() bool {
+	b, err := os.ReadFile("/proc/net/netfilter/nfnetlink_queue")
+	if err != nil {
+		return false
+	}
+	want := strconv.Itoa(s.QNum)
+	for _, line := range strings.Split(string(b), "\n") {
+		if f := strings.Fields(line); len(f) > 0 && f[0] == want {
+			return true
+		}
+	}
+	return false
 }
 
 // StopNfqws terminates the sandbox's nfqws2 child.
 func (s *Sandbox) StopNfqws() {
 	s.mu.Lock()
 	cmd := s.cmd
+	done := s.done
 	s.cmd = nil
+	s.done = nil
 	s.mu.Unlock()
 	if cmd == nil || cmd.Process == nil {
 		return
 	}
 	_ = cmd.Process.Signal(syscall.SIGTERM)
-	done := make(chan struct{})
-	go func() { _, _ = cmd.Process.Wait(); close(done) }()
+	if done == nil { // no Wait goroutine (shouldn't happen); reap directly
+		_, _ = cmd.Process.Wait()
+		return
+	}
 	select {
 	case <-done:
 	case <-time.After(3 * time.Second):
 		_ = cmd.Process.Kill()
+		<-done
 	}
 }
 
-// Log returns the captured nfqws2 output so far.
+// Log returns the engine's captured stdout/stderr from the most recent launch.
 func (s *Sandbox) Log() string {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.log.String()
+	p := s.logPath
+	s.mu.Unlock()
+	if p == "" {
+		return ""
+	}
+	b, _ := os.ReadFile(p)
+	return string(b)
+}
+
+// Diagnostics returns a human-readable report of the most recent launch for the
+// UI: the exact command line, the exit code, the engine's own stdout/stderr (if
+// any -- nfqws2 usually logs to syslog instead), and a tail of the system log
+// filtered for nfqws. It is meant to be called right after StartNfqws fails.
+func (s *Sandbox) Diagnostics() string {
+	s.mu.Lock()
+	args := s.lastArgs
+	exit := s.lastExit
+	s.mu.Unlock()
+	out := s.Log()
+
+	var b strings.Builder
+	if len(args) > 0 {
+		fmt.Fprintf(&b, "$ %s\n", strings.Join(args, " "))
+	}
+	switch exit {
+	case noExit:
+		b.WriteString("статус: процесс ещё жив (очередь не привязалась)\n")
+	case -1:
+		b.WriteString("статус: завершён сигналом\n")
+	default:
+		fmt.Fprintf(&b, "код выхода: %d\n", exit)
+	}
+	if strings.TrimSpace(out) != "" {
+		b.WriteString("\nstdout/stderr движка:\n")
+		b.WriteString(out)
+		if !strings.HasSuffix(out, "\n") {
+			b.WriteByte('\n')
+		}
+	} else {
+		b.WriteString("stdout/stderr движка: пусто (nfqws2 пишет в syslog)\n")
+	}
+	if sl := syslogTail("nfqws", 30); sl != "" {
+		b.WriteString("\nsyslog (последние строки про nfqws):\n")
+		b.WriteString(sl)
+	} else {
+		b.WriteString("\nsyslog: строк про nfqws не найдено (logread недоступен?)\n")
+	}
+	return b.String()
+}
+
+// syslogTail returns up to n recent system-log lines matching filter. It tries
+// busybox `logread` (Keenetic/Entware) first, then common message files. Best
+// effort: any failure yields "".
+func syslogTail(filter string, n int) string {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	tail := strconv.Itoa(n)
+	cmds := []string{
+		"logread 2>/dev/null | grep -iE '" + filter + "' | tail -n " + tail,
+		"dmesg 2>/dev/null | grep -iE '" + filter + "' | tail -n " + tail,
+		"grep -iE '" + filter + "' /var/log/messages 2>/dev/null | tail -n " + tail,
+		"grep -iE '" + filter + "' /opt/var/log/messages 2>/dev/null | tail -n " + tail,
+		"grep -iE '" + filter + "' /opt/var/log/nfqws2.log 2>/dev/null | tail -n " + tail,
+	}
+	for _, c := range cmds {
+		out, err := exec.CommandContext(ctx, "sh", "-c", c).Output()
+		if err == nil && strings.TrimSpace(string(out)) != "" {
+			return string(out)
+		}
+	}
+	return ""
 }

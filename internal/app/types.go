@@ -91,6 +91,7 @@ type StrategyResult struct {
 	Coefficient  float64        `json:"coefficient"`
 	Success      bool           `json:"success"`
 	Error        string         `json:"error,omitempty"`
+	EngineLog    string         `json:"engine_log,omitempty"` // engine launch diagnostics (cmd, exit, syslog) when Error is a start failure
 	PerTarget    []probe.Result `json:"per_target"`
 }
 
