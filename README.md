@@ -58,7 +58,7 @@
 ## Установка
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/Omn1z/nfqws2-keenetic-strategy-selector/master/packaging/install.sh | sh
+wget -qO- https://raw.githubusercontent.com/Omn1z/nfqws2-keenetic-strategy-selector/master/packaging/install.sh | sh
 ```
 
 После установки откройте `http://<IP‑роутера>:8090`.
@@ -90,15 +90,15 @@ HTTP‑клиент скачивает тестовый URL через песо�
 ## Обновление
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/Omn1z/nfqws2-keenetic-strategy-selector/master/packaging/update.sh | sh
+wget -qO- https://raw.githubusercontent.com/Omn1z/nfqws2-keenetic-strategy-selector/master/packaging/update.sh | sh
 ```
 
 ## Удаление
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/Omn1z/nfqws2-keenetic-strategy-selector/master/packaging/uninstall.sh | sh
+wget -qO- https://raw.githubusercontent.com/Omn1z/nfqws2-keenetic-strategy-selector/master/packaging/uninstall.sh | sh
 # или с удалением данных:
-curl -fsSL https://raw.githubusercontent.com/Omn1z/nfqws2-keenetic-strategy-selector/master/packaging/uninstall.sh | sh -s -- --purge
+wget -qO- https://raw.githubusercontent.com/Omn1z/nfqws2-keenetic-strategy-selector/master/packaging/uninstall.sh | sh -s -- --purge
 ```
 
 ## Сборка из исходников
