@@ -69,6 +69,9 @@ func ImportClientConf(text string) (*ServerConfig, error) {
 	}
 
 	cfg := Default()
+	// A newly imported profile inherits only the source's wire parameters.
+	cfg.ProtocolVersion = ""
+	cfg.TrafficObfuscation = nil
 	cfg.Enabled = true
 	cfg.Install = "imported" // ponytail: marker so UI knows there is no remote SSH to redeploy
 	if hasAWGObfuscation(iface) {
@@ -99,22 +102,44 @@ func ImportClientConf(text string) (*ServerConfig, error) {
 	}
 
 	cfg.Obf = Obfuscation{
-		Jc:   atoi(iface["Jc"]),
-		Jmin: atoi(iface["Jmin"]),
-		Jmax: atoi(iface["Jmax"]),
-		S1:   atoi(iface["S1"]),
-		S2:   atoi(iface["S2"]),
-		S3:   atoi(iface["S3"]),
-		S4:   atoi(iface["S4"]),
-		H1:   strings.TrimSpace(iface["H1"]),
-		H2:   strings.TrimSpace(iface["H2"]),
-		H3:   strings.TrimSpace(iface["H3"]),
-		H4:   strings.TrimSpace(iface["H4"]),
-		I1:   strings.TrimSpace(iface["I1"]),
-		I2:   strings.TrimSpace(iface["I2"]),
-		I3:   strings.TrimSpace(iface["I3"]),
-		I4:   strings.TrimSpace(iface["I4"]),
-		I5:   strings.TrimSpace(iface["I5"]),
+		Jc:                     atoi(iface["Jc"]),
+		Jmin:                   atoi(iface["Jmin"]),
+		Jmax:                   atoi(iface["Jmax"]),
+		S1:                     atoi(iface["S1"]),
+		S2:                     atoi(iface["S2"]),
+		S3:                     atoi(iface["S3"]),
+		S4:                     atoi(iface["S4"]),
+		H1:                     strings.TrimSpace(iface["H1"]),
+		H2:                     strings.TrimSpace(iface["H2"]),
+		H3:                     strings.TrimSpace(iface["H3"]),
+		H4:                     strings.TrimSpace(iface["H4"]),
+		I1:                     strings.TrimSpace(iface["I1"]),
+		I2:                     strings.TrimSpace(iface["I2"]),
+		I3:                     strings.TrimSpace(iface["I3"]),
+		I4:                     strings.TrimSpace(iface["I4"]),
+		I5:                     strings.TrimSpace(iface["I5"]),
+		HeaderProtectionKey:    strings.TrimSpace(iface["HeaderProtectionKey"]),
+		ContentPaddingAddition: strings.TrimSpace(iface["ContentPaddingAddition"]),
+		RekeyAfterTime:         strings.TrimSpace(iface["RekeyAfterTime"]),
+		RekeyTimeout:           strings.TrimSpace(iface["RekeyTimeout"]),
+		RejectAfterTime:        strings.TrimSpace(iface["RejectAfterTime"]),
+		KeepaliveTimeout:       strings.TrimSpace(iface["KeepaliveTimeout"]),
+		MaxHandshakeAttempts:   strings.TrimSpace(iface["MaxHandshakeAttempts"]),
+	}
+	for _, field := range []struct {
+		name  string
+		value *bool
+	}{{"RandomTrailers", &cfg.Obf.RandomTrailers}, {"DisableCookies", &cfg.Obf.DisableCookies}} {
+		if v := strings.TrimSpace(iface[field.name]); v != "" {
+			switch strings.ToLower(v) {
+			case "on", "true", "1":
+				*field.value = true
+			case "off", "false", "0":
+				*field.value = false
+			default:
+				return nil, fmt.Errorf("%s: ожидается on или off", field.name)
+			}
+		}
 	}
 
 	ka := atoi(peer["PersistentKeepalive"])
@@ -140,8 +165,47 @@ func ImportClientConf(text string) (*ServerConfig, error) {
 		CreatedAt:  time.Now().Unix(),
 	}}
 	cfg.Client = ClientConfig{Enabled: false, PeerID: "router"}
+	if v := strings.TrimSpace(peer["PersistentKeepalive"]); v != "" {
+		if !validU16Range(v) {
+			return nil, fmt.Errorf("PersistentKeepalive: ожидается число или диапазон 0–65535")
+		}
+		if strings.Contains(v, "-") || v == "0" {
+			cfg.Peers[0].KeepaliveRange = v
+		}
+		if strings.Contains(v, "-") {
+			cfg.Protocol = "awg"
+		}
+	}
+	if v := strings.TrimSpace(iface["ProtocolVersion"]); v != "" {
+		cfg.ProtocolVersion = v
+	}
+	if cfg.ProtocolVersion == "" && cfg.Protocol == "awg" {
+		// Presence is relevant for format detection, even for explicitly disabled
+		// values such as RandomTrailers=off or S3=0.
+		for _, name := range []string{"HeaderProtectionKey", "ContentPaddingAddition", "RekeyAfterTime", "RekeyTimeout", "RejectAfterTime", "KeepaliveTimeout", "MaxHandshakeAttempts", "RandomTrailers", "DisableCookies"} {
+			if _, exists := iface[name]; exists {
+				cfg.ProtocolVersion = "3.1"
+				break
+			}
+		}
+		if cfg.ProtocolVersion == "" {
+			_, s3 := iface["S3"]
+			_, s4 := iface["S4"]
+			if s3 || s4 {
+				cfg.ProtocolVersion = "2"
+			}
+		}
+	}
+	if cfg.Protocol == "awg" && cfg.ProtocolVersion == "" {
+		cfg.ProtocolVersion = cfg.EffectiveProtocolVersion()
+	}
 
 	cfg.Normalize()
+	if cfg.UseObfuscation() {
+		if errs := cfg.Obf.Validate(); len(errs) > 0 {
+			return nil, fmt.Errorf("%s", strings.Join(errs, "; "))
+		}
+	}
 	return cfg, nil
 }
 
@@ -203,18 +267,23 @@ func confFromAmneziaJSON(data []byte) (string, error) {
 		DNS1       string `json:"dns1"`
 		DNS2       string `json:"dns2"`
 		Containers []struct {
-			AWG struct {
-				LastConfig json.RawMessage `json:"last_config"`
-			} `json:"awg"`
+			AWG amneziaImportedProtocol `json:"awg"`
+			WG  amneziaImportedProtocol `json:"wireguard"`
 		} `json:"containers"`
 	}
 	if err := json.Unmarshal(data, &root); err != nil {
 		return "", fmt.Errorf("vpn:// JSON не распознан: %w", err)
 	}
 	var lastRaw json.RawMessage
+	var protocolVersion string
 	for i := len(root.Containers) - 1; i >= 0; i-- {
 		if len(root.Containers[i].AWG.LastConfig) > 0 && string(root.Containers[i].AWG.LastConfig) != "null" {
 			lastRaw = root.Containers[i].AWG.LastConfig
+			protocolVersion = root.Containers[i].AWG.ProtocolVersion
+			break
+		}
+		if len(root.Containers[i].WG.LastConfig) > 0 && string(root.Containers[i].WG.LastConfig) != "null" {
+			lastRaw = root.Containers[i].WG.LastConfig
 			break
 		}
 	}
@@ -230,9 +299,10 @@ func confFromAmneziaJSON(data []byte) (string, error) {
 		lastJSON = lastRaw
 	}
 	var last struct {
-		Config string          `json:"config"`
-		MTU    json.RawMessage `json:"mtu"`
-		Port   json.RawMessage `json:"port"`
+		Config          string          `json:"config"`
+		MTU             json.RawMessage `json:"mtu"`
+		Port            json.RawMessage `json:"port"`
+		ProtocolVersion string          `json:"protocol_version"`
 	}
 	if err := json.Unmarshal(lastJSON, &last); err != nil {
 		return "", fmt.Errorf("AWG last_config не распознан: %w", err)
@@ -249,7 +319,25 @@ func confFromAmneziaJSON(data []byte) (string, error) {
 	if port := rawJSONString(last.Port); port != "" {
 		conf = setInterfaceKV(conf, "ListenPort", port)
 	}
+	if protocolVersion == "" {
+		protocolVersion = last.ProtocolVersion
+	}
+	if protocolVersion != "" {
+		switch protocolVersion {
+		case "1.0", "1.5", "2", "3.1":
+			// Internal import metadata, consumed by ImportClientConf and never
+			// emitted into the awg configuration sent to the engine.
+			conf = setInterfaceKV(conf, "ProtocolVersion", protocolVersion)
+		default:
+			return "", fmt.Errorf("неподдерживаемая версия AmneziaWG: %s", protocolVersion)
+		}
+	}
 	return conf, nil
+}
+
+type amneziaImportedProtocol struct {
+	LastConfig      json.RawMessage `json:"last_config"`
+	ProtocolVersion string          `json:"protocol_version"`
 }
 
 func rawJSONString(raw json.RawMessage) string {
@@ -313,7 +401,7 @@ func splitKV(line string) (key, value string, ok bool) {
 }
 
 func hasAWGObfuscation(iface map[string]string) bool {
-	for _, k := range []string{"Jc", "Jmin", "Jmax", "S1", "S2", "S3", "S4", "H1", "H2", "H3", "H4", "I1", "I2", "I3", "I4", "I5"} {
+	for _, k := range []string{"Jc", "Jmin", "Jmax", "S1", "S2", "S3", "S4", "H1", "H2", "H3", "H4", "I1", "I2", "I3", "I4", "I5", "HeaderProtectionKey", "ContentPaddingAddition", "RekeyAfterTime", "RekeyTimeout", "RejectAfterTime", "KeepaliveTimeout", "MaxHandshakeAttempts", "RandomTrailers", "DisableCookies", "ProtocolVersion"} {
 		if strings.TrimSpace(iface[k]) != "" {
 			return true
 		}

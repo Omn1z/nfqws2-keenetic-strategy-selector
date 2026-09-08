@@ -12,6 +12,8 @@ import (
 // and lets the user go straight to "client up" + routing. Mirrors AWG2AddServer
 // but seeds the manager with the imported config instead of awg.Default().
 func (svc *Service) AWG2Import(text, name string) (AWG2Status, error) {
+	_, unlock := svc.lockClientOps(false)
+	defer unlock()
 	cfg, err := awg.ImportClientConf(text)
 	if err != nil {
 		return svc.AWG2StatusView(), err

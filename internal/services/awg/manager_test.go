@@ -22,6 +22,9 @@ func (f *fakeRunner) Run(_ context.Context, cmd string) (string, string, error) 
 			return r.out, "", nil
 		}
 	}
+	if strings.Contains(cmd, "echo previous=1") {
+		return "previous=1", "", nil
+	}
 	return "", "", nil
 }
 
@@ -34,6 +37,8 @@ func (f *fakeRunner) Close() error { return nil }
 
 func newManagerWithFake(f *fakeRunner) (*Manager, *string) {
 	cfg := Default()
+	cfg.ProtocolVersion = "2" // this fixture exercises the legacy apt/DKMS path
+	cfg.TrafficObfuscation = nil
 	cfg.Conn.Host = "vps.example.com"
 	cfg.Conn.Password = "secret"
 	m := NewManager(cfg)
@@ -66,7 +71,7 @@ func TestDeployFlow(t *testing.T) {
 	}
 	foundConf := false
 	for _, p := range f.puts {
-		if strings.Contains(p, "/etc/amnezia/amneziawg/awg0.conf") {
+		if strings.Contains(p, "/etc/amnezia/amneziawg/.nfqws-deploy-awg0-") && strings.HasSuffix(p, "/new.conf") {
 			foundConf = true
 		}
 	}

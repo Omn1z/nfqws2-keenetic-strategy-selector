@@ -28,7 +28,7 @@ func keyHex(b64 string) (string, error) {
 }
 
 // RenderUAPISet builds the WireGuard/AmneziaWG UAPI `set=1` request to configure
-// the local client interface directly (no `awg` CLI): device identity + AWG 2.0
+// the local client interface directly (no `awg` CLI): device identity + AWG
 // obfuscation + the single server peer. Keys are hex (UAPI requirement) and the
 // endpoint must be a resolved IP (UAPI does not resolve hostnames).
 func RenderUAPISet(c *ServerConfig, p Peer, endpointIP string, port int) (string, error) {
@@ -47,11 +47,9 @@ func RenderUAPISet(c *ServerConfig, p Peer, endpointIP string, port int) (string
 		o := c.Obf
 		fmt.Fprintf(&b, "jc=%d\njmin=%d\njmax=%d\n", o.Jc, o.Jmin, o.Jmax)
 		fmt.Fprintf(&b, "s1=%d\ns2=%d\n", o.S1, o.S2)
-		// S3/S4 only when non-zero. Sending s3=0/s4=0 in UAPI is NOT equivalent to
-		// omitting them — the server validates the handshake auth tag using the same
-		// magic-byte protocol, and zero-vs-absent shifts which bytes appear in the
-		// init packet. If server config has no S3/S4, client must mirror that or the
-		// handshake auth check silently fails (server drops without log).
+		// Omit unused extensions for legacy engines. This request initializes a
+		// fresh device: omission on a running AWG3.1 device would retain its old
+		// settings, so wire changes require an interface/daemon restart.
 		if o.S3 > 0 {
 			fmt.Fprintf(&b, "s3=%d\n", o.S3)
 		}
@@ -64,6 +62,24 @@ func RenderUAPISet(c *ServerConfig, p Peer, endpointIP string, port int) (string
 				fmt.Fprintf(&b, "i%d=%s\n", i+1, strings.TrimSpace(v))
 			}
 		}
+		if strings.TrimSpace(o.HeaderProtectionKey) != "" {
+			key, err := keyHex(o.HeaderProtectionKey)
+			if err != nil {
+				return "", fmt.Errorf("HeaderProtectionKey: %w", err)
+			}
+			fmt.Fprintf(&b, "header_protection_key=%s\n", key)
+		}
+		for _, p := range o.awg31Strings() {
+			if v := strings.TrimSpace(p.value); v != "" {
+				fmt.Fprintf(&b, "%s=%s\n", p.uapi, v)
+			}
+		}
+		if o.RandomTrailers {
+			b.WriteString("random_trailers=true\n")
+		}
+		if o.DisableCookies {
+			b.WriteString("disable_cookies=true\n")
+		}
 	}
 	b.WriteString("replace_peers=true\n")
 	fmt.Fprintf(&b, "public_key=%s\n", pub)
@@ -73,11 +89,7 @@ func RenderUAPISet(c *ServerConfig, p Peer, endpointIP string, port int) (string
 		}
 	}
 	fmt.Fprintf(&b, "endpoint=%s:%d\n", endpointIP, port)
-	ka := p.Keepalive
-	if ka == 0 {
-		ka = 25
-	}
-	fmt.Fprintf(&b, "persistent_keepalive_interval=%d\n", ka)
+	fmt.Fprintf(&b, "persistent_keepalive_interval=%s\n", c.PeerKeepaliveValue(p))
 	b.WriteString("replace_allowed_ips=true\n")
 	for _, a := range splitAllowed(p.AllowedIPs) {
 		fmt.Fprintf(&b, "allowed_ip=%s\n", a)

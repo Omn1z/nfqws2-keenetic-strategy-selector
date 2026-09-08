@@ -320,7 +320,7 @@ export default function Dashboard() {
           const awgR = awgRates[awg.id];
           const awgSt = AWG_STATE[awg.state] ?? AWG_STATE.off;
           return (
-            <Card key={awg.id} title={`AWG2 · ${awg.label || awg.id}`} sub={awg.endpoint || "VPN-туннель"} head={<Badge kind={awgSt.k}>{awgSt.l}</Badge>} className={CARD}>
+            <Card key={awg.id} title={`VPN · ${awg.label || awg.id}`} sub={awg.endpoint || "VPN-туннель"} head={<Badge kind={awgSt.k}>{awgSt.l}</Badge>} className={CARD}>
               <Big value={awgR ? `${human(awgR.rx)}/с` : (awg.running ? "…" : "0 B/с")} sub="↓ через туннель" />
               <Row l="↑ сейчас">{awgR ? `${human(awgR.tx)}/с` : (awg.running ? "…" : "0 B/с")}</Row>
               <Row l="Хендшейк">{awg.last_handshake ? agoRu(awg.last_handshake) : "—"}</Row>
@@ -347,7 +347,7 @@ export default function Dashboard() {
           <Row l="Не отвечают"><span className={d.conns.failing ? "text-bad" : ""}>{d.conns.failing}</span></Row>
         </Card>
 
-        <Card title="Маршрутизация AWG2" sub="DNS + SNI / трассировка" className={CARD}>
+        <Card title="Маршрутизация VPN" sub="DNS + SNI / трассировка" className={CARD}>
           {(() => {
             const tc = d.trace_counters;
             const tr = traceRates;

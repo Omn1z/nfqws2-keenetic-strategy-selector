@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"net"
+	"strings"
 )
 
 // Config holds every knob the proxy understands. It is persisted as tgws.json
@@ -21,10 +22,14 @@ type Config struct {
 	BufferSize    int  `json:"buffer_size"`
 	PoolSize      int  `json:"pool_size"`
 	ProxyProtocol bool `json:"proxy_protocol"`
+	ForceTestDC   bool `json:"force_test_dc"`
+	SNIFronting   bool `json:"sni_fronting"` // opt-in: some fronts upgrade WS but never relay MTProto
 
-	CFProxy             bool   `json:"cfproxy"`
-	CFProxyUserDomain   string `json:"cfproxy_user_domain"`
-	CFProxyWorkerDomain string `json:"cfproxy_worker_domain"`
+	CFProxy              bool     `json:"cfproxy"`
+	CFProxyUserDomain    string   `json:"cfproxy_user_domain"`
+	CFProxyWorkerDomain  string   `json:"cfproxy_worker_domain"`
+	CFProxyUserDomains   []string `json:"cfproxy_user_domains"`
+	CFProxyWorkerDomains []string `json:"cfproxy_worker_domains"`
 
 	FakeTLSDomain string `json:"fake_tls_domain"`
 
@@ -70,6 +75,19 @@ func (c *Config) Normalize() {
 	if c.DCRedirects == nil {
 		c.DCRedirects = map[int]string{}
 	}
+	// Nil means an old config/API caller; an explicit empty list clears the
+	// domains even if a legacy field is present in the same payload.
+	if c.CFProxyUserDomains == nil {
+		c.CFProxyUserDomains = []string{c.CFProxyUserDomain}
+	}
+	if c.CFProxyWorkerDomains == nil {
+		c.CFProxyWorkerDomains = []string{c.CFProxyWorkerDomain}
+	}
+	c.CFProxyUserDomains = normalizeDomainList(c.CFProxyUserDomains)
+	c.CFProxyWorkerDomains = normalizeDomainList(c.CFProxyWorkerDomains)
+	c.CFProxyUserDomain = strings.Join(c.CFProxyUserDomains, ", ")
+	c.CFProxyWorkerDomain = strings.Join(c.CFProxyWorkerDomains, ", ")
+	c.FakeTLSDomain = strings.TrimSpace(c.FakeTLSDomain)
 	c.EnsureSecret()
 }
 
@@ -98,6 +116,16 @@ func (c *Config) Validate() []string {
 	}
 	if c.PoolSize < 0 {
 		errs = append(errs, "pool_size должен быть >= 0")
+	}
+	for _, domains := range [][]string{c.CFProxyUserDomains, c.CFProxyWorkerDomains} {
+		for _, domain := range domains {
+			if !validDomain(domain) {
+				errs = append(errs, fmt.Sprintf("неверный CF-домен %q: укажите имя без https://, порта и пути", domain))
+			}
+		}
+	}
+	if c.FakeTLSDomain != "" && !validDomain(c.FakeTLSDomain) {
+		errs = append(errs, "неверный Fake-TLS домен: укажите доменное имя без https://, порта и пути")
 	}
 	return errs
 }
@@ -148,6 +176,9 @@ var cfproxyEncodedDefaults = []string{
 	"virkgj.com", "vmmzovy.com", "mkuosckvso.com", "zaewayzmplad.com",
 	"twdmbzcm.com", "awzwsldi.com", "clngqrflngqin.com", "tjacxbqtj.com",
 	"bxaxtxmrw.com", "dmohrsgmohcrwb.com",
+	"vwbmtmoi.com", "khgrre.com", "ulihssf.com", "tmhqsdqmfpmk.com",
+	"xwuwoqbm.com", "orgcnunpj.com", "zhkuldz.com", "zypoljnslxa.com",
+	"efabnxaowuzs.com", "zaftuzsftqdq.com",
 }
 
 var cfTLD = string([]byte{46, 99, 111, 46, 117, 107}) // ".co.uk"

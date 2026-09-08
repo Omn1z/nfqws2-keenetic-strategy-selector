@@ -31,8 +31,9 @@ type Service struct {
 
 	// awg is the currently selected server manager. Low-level client/routing code
 	// still operates on one local awg0 tunnel, so it always reads this active one.
-	awg   *awg.Manager
-	route awgRouteState
+	awg     *awg.Manager
+	route   awgRouteState
+	clients clientSupervisor
 
 	// statusCache memoises the last AWG server Status() result. Status() can
 	// hang for up to 25 s when the VPS is slow (SSH, v6 timeouts) — without
@@ -59,6 +60,8 @@ type Service struct {
 	// geoip/list expansion which can be MBs of work per call.
 	expandMu    sync.RWMutex
 	expandCache map[string]expandCacheEntry
+	policyDNSMu sync.Mutex
+	policyDNS   map[string]policyDNSAnswer
 }
 
 type expandCacheEntry struct {
@@ -162,11 +165,24 @@ func (svc *Service) awgActive() *awg.Manager {
 
 // RepairRouting clears any AWG2 routing state leaked by an unclean exit. Called
 // at startup, after the manager exists.
-func (svc *Service) RepairRouting() { svc.awgRepairRouting() }
+func (svc *Service) RepairRouting() {
+	_, unlock := svc.lockClientOps(false)
+	svc.awgRepairRouting()
+	unlock()
+}
+
+// StartClientSupervisor starts retries after the app has initialized Pi-hole
+// and all other services which may mutate routing during startup.
+func (svc *Service) StartClientSupervisor() { svc.startClientSupervisor() }
 
 // TeardownRouting removes the live split-routing without clearing the committed
 // flag (so it restores when the tunnel returns). Called on shutdown.
-func (svc *Service) TeardownRouting() { svc.awgTeardownRouting() }
+func (svc *Service) TeardownRouting() {
+	svc.StopAWG()
+	_, unlock := svc.lockClientOps(false)
+	defer unlock()
+	svc.awgTeardownRouting()
+}
 
 // opkgBin returns the Entware opkg path (used by the AWG2 engine install).
 func opkgBin() string {

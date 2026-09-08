@@ -124,20 +124,22 @@ func (svc *Service) awgDisableLegacyExternalWatchdogsOS() {
 }
 
 func (svc *Service) awgEngineInfoOS() EngineInfo {
-	info := EngineInfo{Arch: runtime.GOARCH, Supported: awgArchSupported(runtime.GOARCH)}
+	info := inspectEngine(awgGoBin())
+	info.Arch, info.Supported = runtime.GOARCH, awgArchSupported(runtime.GOARCH)
 	if _, err := os.Stat("/dev/net/tun"); err == nil {
 		info.TunOK = true
-	}
-	if _, err := os.Stat(awgGoBin()); err == nil {
-		info.Installed = true
 	}
 	return info
 }
 
 func (svc *Service) awgInstallEngineOS() (string, error) {
+	opCtx := svc.clientOpContext()
+	if err := opCtx.Err(); err != nil {
+		return "", err
+	}
 	arch := runtime.GOARCH
 	if !awgArchSupported(arch) {
-		return "", fmt.Errorf("нет сборки движка AWG2 для архитектуры %s", arch)
+		return "", fmt.Errorf("нет сборки движка AmneziaWG для архитектуры %s", arch)
 	}
 	if svc.cfg.Repo == "" {
 		return "", fmt.Errorf("repo релизов не настроен")
@@ -148,16 +150,19 @@ func (svc *Service) awgInstallEngineOS() (string, error) {
 	asset := "awg-engine-linux-" + arch + ".tar.gz"
 	base := "https://github.com/" + svc.cfg.Repo + "/releases/latest/download/"
 	logbuf.Append("awg2", "info", "скачивание движка "+asset+"…")
-	data, err := httpGetBytes(base+asset, 90*time.Second)
+	data, err := httpGetBytes(opCtx, base+asset, 90*time.Second)
 	if err != nil {
 		return "", fmt.Errorf("скачивание движка: %w", err)
 	}
-	if sumTxt, e := httpGetBytes(base+asset+".sha256", 20*time.Second); e == nil {
-		if fields := strings.Fields(string(sumTxt)); len(fields) > 0 {
-			if got := fmt.Sprintf("%x", sha256.Sum256(data)); fields[0] != got {
-				return "", fmt.Errorf("контрольная сумма движка не совпала")
-			}
-		}
+	sumTxt, err := httpGetBytes(opCtx, base+asset+".sha256", 20*time.Second)
+	if err != nil {
+		return "", fmt.Errorf("не удалось получить контрольную сумму движка: %w", err)
+	}
+	if fields := strings.Fields(string(sumTxt)); len(fields) == 0 || !strings.EqualFold(fields[0], fmt.Sprintf("%x", sha256.Sum256(data))) {
+		return "", fmt.Errorf("контрольная сумма движка не совпала")
+	}
+	if err := opCtx.Err(); err != nil {
+		return "", err
 	}
 	if err := extractEngine(data, awgEngineDir); err != nil {
 		return "", err
@@ -166,11 +171,15 @@ func (svc *Service) awgInstallEngineOS() (string, error) {
 	if _, e1 := os.Stat("/opt/sbin/ipset"); e1 != nil {
 		if _, e2 := os.Stat("/opt/bin/ipset"); e2 != nil {
 			logbuf.Append("awg2", "info", "установка ipset (нужен для маршрутизации)…")
-			_, _ = exec.Command("sh", "-c", opkgBin()+" update >/dev/null 2>&1; "+opkgBin()+" install ipset 2>&1").CombinedOutput()
+			ctx, cancel := context.WithTimeout(opCtx, 60*time.Second)
+			cmd := exec.CommandContext(ctx, "sh", "-c", opkgBin()+" update >/dev/null 2>&1; "+opkgBin()+" install ipset 2>&1")
+			cmd.WaitDelay = time.Second
+			_, _ = cmd.CombinedOutput()
+			cancel()
 		}
 	}
 	logbuf.Append("awg2", "info", "движок установлен в "+awgEngineDir)
-	return "движок установлен: " + asset, nil
+	return "движок установлен: " + svc.awgEngineInfoOS().AwgVersion + "; включённые туннели автоматически переподключатся", nil
 }
 
 // extractEngine writes amneziawg-go from the tar.gz to dir (0755).
@@ -184,6 +193,9 @@ func extractEngine(data []byte, dir string) error {
 	}
 	defer zr.Close()
 	tr := tar.NewReader(zr)
+	dst := filepath.Join(dir, "amneziawg-go")
+	tmp := dst + ".new"
+	defer os.Remove(tmp)
 	got := 0
 	for {
 		h, err := tr.Next()
@@ -196,27 +208,39 @@ func extractEngine(data []byte, dir string) error {
 		if filepath.Base(h.Name) != "amneziawg-go" {
 			continue
 		}
-		dst := filepath.Join(dir, "amneziawg-go")
-		tmp := dst + ".new"
+		if h.Typeflag != tar.TypeReg || h.Size <= 0 || h.Size > 64<<20 || got != 0 {
+			return fmt.Errorf("неверный файл amneziawg-go в архиве")
+		}
 		f, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o755)
 		if err != nil {
 			return err
 		}
 		if _, err := io.Copy(f, io.LimitReader(tr, 64<<20)); err != nil {
 			f.Close()
+			_ = os.Remove(tmp)
 			return err
 		}
-		f.Close()
-		if err := os.Rename(tmp, dst); err != nil {
+		if err := f.Close(); err != nil {
+			_ = os.Remove(tmp)
 			return err
 		}
-		_ = os.Chmod(dst, 0o755)
+		if err := validateEngineBinary(tmp, runtime.GOARCH); err != nil {
+			_ = os.Remove(tmp)
+			return err
+		}
 		got++
 	}
 	if got < 1 {
 		return fmt.Errorf("в архиве движка нет amneziawg-go")
 	}
-	return nil
+	// Validate the gzip footer before replacing a working engine.
+	if _, err := io.Copy(io.Discard, zr); err != nil {
+		return fmt.Errorf("повреждён архив движка: %w", err)
+	}
+	if err := os.Chmod(tmp, 0o755); err != nil {
+		return err
+	}
+	return os.Rename(tmp, dst)
 }
 
 func (svc *Service) awgClientUpOS() error {
@@ -224,13 +248,23 @@ func (svc *Service) awgClientUpOS() error {
 }
 
 func (svc *Service) awgClientUpManagerOS(am *awg.Manager) error {
+	opCtx := svc.clientOpContext()
+	if err := opCtx.Err(); err != nil {
+		return err
+	}
+	if am == nil {
+		return fmt.Errorf("AWG2-сервер не выбран")
+	}
+	cfg := am.RuntimeConfig()
+	if !cfg.Enabled {
+		return fmt.Errorf("AWG2-сервер выключен")
+	}
 	if info := svc.awgEngineInfoOS(); !info.Installed {
 		return fmt.Errorf("движок AWG2 не установлен — нажмите «Установить движок»")
 	} else if !info.TunOK {
 		return fmt.Errorf("нет /dev/net/tun — TUN недоступен на этом роутере")
-	}
-	if am == nil {
-		return fmt.Errorf("AWG2-сервер не выбран")
+	} else if cfg.RequiresAWG31() && !info.AWG3Supported {
+		return fmt.Errorf("для этого профиля нужен движок AmneziaWG 3.1 — обновите движок в панели")
 	}
 	p, ok := am.RouterPeer()
 	if !ok {
@@ -239,7 +273,14 @@ func (svc *Service) awgClientUpManagerOS(am *awg.Manager) error {
 	if strings.TrimSpace(p.PrivateKey) == "" {
 		return fmt.Errorf("у роутер-пира нет приватного ключа — добавьте пир заново")
 	}
-	cfg := am.Config()
+	// Omitted AWG device fields retain their previous UAPI values. A fresh
+	// daemon is required for protocol/obfuscation changes and engine upgrades.
+	if err := svc.awgClientDownManagerOS(am); err != nil {
+		return err
+	}
+	if err := opCtx.Err(); err != nil {
+		return err
+	}
 	iface := awgClientIface(cfg)
 	if err := os.MkdirAll(awgClientDir, 0o755); err != nil {
 		return err
@@ -260,7 +301,7 @@ func (svc *Service) awgClientUpManagerOS(am *awg.Manager) error {
 		"ip link set " + iface + " up",
 		"echo iface-up",
 	}, "\n")
-	ctx, cancel := contextTimeout(30 * time.Second)
+	ctx, cancel := context.WithTimeout(opCtx, 30*time.Second)
 	defer cancel()
 	if out, err := exec.CommandContext(ctx, "sh", "-c", script).CombinedOutput(); err != nil {
 		return fmt.Errorf("поднятие интерфейса: %v: %s", err, strs.LastLines(strings.TrimSpace(string(out)), 4))
@@ -270,16 +311,27 @@ func (svc *Service) awgClientUpManagerOS(am *awg.Manager) error {
 		if _, e := os.Stat(awgSockPath(iface)); e == nil {
 			break
 		}
-		time.Sleep(200 * time.Millisecond)
+		if !waitClientContext(opCtx, 200*time.Millisecond) {
+			return opCtx.Err()
+		}
 	}
 	if isWARPConfig(cfg) {
-		next, err := svc.awgApplyBestWARPEndpoint(am, cfg, p, iface)
-		if err != nil {
-			return err
-		}
+		next, err := svc.awgApplyBestWARPEndpoint(opCtx, am, cfg, p, iface)
 		if next.Endpoint != cfg.Endpoint {
+			// A handshake can arrive just after the probe timeout. Keep policy
+			// endpoint exclusions consistent with the daemon's last UAPI set,
+			// including an exhausted scan which will be retried by the supervisor.
+			if am.RuntimeConfig().Endpoint != next.Endpoint {
+				if saveErr := am.SetConfig(&next); saveErr != nil {
+					return saveErr
+				}
+				svc.awgSave()
+			}
 			cfg = next
 			_ = writeFile0600(awgClientConfPath(iface), awg.ClientConf(&cfg, p))
+		}
+		if err != nil {
+			return err
 		}
 		logbuf.Append("awg2", "info", "туннель "+iface+" поднят (WARP endpoint auto)")
 		return nil
@@ -290,6 +342,7 @@ func (svc *Service) awgClientUpManagerOS(am *awg.Manager) error {
 	if endpointIP == "" || port == 0 {
 		return fmt.Errorf("не удалось разрешить адрес сервера (endpoint)")
 	}
+	svc.rememberPolicyDNS(host, []string{endpointIP})
 	if gw, dev := awgDefaultRoute(); dev != "" {
 		_, _ = awgRun(awgEndpointRouteCmd(endpointIP, gw, dev))
 	}
@@ -297,12 +350,17 @@ func (svc *Service) awgClientUpManagerOS(am *awg.Manager) error {
 	if err != nil {
 		return err
 	}
-	resp, err := uapiRequestIface(iface, setText)
+	resp, err := uapiRequestIfaceContext(opCtx, iface, setText)
 	if err != nil {
 		return fmt.Errorf("UAPI: %w", err)
 	}
 	if !strings.Contains(resp, "errno=0") {
 		return fmt.Errorf("UAPI set отклонён: %s", strings.TrimSpace(resp))
+	}
+	if cfg.PeerKeepaliveValue(p) == "0" {
+		if err := svc.awgProbeClientOS(am); err != nil {
+			return err
+		}
 	}
 	logbuf.Append("awg2", "info", "туннель "+iface+" поднят (конфиг применён по UAPI)")
 	return nil
@@ -316,15 +374,15 @@ func (svc *Service) awgClientDownManagerOS(am *awg.Manager) error {
 	if am == nil {
 		return fmt.Errorf("AWG2-server is not selected")
 	}
-	iface := awgClientIface(am.Config())
+	iface := awgClientIface(am.RuntimeConfig())
 	script := strings.Join([]string{
 		"ip link set " + iface + " down 2>/dev/null || true",
 		"ip link del " + iface + " 2>/dev/null || true",
-		"pkill -f '" + awgGoBin() + " " + iface + "' 2>/dev/null || true",
+		"pkill -f '(^|/)amneziawg-go " + iface + "$' 2>/dev/null || true",
 		"rm -f " + awgSockPath(iface) + " 2>/dev/null || true",
 		"echo down",
 	}, "\n")
-	ctx, cancel := contextTimeout(15 * time.Second)
+	ctx, cancel := context.WithTimeout(svc.clientOpContext(), 15*time.Second)
 	defer cancel()
 	out, _ := exec.CommandContext(ctx, "sh", "-c", script).CombinedOutput()
 	logbuf.Append("awg2", "info", "туннель "+iface+" опущен: "+strs.LastLines(strings.TrimSpace(string(out)), 2))
@@ -339,10 +397,13 @@ func (svc *Service) awgClientStatusManagerOS(am *awg.Manager) *ClientStatus {
 	if am == nil {
 		return nil
 	}
-	cfg := am.Config()
+	cfg := am.RuntimeConfig()
 	st := awgClientStatusIfaceOS(awgClientIface(cfg))
 	if st == nil {
 		return nil
+	}
+	if st.Endpoint != "" {
+		svc.rememberPolicyDNS(hostOf(cfg.Endpoint), []string{hostOf(st.Endpoint)})
 	}
 	if st.MTU == 0 {
 		st.MTU = awgTunnelMTU(cfg)
@@ -355,18 +416,25 @@ func (svc *Service) awgClientStatusManagerOS(am *awg.Manager) *ClientStatus {
 			}
 		}
 	}
+	svc.clientRecoveryStatus(am, st)
 	return st
 }
 
 func awgClientStatusIfaceOS(iface string) *ClientStatus {
+	return awgClientStatusIfaceContextOS(context.Background(), iface)
+}
+
+func awgClientStatusIfaceContextOS(opCtx context.Context, iface string) *ClientStatus {
 	st := &ClientStatus{}
-	if exec.Command("ip", "link", "show", iface).Run() == nil {
+	ctx, cancel := context.WithTimeout(opCtx, 2*time.Second)
+	defer cancel()
+	if exec.CommandContext(ctx, "ip", "link", "show", iface).Run() == nil {
 		st.IfacePresent = true
 	}
 	if _, err := os.Stat(awgSockPath(iface)); err != nil {
 		return st
 	}
-	resp, err := uapiRequestIface(iface, "get=1\n\n")
+	resp, err := uapiRequestIfaceContext(opCtx, iface, "get=1\n\n")
 	if err != nil || !strings.Contains(resp, "public_key=") {
 		return st
 	}
@@ -385,11 +453,18 @@ func uapiRequest(req string) (string, error) {
 }
 
 func uapiRequestIface(iface, req string) (string, error) {
-	conn, err := net.DialTimeout("unix", awgSockPath(iface), 5*time.Second)
+	return uapiRequestIfaceContext(context.Background(), iface, req)
+}
+
+func uapiRequestIfaceContext(ctx context.Context, iface, req string) (string, error) {
+	dialer := net.Dialer{Timeout: 5 * time.Second}
+	conn, err := dialer.DialContext(ctx, "unix", awgSockPath(iface))
 	if err != nil {
 		return "", err
 	}
 	defer conn.Close()
+	stop := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	defer stop()
 	_ = conn.SetDeadline(time.Now().Add(8 * time.Second))
 	if _, err := io.WriteString(conn, req); err != nil {
 		return "", err
@@ -406,8 +481,8 @@ func uapiRequestIface(iface, req string) (string, error) {
 
 // ---- helpers ----
 
-func httpGetBytes(url string, timeout time.Duration) ([]byte, error) {
-	ctx, cancel := contextTimeout(timeout)
+func httpGetBytes(parent context.Context, url string, timeout time.Duration) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
 	req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
 	req.Header.Set("User-Agent", "nfqws2-strategy")

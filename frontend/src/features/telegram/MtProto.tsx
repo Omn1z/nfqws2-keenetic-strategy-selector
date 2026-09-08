@@ -24,6 +24,8 @@ interface Form {
   buffer_size: string;
   cfproxy: boolean;
   proxy_protocol: boolean;
+  force_test_dc: boolean;
+  sni_fronting: boolean;
   cfproxy_user_domain: string;
   cfproxy_worker_domain: string;
 }
@@ -46,12 +48,16 @@ const parseDC = (text: string): Record<string, string> => {
 const toForm = (c: TgwsConfig): Form => ({
   port: String(c.port || 1433), secret: c.secret || "", dc: dcText(c.dc_redirects), fake_tls_domain: c.fake_tls_domain || "",
   link_host: c.link_host || "", pool_size: String(c.pool_size ?? 4), buffer_size: String(c.buffer_size || 262144),
-  cfproxy: !!c.cfproxy, proxy_protocol: !!c.proxy_protocol, cfproxy_user_domain: c.cfproxy_user_domain || "", cfproxy_worker_domain: c.cfproxy_worker_domain || "",
+  cfproxy: !!c.cfproxy, proxy_protocol: !!c.proxy_protocol, force_test_dc: !!c.force_test_dc, sni_fronting: !!c.sni_fronting,
+  cfproxy_user_domain: c.cfproxy_user_domains?.join("\n") ?? c.cfproxy_user_domain ?? "",
+  cfproxy_worker_domain: c.cfproxy_worker_domains?.join("\n") ?? c.cfproxy_worker_domain ?? "",
 });
 const collect = (f: Form) => ({
   port: parseInt(f.port, 10) || 1433, secret: f.secret.trim(), dc_redirects: parseDC(f.dc), fake_tls_domain: f.fake_tls_domain.trim(),
   link_host: f.link_host.trim(), pool_size: parseInt(f.pool_size, 10) || 0, buffer_size: parseInt(f.buffer_size, 10) || 262144,
-  cfproxy: f.cfproxy, proxy_protocol: f.proxy_protocol, cfproxy_user_domain: f.cfproxy_user_domain.trim(), cfproxy_worker_domain: f.cfproxy_worker_domain.trim(),
+  cfproxy: f.cfproxy, proxy_protocol: f.proxy_protocol, force_test_dc: f.force_test_dc, sni_fronting: f.sni_fronting,
+  cfproxy_user_domains: f.cfproxy_user_domain.split(/[\s,;]+/).filter(Boolean),
+  cfproxy_worker_domains: f.cfproxy_worker_domain.split(/[\s,;]+/).filter(Boolean),
 });
 
 const StatRow = ({ l, v }: { l: string; v: ReactNode }) => (
@@ -86,7 +92,7 @@ export default function MtProto() {
 
   return (
     <>
-      <Card title="Telegram MTProto → WebSocket прокси" head={<Badge kind={live.running ? "ok" : "bad"}>{live.running ? "работает" : "остановлен"}</Badge>}>
+      <Card title="Telegram MTProto → WebSocket прокси" sub={live.upstream_version ? `TG WS Proxy ${live.upstream_version}` : undefined} head={<Badge kind={live.running ? "ok" : "bad"}>{live.running ? "работает" : "остановлен"}</Badge>}>
         <p className="mb-3 text-xs text-muted">Прокси для Telegram прямо на роутере: клиенты в LAN ходят через <code>&lt;роутер&gt;:порт</code>, трафик идёт к Telegram по WSS с запасными путями.</p>
         <div className="flex flex-wrap items-center gap-4">
           <ToggleField label="Прокси включён" checked={live.config.enabled} onChange={toggle} />
@@ -118,10 +124,14 @@ export default function MtProto() {
         <div className="flex flex-wrap items-end gap-6">
           <ToggleField label="CF fallback" checked={form.cfproxy} onChange={(v) => set("cfproxy", v)} />
           <ToggleField label="PROXY protocol" checked={form.proxy_protocol} onChange={(v) => set("proxy_protocol", v)} />
+          <ToggleField label="Резервный SNI" checked={form.sni_fronting} onChange={(v) => set("sni_fronting", v)} />
+          <ToggleField label="Тестовые DC Telegram" checked={form.force_test_dc} onChange={(v) => set("force_test_dc", v)} />
         </div>
+        <p className="text-xs text-muted">Тестовые DC нужны для тестовой среды Telegram. Для обычного аккаунта оставьте этот переключатель выключенным.</p>
+        <p className="text-xs text-muted">Резервный SNI помогает при блокировке обычного TLS к Telegram. Включайте его при необходимости: некоторые фронты принимают подключение, но не передают трафик.</p>
         <div className="flex flex-wrap gap-4">
-          <Field label="CF свой домен" hint="перебивает встроенный пул" className="min-w-[200px] flex-1"><Input value={form.cfproxy_user_domain} onChange={(e) => set("cfproxy_user_domain", e.target.value)} /></Field>
-          <Field label="CF Worker домен" hint="пробуется первым" className="min-w-[200px] flex-1"><Input value={form.cfproxy_worker_domain} onChange={(e) => set("cfproxy_worker_domain", e.target.value)} /></Field>
+          <Field label="Свои CF-домены" hint="По одному на строку или через запятую. Пусто — встроенный пул с автоматическим обновлением." className="min-w-[200px] flex-1"><Textarea rows={3} value={form.cfproxy_user_domain} onChange={(e) => set("cfproxy_user_domain", e.target.value)} /></Field>
+          <Field label="Домены CF Worker" hint="Пробуются первыми; при ошибке используется следующий. По одному на строку или через запятую." className="min-w-[200px] flex-1"><Textarea rows={3} value={form.cfproxy_worker_domain} onChange={(e) => set("cfproxy_worker_domain", e.target.value)} /></Field>
         </div>
         <div className="mt-2 flex items-center gap-2.5"><Button variant="primary" onClick={save}>Сохранить настройки</Button><span className="text-xs text-muted">при включённом прокси сохранение перезапустит его</span></div>
       </Card>
@@ -135,6 +145,8 @@ export default function MtProto() {
             <StatRow l="Отклонено (плохой секрет) / маскировка" v={`${cc.bad} / ${cc.masked}`} />
             <StatRow l="Трафик ↑ / ↓" v={`${t.human_up || "0.0B"} / ${t.human_down || "0.0B"}`} />
             <StatRow l="Пул (попаданий/всего) · ошибки WS" v={`${w.pool_hits}/${w.pool_hits + w.pool_misses} · ${w.errors}`} />
+            <StatRow l="Пул CF Worker (попаданий/всего)" v={`${w.cf_pool_hits ?? 0}/${(w.cf_pool_hits ?? 0) + (w.cf_pool_misses ?? 0)}`} />
+            <StatRow l="Соединения через резервный SNI" v={cc.fronting ?? 0} />
           </tbody>
         </table>
       </Card>

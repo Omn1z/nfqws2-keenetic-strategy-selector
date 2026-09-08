@@ -299,9 +299,6 @@ func (svc *Service) awgKnownWARPEndpoints() []string {
 			continue
 		}
 		out = append(out, cfg.Endpoint)
-		if cs := svc.awgClientStatusManagerOS(srv.Manager); cs != nil {
-			out = append(out, cs.Endpoint)
-		}
 	}
 	return out
 }

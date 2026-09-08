@@ -123,7 +123,7 @@ export default function System() {
         <Row title="HTTP-логи запросов" desc="Строки «GET /api/… 14ms» в логах. Выключение убирает их шум, остальные логи остаются.">
           <Switch checked={s.http_logs_enabled} onChange={(on) => apply({ http_logs_enabled: on }, on ? "HTTP-логи включены" : "HTTP-логи выключены")} />
         </Row>
-        <Row title="Трассировка AWG2" desc="Запись DNS/SNI-событий в буфер для вкладки «AWG2 → Трассировка». Счётчики (RPS на главной) тикают всегда — кольцо буфера наполняется только в выбранном режиме.">
+        <Row title="Трассировка VPN" desc="Запись DNS/SNI-событий в буфер для вкладки «AmneziaWG → Трассировка». Счётчики (RPS на главной) тикают всегда — кольцо буфера наполняется только в выбранном режиме.">
           <select
             value={s.trace_mode}
             onChange={(e) => void apply({ trace_mode: e.target.value as SystemSettings["trace_mode"] }, "Режим трассировки сохранён")}

@@ -40,6 +40,7 @@ func defaultDialer(ctx context.Context, cred Credentials) (runner, string, error
 type Manager struct {
 	mu         sync.Mutex
 	cfg        *ServerConfig
+	applied    *ServerConfig // last deployed wire config while a desired update is pending; persistence lives in the service wrapper
 	lastDep    *DeployResult
 	lastStatus *Status
 	deploying  bool
@@ -87,6 +88,10 @@ type Status struct {
 
 func (c ServerConfig) clone() ServerConfig {
 	cp := c
+	if c.TrafficObfuscation != nil {
+		on := *c.TrafficObfuscation
+		cp.TrafficObfuscation = &on
+	}
 	if c.Peers == nil {
 		cp.Peers = []Peer{}
 	} else {
@@ -109,6 +114,56 @@ func (m *Manager) Config() ServerConfig {
 	return m.cfg.clone()
 }
 
+// SetAppliedConfig installs a last-successful deployment snapshot. The service
+// layer persists it separately from the public desired config. Nil clears it.
+func (m *Manager) SetAppliedConfig(cfg *ServerConfig) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if cfg == nil {
+		m.applied = nil
+		return
+	}
+	copy := cfg.clone()
+	m.applied = &copy
+}
+
+func (m *Manager) AppliedConfig() *ServerConfig {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.applied == nil {
+		return nil
+	}
+	copy := m.applied.clone()
+	return &copy
+}
+
+func (m *Manager) PendingApply() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.applied != nil
+}
+
+// RuntimeConfig keeps watchdog/recovery and exports on the last deployed wire
+// format. Local availability, autostart and routing controls still take effect.
+func (m *Manager) RuntimeConfig() ServerConfig {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.runtimeConfigLocked()
+}
+
+func (m *Manager) runtimeConfigLocked() ServerConfig {
+	desired := m.cfg.clone()
+	if m.applied == nil {
+		return desired
+	}
+	cfg := m.applied.clone()
+	cfg.Enabled = desired.Enabled
+	cfg.Client.Enabled = desired.Client.Enabled
+	cfg.ClientIface = desired.ClientIface
+	cfg.Routing = desired.Routing
+	return cfg
+}
+
 // Redacted returns a deep copy with every secret blanked, for API responses.
 func (m *Manager) Redacted() ServerConfig {
 	m.mu.Lock()
@@ -118,6 +173,8 @@ func (m *Manager) Redacted() ServerConfig {
 	c.Conn.Password = ""
 	c.Conn.KeyPEM = ""
 	c.Conn.KeyPass = ""
+	c.Obf.HasHeaderProtectionKey = strings.TrimSpace(c.Obf.HeaderProtectionKey) != ""
+	c.Obf.HeaderProtectionKey = ""
 	for i := range c.Peers {
 		c.Peers[i].HasPrivate = strings.TrimSpace(c.Peers[i].PrivateKey) != ""
 		c.Peers[i].PrivateKey = ""
@@ -129,13 +186,19 @@ func (m *Manager) Redacted() ServerConfig {
 // SetConfig validates and replaces the config. The caller (app layer) is
 // responsible for preserving blank-sent secrets and the generated server keys.
 func (m *Manager) SetConfig(in *ServerConfig) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.deploying {
+		return fmt.Errorf("дождитесь завершения развёртывания сервера")
+	}
+	if strings.TrimSpace(in.Obf.HeaderProtectionKey) == "" {
+		in.Obf.HeaderProtectionKey = m.cfg.Obf.HeaderProtectionKey
+	}
 	in.Normalize()
 	if errs := in.Validate(); len(errs) > 0 {
 		return fmt.Errorf("%s", strings.Join(errs, "; "))
 	}
-	m.mu.Lock()
 	m.cfg = in
-	m.mu.Unlock()
 	// Mirror the hot-path booleans under the lock-free atomics so subsequent
 	// ClientEnabled() / Enabled() reads see the swap atomically.
 	m.clientEnabled.Store(in.Client.Enabled)
@@ -225,6 +288,14 @@ func (m *Manager) EnsureRouterPeerLocal() (Peer, bool, error) {
 }
 
 func (m *Manager) ensureRouterPeerLocked() (Peer, bool, error) {
+	if m.applied != nil {
+		for _, p := range m.applied.Peers {
+			if p.IsRouter || (m.applied.Client.PeerID != "" && p.ID == m.applied.Client.PeerID) {
+				return p, false, nil
+			}
+		}
+		return Peer{}, false, fmt.Errorf("в применённой конфигурации нет пира роутера; сначала завершите развёртывание сервера")
+	}
 	for i := range m.cfg.Peers {
 		if m.cfg.Peers[i].IsRouter || (m.cfg.Client.PeerID != "" && m.cfg.Peers[i].ID == m.cfg.Client.PeerID) {
 			m.cfg.Peers[i].IsRouter = true
@@ -245,7 +316,7 @@ func (m *Manager) ensureRouterPeerLocked() (Peer, bool, error) {
 	return p, true, nil
 }
 
-// EnsureKeys generates the server keypair + randomized 2.0 obfuscation once.
+// EnsureKeys generates the server keypair and selected obfuscation profile once.
 // Returns true if anything changed (so the caller persists before deploying).
 func (m *Manager) EnsureKeys() (bool, error) {
 	m.mu.Lock()
@@ -266,8 +337,20 @@ func (m *Manager) EnsureKeys() (bool, error) {
 		return false, err
 	}
 	m.cfg.PrivateKey, m.cfg.PublicKey = priv, pub
-	if err := RandomizeObf(&m.cfg.Obf); err != nil {
-		return false, err
+	if m.cfg.UseObfuscation() {
+		var err error
+		if m.cfg.ProtocolVersion == "3.1" {
+			// Explicit configuration may already have generated and persisted the
+			// shared header key. Never rotate it at WG key generation.
+			if !m.cfg.Obf.hasAWG31() {
+				err = RandomizeObf31(&m.cfg.Obf)
+			}
+		} else {
+			err = RandomizeObf(&m.cfg.Obf)
+		}
+		if err != nil {
+			return false, err
+		}
 	}
 	return true, nil
 }
@@ -306,7 +389,10 @@ func (m *Manager) Deploy(ctx context.Context, progress func(Step)) (DeployResult
 	}
 	defer r.Close()
 
-	res := Deploy(ctx, r, &cfg, progress)
+	res := Deploy(ctx, r, &cfg, progress, func(recoveryCtx context.Context) (runner, error) {
+		fresh, _, err := dial(recoveryCtx, cred)
+		return fresh, err
+	})
 
 	m.mu.Lock()
 	if strings.TrimSpace(m.cfg.Conn.KnownKey) == "" && learned != "" {
@@ -318,6 +404,7 @@ func (m *Manager) Deploy(ctx context.Context, progress func(Step)) (DeployResult
 	if res.OK {
 		m.cfg.DeployedAt = time.Now().Unix()
 		m.cfg.Endpoint = cfg.Endpoint
+		m.applied = nil
 	}
 	m.lastDep = &res
 	m.mu.Unlock()
@@ -412,6 +499,9 @@ func (m *Manager) AddPeer(ctx context.Context, in Peer) (Peer, error) {
 }
 
 func (m *Manager) addPeerLocked(in Peer) (Peer, error) {
+	if m.applied != nil || m.deploying {
+		return Peer{}, fmt.Errorf("сначала завершите развёртывание сохранённых настроек сервера")
+	}
 	if strings.TrimSpace(in.PublicKey) == "" {
 		priv, pub, err := GenKeypair()
 		if err != nil {
@@ -441,6 +531,9 @@ func (m *Manager) addPeerLocked(in Peer) (Peer, error) {
 	if in.Keepalive == 0 {
 		in.Keepalive = 25
 	}
+	if m.cfg.RequiresAWG31() && in.KeepaliveRange == "" {
+		in.KeepaliveRange = "25-35"
+	}
 	in.CreatedAt = time.Now().Unix()
 	in.HasPrivate = strings.TrimSpace(in.PrivateKey) != ""
 	m.cfg.Peers = append(m.cfg.Peers, in)
@@ -450,6 +543,10 @@ func (m *Manager) addPeerLocked(in Peer) (Peer, error) {
 // RemovePeer drops a peer and (if deployed) applies the removal live.
 func (m *Manager) RemovePeer(ctx context.Context, id string) error {
 	m.mu.Lock()
+	if m.applied != nil || m.deploying {
+		m.mu.Unlock()
+		return fmt.Errorf("сначала завершите развёртывание сохранённых настроек сервера")
+	}
 	idx := -1
 	for i := range m.cfg.Peers {
 		if m.cfg.Peers[i].ID == id {
@@ -486,12 +583,13 @@ func (m *Manager) ClientConfig(id string) (text, filename string, err error) {
 func (m *Manager) ClientExport(id, format string) (text, filename, contentType string, err error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	for _, p := range m.cfg.Peers {
+	cfg := m.runtimeConfigLocked()
+	for _, p := range cfg.Peers {
 		if p.ID == id {
 			if strings.TrimSpace(p.PrivateKey) == "" {
 				return "", "", "", fmt.Errorf("для этого пира нет приватного ключа (добавьте пир заново)")
 			}
-			return ClientExport(m.cfg, p, format)
+			return ClientExport(&cfg, p, format)
 		}
 	}
 	return "", "", "", fmt.Errorf("пир не найден")
@@ -501,8 +599,9 @@ func (m *Manager) ClientExport(id, format string) (text, filename, contentType s
 func (m *Manager) RouterPeer() (Peer, bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	for _, p := range m.cfg.Peers {
-		if p.IsRouter || (m.cfg.Client.PeerID != "" && p.ID == m.cfg.Client.PeerID) {
+	cfg := m.runtimeConfigLocked()
+	for _, p := range cfg.Peers {
+		if p.IsRouter || (cfg.Client.PeerID != "" && p.ID == cfg.Client.PeerID) {
 			return p, true
 		}
 	}
@@ -551,8 +650,11 @@ rm -f /tmp/awg-%[1]s.sync
 // ---- small helpers ----
 
 var reKey = regexp.MustCompile(`[A-Za-z0-9+/]{43}=`)
+var reHexKey = regexp.MustCompile(`\b[0-9a-fA-F]{64}\b`)
 
-func redact(s string) string { return reKey.ReplaceAllString(s, "***") }
+func redact(s string) string {
+	return reHexKey.ReplaceAllString(reKey.ReplaceAllString(s, "***"), "***")
+}
 
 func newID() string {
 	var b [6]byte

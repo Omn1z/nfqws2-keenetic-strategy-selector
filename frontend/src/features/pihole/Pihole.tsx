@@ -154,7 +154,7 @@ export default function Pihole() {
 
       <Card title="DNS-цепь" sub="как pi-hole встраивается в наш DNS-стек" className="mt-4">
         <p className="mb-2 text-[12px] text-muted">
-          Когда включено: <code className="text-ink">dnsmasq:53 → наш DNS-proxy:5354 → pi-hole:{st.dns_port} → upstream DoH</code>. AWG2-зоны по-прежнему отдаются нашим proxy (через DoH в обход блока), а всё остальное идёт через pi-hole — там режется реклама. Когда выключено: наш proxy форвардит в системный dnsmasq (как сейчас).
+          Когда включено: <code className="text-ink">dnsmasq:53 → наш DNS-proxy:5354 → pi-hole:{st.dns_port} → upstream DoH</code>. VPN-зоны по-прежнему отдаются нашим proxy (через DoH в обход блока), а всё остальное идёт через pi-hole — там режется реклама. Когда выключено: наш proxy форвардит в системный dnsmasq (как сейчас).
         </p>
         <Switch
           checked={st.dns_chain_enabled}

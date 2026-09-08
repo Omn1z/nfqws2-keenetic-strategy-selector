@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { api } from "@/lib/api";
 import { cn } from "@/lib/cn";
+import { vpnEngineIssue, vpnProfileLabel } from "@/lib/awg";
 import { usePoll } from "@/lib/hooks";
 import { Card } from "@/components/ui/Card";
 import { Badge } from "@/components/ui/Badge";
@@ -17,7 +18,7 @@ import RoutingPane from "./RoutingPane";
 import DevicesRoutingPane from "./DevicesRoutingPane";
 import TracePane from "./TracePane";
 import { SpeedTestPanel } from "./SpeedTestCard";
-import type { Awg2ServerSummary, Awg2Status, AwgDeployResult } from "@/types/api";
+import type { Awg2ServerSummary, Awg2Status, AwgClientStatus, AwgDeployResult } from "@/types/api";
 
 type Sub = "server" | "routing" | "devices" | "trace";
 type DeployOpts = { quiet?: boolean; skipReload?: boolean };
@@ -32,6 +33,7 @@ const emptyNewConnection = () => ({
   user: "root",
   auth: "password",
   password: "",
+  trafficObfuscation: true,
 });
 
 const human = (n: number) => {
@@ -62,15 +64,27 @@ function serverLine(srv: Awg2ServerSummary, deploying: boolean) {
 
 function tunnelLine(srv: Awg2ServerSummary) {
   const cl = srv.client;
-  if (srv.connected) return { kind: "ok" as const, label: "connected" };
   if (!srv.enabled) return { kind: "neutral" as const, label: "туннель выкл" };
+  if (cl?.recovering) return { kind: "warn" as const, label: "переподключение" };
+  if (srv.connected) return { kind: "ok" as const, label: "connected" };
   if (!srv.deployed && !srv.imported) return { kind: "neutral" as const, label: "черновик" };
   if (!cl?.running) return { kind: "neutral" as const, label: "туннель опущен" };
   if (cl.connected) return { kind: "ok" as const, label: "туннель connected" };
   return { kind: "warn" as const, label: "туннель поднят" };
 }
 
-/** «Сервисы → AWG2»: deploy an AmneziaWG 2.0 server on a VPS over SSH, hand out
+function RecoveryStatus({ client }: { client: AwgClientStatus }) {
+  if (!client.recovering) return null;
+  const wait = Math.max(0, (client.retry_at || 0) - Math.floor(Date.now() / 1000));
+  return (
+    <div className="mt-2 text-[11.5px] text-warn" role="status">
+      <span><MiniSpinner /> Автовосстановление{client.retry_count ? ` · попыток: ${client.retry_count}` : ""}{wait > 0 ? ` · повтор через ${wait} с` : " · проверяем соединение"}</span>
+      {client.recovery_error && <div className="mt-0.5 [overflow-wrap:anywhere]">{client.recovery_error}</div>}
+    </div>
+  );
+}
+
+/** «Сервисы → AmneziaWG»: deploy a VPN server on a VPS over SSH, hand out
  *  client configs, and (Routing tab) split-route LAN traffic through the tunnel. */
 export default function AWG2() {
   const [sub, setSub] = useState<Sub>("server");
@@ -88,6 +102,7 @@ export default function AWG2() {
   const [clientsOpen, setClientsOpen] = useState(false);
   const [newConn, setNewConn] = useState(emptyNewConnection);
   const [creating, setCreating] = useState(false);
+  const [formatBusy, setFormatBusy] = useState(false);
   const [speedServer, setSpeedServer] = useState<Awg2ServerSummary | null>(null);
 
   usePoll(async () => {
@@ -152,9 +167,12 @@ export default function AWG2() {
       toast("Это импортированный профиль: деплой на VPS недоступен, можно поднимать туннель", "err");
       return false;
     }
+    const desired = st?.active_server_id === srv.id ? st.config : srv;
+    const engineIssue = st && vpnEngineIssue(st.engine, desired.traffic_obfuscation !== false && (desired.protocol_version === "3.1" || srv.protocol_version === "3.1"));
+    if (engineIssue) { toast(engineIssue, "err"); return false; }
     if (deploying[id]) return false;
     setDeploying((m) => ({ ...m, [id]: true }));
-    if (!opts.quiet) toast("Запущен деплой AWG2-сервера…", "ok");
+    if (!opts.quiet) toast("Запущено развёртывание VPN-сервера…", "ok");
     try {
       const d = await api<{ ok: boolean; result: AwgDeployResult; error?: string }>("POST", `/api/awg2/servers/${encodeURIComponent(id)}/deploy`, {});
       if (!opts.skipReload) await reload();
@@ -196,18 +214,25 @@ export default function AWG2() {
     setNewConn(emptyNewConnection());
   };
 
-  const autoRaiseActiveTunnel = async () => {
+  const autoRaiseActiveTunnel = async (success: string) => {
+    let started = false;
     try {
       await api("POST", "/api/awg2/client/up", {});
-      return await api<Awg2Status>("GET", "/api/awg2");
+      started = true;
     } catch (e) {
       toast("Подключение создано, но туннель не поднялся: " + (e as Error).message, "err");
-      return await api<Awg2Status>("GET", "/api/awg2");
     }
+    const next = await api<Awg2Status>("GET", "/api/awg2");
+    if (started) toast(success, "ok");
+    return next;
   };
 
   const submitNewConnection = async () => {
     if (creating) return;
+    if (newMode === "selfhosted" && st) {
+      const issue = vpnEngineIssue(st.engine, newConn.trafficObfuscation);
+      if (issue) { toast(issue, "err"); return; }
+    }
     setCreating(true);
     try {
       let next: Awg2Status;
@@ -217,16 +242,14 @@ export default function AWG2() {
           return;
         }
         next = await api<Awg2Status>("POST", "/api/awg2/import", { conf: newConn.conf, name: newConn.name.trim() });
-        next = await autoRaiseActiveTunnel();
-        toast("Существующее подключение добавлено и поднято", "ok");
+        next = await autoRaiseActiveTunnel("Подключение добавлено, VPN на роутере запущен");
       } else if (newMode === "warp") {
         next = await api<Awg2Status>("POST", "/api/awg2/warp", {
           name: newConn.name.trim() || "Cloudflare WARP",
           endpoint: newConn.warpEndpoint.trim(),
           accept_tos: true,
         });
-        next = await autoRaiseActiveTunnel();
-        toast("WARP-подключение создано и поднято", "ok");
+        next = await autoRaiseActiveTunnel("WARP создан, VPN на роутере запущен");
       } else {
         if (!newConn.name.trim()) {
           toast("Укажите имя self-hosted сервера", "err");
@@ -239,6 +262,8 @@ export default function AWG2() {
         next = await api<Awg2Status>("POST", "/api/awg2/servers", { name: newConn.name.trim() });
         next = await api<Awg2Status>("POST", "/api/awg2/config", {
           ...next.config,
+          protocol_version: "3.1",
+          traffic_obfuscation: newConn.trafficObfuscation,
           conn: {
             ...next.config.conn,
             host: newConn.host.trim(),
@@ -258,8 +283,7 @@ export default function AWG2() {
         }
         next = await api<Awg2Status>("GET", "/api/awg2");
         if (d.ok) {
-          next = await autoRaiseActiveTunnel();
-          toast("Self-hosted сервер развёрнут и поднят", "ok");
+          next = await autoRaiseActiveTunnel("Сервер развёрнут, VPN на роутере запущен");
         } else {
           toast("Self-hosted подключение создано, но deploy завершился с ошибкой: " + (d.error || d.result?.error || "см. журнал"), "err");
         }
@@ -324,12 +348,12 @@ export default function AWG2() {
 
   const deleteServer = async (id: string) => {
     if (!id) return;
-    if (!(await confirmDialog({ title: "Удалить AWG2-сервер?", body: "Конфиг, ключи и пиры этого сервера будут удалены из панели. На самом VPS уже установленный сервис не трогается.", confirmLabel: "Удалить", danger: true }))) return;
+    if (!(await confirmDialog({ title: "Удалить VPN-подключение?", body: "Конфиг, ключи и пиры этого сервера будут удалены из панели. На самом VPS уже установленный сервис не трогается.", confirmLabel: "Удалить", danger: true }))) return;
     try {
       const next = await api<Awg2Status>("DELETE", `/api/awg2/servers/${encodeURIComponent(id)}`);
       setSt(next);
       setSub("server");
-      toast("Сервер AWG2 удалён", "ok");
+      toast("VPN-подключение удалено", "ok");
     } catch (e) {
       toast((e as Error).message, "err");
     }
@@ -354,8 +378,9 @@ export default function AWG2() {
   const seg = (m: Sub, label: string) => (
     <button
       type="button"
+      disabled={formatBusy}
       onClick={() => setSub(m)}
-      className={cn("border-r border-line px-4 py-1.5 text-[13px] outline-none transition last:border-r-0 focus-visible:relative focus-visible:ring-2 focus-visible:ring-ring/40", sub === m ? "bg-accent text-white" : "bg-panel text-ink-soft hover:bg-line-soft")}
+      className={cn("border-r border-line px-4 py-1.5 text-[13px] outline-none transition last:border-r-0 focus-visible:relative focus-visible:ring-2 focus-visible:ring-ring/40 disabled:cursor-not-allowed disabled:opacity-50", sub === m ? "bg-accent text-white" : "bg-panel text-ink-soft hover:bg-line-soft")}
     >
       {label}
     </button>
@@ -379,20 +404,22 @@ export default function AWG2() {
     newMode === "import" ? "Добавить подключение" :
     newMode === "warp" ? "Создать WARP" :
     "Развернуть сервер";
+  const newEngineIssue = newMode === "selfhosted" ? vpnEngineIssue(st.engine, newConn.trafficObfuscation) : "";
 
   return (
     <>
       <Card
-        title="AWG2 — AmneziaWG 2.0 VPN"
+        title="AmneziaWG VPN"
         sub="свой VPS или imported .conf/.vpn + сплит-роутинг"
         head={
           <div className="flex flex-wrap items-center gap-2">
             <Badge kind={statusKind}>{statusText}</Badge>
-            <Badge kind={st.engine.installed ? "ok" : "neutral"}>{st.engine.installed ? "движок установлен" : "движок не установлен"}</Badge>
+            <Badge kind={st.engine.update_available ? "warn" : st.engine.installed ? "ok" : "neutral"}>{st.engine.update_available ? "доступен новый движок" : st.engine.awg3_supported ? "движок AWG 3.1" : st.engine.installed ? "движок установлен" : "движок не установлен"}</Badge>
+            {st.engine.update_available && <Button mini onClick={() => setSub("routing")} disabled={formatBusy}>Обновить движок</Button>}
           </div>
         }
       >
-        <p className="text-xs text-muted">Разворачивает обфусцированный AmneziaWG 2.0 сервер на вашем VPS по SSH или подключает роутер к уже существующему AWG/WireGuard профилю. Деплой, подключение и маршрутизация — явные действия; роутер не перезагружается.</p>
+        <p className="text-xs text-muted">Разворачивает VPN-сервер на вашем VPS по SSH или подключает роутер к существующему профилю AmneziaWG, WireGuard или WARP.</p>
         {dep && dep.steps?.length > 0 && (
           <div className="mt-3 rounded-lg border border-line bg-line-soft p-2.5">
             <div className="mb-1 text-[11px] font-semibold text-ink-soft">Последний деплой ({dep.method}{dep.wan_iface ? `, WAN ${dep.wan_iface}` : ""}):</div>
@@ -410,14 +437,14 @@ export default function AWG2() {
       </Card>
 
       <Card
-        title="Серверы AWG2"
+        title="VPN-подключения"
         sub="self-hosted, WARP и импортированные подключения"
-        head={<Button mini onClick={() => setAddOpen(true)}>Новое подключение</Button>}
+        head={<Button mini onClick={() => setAddOpen(true)} disabled={formatBusy}>Новое подключение</Button>}
       >
         {selectedIDs.length > 0 && (
           <div className="mb-3 flex flex-wrap items-center gap-2 rounded-lg border border-line bg-line-soft px-3 py-2">
             <span className="text-xs font-semibold text-ink-soft">Выбрано: {selectedIDs.length}</span>
-            <Button mini variant="primary" onClick={deploySelected} disabled={!!batch || !canDeploySelected}>
+            <Button mini variant="primary" onClick={deploySelected} disabled={formatBusy || !!batch || !canDeploySelected}>
               {batch ? `Деплой ${batch.done}/${batch.total}` : "Переразвернуть выбранные"}
             </Button>
             <Button mini variant="ghost" onClick={() => setSelected({})} disabled={!!batch}>Снять выбор</Button>
@@ -451,6 +478,7 @@ export default function AWG2() {
                     <div className="flex min-h-6 items-center gap-2">
                       <button
                         type="button"
+                        disabled={formatBusy}
                         title="Переименовать"
                         onClick={(e) => { e.stopPropagation(); openRename(srv); }}
                         className="min-w-0 max-w-full truncate text-left text-[13px] font-semibold text-ink outline-none transition hover:text-accent focus-visible:ring-2 focus-visible:ring-ring/40"
@@ -462,20 +490,24 @@ export default function AWG2() {
                     <div className="mt-0.5 truncate text-[11.5px] text-muted">{srv.endpoint || srv.host || "адрес не задан"}{srv.client_iface ? ` · ${srv.client_iface}` : ""}</div>
                   </div>
                   <span onClick={(e) => e.stopPropagation()}>
-                    <Switch checked={!!srv.enabled} onChange={(v) => toggleServer(srv.id, v)} />
+                    <Switch checked={!!srv.enabled} onChange={(v) => toggleServer(srv.id, v)} disabled={formatBusy || !!toggling[srv.id]} />
                   </span>
                 </div>
 
                 <div className="mt-3 flex flex-wrap gap-1.5">
                   <Badge kind={sLine.kind}>{busy && <MiniSpinner />} {sLine.label}</Badge>
                   <Badge kind={tLine.kind}>{tLine.label}</Badge>
-                  {srv.imported && <Badge kind="neutral">{srv.protocol === "wireguard" ? "WG" : "AWG"}</Badge>}
+                  <Badge kind="neutral">{srv.deployment_pending ? "Последний успешный: " : ""}{vpnProfileLabel(srv)}</Badge>
+                  {srv.deployment_pending && <Badge kind="warn">изменения не развёрнуты</Badge>}
+                  {!srv.is_warp && srv.protocol !== "wireguard" && srv.traffic_obfuscation === false && <Badge kind="neutral">обфускация выкл.</Badge>}
                 </div>
                 {cl?.running && (
                   <div className="mt-2 text-[11.5px] text-muted">
                     Хендшейк: {ago(cl.last_handshake)} назад · ↓ {human(cl.rx_bytes)} / ↑ {human(cl.tx_bytes)} · MTU {cl.mtu || "—"}
                   </div>
                 )}
+                {srv.enabled && cl && <RecoveryStatus client={cl} />}
+                {srv.deployment_pending && <p className="mt-2 text-[11.5px] text-warn">Роутер и экспорт используют последнюю успешно развёрнутую конфигурацию. Завершите развёртывание в настройках.</p>}
                 {srv.last_error && <div className="mt-2 line-clamp-2 text-[11px] text-warn" title={srv.last_error}>{srv.last_error}</div>}
                 {busy && (
                   <div className="mt-3 h-1.5 overflow-hidden rounded-full bg-line">
@@ -483,19 +515,19 @@ export default function AWG2() {
                   </div>
                 )}
                 <div className="mt-3 flex flex-wrap items-center gap-2">
-                  <Button mini variant="primary" onClick={() => { void selectServer(srv.id); }}>
+                  <Button mini variant="primary" onClick={() => { void selectServer(srv.id); }} disabled={formatBusy}>
                     Настройки
                   </Button>
-                  <Button mini onClick={(e) => { e.stopPropagation(); void deployServer(srv.id); }} disabled={busy || !srv.enabled || srv.imported || !srv.host}>
+                  <Button mini onClick={(e) => { e.stopPropagation(); void deployServer(srv.id); }} disabled={formatBusy || busy || !srv.enabled || srv.imported || !srv.host}>
                     {busy ? "Деплой..." : srv.deployed ? "Переразвернуть" : "Развернуть"}
                   </Button>
-                  <Button mini onClick={(e) => { e.stopPropagation(); void openClients(srv); }} disabled={!srv.enabled || srv.imported}>
-                    Добавить клиента
+                  <Button mini onClick={(e) => { e.stopPropagation(); void openClients(srv); }} disabled={formatBusy || !srv.enabled || srv.imported}>
+                    {srv.deployment_pending ? "Клиенты и экспорт" : "Добавить клиента"}
                   </Button>
                   <Button mini onClick={(e) => { e.stopPropagation(); setSpeedServer(srv); }} disabled={!srv.client_iface || !srv.client?.running}>
                     Замер
                   </Button>
-                  <Button mini variant="danger" onClick={(e) => { e.stopPropagation(); void deleteServer(srv.id); }}>
+                  <Button mini variant="danger" onClick={(e) => { e.stopPropagation(); void deleteServer(srv.id); }} disabled={formatBusy}>
                     Удалить
                   </Button>
                 </div>
@@ -513,7 +545,7 @@ export default function AWG2() {
       </div>
 
       {sub === "server" && <>
-        <ServerPane st={st} reload={reload} deployActive={() => activeServer ? deployServer(activeServer.id) : Promise.resolve(false)} deploying={!!(activeServer && deploying[activeServer.id])} />
+        <ServerPane st={st} reload={reload} deployActive={() => activeServer ? deployServer(activeServer.id) : Promise.resolve(false)} deploying={!!(activeServer && deploying[activeServer.id])} onFormatBusyChange={setFormatBusy} onOpenEngineSettings={() => setSub("routing")} />
       </>}
       {sub === "routing" && <RoutingPane st={st} reload={reload} />}
       {sub === "devices" && <DevicesRoutingPane st={st} reload={reload} />}
@@ -547,7 +579,7 @@ export default function AWG2() {
           title="Новое подключение"
           onClose={closeNewConnection}
           size="lg"
-          actions={<><Button onClick={closeNewConnection} disabled={creating}>Отмена</Button><Button variant="primary" onClick={submitNewConnection} disabled={creating}>{creating ? "..." : newConnectionSubmitLabel}</Button></>}
+          actions={<><Button onClick={closeNewConnection} disabled={creating}>Отмена</Button><Button variant="primary" onClick={submitNewConnection} disabled={creating || !!newEngineIssue}>{creating ? "..." : newConnectionSubmitLabel}</Button></>}
         >
           <div className="space-y-3">
             <div className="grid gap-2 sm:grid-cols-3">
@@ -607,6 +639,13 @@ export default function AWG2() {
 
             {newMode === "selfhosted" && (
               <>
+                <div className="rounded-lg border border-line bg-line-soft p-3">
+                  <Switch checked={newConn.trafficObfuscation} onChange={(v) => setNewConn((s) => ({ ...s, trafficObfuscation: v }))} disabled={creating} label="Обфускация трафика" />
+                  <p className="mt-2 text-xs text-muted">{newConn.trafficObfuscation
+                    ? "Создаст сервер AWG 3.1 с автоматическими настройками обфускации и подключит роутер. Для других устройств потребуется клиент с поддержкой AWG 3.1."
+                    : "Создаст сервер с обычным форматом WireGuard. Шифрование VPN остаётся включённым."}</p>
+                </div>
+                {newEngineIssue && <div className="rounded-lg bg-warn-bg px-3 py-2 text-xs text-warn"><p>{newEngineIssue}</p><Button mini className="mt-2" onClick={() => { setAddOpen(false); setSub("routing"); }} disabled={creating}>Настройки движка</Button></div>}
                 <div className="grid gap-3 sm:grid-cols-[minmax(180px,1fr)_90px]">
                   <Field label="Адрес VPS">
                     <Input value={newConn.host} placeholder="IP или домен" onChange={(e) => setNewConn((s) => ({ ...s, host: e.target.value }))} />

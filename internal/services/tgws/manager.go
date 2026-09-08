@@ -14,17 +14,19 @@ import (
 // Manager owns the proxy lifecycle: it is held by the host app and driven from
 // the web tab. Start/Stop/Restart are safe to call concurrently.
 type Manager struct {
+	opMu    sync.Mutex // serializes complete lifecycle operations, including waits
 	mu      sync.Mutex
 	cfg     *Config
 	stats   *Stats
 	running bool
 
-	ln     net.Listener
-	ctx    context.Context
-	cancel context.CancelFunc
-	pool   *wsPool
-	conns  *connSet
-	wg     sync.WaitGroup
+	ln         net.Listener
+	ctx        context.Context
+	cancel     context.CancelFunc
+	pool       *wsPool
+	workerPool *cfWorkerPool
+	conns      *connSet
+	wg         sync.WaitGroup
 
 	// awgUp is an optional live probe injected by the host app: "is the AWG2
 	// tunnel up?" Read per connection (atomic, settable after Start) to route the
@@ -61,6 +63,8 @@ func (m *Manager) Config() Config {
 	defer m.mu.Unlock()
 	c := *m.cfg
 	c.DCRedirects = copyDC(m.cfg.DCRedirects)
+	c.CFProxyUserDomains = append([]string{}, m.cfg.CFProxyUserDomains...)
+	c.CFProxyWorkerDomains = append([]string{}, m.cfg.CFProxyWorkerDomains...)
 	return c
 }
 
@@ -75,6 +79,8 @@ func (m *Manager) Link(hostOverride string) string {
 // SetConfig replaces the config and, if the proxy is running, restarts it so
 // the change takes effect.
 func (m *Manager) SetConfig(cfg *Config) error {
+	m.opMu.Lock()
+	defer m.opMu.Unlock()
 	cfg.Normalize()
 	if errs := cfg.Validate(); len(errs) > 0 {
 		return fmt.Errorf("%s", joinErrs(errs))
@@ -85,16 +91,22 @@ func (m *Manager) SetConfig(cfg *Config) error {
 	m.mu.Unlock()
 
 	if wasRunning {
-		m.Stop()
+		m.stop()
 	}
 	if cfg.Enabled {
-		return m.Start()
+		return m.start()
 	}
 	return nil
 }
 
 // Start begins listening if enabled and not already running.
 func (m *Manager) Start() error {
+	m.opMu.Lock()
+	defer m.opMu.Unlock()
+	return m.start()
+}
+
+func (m *Manager) start() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.running {
@@ -108,21 +120,23 @@ func (m *Manager) Start() error {
 	}
 
 	bal := newDomainBalancer()
-	if cfg.CFProxy && cfg.CFProxyUserDomain == "" {
+	if cfg.CFProxy && len(cfg.CFProxyUserDomains) == 0 {
 		bal.updatePool(cfg.cfproxyDefaultPool())
-	} else if cfg.CFProxyUserDomain != "" {
-		bal.updatePool([]string{cfg.CFProxyUserDomain})
+	} else if len(cfg.CFProxyUserDomains) > 0 {
+		bal.updatePool(cfg.CFProxyUserDomains)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
-	pool := newWSPool(ctx, cfg.PoolSize, cfg.BufferSize, m.stats)
+	pool := newWSPool(ctx, cfg.PoolSize, cfg.BufferSize, m.stats, cfg.SNIFronting)
+	workerPool := newCFWorkerPool(ctx, cfg.PoolSize, cfg.BufferSize, m.stats)
 	settings := handlerSettings{
 		secret:        secret,
 		dcRedirects:   copyDC(cfg.DCRedirects),
 		bufferSize:    cfg.BufferSize,
 		fakeTLSDomain: cfg.FakeTLSDomain,
 		proxyProtocol: cfg.ProxyProtocol,
-		fallback:      fallbackConfig{cfproxyEnabled: cfg.CFProxy, cfproxyWorkerDomain: cfg.CFProxyWorkerDomain},
+		forceTestDC:   cfg.ForceTestDC,
+		fallback:      fallbackConfig{cfproxyEnabled: cfg.CFProxy, cfproxyWorkerDomains: append([]string{}, cfg.CFProxyWorkerDomains...), workerPool: workerPool},
 		awgAvailable:  m.awgAvailable,
 	}
 	conns := newConnSet()
@@ -131,6 +145,8 @@ func (m *Manager) Start() error {
 	ln, err := net.Listen("tcp", fmt.Sprintf(":%d", cfg.Port))
 	if err != nil {
 		cancel()
+		pool.reset()
+		workerPool.reset()
 		return fmt.Errorf("не удалось открыть порт %d: %w", cfg.Port, err)
 	}
 
@@ -138,27 +154,73 @@ func (m *Manager) Start() error {
 	m.ctx = ctx
 	m.cancel = cancel
 	m.pool = pool
+	m.workerPool = workerPool
 	m.conns = conns
 	m.running = true
 	m.stats.startedAt.Store(time.Now().Unix())
 
 	m.wg.Add(1)
 	go m.acceptLoop(ln, handler, conns)
-	pool.warmup(settings.dcRedirects)
+	if !cfg.ForceTestDC {
+		pool.warmup(settings.dcRedirects)
+		cfTargets := make(map[int]string)
+		for dc, ip := range dcDefaultIPs {
+			if settings.dcRedirects[dc] == "" {
+				cfTargets[dc] = ip
+			}
+		}
+		workerPool.warmup(cfTargets, cfg.CFProxyWorkerDomains)
+	}
+	if cfg.CFProxy && len(cfg.CFProxyUserDomains) == 0 {
+		m.wg.Add(1)
+		go func() { defer m.wg.Done(); runCFDomainRefresh(ctx, bal) }()
+	}
 
-	log.Printf("tgws: listening on :%d (fake-tls=%q, pool=%d)", cfg.Port, cfg.FakeTLSDomain, cfg.PoolSize)
+	log.Printf("tgws: upstream %s listening on :%d (fake-tls=%q, pool=%d)", UpstreamVersion, cfg.Port, censorDomains(cfg.FakeTLSDomain), cfg.PoolSize)
 	return nil
 }
 
 func (m *Manager) acceptLoop(ln net.Listener, h *clientHandler, conns *connSet) {
 	defer m.wg.Done()
+	address := ln.Addr().String()
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
-			return // listener closed on Stop
+			if h.ctx.Err() != nil {
+				return
+			}
+			_ = ln.Close()
+			log.Printf("tgws: listener failed; reopening %s: %s", address, censorDomains(err.Error()))
+			for {
+				select {
+				case <-h.ctx.Done():
+					return
+				case <-time.After(time.Second):
+				}
+				reopened, err := net.Listen("tcp", address)
+				if err != nil {
+					continue
+				}
+				m.mu.Lock()
+				if h.ctx.Err() != nil {
+					m.mu.Unlock()
+					_ = reopened.Close()
+					return
+				}
+				m.ln = reopened
+				m.mu.Unlock()
+				ln = reopened
+				log.Printf("tgws: listener restored on %s", address)
+				break
+			}
+			continue
 		}
-		conns.add(conn)
+		if !conns.add(conn) {
+			continue
+		}
+		m.wg.Add(1)
 		go func() {
+			defer m.wg.Done()
 			defer conns.remove(conn)
 			h.handle(conn)
 		}()
@@ -167,6 +229,12 @@ func (m *Manager) acceptLoop(ln net.Listener, h *clientHandler, conns *connSet) 
 
 // Stop shuts the listener, aborts in-flight dials and drops active clients.
 func (m *Manager) Stop() {
+	m.opMu.Lock()
+	defer m.opMu.Unlock()
+	m.stop()
+}
+
+func (m *Manager) stop() {
 	m.mu.Lock()
 	if !m.running {
 		m.mu.Unlock()
@@ -174,6 +242,8 @@ func (m *Manager) Stop() {
 	}
 	m.running = false
 	cancel, ln, pool, conns := m.cancel, m.ln, m.pool, m.conns
+	workerPool := m.workerPool
+	m.workerPool = nil
 	m.cancel, m.ln, m.pool, m.conns = nil, nil, nil, nil
 	m.mu.Unlock()
 
@@ -189,27 +259,38 @@ func (m *Manager) Stop() {
 	if pool != nil {
 		pool.reset()
 	}
+	if workerPool != nil {
+		workerPool.reset()
+	}
 	m.wg.Wait()
 	log.Printf("tgws: stopped. stats: %s", m.stats.summary())
 }
 
 func (m *Manager) Restart() error {
-	m.Stop()
-	return m.Start()
+	m.opMu.Lock()
+	defer m.opMu.Unlock()
+	m.stop()
+	return m.start()
 }
 
 // connSet tracks live client connections so Stop can drop them all.
 type connSet struct {
-	mu sync.Mutex
-	m  map[net.Conn]struct{}
+	mu     sync.Mutex
+	m      map[net.Conn]struct{}
+	closed bool
 }
 
 func newConnSet() *connSet { return &connSet{m: map[net.Conn]struct{}{}} }
 
-func (cs *connSet) add(c net.Conn) {
+func (cs *connSet) add(c net.Conn) bool {
 	cs.mu.Lock()
+	defer cs.mu.Unlock()
+	if cs.closed {
+		_ = c.Close()
+		return false
+	}
 	cs.m[c] = struct{}{}
-	cs.mu.Unlock()
+	return true
 }
 func (cs *connSet) remove(c net.Conn) {
 	cs.mu.Lock()
@@ -218,6 +299,7 @@ func (cs *connSet) remove(c net.Conn) {
 }
 func (cs *connSet) closeAll() {
 	cs.mu.Lock()
+	cs.closed = true
 	for c := range cs.m {
 		_ = c.Close()
 	}

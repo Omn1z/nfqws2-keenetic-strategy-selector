@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
 	"testing"
 	"time"
 )
@@ -106,6 +107,45 @@ func TestUpstreamSplitterSync(t *testing.T) {
 	dec.XORKeyStream(pt, ct)
 	if !bytes.Equal(pt, payload) {
 		t.Fatalf("splitter decryptor out of sync:\n got %q\nwant %q", pt, payload)
+	}
+}
+
+// These vectors were generated with _build_crypto_ctx in Flowseal/tg-ws-proxy
+// v1.10.2, using prekey=bytes(range(48)), relay=bytes(range(64)), and encrypting
+// bytes(range(1, 80)) in three chunks of lengths 7, 25 and 47. They independently
+// verify key reversal, secret hashing and each direction's init-byte offset.
+func TestCryptoContextUpstreamVectors(t *testing.T) {
+	prekey, relay, payload := make([]byte, 48), make([]byte, 64), make([]byte, 79)
+	for i := range prekey {
+		prekey[i] = byte(i)
+	}
+	for i := range relay {
+		relay[i] = byte(i)
+	}
+	for i := range payload {
+		payload[i] = byte(i + 1)
+	}
+	secret, _ := hex.DecodeString("00112233445566778899aabbccddeeff")
+	ctx := buildContext(prekey, secret, relay)
+	for _, tc := range []struct {
+		name   string
+		stream interface{ XORKeyStream([]byte, []byte) }
+		want   string
+	}{
+		{"client decrypt", ctx.clientDecrypt, "d0a653a2fb91085271dd64ad23658e28273f8828e454dbe83c19aa596754c484f58101cd88c6d84575cfb4c9e2787831554213479764c20e9b08d4084ff32e062a0e62f82d4adc3fec268db8432723"},
+		{"client encrypt", ctx.clientEncrypt, "3e8d10ed9442c3f6badfd3482eb47e422169d854a6540ef16e808eb17d349abd153e035b92e2983773f17308780297f18c0a10e23c21d04263bf81031566dac05d1e9b275ac8ba1fab8aea3fb4b0d1"},
+		{"upstream encrypt", ctx.upstreamEncrypt, "33abc22c3df762492bbb9bb110acbd1bb3b4d7b9cce119e3348c0d001e5747f3a259f1a8afb4d78518a252da3bcd07a36b5a8e42a6bacd944c811c3c626bfffce0e7e2902be7f4829a1ee5aededd91"},
+		{"upstream decrypt", ctx.upstreamDecrypt, "2e9fe074dbca01489cd33aef07287479c02fa5a9f026976ef45fecad041f6d4e456bffcc1c1eb632ae31c620025f76146313025bb8b8b46d6dcb9a77ba723ba0d16adace1aee7cb61f2afc088daa48"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := make([]byte, len(payload))
+			tc.stream.XORKeyStream(got[:7], payload[:7])
+			tc.stream.XORKeyStream(got[7:32], payload[7:32])
+			tc.stream.XORKeyStream(got[32:], payload[32:])
+			if hex.EncodeToString(got) != tc.want {
+				t.Fatalf("Go stream differs from upstream Python: %x", got)
+			}
+		})
 	}
 }
 

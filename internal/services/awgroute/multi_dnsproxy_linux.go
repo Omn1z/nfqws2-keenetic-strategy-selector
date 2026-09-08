@@ -115,6 +115,7 @@ func (svc *Service) awgMultiLearnDNSAnswer(rules []awgMultiRule, name, srcIP str
 	if len(v4) == 0 {
 		return
 	}
+	svc.rememberPolicyDNS(name, v4)
 	if immediate {
 		awgIPSetAddManySync(r.SetName, v4)
 		return

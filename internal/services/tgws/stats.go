@@ -13,6 +13,7 @@ type Stats struct {
 	connectionsWS          atomic.Int64
 	connectionsTCPFallback atomic.Int64
 	connectionsCFProxy     atomic.Int64
+	connectionsFronting    atomic.Int64
 	connectionsBad         atomic.Int64
 	connectionsMasked      atomic.Int64
 	wsErrors               atomic.Int64
@@ -20,6 +21,8 @@ type Stats struct {
 	bytesDown              atomic.Int64
 	poolHits               atomic.Int64
 	poolMisses             atomic.Int64
+	cfPoolHits             atomic.Int64
+	cfPoolMisses           atomic.Int64
 	startedAt              atomic.Int64 // unix seconds
 }
 
@@ -42,6 +45,7 @@ type Snapshot struct {
 		WS          int64 `json:"ws"`
 		TCPFallback int64 `json:"tcp_fallback"`
 		CFProxy     int64 `json:"cfproxy"`
+		Fronting    int64 `json:"fronting"`
 		Bad         int64 `json:"bad"`
 		Masked      int64 `json:"masked"`
 	} `json:"connections"`
@@ -52,9 +56,11 @@ type Snapshot struct {
 		HumanDown string `json:"human_down"`
 	} `json:"traffic"`
 	WS struct {
-		Errors     int64 `json:"errors"`
-		PoolHits   int64 `json:"pool_hits"`
-		PoolMisses int64 `json:"pool_misses"`
+		Errors       int64 `json:"errors"`
+		PoolHits     int64 `json:"pool_hits"`
+		PoolMisses   int64 `json:"pool_misses"`
+		CFPoolHits   int64 `json:"cf_pool_hits"`
+		CFPoolMisses int64 `json:"cf_pool_misses"`
 	} `json:"ws"`
 	StartedAt int64 `json:"started_at"`
 }
@@ -66,6 +72,7 @@ func (s *Stats) snapshot() Snapshot {
 	out.Connections.WS = s.connectionsWS.Load()
 	out.Connections.TCPFallback = s.connectionsTCPFallback.Load()
 	out.Connections.CFProxy = s.connectionsCFProxy.Load()
+	out.Connections.Fronting = s.connectionsFronting.Load()
 	out.Connections.Bad = s.connectionsBad.Load()
 	out.Connections.Masked = s.connectionsMasked.Load()
 	up, down := s.bytesUp.Load(), s.bytesDown.Load()
@@ -76,6 +83,8 @@ func (s *Stats) snapshot() Snapshot {
 	out.WS.Errors = s.wsErrors.Load()
 	out.WS.PoolHits = s.poolHits.Load()
 	out.WS.PoolMisses = s.poolMisses.Load()
+	out.WS.CFPoolHits = s.cfPoolHits.Load()
+	out.WS.CFPoolMisses = s.cfPoolMisses.Load()
 	out.StartedAt = s.startedAt.Load()
 	return out
 }
@@ -86,9 +95,9 @@ func (s *Stats) summary() string {
 	if pool > 0 {
 		poolS = fmt.Sprintf("%d/%d", s.poolHits.Load(), pool)
 	}
-	return fmt.Sprintf("total=%d active=%d ws=%d tcp_fb=%d cf=%d bad=%d masked=%d err=%d pool=%s up=%s down=%s",
+	return fmt.Sprintf("total=%d active=%d ws=%d tcp_fb=%d cf=%d front=%d bad=%d masked=%d err=%d pool=%s cf_pool=%d/%d up=%s down=%s",
 		s.connectionsTotal.Load(), s.connectionsActive.Load(), s.connectionsWS.Load(),
-		s.connectionsTCPFallback.Load(), s.connectionsCFProxy.Load(), s.connectionsBad.Load(),
-		s.connectionsMasked.Load(), s.wsErrors.Load(), poolS,
+		s.connectionsTCPFallback.Load(), s.connectionsCFProxy.Load(), s.connectionsFronting.Load(), s.connectionsBad.Load(),
+		s.connectionsMasked.Load(), s.wsErrors.Load(), poolS, s.cfPoolHits.Load(), s.cfPoolHits.Load()+s.cfPoolMisses.Load(),
 		humanBytes(s.bytesUp.Load()), humanBytes(s.bytesDown.Load()))
 }

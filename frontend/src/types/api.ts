@@ -261,9 +261,9 @@ export interface ARPSpoofView {
 }
 
 export interface TgwsSnapshot {
-  connections: { total: number; active: number; ws: number; tcp_fallback: number; cfproxy: number; bad: number; masked: number };
+  connections: { total: number; active: number; ws: number; tcp_fallback: number; cfproxy: number; fronting: number; bad: number; masked: number };
   traffic: { bytes_up: number; bytes_down: number; human_up: string; human_down: string };
-  ws: { errors: number; pool_hits: number; pool_misses: number };
+  ws: { errors: number; pool_hits: number; pool_misses: number; cf_pool_hits: number; cf_pool_misses: number };
   started_at: number;
 }
 
@@ -275,14 +275,19 @@ export interface TgwsConfig {
   buffer_size: number;
   pool_size: number;
   proxy_protocol: boolean;
+  force_test_dc: boolean;
+  sni_fronting: boolean;
   cfproxy: boolean;
   cfproxy_user_domain: string;
   cfproxy_worker_domain: string;
+  cfproxy_user_domains: string[];
+  cfproxy_worker_domains: string[];
   fake_tls_domain: string;
   link_host: string;
 }
 
 export interface TgwsStatus {
+  upstream_version: string;
   running: boolean;
   config: TgwsConfig;
   stats: TgwsSnapshot;
@@ -318,13 +323,23 @@ export interface Socks5Status {
 export interface AwgFallbackServer { id: string; label: string; client_iface?: string; connected: boolean }
 export interface AwgFallbackView { value: string; servers: AwgFallbackServer[] }
 
-// ---- AWG2 (AmneziaWG 2.0). Secret fields (password/key_pem/key_pass/private_key/psk)
-// are write-only: sent on save, never returned by the API. ----
+// ---- AmneziaWG (legacy awg2 API paths). Secret fields, including
+// obf.header_protection_key, are write-only; presence flags are safe to display. ----
 export interface AwgObfuscation {
   jc: number; jmin: number; jmax: number;
   s1: number; s2: number; s3: number; s4: number;
   h1: string; h2: string; h3: string; h4: string;
   i1: string; i2: string; i3: string; i4: string; i5: string;
+  header_protection_key?: string;
+  has_header_protection_key?: boolean;
+  content_padding_addition?: string;
+  rekey_after_time?: string;
+  rekey_timeout?: string;
+  reject_after_time?: string;
+  keepalive_timeout?: string;
+  max_handshake_attempts?: string;
+  random_trailers?: boolean;
+  disable_cookies?: boolean;
 }
 export interface AwgCredentials {
   host: string; port: number; user: string; auth_kind: string;
@@ -334,6 +349,7 @@ export interface AwgPeer {
   id: string; name: string; public_key: string;
   private_key?: string; psk?: string;
   address: string; allowed_ips: string; keepalive: number;
+  keepalive_range?: string;
   is_router: boolean; has_private: boolean; created_at: number;
 }
 /** A routing rule (UI: «Правило»). Order in the parent zones[] array IS its
@@ -360,6 +376,8 @@ export interface AwgClientConfig { enabled: boolean; peer_id: string }
 export interface AwgServerConfig {
   enabled: boolean;
   protocol?: string;
+  protocol_version?: string;
+  traffic_obfuscation?: boolean;
   conn: AwgCredentials;
   install: string;
   private_key?: string;
@@ -383,6 +401,8 @@ export interface AwgStep { name: string; ok: boolean; detail: string }
 export interface AwgDeployResult {
   ok: boolean; method: string; wan_iface: string; listening: boolean; handshake: boolean;
   steps: AwgStep[]; error?: string;
+  rollback_status?: "restored" | "removed_new" | "failed";
+  rollback_error?: string; rollback_backup?: string;
 }
 export interface AwgPeerStatus {
   id: string; name: string; public_key: string; endpoint: string;
@@ -393,16 +413,20 @@ export interface AwgStatus {
 }
 export interface AwgEngineInfo {
   installed: boolean; awg_version: string; arch: string; supported: boolean; tun_ok: boolean; error?: string;
+  awg3_supported?: boolean; update_available?: boolean; target_version?: string;
 }
 export interface AwgClientStatus {
   running: boolean; iface_present: boolean; last_handshake: number; rx_bytes: number; tx_bytes: number;
   endpoint: string; address: string; mtu: number; connected: boolean; error?: string;
+  recovering?: boolean; retry_at?: number; retry_count?: number; recovery_error?: string;
 }
 export interface Awg2ServerSummary {
+  deployment_pending?: boolean;
   id: string; label: string; host: string; endpoint: string;
   client_iface?: string;
   client?: AwgClientStatus | null;
   enabled: boolean; imported: boolean; protocol: string;
+  protocol_version?: string; traffic_obfuscation?: boolean; is_warp?: boolean;
   active: boolean; deployed: boolean; connected: boolean; reachable: boolean;
   has_password: boolean; has_key: boolean; has_server_key: boolean; last_error?: string;
 }
@@ -410,6 +434,7 @@ export interface AwgDeployServerResult {
   id: string; label: string; ok: boolean; result: AwgDeployResult; error?: string;
 }
 export interface Awg2Status {
+  deployment_pending?: boolean;
   config: AwgServerConfig; // redacted (no secrets)
   active_server_id: string;
   servers: Awg2ServerSummary[];

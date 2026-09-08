@@ -75,7 +75,7 @@ func (svc *Service) awgApplyRoutingOS() error {
 	if am == nil {
 		return fmt.Errorf("AWG2-сервер не выбран")
 	}
-	cfg := am.Config()
+	cfg := am.RuntimeConfig()
 	r := cfg.Routing
 	if r.Mode == "off" {
 		return svc.awgTeardownRoutingOS()
@@ -168,7 +168,7 @@ func (svc *Service) awgRefreshRoutingOS() error {
 	if am == nil {
 		return fmt.Errorf("AWG2-сервер не выбран")
 	}
-	cfg := am.Config()
+	cfg := am.RuntimeConfig()
 	r := cfg.Routing
 	if r.Mode == "off" {
 		return svc.awgTeardownRoutingOS()
@@ -226,6 +226,11 @@ func (svc *Service) awgArmRollback(d time.Duration) {
 	}
 	svc.route.active = true
 	svc.route.rollback = time.AfterFunc(d, func() {
+		ctx, unlock := svc.lockClientOps(false)
+		defer unlock()
+		if ctx.Err() != nil {
+			return
+		}
 		defer func() {
 			if r := recover(); r != nil {
 				logbuf.Append("awg2", "warn", fmt.Sprintf("rollback panic: %v", r))
@@ -264,16 +269,22 @@ func (svc *Service) awgStartRefresh() {
 			case <-stop:
 				return
 			case <-t.C:
+				unlock, ok := svc.tryClientOps()
+				if !ok {
+					continue
+				}
 				// Snapshot the active manager pointer once per tick so a
 				// concurrent server-swap can't change svc.awg out from under us
 				// mid-tick (would leave the hook + routes installed for the
 				// old server's mode/endpoint/MTU).
 				am := svc.awgActive()
 				if am == nil {
+					unlock()
 					continue
 				}
-				c := am.Config()
-				if c.Routing.Mode == "off" {
+				c := am.RuntimeConfig()
+				if !c.Enabled || !c.Client.Enabled || c.Routing.Mode == "off" {
+					unlock()
 					continue
 				}
 				// Hash the inputs that drive the firewall hook. When unchanged AND we
@@ -310,6 +321,7 @@ func (svc *Service) awgStartRefresh() {
 						awgSaveSets()
 						svc.awgSaveRecent()
 					}
+					unlock()
 					continue
 				}
 				// Full re-assertion (hash changed, hook missing, or backstop fired).
@@ -341,6 +353,7 @@ func (svc *Service) awgStartRefresh() {
 					awgSaveSets()       // persist proxy-learned IPs so they survive a restart/reboot
 					svc.awgSaveRecent() // persist seen domains so masks re-apply after a restart
 				}
+				unlock()
 			}
 		}
 	}()
@@ -381,6 +394,7 @@ func (svc *Service) awgStopLegacyRoutingRuntimeOS() {
 }
 
 func (svc *Service) awgTeardownRoutingOS() error {
+	svc.awgClearMultiPolicyOS()
 	svc.awgStopLegacyRoutingRuntimeOS()
 	// Wait for any in-flight refresh goroutine to actually exit before we tear
 	// the firewall rules down — without this its pending awgRun calls would
@@ -401,7 +415,7 @@ func (svc *Service) awgTeardownRoutingOS() error {
 	_, _ = awgRun("iptables -t nat -D POSTROUTING -o " + awgIface + " -j MASQUERADE 2>/dev/null")
 	mtu := 1280
 	if am := svc.awgActive(); am != nil {
-		mtu = awgTunnelMTU(am.Config())
+		mtu = awgTunnelMTU(am.RuntimeConfig())
 	}
 	mss := strconv.Itoa(mtu - 40)
 	for _, dir := range []string{"-o", "-i"} {

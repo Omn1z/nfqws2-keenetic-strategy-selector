@@ -29,12 +29,13 @@ type warpEndpointScore struct {
 	ok   bool
 }
 
-func (svc *Service) awgApplyBestWARPEndpoint(am *awg.Manager, cfg awg.ServerConfig, p awg.Peer, iface string) (awg.ServerConfig, error) {
+func (svc *Service) awgApplyBestWARPEndpoint(ctx context.Context, am *awg.Manager, cfg awg.ServerConfig, p awg.Peer, iface string) (awg.ServerConfig, error) {
 	current := normalizeWARPEndpoint(cfg.Endpoint)
+	lastConfigured := cfg
 	failures := []string{}
 	attempts := 0
 
-	candidates := svc.awgRankWARPEndpointCandidates(cfg.Endpoint)
+	candidates := svc.awgRankWARPEndpointCandidates(ctx, cfg.Endpoint)
 	candidates = svc.awgPrioritizedWARPEndpointCandidates(current, candidates)
 	if len(candidates) == 0 {
 		return cfg, nil
@@ -43,8 +44,14 @@ func (svc *Service) awgApplyBestWARPEndpoint(am *awg.Manager, cfg awg.ServerConf
 		candidates = candidates[:warpEndpointAttemptLimit]
 	}
 	for i, endpoint := range candidates {
+		if err := ctx.Err(); err != nil {
+			return lastConfigured, err
+		}
 		attempts++
-		next, ok, err := svc.awgTryWARPEndpoint(am, cfg, p, iface, endpoint, i+1, len(candidates))
+		next, ok, err := svc.awgTryWARPEndpoint(ctx, am, cfg, p, iface, endpoint, i+1, len(candidates))
+		if next.Endpoint != cfg.Endpoint {
+			lastConfigured = next
+		}
 		if ok {
 			return next, nil
 		}
@@ -61,10 +68,13 @@ func (svc *Service) awgApplyBestWARPEndpoint(am *awg.Manager, cfg awg.ServerConf
 	}
 	err := fmt.Errorf("WARP endpoint: no fresh handshake after %d probes: %s", attempts, detail)
 	logbuf.Append("awg2", "warn", err.Error())
-	return cfg, err
+	return lastConfigured, err
 }
 
-func (svc *Service) awgTryWARPEndpoint(am *awg.Manager, cfg awg.ServerConfig, p awg.Peer, iface, endpoint string, idx, total int) (awg.ServerConfig, bool, error) {
+func (svc *Service) awgTryWARPEndpoint(ctx context.Context, am *awg.Manager, cfg awg.ServerConfig, p awg.Peer, iface, endpoint string, idx, total int) (awg.ServerConfig, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return cfg, false, err
+	}
 	host, port, ok := splitHostPortDefault(endpoint, 2408)
 	if !ok {
 		return cfg, false, fmt.Errorf("%s: invalid endpoint", endpoint)
@@ -86,17 +96,24 @@ func (svc *Service) awgTryWARPEndpoint(am *awg.Manager, cfg awg.ServerConfig, p 
 		return cfg, false, err
 	}
 	start := time.Now().Unix()
-	resp, err := uapiRequestIface(iface, setText)
+	resp, err := uapiRequestIfaceContext(ctx, iface, setText)
 	if err != nil {
 		return cfg, false, fmt.Errorf("%s: UAPI: %w", selectedEndpoint, err)
 	}
 	if !strings.Contains(resp, "errno=0") {
 		return cfg, false, fmt.Errorf("%s: UAPI rejected: %s", selectedEndpoint, strings.TrimSpace(resp))
 	}
+	if cfg.PeerKeepaliveValue(p) == "0" {
+		if err := svc.awgProbeClientOS(am); err != nil {
+			return next, false, err
+		}
+	}
 	logbuf.Append("awg2", "info", fmt.Sprintf("WARP endpoint probe %d/%d: %s", idx, total, selectedEndpoint))
-	awgTriggerWARPHandshake(iface)
-	if !awgWaitEndpointHandshake(iface, ip, port, start, warpEndpointProbeWait) {
-		return cfg, false, fmt.Errorf("%s: no handshake", selectedEndpoint)
+	// replace_peers creates a new peer whose nonzero persistent keepalive
+	// immediately triggers a handshake. No temporary public /32 main-table
+	// route is needed (that used to disturb unrelated 1.1.1.1 DNS traffic).
+	if !awgWaitEndpointHandshake(ctx, iface, ip, port, start, warpEndpointProbeWait) {
+		return next, false, fmt.Errorf("%s: no handshake", selectedEndpoint)
 	}
 	endpointChanged := strings.TrimSpace(cfg.Endpoint) != selectedEndpoint
 	if endpointChanged {
@@ -109,7 +126,7 @@ func (svc *Service) awgTryWARPEndpoint(am *awg.Manager, cfg awg.ServerConfig, p 
 	return next, true, nil
 }
 
-func (svc *Service) awgRankWARPEndpointCandidates(current string) []string {
+func (svc *Service) awgRankWARPEndpointCandidates(ctx context.Context, current string) []string {
 	candidates := warpEndpointCandidates(current)
 	if len(candidates) <= 1 {
 		return candidates
@@ -128,7 +145,7 @@ func (svc *Service) awgRankWARPEndpointCandidates(current string) []string {
 		seenHost[key] = true
 		hostOrder = append(hostOrder, host)
 	}
-	scores := warpScoreHosts(hostOrder)
+	scores := warpScoreHosts(ctx, hostOrder)
 	scoreOf := func(endpoint string) warpEndpointScore {
 		host, _, ok := splitHostPortDefault(endpoint, 2408)
 		if !ok {
@@ -158,7 +175,7 @@ func (svc *Service) awgRankWARPEndpointCandidates(current string) []string {
 	return candidates
 }
 
-func warpScoreHosts(hosts []string) map[string]warpEndpointScore {
+func warpScoreHosts(ctx context.Context, hosts []string) map[string]warpEndpointScore {
 	out := map[string]warpEndpointScore{}
 	type result struct {
 		score warpEndpointScore
@@ -175,13 +192,21 @@ func warpScoreHosts(hosts []string) map[string]warpEndpointScore {
 		go func() {
 			defer wg.Done()
 			for host := range jobs {
-				rtt, ok := warpPingHost(host)
+				if ctx.Err() != nil {
+					return
+				}
+				rtt, ok := warpPingHost(ctx, host)
 				results <- result{score: warpEndpointScore{host: host, rtt: rtt, ok: ok}}
 			}
 		}()
 	}
+sendJobs:
 	for _, host := range hosts {
-		jobs <- host
+		select {
+		case jobs <- host:
+		case <-ctx.Done():
+			break sendJobs
+		}
 	}
 	close(jobs)
 	wg.Wait()
@@ -192,8 +217,8 @@ func warpScoreHosts(hosts []string) map[string]warpEndpointScore {
 	return out
 }
 
-func warpPingHost(host string) (time.Duration, bool) {
-	ctx, cancel := context.WithTimeout(context.Background(), 1100*time.Millisecond)
+func warpPingHost(parent context.Context, host string) (time.Duration, bool) {
+	ctx, cancel := context.WithTimeout(parent, 1100*time.Millisecond)
 	defer cancel()
 	cmd := "ping -c 1 -W 1 " + shell.Quote(host) + " 2>&1"
 	out, err := exec.CommandContext(ctx, "sh", "-c", cmd).CombinedOutput()
@@ -245,26 +270,19 @@ func warpPortRank(port int) int {
 	}
 }
 
-func awgTriggerWARPHandshake(iface string) {
-	target := "1.1.1.1"
-	cmd := strings.Join([]string{
-		"ip route replace " + target + "/32 dev " + shell.Quote(iface) + " 2>/dev/null || true",
-		"ping -c 1 -W 1 -I " + shell.Quote(iface) + " " + target + " >/dev/null 2>&1 || true",
-		"ip route del " + target + "/32 dev " + shell.Quote(iface) + " 2>/dev/null || true",
-	}, "; ")
-	ctx, cancel := context.WithTimeout(context.Background(), 1600*time.Millisecond)
-	defer cancel()
-	_ = exec.CommandContext(ctx, "sh", "-c", cmd).Run()
-}
-
-func awgWaitEndpointHandshake(iface, ip string, port int, since int64, d time.Duration) bool {
+func awgWaitEndpointHandshake(ctx context.Context, iface, ip string, port int, since int64, d time.Duration) bool {
 	deadline := time.Now().Add(d)
 	for time.Now().Before(deadline) {
-		st := awgClientStatusIfaceOS(iface)
+		if ctx.Err() != nil {
+			return false
+		}
+		st := awgClientStatusIfaceContextOS(ctx, iface)
 		if st != nil && st.LastHandshake >= since && endpointMatches(st.Endpoint, ip, port) {
 			return true
 		}
-		time.Sleep(180 * time.Millisecond)
+		if !waitClientContext(ctx, 180*time.Millisecond) {
+			return false
+		}
 	}
 	return false
 }

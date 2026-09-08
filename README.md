@@ -45,7 +45,10 @@
   два взаимозаменяемых прокси прямо на роутере: **MTProto → WebSocket** и **SOCKS5**
   (на базе TGLock). Оба туннелируют трафик Telegram по WSS к `web.telegram.org`
   (обход блокировки по IP); по умолчанию выключены. SOCKS5 опционально защищается
-  логином/паролем.
+  логином/паролем. MTProto-компонент синхронизирован с **Flowseal TG WS Proxy
+  v1.10.2**: восстановление слушающего порта и пула WS, несколько CF/Worker-доменов,
+  ежечасное обновление резервных доменов и поддержка тестовых DC. Старые секреты,
+  порты и DC-редиректы сохраняются. [Ревизия и границы переноса](internal/services/tgws/UPSTREAM.md).
 - **Управление движком NFQWS2** (вкладка «Сервисы → NFQWS2») — редактирование
   конфига (`nfqws2.conf`: быстрые настройки + полный текстовый редактор),
   Lua‑скриптов обхода и списков доменов/IP прямо в панели (загрузка/скачивание/
@@ -54,11 +57,13 @@
   «Применить (reload)» по `SIGHUP` перечитывает списки без обрыва очереди.
   Полноценная замена стороннего `nfqws-keenetic-web`.
 - **Установщик / обновление / удаление**, мульти‑арч сборки в GitHub Releases.
+- **AmneziaWG 3.1** — развёртывание VPS по SSH, импорт AWG/WireGuard/WARP,
+  несколько туннелей, правила маршрутизации и автовосстановление соединений.
 
 ## Установка
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/Omn1z/nfqws2-keenetic-strategy-selector/master/packaging/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/Omn1z/nfqws2-keenetic-strategy-selector/v1.5.0/packaging/install.sh | sh
 ```
 
 После установки откройте `http://<IP‑роутера>:8090`.
@@ -87,23 +92,52 @@ connmark `0x20000000`, поэтому основной nfqws2 (очередь 30
 HTTP‑клиент скачивает тестовый URL через песочницу, измеряет байты/время и ловит
 обрыв на ~16 КБ. По завершении все правила и процессы убираются.
 
+## AmneziaWG
+
+Новые VPS-профили используют **AWG 3.1**. Переключатель **«Обфускация трафика»**
+включает защиту заголовков, случайные дополнения пакетов, сигнатурные пакеты и
+диапазоны таймеров. При выключении применяется формат WireGuard; шифрование
+сохраняется. Параметры обфускации сохраняются для последующего включения.
+
+Движок роутера и установщик VPS закреплены на официальных версиях
+[amneziawg-go v3.1.20260828](https://github.com/amnezia-vpn/amneziawg-go/releases/tag/v3.1.20260828)
+и [amneziawg-tools v3.1.20260812](https://github.com/amnezia-vpn/amneziawg-tools/releases/tag/v3.1.20260812).
+Для VPS с AWG 3.1 используется userspace, чтобы старый модуль ядра не перехватил
+создание интерфейса. Поддерживаются Debian/Ubuntu на amd64 и arm64.
+
+Обновление движка сохраняет совместимость существующих AWG 1.x/2.0 и WARP.
+Чтобы перевести свой VPS на новый формат, обновите движок в настройках
+AmneziaWG, затем выберите **«Перейти на AWG 3.1» → «Сохранить и развернуть»**.
+После успешного развёртывания заново импортируйте клиентские конфиги на остальных
+устройствах с поддержкой AWG 3.1. WARP и импортированные подключения используют
+формат своего сервера. Если развёртывание не завершилось, роутер сохраняет
+последнюю применённую конфигурацию, в том числе после перезапуска панели.
+
+Фоновая проверка охватывает все включённые туннели каждые 10 секунд. Если нет
+свежего хендшейка и приёма данных в течение 5 минут, сначала отправляется
+keepalive-проба. Без ответа за 90 секунд пересоздаётся только проблемный туннель.
+При отсутствии интерфейса восстановление начинается сразу. Неудачные попытки
+повторяются без ограничения количества, с паузой от 15 секунд до 5 минут;
+создание интерфейса само по себе не считается восстановлением связи. Для WARP
+повторяется подбор endpoint. Выключенные пользователем туннели не запускаются.
+
 ## Обновление
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/Omn1z/nfqws2-keenetic-strategy-selector/master/packaging/update.sh | sh
+curl -fsSL https://raw.githubusercontent.com/Omn1z/nfqws2-keenetic-strategy-selector/v1.5.0/packaging/update.sh | sh
 ```
 
 ## Удаление
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/Omn1z/nfqws2-keenetic-strategy-selector/master/packaging/uninstall.sh | sh
+curl -fsSL https://raw.githubusercontent.com/Omn1z/nfqws2-keenetic-strategy-selector/v1.5.0/packaging/uninstall.sh | sh
 # или с удалением данных:
-curl -fsSL https://raw.githubusercontent.com/Omn1z/nfqws2-keenetic-strategy-selector/master/packaging/uninstall.sh | sh -s -- --purge
+curl -fsSL https://raw.githubusercontent.com/Omn1z/nfqws2-keenetic-strategy-selector/v1.5.0/packaging/uninstall.sh | sh -s -- --purge
 ```
 
 ## Сборка из исходников
 
-Нужны Go ≥ 1.22 и Node ≥ 20 (веб-интерфейс — React 19 + TypeScript + Tailwind на
+Нужны Go ≥ 1.22 и Node 20.19+ или 22.12+ (веб-интерфейс — React 19 + TypeScript + Tailwind на
 Vite). Скрипты сборки сами собирают фронтенд (`npm`) в один встраиваемый файл,
 а затем линкуют бинарь.
 
@@ -113,6 +147,17 @@ powershell -File scripts/build.ps1 -Version v1.0.0   # Windows
 ```
 
 Бинарники появятся в `dist/` для `arm64`, `arm` (v7), `mipsle`, `mips`.
+
+Движок AmneziaWG собирается отдельно с Go 1.25.7:
+
+```sh
+sh scripts/build-engine.sh
+powershell -File scripts/build-engine.ps1 -Go /path/to/go.exe
+```
+
+Архивы `awg-engine-linux-<arch>.tar.gz` и обязательные SHA256-файлы появляются
+в `dist/`. Установщик проверяет контрольную сумму, архитектуру и поддержку 3.1
+до замены существующего движка.
 
 ## Поддерживаемые архитектуры
 

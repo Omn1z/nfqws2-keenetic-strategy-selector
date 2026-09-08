@@ -5,7 +5,7 @@ import (
 	"strings"
 )
 
-// ServerConf renders the server-side awg0.conf (AmneziaWG 2.0), including NAT
+// ServerConf renders the server-side awg0.conf, including NAT
 // PostUp/PostDown so awg-quick owns its own teardown.
 func ServerConf(c *ServerConfig) string {
 	var b strings.Builder
@@ -59,15 +59,11 @@ func ClientConf(c *ServerConfig, p Peer) string {
 		allowed = "0.0.0.0/0, ::/0"
 	}
 	fmt.Fprintf(&b, "AllowedIPs = %s\n", allowed)
-	ka := p.Keepalive
-	if ka == 0 {
-		ka = 25
-	}
-	fmt.Fprintf(&b, "PersistentKeepalive = %d\n", ka)
+	fmt.Fprintf(&b, "PersistentKeepalive = %s\n", c.PeerKeepaliveValue(p))
 	return b.String()
 }
 
-// obfLines renders the AmneziaWG 2.0 obfuscation block used VERBATIM by both
+// obfLines renders the AmneziaWG obfuscation block used VERBATIM by both
 // server and client configs (they must match byte-for-byte).
 func obfLines(o Obfuscation) string {
 	var b strings.Builder
@@ -76,9 +72,8 @@ func obfLines(o Obfuscation) string {
 	fmt.Fprintf(&b, "Jmax = %d\n", o.Jmax)
 	fmt.Fprintf(&b, "S1 = %d\n", o.S1)
 	fmt.Fprintf(&b, "S2 = %d\n", o.S2)
-	// S3/S4 only when non-zero. AmneziaWG treats absent vs 0 as DIFFERENT — if
-	// the server config has no S3/S4 line, the client MUST also omit it or the
-	// handshake silently fails (server drops the auth-tagged packet).
+	// Preserve omitted zero-valued extensions in legacy client exports. The
+	// deployment/client lifecycle restarts the device to clear old parameters.
 	if o.S3 > 0 {
 		fmt.Fprintf(&b, "S3 = %d\n", o.S3)
 	}
@@ -94,6 +89,16 @@ func obfLines(o Obfuscation) string {
 	writeStrIf(&b, "I3", o.I3)
 	writeStrIf(&b, "I4", o.I4)
 	writeStrIf(&b, "I5", o.I5)
+	writeStrIf(&b, "HeaderProtectionKey", o.HeaderProtectionKey)
+	for _, p := range o.awg31Strings() {
+		writeStrIf(&b, p.conf, p.value)
+	}
+	if o.RandomTrailers {
+		writeStrIf(&b, "RandomTrailers", "on")
+	}
+	if o.DisableCookies {
+		writeStrIf(&b, "DisableCookies", "on")
+	}
 	return b.String()
 }
 
@@ -118,8 +123,8 @@ func SetConfText(c *ServerConfig, p Peer) string {
 		allowed = "0.0.0.0/0, ::/0"
 	}
 	fmt.Fprintf(&b, "AllowedIPs = %s\n", allowed)
-	if p.Keepalive > 0 {
-		fmt.Fprintf(&b, "PersistentKeepalive = %d\n", p.Keepalive)
+	if p.Keepalive > 0 || p.KeepaliveRange != "" {
+		fmt.Fprintf(&b, "PersistentKeepalive = %s\n", c.PeerKeepaliveValue(p))
 	}
 	return b.String()
 }

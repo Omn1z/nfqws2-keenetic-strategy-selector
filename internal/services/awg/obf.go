@@ -29,8 +29,15 @@ func (o *Obfuscation) normalize() {
 	if o.H4 == "" {
 		o.H4 = "4"
 	}
-	if o.Jc == 0 && o.Jmin == 0 && o.Jmax == 0 {
-		o.Jc, o.Jmin, o.Jmax = 4, 8, 80
+	// Zero is an explicit disabled value, including in imported AWG profiles.
+	o.HasHeaderProtectionKey = strings.TrimSpace(o.HeaderProtectionKey) != ""
+	for _, v := range []*string{&o.H1, &o.H2, &o.H3, &o.H4} {
+		*v = wireRange(*v, 32)
+	}
+	for _, v := range []*string{&o.ContentPaddingAddition, &o.RekeyAfterTime, &o.RekeyTimeout, &o.RejectAfterTime, &o.KeepaliveTimeout, &o.MaxHandshakeAttempts} {
+		if strings.TrimSpace(*v) != "" {
+			*v = wireRange(*v, 16)
+		}
 	}
 }
 
@@ -71,6 +78,32 @@ func (o Obfuscation) Validate() []string {
 		}
 		if err := validateCPS(ip.v); err != nil {
 			errs = append(errs, ip.n+": "+err.Error())
+		}
+	}
+	for _, p := range o.awg31Strings() {
+		if strings.TrimSpace(p.value) != "" && !validU16Range(p.value) {
+			errs = append(errs, p.conf+": ожидается число или диапазон 0–65535")
+		}
+	}
+	if strings.TrimSpace(o.HeaderProtectionKey) != "" {
+		if _, err := keyHex(o.HeaderProtectionKey); err != nil {
+			errs = append(errs, "HeaderProtectionKey: требуется 32-байтовый ключ в base64")
+		}
+		if o.S1 < 12 || o.S2 < 12 || o.S3 < 12 || o.S4 < 12 {
+			errs = append(errs, "HeaderProtectionKey требует S1, S2, S3 и S4 не меньше 12")
+		}
+	}
+	headers := []string{o.H1, o.H2, o.H3, o.H4}
+	for i, h := range headers {
+		a, b, ok := numericRange(h, 32)
+		if !ok {
+			continue
+		}
+		for j := 0; j < i; j++ {
+			x, y, otherOK := numericRange(headers[j], 32)
+			if otherOK && a <= y && x <= b {
+				errs = append(errs, fmt.Sprintf("диапазоны H%d и H%d пересекаются", j+1, i+1))
+			}
 		}
 	}
 	return errs

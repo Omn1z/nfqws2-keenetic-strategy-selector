@@ -76,6 +76,14 @@ func (svc *Service) awgApplyMultiPolicyOS() error {
 }
 
 func (svc *Service) awgBuildMultiPolicy() ([]awgMultiRule, []awgMultiTunnel) {
+	return svc.awgBuildMultiPolicyWithResolve(true)
+}
+
+func (svc *Service) awgBuildMultiPolicyCached() ([]awgMultiRule, []awgMultiTunnel) {
+	return svc.awgBuildMultiPolicyWithResolve(false)
+}
+
+func (svc *Service) awgBuildMultiPolicyWithResolve(resolve bool) ([]awgMultiRule, []awgMultiTunnel) {
 	servers := map[string]*managedServer{}
 	for _, srv := range svc.serverSnapshot() {
 		servers[srv.ID] = srv
@@ -89,29 +97,23 @@ func (svc *Service) awgBuildMultiPolicy() ([]awgMultiRule, []awgMultiTunnel) {
 		if t := tunnelByID[srv.ID]; t != nil {
 			return t
 		}
-		cfg := srv.Manager.Config()
-		if !cfg.Enabled || cfg.Routing.Mode == "off" || !cfg.Routing.Active {
+		cfg := srv.Manager.RuntimeConfig()
+		if !cfg.Enabled || !cfg.Client.Enabled || cfg.Routing.Mode == "off" || !cfg.Routing.Active {
 			return nil
 		}
 		iface := awgClientIfaceName(cfg)
 		if !validAWGClientIfaceName(iface) || strings.TrimSpace(cfg.Endpoint) == "" {
 			return nil
 		}
-		if cs := svc.awgClientStatusManagerOS(srv.Manager); cs == nil || !cs.Running {
-			if awgCanStartLocalClient(cfg) {
-				if err := svc.awgClientUpManagerOS(srv.Manager); err != nil {
-					logbuf.Append("awg2", "warn", "multi-routing: tunnel "+iface+" is not up: "+err.Error())
-					return nil
-				}
-				srv.Manager.SetClientEnabled(true)
-				svc.awgSave()
-			}
-		} else if !cfg.Client.Enabled {
-			srv.Manager.SetClientEnabled(true)
-			svc.awgSave()
+		// Build desired policy without changing client intent. The supervisor
+		// alone repairs absent interfaces; preserving the slot while down keeps
+		// other tunnels' marks/tables stable and the configured killswitch intact.
+		endpointIP := svc.cachedPolicyHostIP(hostOf(cfg.Endpoint))
+		if resolve && endpointIP == "" {
+			endpointIP = resolveHostIP(hostOf(cfg.Endpoint))
+			svc.rememberPolicyDNS(hostOf(cfg.Endpoint), []string{endpointIP})
 		}
-		endpointIP := resolveHostIP(hostOf(cfg.Endpoint))
-		if endpointIP == "" {
+		if endpointIP == "" && resolve {
 			logbuf.Append("awg2", "warn", "multi-routing: endpoint is not resolved for "+iface)
 			return nil
 		}
@@ -143,8 +145,8 @@ func (svc *Service) awgBuildMultiPolicy() ([]awgMultiRule, []awgMultiTunnel) {
 		if srv == nil {
 			continue
 		}
-		cfg := srv.Manager.Config()
-		if !cfg.Enabled || cfg.Routing.Mode == "off" || !cfg.Routing.Active {
+		cfg := srv.Manager.RuntimeConfig()
+		if !cfg.Enabled || !cfg.Client.Enabled || cfg.Routing.Mode == "off" || !cfg.Routing.Active {
 			continue
 		}
 		route := z.RouteValue()
@@ -162,7 +164,7 @@ func (svc *Service) awgBuildMultiPolicy() ([]awgMultiRule, []awgMultiTunnel) {
 			Sources:   awgCleanMultiSources(z.SourceIPs),
 			RuleIndex: i,
 		}
-		r.Entries, r.CatchAll, r.StaticOK = svc.awgMultiRuleEntries(z)
+		r.Entries, r.CatchAll, r.StaticOK = svc.awgMultiRuleEntriesWithLookup(z, svc.policyDNSLookup(resolve, resolveDomainAll))
 		r.DomainEntries = svc.awgMultiRuleDomainEntries(z)
 		if len(r.DomainEntries) > 0 {
 			ms, _ := awg.CompileMatcherSet(r.DomainEntries)
@@ -188,8 +190,8 @@ func (svc *Service) awgBuildMultiPolicy() ([]awgMultiRule, []awgMultiTunnel) {
 		if srv == nil {
 			continue
 		}
-		cfg := srv.Manager.Config()
-		if !cfg.Enabled || cfg.Routing.Mode == "off" || !cfg.Routing.Active {
+		cfg := srv.Manager.RuntimeConfig()
+		if !cfg.Enabled || !cfg.Client.Enabled || cfg.Routing.Mode == "off" || !cfg.Routing.Active {
 			continue
 		}
 		_ = getTunnel(srv)
@@ -209,78 +211,7 @@ func (svc *Service) awgMultiRuleDomainEntries(z awg.Zone) []string {
 }
 
 func (svc *Service) awgMultiRuleEntries(z awg.Zone) ([]string, bool, bool) {
-	seen := map[string]bool{}
-	out := []string{}
-	add := func(raw string) {
-		if ent, ok := awgNormalizeMultiEntry(raw); ok && !seen[ent] {
-			seen[ent] = true
-			out = append(out, ent)
-		}
-	}
-	catchAll := z.IsCatchAll()
-	staticOK := len(z.Domains) == 0 && len(z.IPs) == 0
-	expDomains, expIPs := svc.expandEntries(z.Domains)
-	for _, ip := range append(append([]string{}, z.IPs...), expIPs...) {
-		if awgIsCatchAll(ip) {
-			catchAll = true
-			staticOK = true
-			continue
-		}
-		before := len(out)
-		add(ip)
-		if len(out) > before {
-			staticOK = true
-		}
-	}
-	for _, d := range expDomains {
-		d = strings.TrimSpace(d)
-		if d == "" {
-			continue
-		}
-		if awgIsCatchAll(d) {
-			catchAll = true
-			staticOK = true
-			continue
-		}
-		if isMaskEntry(d) {
-			continue
-		}
-		for _, ip := range resolveDomainAll(d) {
-			if _, ok := sharedCDNProvider(ip); ok {
-				svc.awgNoteSharedCDNSkip("multi-resolve", ip)
-				continue
-			}
-			before := len(out)
-			add(ip)
-			if len(out) > before {
-				staticOK = true
-			}
-		}
-	}
-	sort.Strings(out)
-	return out, catchAll, staticOK
-}
-
-func awgNormalizeMultiEntry(raw string) (string, bool) {
-	s := strings.TrimSpace(raw)
-	if s == "" || s == "*" {
-		return "", false
-	}
-	if ip := net.ParseIP(s); ip != nil {
-		if v4 := ip.To4(); v4 != nil {
-			return v4.String() + "/32", true
-		}
-		return "", false
-	}
-	ip, n, err := net.ParseCIDR(s)
-	if err != nil {
-		return "", false
-	}
-	if v4 := ip.To4(); v4 != nil {
-		n.IP = v4
-		return n.String(), true
-	}
-	return "", false
+	return svc.awgMultiRuleEntriesWithLookup(z, svc.policyDNSLookup(true, resolveDomainAll))
 }
 
 func awgCleanMultiSources(in []string) []string {
@@ -348,8 +279,12 @@ func (svc *Service) awgInstallMultiRoutes(tunnels []awgMultiTunnel) error {
 				logbuf.Append("awg2", "warn", "multi-routing: endpoint route "+t.EndpointIP+": "+err.Error())
 			}
 		}
-		if err := awgRunCheck("ip route replace default dev " + t.Iface + " table " + strconv.Itoa(t.Table)); err != nil && firstErr == nil {
-			firstErr = fmt.Errorf("ip tunnel route %s: %w", t.Iface, err)
+		// A different enabled tunnel may still be offline or starting. Keep its
+		// policy slot/killswitch, without making a healthy tunnel's restore fail.
+		if _, err := os.Stat("/sys/class/net/" + t.Iface); err == nil {
+			if err := awgRunCheck("ip route replace default dev " + t.Iface + " table " + strconv.Itoa(t.Table)); err != nil && firstErr == nil {
+				firstErr = fmt.Errorf("ip tunnel route %s: %w", t.Iface, err)
+			}
 		}
 		_, _ = awgRun("ip rule add pref " + strconv.Itoa(awgMultiPref(t)) + " fwmark " + t.Mark + "/" + awgMultiMarkMask + " table " + strconv.Itoa(t.Table) + " 2>/dev/null")
 		if t.Killswitch {
@@ -540,10 +475,15 @@ func (svc *Service) awgStartMultiPolicyRefresh() {
 			case <-stop:
 				return
 			case <-t.C:
+				unlock, ok := svc.tryClientOps()
+				if !ok {
+					continue
+				}
 				ticks++
 				if _, err := os.Stat(awgMultiHookPath); err != nil || ticks%15 == 0 {
-					rules, tunnels := svc.awgBuildMultiPolicy()
+					rules, tunnels := svc.awgBuildMultiPolicyCached()
 					if len(rules) == 0 || len(tunnels) == 0 {
+						unlock()
 						continue
 					}
 					if err := awgWriteMultiSets(rules); err != nil {
@@ -566,6 +506,7 @@ func (svc *Service) awgStartMultiPolicyRefresh() {
 					_, _ = awgRun("sh " + awgMultiHookPath)
 				}
 				awgSetAccel(false)
+				unlock()
 			}
 		}
 	}()
@@ -599,8 +540,8 @@ func (svc *Service) awgBuildMultiTunnelsOnly() []awgMultiTunnel {
 		if srv == nil {
 			continue
 		}
-		cfg := srv.Manager.Config()
-		if !cfg.Enabled || cfg.Routing.Mode == "off" || !cfg.Routing.Active {
+		cfg := srv.Manager.RuntimeConfig()
+		if !cfg.Enabled || !cfg.Client.Enabled || cfg.Routing.Mode == "off" || !cfg.Routing.Active {
 			continue
 		}
 		if tunnelByID[srv.ID] != nil {
@@ -610,8 +551,8 @@ func (svc *Service) awgBuildMultiTunnelsOnly() []awgMultiTunnel {
 		if !validAWGClientIfaceName(iface) || strings.TrimSpace(cfg.Endpoint) == "" {
 			continue
 		}
-		endpointIP := resolveHostIP(hostOf(cfg.Endpoint))
-		if endpointIP == "" || len(tunnelOrder) >= awgMultiMax {
+		endpointIP := svc.cachedPolicyHostIP(hostOf(cfg.Endpoint))
+		if len(tunnelOrder) >= awgMultiMax {
 			continue
 		}
 		slot := len(tunnelOrder) + 1

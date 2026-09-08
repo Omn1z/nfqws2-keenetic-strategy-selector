@@ -57,7 +57,7 @@ func clientAmneziaJSON(c *ServerConfig, p Peer) ([]byte, error) {
 		"client_pub_key":        p.PublicKey,
 		"server_pub_key":        c.PublicKey,
 		"allowed_ips":           splitList(peerAllowedIPs(p)),
-		"persistent_keep_alive": strconv.Itoa(peerKeepalive(p)),
+		"persistent_keep_alive": c.PeerKeepaliveValue(p),
 		"mtu":                   strconv.Itoa(mtu),
 	}
 	if psk := strings.TrimSpace(p.PSK); psk != "" {
@@ -77,18 +77,23 @@ func clientAmneziaJSON(c *ServerConfig, p Peer) ([]byte, error) {
 		"port":               strconv.Itoa(c.ListenPort),
 		"transport_proto":    "udp",
 	}
-	if v := amneziaProtocolVersion(c.Obf); v != "" {
-		proto["protocol_version"] = v
+	container, protocol := "amnezia-awg", "awg"
+	if c.UseObfuscation() {
+		if v := c.EffectiveProtocolVersion(); v != "" && v != "1.0" {
+			proto["protocol_version"] = v
+		}
+	} else {
+		container, protocol = "amnezia-wireguard", "wireguard"
 	}
 	return json.Marshal(map[string]any{
 		"description":      safeName(p.Name),
 		"dns1":             dns1,
 		"dns2":             dns2,
 		"hostName":         host,
-		"defaultContainer": "amnezia-awg",
+		"defaultContainer": container,
 		"containers": []map[string]any{{
-			"container": "amnezia-awg",
-			"awg":       proto,
+			"container": container,
+			protocol:    proto,
 		}},
 	})
 }
@@ -117,6 +122,20 @@ func addAmneziaObf(dst map[string]any, o Obfuscation) {
 			dst[kv.k] = v
 		}
 	}
+	if v := strings.TrimSpace(o.HeaderProtectionKey); v != "" {
+		dst["HeaderProtectionKey"] = v
+	}
+	for _, p := range o.awg31Strings() {
+		if v := strings.TrimSpace(p.value); v != "" {
+			dst[p.conf] = v
+		}
+	}
+	if o.RandomTrailers {
+		dst["RandomTrailers"] = "on"
+	}
+	if o.DisableCookies {
+		dst["DisableCookies"] = "on"
+	}
 }
 
 func splitList(s string) []string {
@@ -144,7 +163,10 @@ func peerAllowedIPs(p Peer) string {
 }
 
 func amneziaProtocolVersion(o Obfuscation) string {
-	if o.S3 > 0 && o.S4 > 0 {
+	if o.hasAWG31() {
+		return "3.1"
+	}
+	if o.S3 > 0 || o.S4 > 0 || strings.Contains(o.H1+o.H2+o.H3+o.H4, "-") {
 		return "2"
 	}
 	if strings.TrimSpace(o.I1) != "" || strings.TrimSpace(o.I2) != "" || strings.TrimSpace(o.I3) != "" || strings.TrimSpace(o.I4) != "" || strings.TrimSpace(o.I5) != "" {

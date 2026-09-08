@@ -2,6 +2,7 @@ package tgws
 
 import (
 	"bufio"
+	"context"
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
@@ -137,6 +138,9 @@ func newFakeTLSStream(r *bufio.Reader, w net.Conn) *fakeTLSStream {
 }
 
 func (s *fakeTLSStream) Read(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
 	if len(s.pending) == 0 {
 		chunk, err := s.readRecordChunk()
 		if err != nil {
@@ -184,6 +188,11 @@ func (s *fakeTLSStream) readRecordChunk() ([]byte, error) {
 		if recType != tlsRecordAppData {
 			return nil, io.EOF
 		}
+		// TLS permits empty application records. They do not terminate the
+		// encrypted MTProto stream or consume any of its AES-CTR keystream.
+		if recLen == 0 {
+			continue
+		}
 		n := recLen
 		if n > 65536 {
 			n = 65536
@@ -209,12 +218,30 @@ func (s *fakeTLSStream) Write(p []byte) (int, error) {
 
 // relayToMaskingDomain tunnels the client to a real HTTPS site when Fake-TLS
 // auth fails, forwarding the bytes already read (the client hello) first.
-func relayToMaskingDomain(client io.ReadWriter, initial []byte, domain string) {
-	upstream, err := net.DialTimeout("tcp", net.JoinHostPort(domain, "443"), 10*time.Second)
+func relayToMaskingDomain(client io.ReadWriter, initial []byte, domain string, contexts ...context.Context) {
+	ctx := context.Background()
+	if len(contexts) > 0 && contexts[0] != nil {
+		ctx = contexts[0]
+	}
+	dialer := &net.Dialer{Timeout: 10 * time.Second}
+	upstream, err := dialer.DialContext(ctx, "tcp", net.JoinHostPort(domain, "443"))
 	if err != nil {
 		return
 	}
-	defer upstream.Close()
+	relayMaskingStreams(ctx, client, upstream, initial)
+}
+
+func relayMaskingStreams(ctx context.Context, client io.ReadWriter, upstream net.Conn, initial []byte) {
+	clientCloser, canCloseClient := client.(io.Closer)
+	stop := func() {
+		_ = upstream.Close()
+		if canCloseClient {
+			_ = clientCloser.Close()
+		}
+	}
+	stopOnCancel := context.AfterFunc(ctx, stop)
+	defer stopOnCancel()
+	defer stop()
 	if len(initial) > 0 {
 		if _, err := upstream.Write(initial); err != nil {
 			return
@@ -224,6 +251,10 @@ func relayToMaskingDomain(client io.ReadWriter, initial []byte, domain string) {
 	go func() { _, _ = io.Copy(upstream, client); done <- struct{}{} }()
 	go func() { _, _ = io.Copy(client, upstream); done <- struct{}{} }()
 	<-done
+	stop()
+	if canCloseClient {
+		<-done
+	}
 }
 
 // --- helpers -------------------------------------------------------------

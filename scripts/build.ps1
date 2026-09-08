@@ -9,8 +9,8 @@ New-Item -ItemType Directory -Force -Path dist | Out-Null
 
 # Build the React UI into the single embedded internal/server/web/index.html first.
 Write-Output "building frontend (vite single-file)..."
-npm --prefix frontend install
-if ($LASTEXITCODE -ne 0) { throw "npm install failed" }
+npm --prefix frontend ci
+if ($LASTEXITCODE -ne 0) { throw "npm ci failed" }
 npm --prefix frontend run build
 if ($LASTEXITCODE -ne 0) { throw "frontend build failed" }
 

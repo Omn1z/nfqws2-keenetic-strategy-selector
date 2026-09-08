@@ -41,15 +41,15 @@ export default function AwgFallback() {
   return (
     <Card title="Туннель для Telegram DC" sub="DC1/3/5 — общий для MTProto и SOCKS5" head={status}>
       <p className="mb-3 text-xs text-muted">
-        Часть дата-центров Telegram провайдер режет напрямую. Можно отправить их через выбранный AWG2-профиль; если туннель не поднят, прокси вернутся к обычному фолбэку.
+        Часть дата-центров Telegram провайдер режет напрямую. Можно отправить их через выбранный VPN-профиль; если туннель не поднят, прокси вернутся к обычному фолбэку.
       </p>
       <Field label="Маршрут для фолбэка" className="max-w-sm">
         <Select value={data.value} onChange={(e) => change(e.target.value)}>
           <option value="off">Выкл — обычный фолбэк (Cloudflare-воркер)</option>
-          <option value="auto">Авто — доступный AWG2</option>
+          <option value="auto">Авто — доступный VPN</option>
           {servers.map((s) => (
             <option key={s.id} value={s.id}>
-              AWG2 — {s.label}
+              VPN — {s.label}
               {s.connected ? " — подключён" : ""}
             </option>
           ))}

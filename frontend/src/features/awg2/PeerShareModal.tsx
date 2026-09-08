@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import QRCode from "qrcode";
 import { api, downloadFile } from "@/lib/api";
 import { cn } from "@/lib/cn";
+import { vpnProfileLabel } from "@/lib/awg";
 import { toast } from "@/components/ui/Toast";
 import { confirmDialog } from "@/components/ui/Confirm";
 import { Modal } from "@/components/ui/Modal";
@@ -13,7 +14,7 @@ import type { Awg2Status, AwgPeer, AwgPeerStatus } from "@/types/api";
 type ExportFormat = "conf" | "vpn";
 
 const safeFile = (s: string, format: ExportFormat) => `${s.replace(/[^\w.-]+/g, "_") || "awg-client"}.${format}`;
-const awgConf = (text: string) => /\nJc\s*=|\nJmin\s*=|\nJmax\s*=|\nH1\s*=|\nS1\s*=/.test(`\n${text}`);
+const awgConf = (text: string) => /^\s*(?:Jc|Jmin|Jmax|[HS][1-4]|I[1-5]|HeaderProtectionKey|ContentPaddingAddition|RandomTrailers|DisableCookies|RekeyAfterTime|RekeyTimeout|RejectAfterTime|KeepaliveTimeout|MaxHandshakeAttempts)\s*=/m.test(text);
 const qrPayload = (format: ExportFormat, text: string) => {
   const trimmed = text.trim();
   if (format === "vpn" && trimmed.toLowerCase().startsWith("vpn://")) return trimmed.slice("vpn://".length);
@@ -114,10 +115,12 @@ export default function PeerShareModal({ st, onClose, reload }: { st: Awg2Status
   const [busy, setBusy] = useState(false);
   const peers = useMemo(() => (st.config.peers || []).filter((p) => !p.is_router), [st.config.peers]);
   const routerPeer = (st.config.peers || []).find((p) => p.is_router);
+  const profileLabel = vpnProfileLabel(st.servers.find((s) => s.id === st.active_server_id) || st.config);
   const liveByPub: Record<string, AwgPeerStatus> = {};
   for (const p of st.status?.peers || []) liveByPub[p.public_key] = p;
 
   const add = async () => {
+    if (st.deployment_pending) return;
     setBusy(true);
     try {
       const body = {
@@ -139,7 +142,8 @@ export default function PeerShareModal({ st, onClose, reload }: { st: Awg2Status
   };
 
   const remove = async (p: AwgPeer) => {
-    if (!(await confirmDialog({ title: `Удалить клиента «${p.name}»?`, body: "Этот конфиг перестанет подключаться к AWG2.", confirmLabel: "Удалить", danger: true }))) return;
+    if (st.deployment_pending) return;
+    if (!(await confirmDialog({ title: `Удалить клиента «${p.name}»?`, body: "Этот конфиг перестанет подключаться к VPN-серверу.", confirmLabel: "Удалить", danger: true }))) return;
     try {
       await api("DELETE", `/api/awg2/peers/${encodeURIComponent(p.id)}`);
       toast("Клиент удалён", "ok");
@@ -150,13 +154,16 @@ export default function PeerShareModal({ st, onClose, reload }: { st: Awg2Status
   };
 
   return (
-    <Modal title="Клиенты AWG2" onClose={onClose} size="lg" actions={<Button variant="primary" onClick={onClose}>Закрыть</Button>}>
+    <Modal title="Клиенты VPN" onClose={onClose} size="lg" actions={<Button variant="primary" onClick={onClose}>Закрыть</Button>}>
       <div className="space-y-4">
         <div className="rounded-lg border border-line bg-line-soft p-3">
           <div className="flex flex-wrap items-center gap-2">
+            <Badge kind="neutral">{profileLabel}</Badge>
             <Badge kind={routerPeer ? "ok" : "warn"}>{routerPeer ? "роутер-пир готов" : "роутер-пир создастся автоматически"}</Badge>
             {routerPeer && <span className="font-mono text-[11px] text-muted">{routerPeer.address}</span>}
           </div>
+          {st.deployment_pending && <p className="mt-2 text-xs text-warn">Сохранённые изменения сервера ещё не развёрнуты. Здесь экспортируется последняя успешно развёрнутая конфигурация. Добавление и удаление клиентов станет доступно после развёртывания.</p>}
+          {profileLabel === "AWG 3.1" && <p className="mt-2 text-xs text-muted">Для этого профиля нужен клиент с поддержкой AWG 3.1. После изменения обфускации на сервере скачайте и заново импортируйте конфиг на каждом устройстве.</p>}
         </div>
 
         <div className="rounded-lg border border-line p-3">
@@ -172,7 +179,7 @@ export default function PeerShareModal({ st, onClose, reload }: { st: Awg2Status
             </Field>
           </div>
           <div className="mt-3 flex justify-end">
-            <Button variant="primary" className="w-full sm:w-auto" onClick={add} disabled={busy}>{busy ? "..." : "Добавить"}</Button>
+            <Button variant="primary" className="w-full sm:w-auto" onClick={add} disabled={busy || st.deployment_pending}>{busy ? "..." : "Добавить"}</Button>
           </div>
         </div>
 
@@ -187,7 +194,7 @@ export default function PeerShareModal({ st, onClose, reload }: { st: Awg2Status
                   <div className="flex flex-wrap items-center gap-2">
                     <Badge kind={live?.online ? "ok" : "neutral"}>{live?.online ? "онлайн" : "офлайн"}</Badge>
                     {live && <span className={cn("text-[11px] text-muted", live.online && "text-ok")}>handshake {ago(live.latest_handshake)} · ↑ {human(live.tx_bytes)} / ↓ {human(live.rx_bytes)}</span>}
-                    <Button mini variant="danger" onClick={() => remove(p)}>Удалить</Button>
+                    <Button mini variant="danger" onClick={() => remove(p)} disabled={st.deployment_pending}>Удалить</Button>
                   </div>
                   <PeerExport peer={p} />
                 </div>

@@ -1,5 +1,5 @@
 // Package tgws is a Telegram MTProto -> WebSocket proxy, ported from the
-// Python tg-ws-keenetic project. It runs in-process alongside the strategy
+// Python Flowseal/tg-ws-proxy project. It runs in-process alongside the strategy
 // selector and is controlled from the "TG WS Proxy" web tab.
 //
 // A client speaks obfuscated MTProto (optionally wrapped in Fake TLS) to our
@@ -9,6 +9,13 @@
 // in plaintext: they are decrypted with the client key and immediately
 // re-encrypted with the upstream key.
 package tgws
+
+// UpstreamVersion and UpstreamCommit identify the network implementation
+// synchronized into this Go/Keenetic port.
+const (
+	UpstreamVersion = "1.10.2"
+	UpstreamCommit  = "f200e33fd283143a9f101d62aaf9d8c1468a23fe"
+)
 
 // --- MTProto obfuscation handshake ---------------------------------------
 
@@ -60,6 +67,19 @@ var dcDefaultIPs = map[int]string{
 	5:   "149.154.171.5",
 	203: "91.105.192.100",
 }
+
+// Test accounts use a separate Telegram environment; never send their fallback
+// traffic to production DCs or the public CF proxy domain pool.
+var dcTestIPs = map[int]string{
+	1: "149.154.175.10",
+	2: "149.154.167.40",
+	3: "149.154.175.117",
+}
+
+const (
+	wsPath     = "/apiws"
+	wsTestPath = "/apiws_test"
+)
 
 // dcIDs are the valid DC numbers we route to.
 var dcIDs = []int{1, 2, 3, 4, 5, 203}

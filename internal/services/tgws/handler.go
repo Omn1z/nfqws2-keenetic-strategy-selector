@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"context"
 	"encoding/binary"
+	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -15,9 +17,10 @@ import (
 )
 
 const (
-	dcFailCooldown     = 30 * time.Second
+	ipFailCooldown     = time.Hour
+	dcFailCooldown     = 60 * time.Second
 	wsFastFailTimeout  = 2 * time.Second
-	wsDefaultTimeout   = 10 * time.Second
+	wsDefaultTimeout   = 5 * time.Second
 	handshakeReadLimit = 10 * time.Second
 )
 
@@ -27,6 +30,7 @@ type handlerSettings struct {
 	bufferSize    int
 	fakeTLSDomain string
 	proxyProtocol bool
+	forceTestDC   bool
 	fallback      fallbackConfig
 	awgAvailable  func() bool // live "is the AWG2 tunnel up?" probe (may be nil)
 }
@@ -47,15 +51,17 @@ type bufConn struct {
 
 func (b *bufConn) Read(p []byte) (int, error)  { return b.r.Read(p) }
 func (b *bufConn) Write(p []byte) (int, error) { return b.c.Write(p) }
+func (b *bufConn) Close() error                { return b.c.Close() }
 
 type cooldownTracker struct {
-	mu        sync.Mutex
-	blacklist map[string]bool
-	failUntil map[string]time.Time
+	mu          sync.Mutex
+	blacklist   map[string]bool
+	failUntil   map[string]time.Time
+	ipFailUntil map[string]time.Time
 }
 
 func newCooldownTracker() *cooldownTracker {
-	return &cooldownTracker{blacklist: map[string]bool{}, failUntil: map[string]time.Time{}}
+	return &cooldownTracker{blacklist: map[string]bool{}, failUntil: map[string]time.Time{}, ipFailUntil: map[string]time.Time{}}
 }
 
 func (c *cooldownTracker) isBlacklisted(key string) bool {
@@ -89,6 +95,29 @@ func (c *cooldownTracker) clear(key string) {
 	c.mu.Unlock()
 }
 
+func (c *cooldownTracker) ipCoolingDown(ip string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	until := c.ipFailUntil[ip]
+	if time.Now().Before(until) {
+		return true
+	}
+	delete(c.ipFailUntil, ip)
+	return false
+}
+
+func (c *cooldownTracker) cooldownIP(ip string) {
+	c.mu.Lock()
+	c.ipFailUntil[ip] = time.Now().Add(ipFailCooldown)
+	c.mu.Unlock()
+}
+
+func (c *cooldownTracker) clearIP(ip string) {
+	c.mu.Lock()
+	delete(c.ipFailUntil, ip)
+	c.mu.Unlock()
+}
+
 type clientHandler struct {
 	ctx      context.Context
 	settings handlerSettings
@@ -96,10 +125,11 @@ type clientHandler struct {
 	stats    *Stats
 	bal      *domainBalancer
 	cooldown *cooldownTracker
+	connect  func(context.Context, string, string, time.Duration, string, int) (*rawWebSocket, error)
 }
 
 func newClientHandler(ctx context.Context, s handlerSettings, pool *wsPool, stats *Stats, bal *domainBalancer) *clientHandler {
-	return &clientHandler{ctx: ctx, settings: s, pool: pool, stats: stats, bal: bal, cooldown: newCooldownTracker()}
+	return &clientHandler{ctx: ctx, settings: s, pool: pool, stats: stats, bal: bal, cooldown: newCooldownTracker(), connect: connectWS}
 }
 
 func (h *clientHandler) handle(conn net.Conn) {
@@ -133,10 +163,12 @@ func (h *clientHandler) handle(conn net.Conn) {
 }
 
 func (h *clientHandler) readInit(br *bufio.Reader, conn net.Conn, label string) ([]byte, rwStream, bool) {
-	if h.settings.proxyProtocol {
-		consumeProxyProtocol(br)
-	}
 	_ = conn.SetReadDeadline(time.Now().Add(handshakeReadLimit))
+	if h.settings.proxyProtocol {
+		if err := consumeProxyProtocol(br); err != nil {
+			return nil, nil, false
+		}
+	}
 
 	first, err := br.ReadByte()
 	if err != nil {
@@ -179,10 +211,10 @@ func (h *clientHandler) readInitViaFakeTLS(br *bufio.Reader, conn net.Conn, firs
 
 	cr, sid, ok := verifyClientHello(clientHello, h.settings.secret)
 	if !ok {
-		log.Printf("tgws: [%s] Fake-TLS verify failed -> masking via %s", label, masking)
+		log.Printf("tgws: [%s] Fake-TLS verify failed -> masking via %s", label, censorDomains(masking))
 		h.stats.connectionsMasked.Add(1)
 		_ = conn.SetReadDeadline(time.Time{})
-		relayToMaskingDomain(&bufConn{r: br, c: conn}, clientHello, masking)
+		relayToMaskingDomain(&bufConn{r: br, c: conn}, clientHello, masking, h.ctx)
 		return nil, nil, false
 	}
 	serverHello := buildServerHello(h.settings.secret, cr, sid)
@@ -199,27 +231,39 @@ func (h *clientHandler) readInitViaFakeTLS(br *bufio.Reader, conn net.Conn, firs
 }
 
 func (h *clientHandler) serveAuthenticated(parsed *clientHandshake, stream rwStream, conn net.Conn, label string) {
-	dc, isMedia := parsed.dcID, parsed.isMedia
+	dc, isTest := normalizeClientDC(parsed.dcID, h.settings.forceTestDC)
+	isMedia := parsed.isMedia
 	protoInt := parsed.protoInt()
-	dcKey := itoa(dc)
+	dcKey := connectionDCKey(dc, isTest, isMedia)
 	mediaTag := ""
 	if isMedia {
-		dcKey += "m"
 		mediaTag = " media"
 	}
+	if isTest {
+		mediaTag += " test"
+	}
 	closeClient := func() { _ = conn.Close() }
-
-	relayInit := generateRelayHandshake(parsed.protoTag, parsed.dcIndex())
+	dcIndex := dc
+	if isMedia {
+		dcIndex = -dc
+	}
+	relayInit := generateRelayHandshake(parsed.protoTag, dcIndex)
 	reenc := buildContext(parsed.prekeyIV, h.settings.secret, relayInit)
+	fallback := func() {
+		splitter := newMessageSplitter(relayInit, protoInt)
+		if !attemptFallback(h.ctx, stream, stream, closeClient, relayInit, dc, isTest, isMedia, reenc, h.stats, h.settings.fallback, h.bal, splitter) {
+			log.Printf("tgws: [%s] DC%d%s no fallback available", label, dc, mediaTag)
+		}
+	}
 
 	targetIP, hasRoute := h.settings.dcRedirects[dc]
 	// DCs without a user-configured redirect (DC1/3/5 have no unblocked direct
-	// front) can still reach their real front THROUGH the AWG2 tunnel — but only
+	// front) can still reach their real front THROUGH the AWG tunnel — but only
 	// while the tunnel is actually up; otherwise fall through to the normal chain.
 	if !hasRoute {
 		if front, okFront := tgfronts.FrontForDC(dc); okFront && h.settings.awgAvailable != nil && h.settings.awgAvailable() {
 			targetIP, hasRoute = front, true
-			log.Printf("tgws: [%s] DC%d%s -> AWG2 front %s", label, dc, mediaTag, front)
+			log.Printf("tgws: [%s] DC%d%s -> AWG front %s", label, dc, mediaTag, front)
 		}
 	}
 	if !hasRoute || h.cooldown.isBlacklisted(dcKey) {
@@ -228,77 +272,132 @@ func (h *clientHandler) serveAuthenticated(parsed *clientHandshake, stream rwStr
 			reason = "DC blacklisted"
 		}
 		log.Printf("tgws: [%s] DC%d%s %s -> fallback", label, dc, mediaTag, reason)
-		splitter := newMessageSplitter(relayInit, protoInt)
-		if !attemptFallback(h.ctx, stream, stream, closeClient, relayInit, dc, isMedia, reenc, h.stats, h.settings.fallback, h.bal, splitter) {
-			log.Printf("tgws: [%s] DC%d%s no fallback available", label, dc, mediaTag)
-		}
+		fallback()
 		return
 	}
 
 	domains := wsDomainsFor(dc, isMedia)
+	path := wsPath
+	if isTest {
+		path = wsTestPath
+	}
+	var ws *rawWebSocket
+	if !isTest && h.pool != nil {
+		ws = h.pool.acquire(dc, isMedia, targetIP, domains)
+	}
+	// A timeout means both SNI alternatives share an unreachable IP. Skip
+	// repeated foreground dials for an hour when CF can serve the connection,
+	// but let a successfully refilled pool override that negative cache.
+	hasCFFallback := (!isTest && h.settings.fallback.cfproxyEnabled) || len(h.settings.fallback.cfproxyWorkerDomains) > 0
+	if ws == nil && hasCFFallback && h.cooldown.ipCoolingDown(targetIP) {
+		log.Printf("tgws: [%s] DC%d%s IP %s on cooldown -> fallback", label, dc, mediaTag, targetIP)
+		fallback()
+		return
+	}
 	timeout := wsDefaultTimeout
 	if h.cooldown.remainingCooldown(dcKey) > 0 {
 		timeout = wsFastFailTimeout
 	}
 
-	ws := h.pool.acquire(dc, isMedia, targetIP, domains)
-	wsRedirectOnly := true
 	if ws != nil {
-		log.Printf("tgws: [%s] DC%d%s -> pool hit via %s", label, dc, mediaTag, targetIP)
+		log.Printf("tgws: [%s] DC%d%s -> pool hit via %s (host=%s, sni=%s)", label, dc, mediaTag, targetIP, censorDomains(ws.domain), censorDomains(ws.sni))
 	} else {
-		for _, domain := range domains {
-			log.Printf("tgws: [%s] DC%d%s -> wss://%s via %s", label, dc, mediaTag, domain, targetIP)
-			w, err := connectWS(h.ctx, targetIP, domain, timeout, "/apiws", h.settings.bufferSize)
-			if err == nil {
-				ws = w
-				wsRedirectOnly = false
-				break
-			}
-			h.stats.wsErrors.Add(1)
-			if hs, isHS := err.(*wsHandshakeError); isHS && hs.isRedirect() {
-				log.Printf("tgws: [%s] DC%d%s %d from %s -> %s", label, dc, mediaTag, hs.statusCode, domain, hs.location)
-				continue
-			}
-			wsRedirectOnly = false
-			log.Printf("tgws: [%s] DC%d%s WS connect failed: %v", label, dc, mediaTag, err)
-		}
+		ws = h.connectDirect(dcKey, targetIP, domains, path, timeout, label)
 	}
 
 	if ws == nil {
-		if wsRedirectOnly {
-			h.cooldown.addBlacklist(dcKey)
-			log.Printf("tgws: [%s] DC%d%s blacklisted for WS (all redirects)", label, dc, mediaTag)
-		} else {
-			h.cooldown.cooldown(dcKey)
-			log.Printf("tgws: [%s] DC%d%s WS cooldown for %ds", label, dc, mediaTag, int(dcFailCooldown.Seconds()))
-		}
-		splitter := newMessageSplitter(relayInit, protoInt)
-		attemptFallback(h.ctx, stream, stream, closeClient, relayInit, dc, isMedia, reenc, h.stats, h.settings.fallback, h.bal, splitter)
+		fallback()
 		return
 	}
 
 	h.cooldown.clear(dcKey)
+	h.cooldown.clearIP(targetIP)
+	if !isTest && h.pool != nil {
+		h.pool.reportSuccess(dc, isMedia)
+	}
 	h.stats.connectionsWS.Add(1)
 	splitter := newMessageSplitter(relayInit, protoInt)
 	if err := ws.send(relayInit); err != nil {
 		_ = ws.close()
 		return
 	}
-	bridgeWS(stream, stream, closeClient, ws, reenc, h.stats, splitter)
+	bridgeWS(stream, stream, closeClient, ws, reenc, h.stats, splitter, label+" DC"+dcKey)
 }
 
-func consumeProxyProtocol(br *bufio.Reader) {
-	line, err := br.ReadString('\n')
-	if err != nil {
-		return
+func normalizeClientDC(dc int, forceTest bool) (int, bool) {
+	if dc >= 10000 {
+		return dc - 10000, true
 	}
-	text := strings.TrimSpace(line)
-	if !strings.HasPrefix(text, "PROXY ") {
-		// Not a PROXY header — but we've consumed the line. The reference
-		// implementation only enables this when fronted by a proxy, so the
-		// first line is always the PROXY header in practice.
-		return
+	return dc, forceTest
+}
+
+func connectionDCKey(dc int, isTest, isMedia bool) string {
+	key := itoa(dc)
+	if isTest {
+		key += "t"
 	}
+	if isMedia {
+		key += "m"
+	}
+	return key
+}
+
+func (h *clientHandler) connectDirect(dcKey, targetIP string, domains []string, path string, timeout time.Duration, label string) *rawWebSocket {
+	allRedirects := len(domains) > 0
+	for _, domain := range domains {
+		if h.ctx.Err() != nil {
+			return nil
+		}
+		log.Printf("tgws: [%s] DC%s -> wss://%s%s via %s", label, dcKey, domain, path, targetIP)
+		ws, err := h.connect(h.ctx, targetIP, domain, timeout, path, h.settings.bufferSize)
+		if err == nil {
+			return ws
+		}
+		h.stats.wsErrors.Add(1)
+		if h.ctx.Err() != nil {
+			return nil
+		}
+		var hs *wsHandshakeError
+		if errors.As(err, &hs) && hs.isRedirect() {
+			log.Printf("tgws: [%s] DC%s %d from %s -> %s", label, dcKey, hs.statusCode, domain, censorDomains(hs.location))
+			continue
+		}
+		allRedirects = false
+		var netErr net.Error
+		if errors.Is(err, context.DeadlineExceeded) || (errors.As(err, &netErr) && netErr.Timeout()) {
+			h.cooldown.cooldownIP(targetIP)
+			log.Printf("tgws: [%s] DC%s IP %s timed out; cooldown for %ds", label, dcKey, targetIP, int(ipFailCooldown.Seconds()))
+			break
+		}
+		log.Printf("tgws: [%s] DC%s WS connect failed: %s", label, dcKey, censorDomains(err.Error()))
+	}
+	if allRedirects {
+		h.cooldown.addBlacklist(dcKey)
+		log.Printf("tgws: [%s] DC%s blacklisted for WS (all redirects)", label, dcKey)
+	} else {
+		h.cooldown.cooldown(dcKey)
+	}
+	return nil
+}
+
+func consumeProxyProtocol(br *bufio.Reader) error {
+	// HAProxy v1 has a 107-byte maximum line. The connection's handshake
+	// deadline is already set, and a missing newline cannot allocate endlessly.
+	var line []byte
+	for len(line) < 107 {
+		b, err := br.ReadByte()
+		if err != nil {
+			return err
+		}
+		line = append(line, b)
+		if b == '\n' {
+			if !strings.HasPrefix(string(line), "PROXY ") || !strings.HasSuffix(string(line), "\r\n") {
+				return fmt.Errorf("invalid PROXY protocol v1 header")
+			}
+			return nil
+		}
+	}
+	return fmt.Errorf("PROXY protocol v1 header too long")
 }
 
 func drain(r io.Reader) {

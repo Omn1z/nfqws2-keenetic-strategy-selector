@@ -110,14 +110,15 @@ func New(cfg *config.Config) (*App, error) {
 	}
 	a.monitor = monitor.New(cfg, st, a.proxy, a.awgroute) // dashboard reads the proxy + AWG2 tunnel status
 	a.proxy.SetAWGFallbackProbe(a.proxyTunnelFallbackUp)  // Telegram proxies route ISP-blocked DC1/3/5 via the selected tunnel backend while it is up
+	a.awgroute.SetClientRecoveryHook(func() { a.syncProxyTunnelRoutes(a.proxy.AWGFallback()) })
 	a.syncProxyTunnelRoutes(a.proxy.AWGFallback())
 	a.initDNS()
 	// Repair any sandbox state leaked by a previous unclean exit (stale STRAT_*
 	// iptables chains / orphaned test nfqws2 children). Without this a killed run
 	// leaves an exclude-connmark rule that makes the MAIN nfqws2 skip connections.
 	engine.CleanupSandboxes(cfg, maxThreads)
-	// Clear any leaked AWG2 routing state from an unclean exit. Runs AFTER the
-	// manager exists but BEFORE the autostart goroutine's delayed routing re-apply.
+	// Clear leaked AWG routing before DNS/Pi-hole initialization. Start recovery
+	// only after initialization, so it cannot block startup on the lifecycle lock.
 	a.awgroute.RepairRouting()
 	if err := a.portfwd.Apply(); err != nil {
 		logbuf.Append("port-forwarding", "warn", err.Error())
@@ -128,6 +129,10 @@ func New(cfg *config.Config) (*App, error) {
 	if err := a.arpspoof.Apply(); err != nil {
 		logbuf.Append("arp-spoofing", "warn", err.Error())
 	}
+	a.awgroute.StartClientSupervisor()
+	// Open Telegram listeners and warm their TLS pools only after the startup
+	// route/firewall repair has finished, so local resets do not trigger fronting.
+	a.proxy.StartEnabled()
 	return a, nil
 }
 

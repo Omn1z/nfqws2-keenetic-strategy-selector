@@ -21,9 +21,20 @@ func DNSProxyUpstreamAddr() string { return "127.0.0.1#" + awgDNSPort }
 // the new state on the next routing apply. The CAS on the atomic.Bool gives
 // us "already in that state → no-op" without a mutex round-trip.
 func (svc *Service) SetDNSChainEnabled(enabled bool) {
+	if svc.route.dnsChainEnabledFlag.Load() == enabled {
+		return
+	}
+	_, unlock := svc.lockClientOps(false)
+	defer unlock()
 	if svc.route.dnsChainEnabledFlag.Swap(enabled) == enabled {
 		return
 	}
+	svc.route.mu.Lock()
+	initialized := svc.route.multiStopRefresh != nil || svc.route.stopRefresh != nil || svc.route.dnsProxy != nil
+	svc.route.mu.Unlock()
+	if !initialized {
+		return
+	} // Startup: supervisor applies the chosen chain after initialization.
 	svc.awgApplyMultiHostRoutesOS()
 }
 

@@ -144,7 +144,7 @@ export default function DevicesRoutingPane({ st, reload }: Props) {
 
   return (
     <Card
-      title="Устройства AWG2"
+      title="Устройства VPN"
       sub="клик на устройство — сразу применяется"
       head={
         <div className="flex flex-wrap items-center gap-2">

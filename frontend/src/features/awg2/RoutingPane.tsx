@@ -78,11 +78,15 @@ export default function RoutingPane({ st, reload }: { st: Awg2Status; reload: ()
     post("/api/awg2/routing/rules", nextRouting, ok, after, nextRouting);
 
   const install = async () => {
-    if (!(await confirmDialog({ title: "Установить движок AmneziaWG?", body: "Скачает нашу сборку amneziawg-go + awg и установит на роутер (нужен интернет).", confirmLabel: "Установить" }))) return;
+    if (!(await confirmDialog({
+      title: eng.installed ? "Обновить движок AmneziaWG?" : "Установить движок AmneziaWG?",
+      body: `Установит ${eng.target_version || "актуальную сборку"} на роутер. Действующие VPN-туннели будут перезапущены с сохранением профилей.`,
+      confirmLabel: eng.installed ? "Обновить" : "Установить",
+    }))) return;
     setBusy(true);
     try {
       const d = await api<{ ok: boolean; detail?: string; error?: string }>("POST", "/api/awg2/install", {});
-      toast(d.ok ? "Движок установлен" : "Ошибка: " + (d.error || "?"), d.ok ? "ok" : "err");
+      toast(d.ok ? "Движок AmneziaWG готов" : "Ошибка: " + (d.error || "?"), d.ok ? "ok" : "err");
       await reload();
     } catch (e) { toast((e as Error).message, "err"); } finally { setBusy(false); }
   };
@@ -120,16 +124,17 @@ export default function RoutingPane({ st, reload }: { st: Awg2Status; reload: ()
 
   return (
     <>
-      {!eng.installed && (
-      <Card title="Движок AmneziaWG" sub="нужен для поднятия локальных awgN-интерфейсов">
+      {(!eng.installed || eng.update_available || !eng.awg3_supported || !eng.tun_ok) && (
+      <Card title="Движок AmneziaWG" sub={eng.installed ? `Установлен: ${eng.awg_version || "версия неизвестна"}` : "нужен для запуска VPN на роутере"}>
         {!eng.supported ? (
           <p className="text-xs text-bad">Для архитектуры {eng.arch} готовой сборки движка нет.</p>
         ) : (
           <div className="flex flex-wrap items-center gap-3">
-            <Button variant="primary" onClick={install} disabled={busy}>Установить движок</Button>
+            <Button variant="primary" onClick={install} disabled={busy}>{busy ? "Установка…" : `${eng.installed ? "Обновить движок" : "Установить движок"}${eng.target_version ? ` · ${eng.target_version}` : ""}`}</Button>
             {!eng.tun_ok && <span className="text-xs text-warn">⚠ /dev/net/tun не найден — при установке будет попытка загрузить модуль</span>}
           </div>
         )}
+        {eng.update_available && <p className="mt-2 text-xs text-muted">Обновление добавляет поддержку AWG 3.1. Существующие профили AWG 2.0, WireGuard и WARP сохраняются.</p>}
       </Card>
       )}
 

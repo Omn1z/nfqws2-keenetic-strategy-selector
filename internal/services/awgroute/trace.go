@@ -230,6 +230,8 @@ func (svc *Service) TraceCounters() TraceCounters {
 // Routing config so the choice survives a watchdog re-render. Returns the new
 // state. When turning off, existing entries stay in the ring for inspection.
 func (svc *Service) TraceSetEnabled(on bool) bool {
+	_, unlock := svc.lockClientOps(false)
+	defer unlock()
 	traceSetEnabled(on)
 	if m := svc.awgActive(); m != nil {
 		c := m.Config()

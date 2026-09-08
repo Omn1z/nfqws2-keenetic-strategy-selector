@@ -4,8 +4,10 @@ import (
 	"crypto/cipher"
 	"encoding/binary"
 	"io"
+	"log"
 	"net"
 	"sync"
+	"time"
 )
 
 // messageSplitter slices an MTProto byte stream into individual transport
@@ -53,6 +55,8 @@ func (m *messageSplitter) split(chunk []byte) [][]byte {
 			break
 		}
 		parts = append(parts, append([]byte(nil), m.cipherBuf[:length]...))
+		// Advancing slices is O(1), unlike deleting the front of Python's
+		// bytearray. A batch of many small packets remains O(N).
 		m.cipherBuf = m.cipherBuf[length:]
 		m.plainBuf = m.plainBuf[length:]
 	}
@@ -124,18 +128,27 @@ func (m *messageSplitter) intermediateLen() (int, bool) {
 
 // bridgeWS relays a client TCP stream and an upstream WS connection, decrypting
 // with one key and re-encrypting with the other in each direction.
-func bridgeWS(client io.Reader, clientWriter io.Writer, closeClient func(), ws *rawWebSocket, ctx *reencryptionContext, stats *Stats, splitter *messageSplitter) {
+func bridgeWS(client io.Reader, clientWriter io.Writer, closeClient func(), ws *rawWebSocket, ctx *reencryptionContext, stats *Stats, splitter *messageSplitter, labels ...string) {
 	var once sync.Once
 	stop := func() { once.Do(func() { _ = ws.close(); closeClient() }) }
 
-	done := make(chan struct{}, 2)
+	started := time.Now()
+	var upBytes, downBytes, upPackets, downPackets int64
+	type result struct {
+		source string
+		err    error
+	}
+	done := make(chan result, 2)
 	go func() {
-		defer func() { done <- struct{}{} }()
+		closed := result{source: "client", err: io.EOF}
+		defer func() { done <- closed }()
 		buf := make([]byte, 65536)
 		for {
 			n, err := client.Read(buf)
 			if n > 0 {
 				stats.bytesUp.Add(int64(n))
+				upBytes += int64(n)
+				upPackets++
 				reenc := make([]byte, n)
 				ctx.clientDecrypt.XORKeyStream(reenc, buf[:n])
 				ctx.upstreamEncrypt.XORKeyStream(reenc, reenc)
@@ -143,18 +156,22 @@ func bridgeWS(client io.Reader, clientWriter io.Writer, closeClient func(), ws *
 					parts := splitter.split(reenc)
 					if len(parts) == 1 {
 						if e := ws.send(parts[0]); e != nil {
+							closed = result{source: "upstream write", err: e}
 							return
 						}
 					} else if len(parts) > 1 {
 						if e := ws.sendBatch(parts); e != nil {
+							closed = result{source: "upstream write", err: e}
 							return
 						}
 					}
 				} else if e := ws.send(reenc); e != nil {
+					closed = result{source: "upstream write", err: e}
 					return
 				}
 			}
 			if err != nil {
+				closed.err = err
 				if splitter != nil {
 					if tail := splitter.flush(); tail != nil {
 						_ = ws.send(tail)
@@ -165,25 +182,39 @@ func bridgeWS(client io.Reader, clientWriter io.Writer, closeClient func(), ws *
 		}
 	}()
 	go func() {
-		defer func() { done <- struct{}{} }()
+		closed := result{source: "upstream", err: io.EOF}
+		defer func() { done <- closed }()
 		for {
 			data, err := ws.recv()
 			if err != nil {
+				closed.err = err
 				return
 			}
 			stats.bytesDown.Add(int64(len(data)))
+			downBytes += int64(len(data))
+			downPackets++
 			out := make([]byte, len(data))
 			ctx.upstreamDecrypt.XORKeyStream(out, data)
 			ctx.clientEncrypt.XORKeyStream(out, out)
 			if _, e := clientWriter.Write(out); e != nil {
+				closed = result{source: "client write", err: e}
 				return
 			}
 		}
 	}()
 
-	<-done
+	closed := <-done
 	stop()
 	<-done
+	label := ws.conn.RemoteAddr().String()
+	if len(labels) > 0 && labels[0] != "" {
+		label = labels[0]
+	}
+	// Both goroutines have finished before reading their counters. Keep the
+	// original close cause instead of the errors induced by stop().
+	log.Printf("tgws: [%s] WS session closed (%s: %s): up=%d (%d chunks) down=%d (%d frames) in %.1fs",
+		censorDomains(label), closed.source, censorDomains(closed.err.Error()),
+		upBytes, upPackets, downBytes, downPackets, time.Since(started).Seconds())
 }
 
 // bridgeTCP relays a client stream and an upstream TCP connection (the direct

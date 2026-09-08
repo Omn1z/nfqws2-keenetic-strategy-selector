@@ -127,7 +127,9 @@ func (m *Socks5Manager) acceptLoop(ln net.Listener, h *socks5Handler, conns *con
 		if err != nil {
 			return // listener closed on Stop
 		}
-		conns.add(conn)
+		if !conns.add(conn) {
+			continue
+		}
 		go func() {
 			defer conns.remove(conn)
 			h.handle(conn)

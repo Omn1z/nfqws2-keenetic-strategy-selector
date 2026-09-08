@@ -22,10 +22,11 @@ const (
 
 // TGWSStatus is the combined view the Telegram tab polls.
 type TGWSStatus struct {
-	Running bool          `json:"running"`
-	Config  tgws.Config   `json:"config"`
-	Stats   tgws.Snapshot `json:"stats"`
-	Link    string        `json:"link"`
+	UpstreamVersion string        `json:"upstream_version"`
+	Running         bool          `json:"running"`
+	Config          tgws.Config   `json:"config"`
+	Stats           tgws.Snapshot `json:"stats"`
+	Link            string        `json:"link"`
 }
 
 // Socks5Status is the combined view the SOCKS5 sub-tab polls.
@@ -50,15 +51,30 @@ type Service struct {
 	awgProbe    atomic.Pointer[func(string) bool]
 }
 
-// New loads the persisted configs (or defaults) and auto-starts each proxy that
-// was enabled (a start failure, e.g. a busy port, is logged, not fatal), then
-// persists back (so a freshly generated secret is saved).
+// New loads and persists configs, including freshly generated secrets. Call
+// StartEnabled after the host finishes changing routes and firewall rules.
 func New(st *store.Store) *Service {
 	s := &Service{store: st}
 	s.initShared()
 	s.initTGWS()
 	s.initSocks5()
 	return s
+}
+
+// StartEnabled starts persisted enabled services after network initialization.
+// Warming TLS pools while the host tears down routing can poison their SNI
+// preference with failures caused by startup, rather than by the remote DC.
+func (s *Service) StartEnabled() {
+	if s.tgws.Config().Enabled {
+		if err := s.tgws.Start(); err != nil {
+			log.Printf("tgws: autostart: %v", err)
+		}
+	}
+	if s.socks5.Config().Enabled {
+		if err := s.socks5.Start(); err != nil {
+			log.Printf("socks5: autostart: %v", err)
+		}
+	}
 }
 
 // TGWS / Socks5 expose the underlying managers for service-control (restart).
@@ -137,11 +153,6 @@ func (s *Service) initTGWS() {
 	}
 	cfg.Normalize()
 	s.tgws = tgws.NewManager(cfg)
-	if cfg.Enabled {
-		if err := s.tgws.Start(); err != nil {
-			log.Printf("tgws: auto-start failed: %v", err)
-		}
-	}
 	s.tgwsSave()
 }
 
@@ -156,10 +167,11 @@ func (s *Service) tgwsSave() {
 // tg:// link at the address the user reached the UI on.
 func (s *Service) TGWSStatusFor(host string) TGWSStatus {
 	return TGWSStatus{
-		Running: s.tgws.Running(),
-		Config:  s.tgws.Config(),
-		Stats:   s.tgws.Stats(),
-		Link:    s.tgws.Link(host),
+		UpstreamVersion: tgws.UpstreamVersion,
+		Running:         s.tgws.Running(),
+		Config:          s.tgws.Config(),
+		Stats:           s.tgws.Stats(),
+		Link:            s.tgws.Link(host),
 	}
 }
 
@@ -224,11 +236,6 @@ func (s *Service) initSocks5() {
 	}
 	cfg.Normalize()
 	s.socks5 = tgws.NewSocks5Manager(cfg)
-	if cfg.Enabled {
-		if err := s.socks5.Start(); err != nil {
-			log.Printf("socks5: auto-start failed: %v", err)
-		}
-	}
 	s.socks5Save()
 }
 

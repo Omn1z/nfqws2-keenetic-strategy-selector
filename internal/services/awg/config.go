@@ -1,7 +1,6 @@
-// Package awg models and deploys an AmneziaWG 2.0 ("AWG2") VPN: it provisions a
-// server on a remote VPS over SSH, renders server/client configs, and is the
-// portable core behind the panel's «Сервисы → AWG2» tab. All obfuscation
-// parameters are AmneziaWG 2.0 and must be byte-identical on both ends.
+// Package awg models and deploys AmneziaWG VPN servers over SSH and renders
+// server/client configs. New servers use AWG 3.1; existing AWG 1.x/2.0 and plain
+// WireGuard profiles retain their wire parameters until explicitly changed.
 package awg
 
 import (
@@ -14,8 +13,10 @@ import (
 // private keys and the VPS password). It mirrors the socks5/tgws config shape
 // (Default/Normalize/Validate).
 type ServerConfig struct {
-	Enabled  bool   `json:"enabled"`            // profile is available in the UI; deploy/connect are still explicit actions
-	Protocol string `json:"protocol,omitempty"` // "awg" (default) | "wireguard" (plain WG import)
+	Enabled            bool   `json:"enabled"`                       // profile is available in the UI; deploy/connect are still explicit actions
+	Protocol           string `json:"protocol,omitempty"`            // "awg" (default) | "wireguard" (plain WG import)
+	ProtocolVersion    string `json:"protocol_version,omitempty"`    // absent preserves legacy profiles; "1.0", "1.5", "2", "3.1"
+	TrafficObfuscation *bool  `json:"traffic_obfuscation,omitempty"` // nil preserves legacy behavior; false renders plain WG
 
 	Conn    Credentials `json:"conn"`    // VPS SSH connection
 	Install string      `json:"install"` // "apt" (default) | "userspace"
@@ -55,41 +56,52 @@ type Credentials struct {
 	KnownKey string `json:"known_key"`          // TOFU-pinned host key (authorized_keys line)
 }
 
-// Obfuscation holds the AmneziaWG 2.0 [Interface]-level parameters. H1..H4 and
+// Obfuscation holds the AmneziaWG [Interface]-level parameters. H1..H4 and
 // I1..I5 are strings so header ranges ("x-y") and the I-packet CPS DSL survive.
 // These MUST be identical on server and client.
 type Obfuscation struct {
-	Jc   int    `json:"jc"`
-	Jmin int    `json:"jmin"`
-	Jmax int    `json:"jmax"`
-	S1   int    `json:"s1"`
-	S2   int    `json:"s2"`
-	S3   int    `json:"s3"` // 2.0: cookie-reply padding
-	S4   int    `json:"s4"` // 2.0: transport padding
-	H1   string `json:"h1"`
-	H2   string `json:"h2"`
-	H3   string `json:"h3"`
-	H4   string `json:"h4"`
-	I1   string `json:"i1"` // 2.0: signature packets (CPS DSL); optional
-	I2   string `json:"i2"`
-	I3   string `json:"i3"`
-	I4   string `json:"i4"`
-	I5   string `json:"i5"`
+	Jc                     int    `json:"jc"`
+	Jmin                   int    `json:"jmin"`
+	Jmax                   int    `json:"jmax"`
+	S1                     int    `json:"s1"`
+	S2                     int    `json:"s2"`
+	S3                     int    `json:"s3"` // 2.0: cookie-reply padding
+	S4                     int    `json:"s4"` // 2.0: transport padding
+	H1                     string `json:"h1"`
+	H2                     string `json:"h2"`
+	H3                     string `json:"h3"`
+	H4                     string `json:"h4"`
+	I1                     string `json:"i1"` // 2.0: signature packets (CPS DSL); optional
+	I2                     string `json:"i2"`
+	I3                     string `json:"i3"`
+	I4                     string `json:"i4"`
+	I5                     string `json:"i5"`
+	HeaderProtectionKey    string `json:"header_protection_key,omitempty"`     // base64 shared secret; REDACTED in API responses
+	HasHeaderProtectionKey bool   `json:"has_header_protection_key,omitempty"` // computed for the frontend
+	ContentPaddingAddition string `json:"content_padding_addition,omitempty"`
+	RekeyAfterTime         string `json:"rekey_after_time,omitempty"`
+	RekeyTimeout           string `json:"rekey_timeout,omitempty"`
+	RejectAfterTime        string `json:"reject_after_time,omitempty"`
+	KeepaliveTimeout       string `json:"keepalive_timeout,omitempty"`
+	MaxHandshakeAttempts   string `json:"max_handshake_attempts,omitempty"`
+	RandomTrailers         bool   `json:"random_trailers,omitempty"`
+	DisableCookies         bool   `json:"disable_cookies,omitempty"`
 }
 
 // Peer is one client of the server. Secret fields REDACTED in API responses.
 type Peer struct {
-	ID         string `json:"id"`
-	Name       string `json:"name"`
-	PublicKey  string `json:"public_key"`
-	PrivateKey string `json:"private_key"` // REDACTED; "" if only a pubkey was supplied
-	PSK        string `json:"psk"`         // REDACTED
-	Address    string `json:"address"`     // peer tunnel address, e.g. 10.13.13.2/32
-	AllowedIPs string `json:"allowed_ips"` // client-side routing
-	Keepalive  int    `json:"keepalive"`
-	IsRouter   bool   `json:"is_router"`   // this peer is the local Keenetic router
-	HasPrivate bool   `json:"has_private"` // computed for the frontend
-	CreatedAt  int64  `json:"created_at"`
+	ID             string `json:"id"`
+	Name           string `json:"name"`
+	PublicKey      string `json:"public_key"`
+	PrivateKey     string `json:"private_key"` // REDACTED; "" if only a pubkey was supplied
+	PSK            string `json:"psk"`         // REDACTED
+	Address        string `json:"address"`     // peer tunnel address, e.g. 10.13.13.2/32
+	AllowedIPs     string `json:"allowed_ips"` // client-side routing
+	Keepalive      int    `json:"keepalive"`
+	KeepaliveRange string `json:"keepalive_range,omitempty"` // AWG 3.1 range or explicit zero; takes precedence over Keepalive
+	IsRouter       bool   `json:"is_router"`                 // this peer is the local Keenetic router
+	HasPrivate     bool   `json:"has_private"`               // computed for the frontend
+	CreatedAt      int64  `json:"created_at"`
 }
 
 // ClientConfig controls bringing the local router up as a client of the server.
@@ -161,21 +173,26 @@ type RoutingConfig struct {
 	Active       bool   `json:"active"`        // committed → re-apply on boot (set on commit, cleared on explicit teardown)
 }
 
-// Default returns a ready-to-fill server config with AWG 2.0 defaults.
+// Default returns a new self-hosted AWG 3.1 profile. Shared obfuscation secrets
+// are generated by ConfigureTrafficObfuscation or EnsureKeys and then persisted.
 func Default() *ServerConfig {
+	on := true
 	return &ServerConfig{
-		Enabled:     true,
-		Conn:        Credentials{Port: 22, User: "root", AuthKind: "password"},
-		Install:     "apt",
-		ListenPort:  51820,
-		Address:     "10.13.13.1/24",
-		Subnet:      "10.13.13.0/24",
-		MTU:         1420,
-		DNS:         "1.1.1.1, 1.0.0.1",
-		Obf:         DefaultObf(),
-		Peers:       []Peer{},
-		Interface:   "awg0",
-		ClientIface: "awg0",
+		Enabled:            true,
+		Protocol:           "awg",
+		ProtocolVersion:    "3.1",
+		TrafficObfuscation: &on,
+		Conn:               Credentials{Port: 22, User: "root", AuthKind: "password"},
+		Install:            "apt",
+		ListenPort:         51820,
+		Address:            "10.13.13.1/24",
+		Subnet:             "10.13.13.0/24",
+		MTU:                1420,
+		DNS:                "1.1.1.1, 1.0.0.1",
+		Obf:                DefaultObf(),
+		Peers:              []Peer{},
+		Interface:          "awg0",
+		ClientIface:        "awg0",
 		Routing: RoutingConfig{
 			Mode:         "off",
 			Zones:        []Zone{},
@@ -186,7 +203,7 @@ func Default() *ServerConfig {
 }
 
 func (c ServerConfig) UseObfuscation() bool {
-	return c.Protocol != "wireguard"
+	return c.Protocol != "wireguard" && (c.TrafficObfuscation == nil || *c.TrafficObfuscation)
 }
 
 // Normalize fills zero/blank fields with defaults so a partial config is usable.
@@ -320,6 +337,9 @@ func (c *ServerConfig) Validate() []string {
 	if c.ListenPort < 1 || c.ListenPort > 65535 {
 		errs = append(errs, "UDP-порт сервера вне диапазона")
 	}
+	if !validInterfaceName(c.Interface) {
+		errs = append(errs, "имя интерфейса должно содержать 1–15 букв, цифр, точек, дефисов или подчёркиваний")
+	}
 	if _, _, err := net.ParseCIDR(strings.TrimSpace(c.Address)); err != nil {
 		errs = append(errs, "адрес интерфейса должен быть в формате CIDR, напр. 10.13.13.1/24")
 	}
@@ -329,13 +349,21 @@ func (c *ServerConfig) Validate() []string {
 	if c.MTU < 1280 || c.MTU > 1500 {
 		errs = append(errs, "MTU вне диапазона 1280–1500")
 	}
-	if c.Protocol != "wireguard" {
+	if c.UseObfuscation() {
 		errs = append(errs, c.Obf.Validate()...)
+	}
+	switch c.ProtocolVersion {
+	case "", "1.0", "1.5", "2", "3.1":
+	default:
+		errs = append(errs, "неизвестная версия AmneziaWG")
 	}
 	seenName := map[string]bool{}
 	seenPub := map[string]bool{}
 	seenAddr := map[string]bool{}
 	for _, p := range c.Peers {
+		if !validU16Range(p.KeepaliveValue()) {
+			errs = append(errs, "PersistentKeepalive: ожидается число или диапазон 0–65535")
+		}
 		name := strings.TrimSpace(p.Name)
 		if name == "" {
 			errs = append(errs, "у пира пустое имя")
@@ -368,6 +396,18 @@ func (c *ServerConfig) Validate() []string {
 		errs = append(errs, "неизвестный источник доменов для маршрутизации")
 	}
 	return errs
+}
+
+func validInterfaceName(name string) bool {
+	if len(name) < 1 || len(name) > 15 {
+		return false
+	}
+	for _, r := range name {
+		if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '_' || r == '-' || r == '.') {
+			return false
+		}
+	}
+	return name != "." && name != ".."
 }
 
 func validPeerAddr(s string) bool {
