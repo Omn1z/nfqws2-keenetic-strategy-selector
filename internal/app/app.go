@@ -18,6 +18,8 @@ import (
 	"nfqws2strategy/internal/services/arpspoof"
 	"nfqws2strategy/internal/services/awgroute"
 	"nfqws2strategy/internal/services/blobs"
+	"nfqws2strategy/internal/services/dnsroute"
+	"nfqws2strategy/internal/services/dnsserver"
 	"nfqws2strategy/internal/services/monitor"
 	"nfqws2strategy/internal/services/nfqws2"
 	"nfqws2strategy/internal/services/pihole"
@@ -57,15 +59,18 @@ type App struct {
 	traceMode        string // "off" | "auto" | "always"
 	selfUpdateMu     sync.Mutex
 	selfUpdate       SelfUpdateStatus
+	panelMu          sync.Mutex
+	panelListener    PanelListener
 
-	proxy    *proxy.Service    // Telegram proxies: MTProto->WS + SOCKS5 (Telegram tab)
-	monitor  *monitor.Service  // live network views: dashboard, conns, devices, traces, pcaps
-	nfqws2   *nfqws2.Manager   // nfqws2 engine file/version/update/reload (nfqws2 tab)
-	awgroute *awgroute.Service // AWG2 server + router client/split-routing (AWG2 tab)
-	blobs    *blobs.Service    // fake-payload blob store + ClientHello capture (Blobs tab)
-	portfwd  *portforward.Service
-	pihole   *pihole.Service // Pi-hole v6 container (ad-block, DNS sinkhole)
-	arpspoof *arpspoof.Service
+	proxy     *proxy.Service    // Telegram proxies: MTProto->WS + SOCKS5 (Telegram tab)
+	monitor   *monitor.Service  // live network views: dashboard, conns, devices, traces, pcaps
+	nfqws2    *nfqws2.Manager   // nfqws2 engine file/version/update/reload (nfqws2 tab)
+	awgroute  *awgroute.Service // AWG2 server + router client/split-routing (AWG2 tab)
+	blobs     *blobs.Service    // fake-payload blob store + ClientHello capture (Blobs tab)
+	portfwd   *portforward.Service
+	pihole    *pihole.Service // Pi-hole v6 container (ad-block, DNS sinkhole)
+	arpspoof  *arpspoof.Service
+	dnsServer *dnsserver.Service
 
 	dnsMu      sync.Mutex
 	dnsServers []dns.Server // configured DoH/DoT servers (DNS tab + run matrix)
@@ -133,6 +138,10 @@ func New(cfg *config.Config) (*App, error) {
 	// Open Telegram listeners and warm their TLS pools only after the startup
 	// route/firewall repair has finished, so local resets do not trigger fronting.
 	a.proxy.StartEnabled()
+	a.dnsServer = dnsserver.New(st, dnsroute.New(cfg, a.awgroute), func(host string) (string, error) {
+		return dnsroute.ResolveLANHost(host, cfg.WANIfaces)
+	})
+	a.dnsServer.StartEnabled()
 	return a, nil
 }
 
@@ -226,6 +235,9 @@ func (a *App) Shutdown() {
 	engine.CleanupSandboxes(a.Cfg, maxThreads)
 	a.StopTGWS()
 	a.StopSocks5()
+	if a.dnsServer != nil {
+		a.dnsServer.Close()
+	}
 	a.arpspoof.Stop()
 	a.awgroute.StopAWG()
 	a.awgroute.TeardownRouting()

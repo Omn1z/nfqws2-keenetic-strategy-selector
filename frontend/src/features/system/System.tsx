@@ -6,7 +6,8 @@ import { Card } from "@/components/ui/Card";
 import { Switch } from "@/components/ui/Switch";
 import { Modal } from "@/components/ui/Modal";
 import { Button } from "@/components/ui/Button";
-import type { SystemSettings } from "@/types/api";
+import { Field, Input } from "@/components/ui/form";
+import type { SystemPorts, SystemSettings } from "@/types/api";
 
 const Row = ({ title, desc, children }: { title: string; desc: string; children: ReactNode }) => (
   <div className="flex items-center justify-between gap-4 border-t border-line-soft py-3.5 first:border-t-0">
@@ -17,6 +18,99 @@ const Row = ({ title, desc, children }: { title: string; desc: string; children:
     <div className="shrink-0">{children}</div>
   </div>
 );
+
+const parsePort = (value: string, name: string) => {
+  if (!/^\d+$/.test(value) || Number(value) < 1 || Number(value) > 65535) {
+    throw new Error(`${name}: укажите целое число от 1 до 65535`);
+  }
+  return Number(value);
+};
+
+function Ports() {
+  const [saved, setSaved] = useState<SystemPorts | null>(null);
+  const [panelPort, setPanelPort] = useState("");
+  const [dnsPort, setDnsPort] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [panelURL, setPanelURL] = useState("");
+  const [panelNotice, setPanelNotice] = useState("");
+  const saving = useRef(false);
+
+  const accept = (ports: SystemPorts) => {
+    setSaved(ports);
+    setPanelPort(String(ports.panel_port));
+    setDnsPort(String(ports.dns_port));
+  };
+  const load = useCallback(async () => {
+    try { accept(await api<SystemPorts>("GET", "/api/system/ports")); setError(""); }
+    catch (e) { setError((e as Error).message); }
+  }, []);
+  useEffect(() => { void load(); }, [load]);
+
+  const save = async () => {
+    if (!saved || saving.current) return;
+    try {
+      const next = { panel_port: parsePort(panelPort, "Порт панели"), dns_port: parsePort(dnsPort, "Порт DNS") };
+      if (next.panel_port === next.dns_port) throw new Error("Панель и DNS-сервер должны использовать разные порты");
+      saving.current = true; setBusy(true); setError(""); setPanelNotice("");
+      const ports = await api<SystemPorts>("POST", "/api/system/ports", next);
+      accept(ports);
+      if (ports.panel_port !== saved.panel_port) {
+        // A proxy can expose a different scheme or port from the actual panel.
+        // Only change the browser address when it matches the direct listener.
+        const browserPort = Number(window.location.port || (window.location.protocol === "https:" ? 443 : 80));
+        let target: URL | null = null;
+        try { if (ports.panel_url) target = new URL(ports.panel_url); } catch { /* Keep the saved result; URL is optional. */ }
+        if (target && target.hostname === window.location.hostname && target.protocol === window.location.protocol &&
+          !target.username && !target.password && browserPort === saved.panel_port) {
+          target.pathname = window.location.pathname;
+          target.search = window.location.search;
+          target.hash = window.location.hash;
+          const href = target.href;
+          setPanelURL(href);
+          toast("Порты сохранены — открываем панель по новому адресу…", "ok");
+          window.setTimeout(() => window.location.assign(href), 600);
+          return;
+        }
+        setPanelNotice(`Порт панели изменён на ${ports.panel_port}. Если подключение идёт через прокси, обновите его адрес назначения отдельно.`);
+      }
+      toast("Порты сохранены", "ok");
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      saving.current = false; setBusy(false);
+    }
+  };
+
+  const dirty = saved && (panelPort !== String(saved.panel_port) || dnsPort !== String(saved.dns_port));
+  return (
+    <Card title="Порты" sub="веб-панель и DNS Server">
+      {!saved ? <>
+        <p role={error ? "alert" : undefined} className="text-xs text-muted">{error || "Загрузка…"}</p>
+        {error && <Button mini className="mt-3" onClick={load}>Повторить</Button>}
+      </> : <form onSubmit={(e) => { e.preventDefault(); void save(); }}>
+        <fieldset disabled={busy || !!panelURL} className="grid min-w-0 gap-4 sm:grid-cols-2">
+          <Field label="Порт веб-панели · TCP">
+            <Input type="number" inputMode="numeric" min={1} max={65535} step={1} required value={panelPort} onChange={(e) => setPanelPort(e.target.value)} />
+            <span className="mt-1.5 block text-xs font-normal text-muted">При прямом подключении панель откроется по новому адресу.</span>
+          </Field>
+          <Field label="Порт DNS-сервера · UDP и TCP">
+            <Input type="number" inputMode="numeric" min={1} max={65535} step={1} required value={dnsPort} onChange={(e) => setDnsPort(e.target.value)} />
+            <span className="mt-1.5 block text-xs font-normal text-muted">По умолчанию 5355. Порт 53 обычно занят DNS роутера.</span>
+          </Field>
+        </fieldset>
+        <p className="mt-3 text-xs text-muted">Изменения применяются сразу. Сохранение порта DNS не включает выключенный сервис. Укажите новый порт и в настройках DNS-клиентов.</p>
+        {error && <p role="alert" className="mt-3 text-xs text-bad [overflow-wrap:anywhere]">{error}</p>}
+        {panelURL && <p role="status" className="mt-3 text-xs text-muted">Новый адрес панели: <a className="text-accent underline [overflow-wrap:anywhere]" href={panelURL}>{panelURL}</a></p>}
+        {panelNotice && <p role="status" className="mt-3 text-xs text-muted">{panelNotice}</p>}
+        <div className="mt-4 flex flex-wrap items-center gap-3">
+          <Button type="submit" variant="primary" disabled={busy || !!panelURL || !dirty}>{busy ? "Сохранение…" : "Сохранить порты"}</Button>
+          {dirty && <Button type="button" disabled={busy || !!panelURL} onClick={() => { accept(saved); setError(""); }}>Отменить</Button>}
+        </div>
+      </form>}
+    </Card>
+  );
+}
 
 export default function System() {
   const [s, setS] = useState<SystemSettings | null>(null);
@@ -138,6 +232,8 @@ export default function System() {
           <Button variant="danger" onClick={onRestart} disabled={restarting}>{restarting ? "перезапуск…" : "Перезапустить"}</Button>
         </Row>
       </Card>
+
+      <Ports />
 
       <Card title="Резервные копии" sub="на сервере ничего не хранится — архив скачивается сразу тебе; обратно — тем же файлом">
         <Row

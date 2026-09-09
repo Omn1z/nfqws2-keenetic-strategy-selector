@@ -10,6 +10,8 @@ import (
 	"strings"
 	"time"
 
+	"golang.org/x/mod/semver"
+
 	"nfqws2strategy/internal/tools/logbuf"
 )
 
@@ -58,8 +60,43 @@ func (a *App) CheckUpdate() (UpdateInfo, error) {
 	}
 	info.Latest = rel.TagName
 	info.URL = rel.HTMLURL
-	info.Available = rel.TagName != "" && rel.TagName != a.Cfg.Version
+	info.Available = selfUpdateAvailable(a.Cfg.Version, rel.TagName)
 	return info, nil
+}
+
+// selfUpdateAvailable preserves the numeric version of development builds:
+// v1.6.0-dev can upgrade to v1.6.0, but must not be replaced by v1.5.0.
+// Unversioned local builds ("dev", a commit hash, etc.) can install a release.
+func selfUpdateAvailable(current, latest string) bool {
+	currentVersion, currentRevision := selfUpdateVersion(current)
+	latestVersion, latestRevision := selfUpdateVersion(latest)
+	if latestVersion == "" {
+		return false
+	}
+	if currentVersion == "" {
+		return true
+	}
+	if cmp := semver.Compare(latestVersion, currentVersion); cmp != 0 {
+		return cmp > 0
+	}
+	return latestRevision > currentRevision
+}
+
+func selfUpdateVersion(version string) (string, string) {
+	version = strings.TrimSpace(version)
+	if !strings.HasPrefix(version, "v") {
+		version = "v" + version
+	}
+	if semver.IsValid(version) {
+		return version, ""
+	}
+	// Historical release tags v1.4.1a and v1.4.1b were fixes published after
+	// v1.4.1. Keep that ordering without interpreting them as prereleases.
+	base := strings.TrimRight(version, "abcdefghijklmnopqrstuvwxyz")
+	if base != version && strings.Count(base, ".") == 2 && !strings.ContainsAny(base, "-+") && semver.IsValid(base) {
+		return base, strings.TrimPrefix(version, base)
+	}
+	return "", ""
 }
 
 // StartSelfUpdate starts a background self-update and returns immediately. The

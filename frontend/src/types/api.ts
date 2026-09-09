@@ -323,6 +323,135 @@ export interface Socks5Status {
 export interface AwgFallbackServer { id: string; label: string; client_iface?: string; connected: boolean }
 export interface AwgFallbackView { value: string; servers: AwgFallbackServer[] }
 
+// ---- Local DNS service. Upstreams are DoH; listeners accept UDP/TCP DNS. ----
+export interface DnsServerUpstream { address: string; bootstrap_ips: string[] }
+export interface DnsServerRule {
+  id: string;
+  enabled: boolean;
+  domain: string;
+  include_subdomains: boolean;
+  upstream: DnsServerUpstream;
+  pool?: DnsServerUpstream[];
+}
+export interface DnsServerConfig {
+  enabled: boolean;
+  listen_host: string;
+  dns_port: number;
+  default_upstream: DnsServerUpstream;
+  default_pool?: DnsServerUpstream[];
+  logging_enabled: boolean;
+  fast_dns: boolean;
+  awg_fallback: string;
+  timeout_seconds: number;
+  cache_size: number;
+  cache_ttl_seconds: number;
+  rules: DnsServerRule[];
+}
+export interface DnsServerStats {
+  queries: number;
+  cache_hits: number;
+  nfqws_success: number;
+  awg_success: number;
+  failures: number;
+  last_domain?: string;
+  last_route?: string;
+  last_upstream?: string;
+  last_error?: string;
+}
+export interface DnsServerCache {
+  entries: number;
+  capacity: number;
+  ttl_seconds: number;
+}
+export interface DnsServerFastDNSStatus {
+  enabled: boolean;
+  entries: number;
+  ready: number;
+  refreshing: number;
+  last_refresh_at?: string;
+  next_refresh_at?: string;
+  last_error?: string;
+}
+export interface DnsServerStatus {
+  config: DnsServerConfig;
+  running: boolean;
+  listen_host: string;
+  endpoints: { dns: string };
+  last_error?: string;
+  stats: DnsServerStats;
+  cache: DnsServerCache;
+  fast_dns?: DnsServerFastDNSStatus;
+  routes: { id: string; name: string; interface: string; available: boolean; error?: string }[];
+}
+export interface DnsServerTestResult {
+  ok: boolean;
+  domain: string;
+  type: "A" | "AAAA";
+  route: string;
+  upstream: string;
+  answers: string[];
+  duration_ms: number;
+  error?: string;
+}
+export interface DnsServerLogEntry {
+  id: number;
+  time: string;
+  level: string;
+  event: string;
+  domain?: string;
+  qtype?: string;
+  upstream?: string;
+  route?: string;
+  duration_ms?: number;
+  message?: string;
+  count?: number;
+}
+export interface DnsServerLogSnapshot {
+  enabled: boolean;
+  bytes: number;
+  max_bytes: number;
+  oldest_id: number;
+  last_id: number;
+  dropped: number;
+  entries: DnsServerLogEntry[];
+}
+export interface DnsServerSchedulerCandidate {
+  position: number;
+  route: string;
+  route_name: string;
+  upstream: string;
+  available: boolean;
+  score: number;
+  reliability: number;
+  latency_ms: number;
+  latency_penalty: number;
+  failure_penalty: number;
+  attempts: number;
+  successes: number;
+  failures: number;
+  consecutive_failures: number;
+  last_error: string;
+  last_attempt_at: string;
+  last_result_at?: string;
+  last_probe_at?: string;
+  probing?: boolean;
+  probe_attempts?: number;
+  probe_successes?: number;
+  probe_failures?: number;
+  exploration: boolean;
+}
+export interface DnsServerSchedulerSnapshot {
+  domain: string;
+  pool_source: string;
+  formula: string;
+  parallel_limit: number;
+  tracked_pairs: number;
+  active_probes?: number;
+  probe_interval_seconds?: number;
+  probe_recheck_seconds?: number;
+  candidates: DnsServerSchedulerCandidate[];
+}
+
 // ---- AmneziaWG (legacy awg2 API paths). Secret fields, including
 // obf.header_protection_key, are write-only; presence flags are safe to display. ----
 export interface AwgObfuscation {
@@ -539,6 +668,14 @@ export interface AutomationStatus {
 export interface Dashboard {
   tgws: TgwsStatus;
   socks5: Socks5Status;
+  dnsserver: {
+    enabled: boolean;
+    running: boolean;
+    endpoint: string;
+    last_error?: string;
+    stats: DnsServerStats;
+    cache: DnsServerCache;
+  };
   awg: AwgConn[];
   nfqws2_running: boolean;
   conntrack: { count: number; max: number };
@@ -616,6 +753,12 @@ export interface SystemSettings {
   logging_enabled: boolean;
   http_logs_enabled: boolean;
   trace_mode: "off" | "auto" | "always";
+}
+
+export interface SystemPorts {
+  panel_port: number;
+  dns_port: number;
+  panel_url?: string;
 }
 
 export interface BlobCapture {

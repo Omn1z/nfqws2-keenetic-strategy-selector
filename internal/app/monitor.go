@@ -1,6 +1,7 @@
 package app
 
 import (
+	"nfqws2strategy/internal/services/dnsserver"
 	"nfqws2strategy/internal/services/monitor"
 	"nfqws2strategy/internal/tools/tcpdump"
 )
@@ -11,7 +12,6 @@ import (
 // unchanged.
 
 type (
-	DashboardView      = monitor.DashboardView
 	ConnectionsView    = monitor.ConnectionsView
 	DeviceActivityView = monitor.DeviceActivityView
 	Trace              = monitor.Trace
@@ -20,12 +20,23 @@ type (
 	Pcap               = monitor.Pcap
 )
 
+type DashboardView struct {
+	monitor.DashboardView
+	DNSServer dnsserver.Summary `json:"dnsserver"`
+}
+
 // ErrNeedTcpdump re-exports the shared sentinel so the server's
 // errors.Is(err, app.ErrNeedTcpdump) keeps working for both the device pcap
 // capture and the ClientHello blob capture.
 var ErrNeedTcpdump = tcpdump.ErrNeedInstall
 
-func (a *App) Dashboard(host string) DashboardView         { return a.monitor.Dashboard(host) }
+func (a *App) Dashboard(host string) DashboardView {
+	view := DashboardView{DashboardView: a.monitor.Dashboard(host)}
+	if a.dnsServer != nil {
+		view.DNSServer = a.dnsServer.Summary()
+	}
+	return view
+}
 func (a *App) Connections() (ConnectionsView, error)       { return a.monitor.Connections() }
 func (a *App) DeviceActivity() (DeviceActivityView, error) { return a.monitor.DeviceActivity() }
 

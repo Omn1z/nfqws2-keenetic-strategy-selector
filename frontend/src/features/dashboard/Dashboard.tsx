@@ -2,6 +2,7 @@ import { useRef, useState } from "react";
 import type { ReactNode } from "react";
 import { api } from "@/lib/api";
 import { usePoll } from "@/lib/hooks";
+import { navigate } from "@/lib/router";
 import { fmtNum, human } from "@/lib/format";
 import { Card } from "@/components/ui/Card";
 import { Badge } from "@/components/ui/Badge";
@@ -11,6 +12,7 @@ import { Modal } from "@/components/ui/Modal";
 import { toast } from "@/components/ui/Toast";
 import { confirmDialog } from "@/components/ui/Confirm";
 import { Sparkline } from "@/components/ui/Chart";
+import { DnsStatistics } from "@/features/dnsserver/DnsStatistics";
 import type { Dashboard as DashboardData } from "@/types/api";
 
 const Row = ({ l, children }: { l: string; children: ReactNode }) => (
@@ -338,6 +340,13 @@ export default function Dashboard() {
           </Card>
         )}
       </div>
+
+      <Card title="Статистика DNS Server" sub={d.dnsserver.endpoint || "локальный DNS"} head={<div className="flex flex-wrap items-center gap-2"><Badge kind={d.dnsserver.running ? "ok" : d.dnsserver.enabled ? "bad" : "neutral"}>{d.dnsserver.running ? "работает" : d.dnsserver.enabled ? "ошибка запуска" : "выключен"}</Badge><Button mini onClick={() => navigate("dnsserver")}>Настройки DNS</Button></div>}>
+        <DnsStatistics stats={d.dnsserver.stats} cache={d.dnsserver.cache} />
+        <p className="mt-3 text-xs text-muted">Счётчики с последнего запуска DNS-сервера.</p>
+        {d.dnsserver.last_error && <p className="mt-2 text-xs text-bad [overflow-wrap:anywhere]">{d.dnsserver.last_error}</p>}
+        {!d.dnsserver.last_error && d.dnsserver.stats.last_error && <p className="mt-2 text-xs text-bad [overflow-wrap:anywhere]">Последняя ошибка: {d.dnsserver.stats.last_error}</p>}
+      </Card>
 
       {/* STATS 3-up: connections, routing RPS, DPI. */}
       <div className={`${GRID3} mb-4`}>

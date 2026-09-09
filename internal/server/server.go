@@ -34,8 +34,9 @@ import (
 var webAssets embed.FS
 
 type Server struct {
-	app *app.App
-	mux *http.ServeMux
+	app     *app.App
+	mux     *http.ServeMux
+	portsMu sync.Mutex // serialize DNS edits with combined port changes
 }
 
 func New(a *app.App) *Server {
@@ -254,6 +255,8 @@ func (s *Server) routes() {
 	m.HandleFunc("POST /api/system/install", s.installPackage)
 	m.HandleFunc("GET /api/system/settings", s.getSystemSettings)
 	m.HandleFunc("POST /api/system/settings", s.setSystemSettings)
+	m.HandleFunc("GET /api/system/ports", s.getSystemPorts)
+	m.HandleFunc("POST /api/system/ports", s.setSystemPorts)
 	m.HandleFunc("POST /api/services/restart", s.restartServices)
 	m.HandleFunc("POST /api/system/restart", s.restartSelector)
 	m.HandleFunc("POST /api/system/backup", s.backupDownload)
@@ -266,6 +269,16 @@ func (s *Server) routes() {
 	m.HandleFunc("POST /api/arp-spoofing/config", s.saveARPSpoofingConfig)
 	m.HandleFunc("POST /api/arp-spoofing/enabled", s.setARPSpoofingEnabled)
 	m.HandleFunc("POST /api/arp-spoofing/generate", s.generateARPSpoofingMAC)
+	m.HandleFunc("GET /api/dnsserver", s.dnsServerStatus)
+	m.HandleFunc("POST /api/dnsserver/config", s.dnsServerConfig)
+	m.HandleFunc("POST /api/dnsserver/start", s.dnsServerStart)
+	m.HandleFunc("POST /api/dnsserver/stop", s.dnsServerStop)
+	m.HandleFunc("POST /api/dnsserver/test", s.dnsServerTest)
+	m.HandleFunc("GET /api/dnsserver/logs", s.dnsServerLogs)
+	m.HandleFunc("POST /api/dnsserver/logs/clear", s.dnsServerClearLogs)
+	m.HandleFunc("POST /api/dnsserver/cache/clear", s.dnsServerClearCache)
+	m.HandleFunc("POST /api/dnsserver/logging", s.dnsServerLogging)
+	m.HandleFunc("GET /api/dnsserver/scheduler", s.dnsServerScheduler)
 
 	m.HandleFunc("GET /api/logs", s.getLogs)
 	m.HandleFunc("POST /api/logs/clear", s.clearLogs)

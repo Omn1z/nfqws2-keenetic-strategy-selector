@@ -19,7 +19,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.22'
+          go-version: '1.25.7'
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
@@ -32,7 +32,9 @@ jobs:
       - name: Build frontend and all architectures
         run: sh scripts/build.sh "${GITHUB_REF_NAME:-dev}"
       - name: Include upstream license
-        run: cp internal/services/tgws/LICENSE.upstream dist/TGWS-LICENSE.txt
+        run: |
+          cp internal/services/tgws/LICENSE.upstream dist/TGWS-LICENSE.txt
+          cp THIRD_PARTY_NOTICES.md dist/THIRD-PARTY-NOTICES.txt
       - name: Upload panel artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -43,6 +45,7 @@ jobs:
             dist/nfqws2-strategy-linux-mipsle
             dist/nfqws2-strategy-linux-mips
             dist/TGWS-LICENSE.txt
+            dist/THIRD-PARTY-NOTICES.txt
           if-no-files-found: error
           compression-level: 0
 
@@ -97,9 +100,10 @@ jobs:
           done
           test -s TGWS-LICENSE.txt
           test -s AMNEZIAWG-LICENSE.txt
-          test "$(find . -maxdepth 1 -type f | wc -l)" -eq 14
+          test -s THIRD-PARTY-NOTICES.txt
+          test "$(find . -maxdepth 1 -type f | wc -l)" -eq 15
           sha256sum nfqws2-strategy-linux-* awg-engine-linux-*.tar.gz \
-            TGWS-LICENSE.txt AMNEZIAWG-LICENSE.txt > SHA256SUMS
+            TGWS-LICENSE.txt AMNEZIAWG-LICENSE.txt THIRD-PARTY-NOTICES.txt > SHA256SUMS
       - name: Upload all assets to a draft and publish
         run: |
           prerelease=(--prerelease=false)

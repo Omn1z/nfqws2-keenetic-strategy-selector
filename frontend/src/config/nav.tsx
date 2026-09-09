@@ -9,6 +9,7 @@ import Blobs from "@/features/blobs/Blobs";
 import Lists from "@/features/lists/Lists";
 import Geo from "@/features/geo/Geo";
 import Dns from "@/features/dns/Dns";
+import DnsServer from "@/features/dnsserver/DnsServer";
 import MtProto from "@/features/telegram/MtProto";
 import Socks5 from "@/features/telegram/Socks5";
 import Nfqws2 from "@/features/nfqws2/Nfqws2";
@@ -45,6 +46,7 @@ export const TABS: Record<string, Tab> = {
   mtproto: { label: "MT Proto", Component: MtProto, icon: I(<path d="M22 3 2 11l6 2 2 6 3-4 5 4z" />) },
   socks5: { label: "SOCKS5", Component: Socks5, icon: I(<><circle cx="6" cy="12" r="2" /><circle cx="18" cy="6" r="2" /><circle cx="18" cy="18" r="2" /><path d="M8 11l8-4M8 13l8 4" /></>) },
   nfqws2: { label: "NFQWS2", Component: Nfqws2, icon: I(<><path d="M12 2 4 6v6c0 5 3.5 8 8 10 4.5-2 8-5 8-10V6z" /><path d="M9 12h6M12 9v6" /></>) },
+  dnsserver: { label: "DNS Server", Component: DnsServer, icon: I(<><rect x="3" y="3" width="18" height="7" rx="2" /><rect x="3" y="14" width="18" height="7" rx="2" /><path d="M7 6.5h.01M7 17.5h.01M11 6.5h6M11 17.5h6M12 10v4" /></>) },
   awg2: { label: "AmneziaWG", Component: AWG2, icon: I(<><circle cx="7.5" cy="15.5" r="3.5" /><path d="M10 13 20 3M17 4l3 3M15 6l3 3" /></>) },
   portforward: { label: "Port Forwarding", Component: PortForwarding, icon: I(<><path d="M4 7h9a4 4 0 0 1 0 8H8" /><path d="m8 11-4 4 4 4" /><path d="M17 5l3 3-3 3" /></>) },
   pihole: { label: "Pi-hole", Component: Pihole, icon: I(<><circle cx="12" cy="12" r="9" /><circle cx="12" cy="12" r="4" /><path d="M12 3v2M12 19v2M3 12h2M19 12h2" /></>) },
@@ -60,7 +62,7 @@ export const NAV_GROUPS: { title: string; items: NavItem[] }[] = [
   { title: "Статус", items: ["dashboard", "conns", "devices"] },
   { title: "Подбор", items: ["runs", "blockcheck", "strategies", "blobs"] },
   { title: "Списки и данные", items: ["lists", "geo", "dns"] },
-  { title: "Сервисы", items: [{ sub: "Telegram", tabs: ["mtproto", "socks5"] }, "nfqws2", "awg2", "portforward", "pihole", "arpspoof"] },
+  { title: "Сервисы", items: [{ sub: "Telegram", tabs: ["mtproto", "socks5"] }, "nfqws2", "dnsserver", "awg2", "portforward", "pihole", "arpspoof"] },
   { title: "Управление", items: ["logs", "system"] },
 ];
 
