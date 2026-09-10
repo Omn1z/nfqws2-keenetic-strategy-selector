@@ -5,21 +5,44 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"net/http"
 	"os"
 	"os/signal"
+	"runtime/debug"
 	"strconv"
 	"syscall"
 	"time"
 
 	"nfqws2strategy/internal/app"
-	"nfqws2strategy/internal/catalog"
-	"nfqws2strategy/internal/config"
-	"nfqws2strategy/internal/engine"
-	"nfqws2strategy/internal/logbuf"
-	"nfqws2strategy/internal/probe"
 	"nfqws2strategy/internal/server"
+	"nfqws2strategy/internal/services/strategy/core/catalog"
+	"nfqws2strategy/internal/services/strategy/core/engine"
+	"nfqws2strategy/internal/tools/config"
+	"nfqws2strategy/internal/tools/logbuf"
+	"nfqws2strategy/internal/tools/probe"
 )
+
+func init() {
+	// Router-side runtime tuning. BE7000 has ~800 MiB RAM shared with vendor
+	// daemons + Docker + pi-hole — Go's default GC pacing (GOGC=100, no soft
+	// memory ceiling) is happy to keep doubling the heap, which on a router can
+	// trigger OOM-kill cascades. Two knobs:
+	//
+	//   GOMEMLIMIT=250MiB — soft ceiling. The runtime starts GC'ing harder as
+	//   the heap approaches this; on a process that idles around 50-100 MiB
+	//   live this keeps peak well under control without throttling normal ops.
+	//
+	//   GOGC=75 — slightly more aggressive than default (100). Costs a bit of
+	//   CPU but trims tail-allocation spikes a router can't afford.
+	//
+	// Both are overridable via env vars (debug.Set* honours envs), so a future
+	// dev who needs different limits can just export them.
+	if v, ok := os.LookupEnv("GOMEMLIMIT"); !ok || v == "" {
+		debug.SetMemoryLimit(250 << 20)
+	}
+	if v, ok := os.LookupEnv("GOGC"); !ok || v == "" {
+		debug.SetGCPercent(75)
+	}
+}
 
 // version is set at build time via -ldflags "-X main.version=...".
 var version = "dev"
@@ -81,7 +104,7 @@ func cmdUpdate() {
 
 func usage() {
 	fmt.Fprintln(os.Stderr, "usage:")
-	fmt.Fprintln(os.Stderr, "  nfqws2-strategy serve [-l <addr>]                                run web UI + API (default :8090)")
+	fmt.Fprintln(os.Stderr, "  nfqws2-strategy serve [-l <addr>] [--ignore-saved-port]             run web UI + API (default :8090; saved System port takes precedence)")
 	fmt.Fprintln(os.Stderr, "  nfqws2-strategy selftest [-s <strategyIndex>] <host> [host...]   run one strategy against hosts, print JSON")
 	fmt.Fprintln(os.Stderr, "  nfqws2-strategy config                                          print resolved config")
 	fmt.Fprintln(os.Stderr, "  nfqws2-strategy checkupdate                                     check GitHub for a newer release")
@@ -91,6 +114,7 @@ func usage() {
 func cmdServe(args []string) {
 	cfg := loadConfig()
 	daemon := false
+	ignoreSavedPort := false
 	logPath, pidPath := "", ""
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
@@ -101,6 +125,8 @@ func cmdServe(args []string) {
 			}
 		case "-d":
 			daemon = true
+		case "--ignore-saved-port":
+			ignoreSavedPort = true
 		case "-log":
 			if i+1 < len(args) {
 				logPath = args[i+1]
@@ -112,6 +138,13 @@ func cmdServe(args []string) {
 				i++
 			}
 		}
+	}
+	if !ignoreSavedPort {
+		address, err := app.ResolvePanelListenAddr(cfg.DataDir, cfg.ListenAddr)
+		if err != nil {
+			log.Fatalln("load panel port (use --ignore-saved-port to recover):", err)
+		}
+		cfg.ListenAddr = address
 	}
 	if daemon {
 		isParent, err := maybeDaemonize(logPath, pidPath)
@@ -132,18 +165,21 @@ func cmdServe(args []string) {
 	if err != nil {
 		log.Fatalln("init:", err)
 	}
-	srv := &http.Server{Addr: cfg.ListenAddr, Handler: server.New(a).Handler()}
-
-	go func() {
-		log.Printf("nfqws2-strategy %s listening on %s (data: %s)", version, cfg.ListenAddr, cfg.DataDir)
-		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalln("serve:", err)
-		}
-	}()
+	srv, err := server.NewPanelListener(cfg.ListenAddr, server.New(a).Handler())
+	if err != nil {
+		a.Shutdown()
+		log.Fatalln("serve:", err)
+	}
+	a.SetPanelListener(srv)
+	log.Printf("nfqws2-strategy %s listening on %s (data: %s)", version, srv.Address(), cfg.DataDir)
 
 	sigc := make(chan os.Signal, 1)
 	signal.Notify(sigc, os.Interrupt, syscall.SIGTERM)
-	<-sigc
+	select {
+	case <-sigc:
+	case err := <-srv.Errors():
+		log.Println("serve:", err)
+	}
 	log.Println("shutting down...")
 	a.Shutdown()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)

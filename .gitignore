@@ -10,3 +10,10 @@
 # single-file internal/server/web/index.html is committed and embedded).
 /frontend/node_modules/
 .idea
+build/
+/.engine-build/
+# Local upstream research and device compatibility harnesses.
+/.codex/upstream/
+/.codex/awg31-compat/
+/.codex/engine-smoke/
+/.codex/recovery-smoke/

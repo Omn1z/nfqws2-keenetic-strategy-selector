@@ -7,7 +7,8 @@ import (
 	"strings"
 	"time"
 
-	"nfqws2strategy/internal/logbuf"
+	"nfqws2strategy/internal/tools/logbuf"
+	"nfqws2strategy/internal/tools/strs"
 )
 
 // ServiceResult is the outcome of restarting one service (Dashboard restart button).
@@ -60,7 +61,7 @@ func (a *App) restartNfqws2() ServiceResult {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	b, err := exec.CommandContext(ctx, "sh", "-c", script).CombinedOutput()
-	detail := lastLines(strings.TrimSpace(string(b)), 6)
+	detail := strs.LastLines(strings.TrimSpace(string(b)), 6)
 	if err != nil {
 		logbuf.Append("system", "error", "restart nfqws2: "+err.Error())
 		return ServiceResult{Name: "nfqws2", OK: false, Detail: fmt.Sprintf("%s (%v)", detail, err)}
@@ -70,14 +71,14 @@ func (a *App) restartNfqws2() ServiceResult {
 }
 
 func (a *App) restartSocks5() ServiceResult {
-	if a.socks5 == nil {
+	if a.proxy.Socks5() == nil {
 		return ServiceResult{Name: "socks5", OK: false, Detail: "менеджер не инициализирован"}
 	}
-	if !a.socks5.Config().Enabled {
+	if !a.proxy.Socks5().Config().Enabled {
 		return ServiceResult{Name: "socks5", OK: false, Detail: "прокси выключен — нечего перезапускать"}
 	}
 	logbuf.Append("system", "info", "restart socks5…")
-	if err := a.socks5.Restart(); err != nil {
+	if err := a.proxy.Socks5().Restart(); err != nil {
 		logbuf.Append("system", "error", "restart socks5: "+err.Error())
 		return ServiceResult{Name: "socks5", OK: false, Detail: err.Error()}
 	}
@@ -90,13 +91,24 @@ func (a *App) restartSocks5() ServiceResult {
 // NFQWS2 Start/Stop controls; the router is never rebooted.
 func (a *App) Nfqws2Start() ServiceResult {
 	init := a.Cfg.Nfqws2Init
-	script := "killall nfqws2 2>/dev/null\nkillall nfqws2-keenetic 2>/dev/null\nsleep 1\n" + init + " start 2>&1"
+	script := "for n in nfqws2 nfqws2.real nfqws2-keenetic; do killall \"$n\" 2>/dev/null; done\nsleep 1\n" + init + " start 2>&1"
 	return a.nfqws2Ctl("start", script)
 }
 
+// The upstream S51 init's stop is fragile on installations where the actual
+// binary is "nfqws2.real" (an Entware wrapper) and/or where the pidfile got
+// wiped: is_running()'s pidfile check fails, stop() bails with "not running",
+// the .real daemon survives, the queue stays bound. So we do the cleanup
+// ourselves first — kill every known process name AND every nfqws2.real PID
+// found via pidof — then run the init's stop to clean up firewall rules.
 func (a *App) Nfqws2Stop() ServiceResult {
 	init := a.Cfg.Nfqws2Init
-	script := init + " stop 2>&1 || true\nkillall nfqws2 2>/dev/null\nkillall nfqws2-keenetic 2>/dev/null\necho 'nfqws2 stopped'"
+	script := "for n in nfqws2 nfqws2.real nfqws2-keenetic; do killall \"$n\" 2>/dev/null; done\n" +
+		"for pid in $(pidof nfqws2.real 2>/dev/null); do kill -15 \"$pid\" 2>/dev/null; done\n" +
+		"sleep 1\n" +
+		"for pid in $(pidof nfqws2.real 2>/dev/null); do kill -9 \"$pid\" 2>/dev/null; done\n" +
+		init + " stop 2>&1 || true\n" +
+		"echo 'nfqws2 stopped'"
 	return a.nfqws2Ctl("stop", script)
 }
 
@@ -105,7 +117,7 @@ func (a *App) nfqws2Ctl(action, script string) ServiceResult {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	b, err := exec.CommandContext(ctx, "sh", "-c", script).CombinedOutput()
-	detail := lastLines(strings.TrimSpace(string(b)), 6)
+	detail := strs.LastLines(strings.TrimSpace(string(b)), 6)
 	if err != nil {
 		logbuf.Append("system", "error", "nfqws2 "+action+": "+err.Error())
 		return ServiceResult{Name: "nfqws2", OK: false, Detail: fmt.Sprintf("%s (%v)", detail, err)}
@@ -115,25 +127,16 @@ func (a *App) nfqws2Ctl(action, script string) ServiceResult {
 }
 
 func (a *App) restartTGWS() ServiceResult {
-	if a.tgws == nil {
+	if a.proxy.TGWS() == nil {
 		return ServiceResult{Name: "tgws", OK: false, Detail: "менеджер не инициализирован"}
 	}
-	if !a.tgws.Config().Enabled {
+	if !a.proxy.TGWS().Config().Enabled {
 		return ServiceResult{Name: "tgws", OK: false, Detail: "прокси выключен — нечего перезапускать"}
 	}
 	logbuf.Append("system", "info", "restart tgws…")
-	if err := a.tgws.Restart(); err != nil {
+	if err := a.proxy.TGWS().Restart(); err != nil {
 		logbuf.Append("system", "error", "restart tgws: "+err.Error())
 		return ServiceResult{Name: "tgws", OK: false, Detail: err.Error()}
 	}
 	return ServiceResult{Name: "tgws", OK: true, Detail: "перезапущен"}
-}
-
-// lastLines keeps at most the final n lines, for compact UI display.
-func lastLines(s string, n int) string {
-	lines := strings.Split(s, "\n")
-	if len(lines) <= n {
-		return s
-	}
-	return strings.Join(lines[len(lines)-n:], "\n")
 }

@@ -1,0 +1,692 @@
+package awg
+
+import (
+	"context"
+	crand "crypto/rand"
+	"encoding/hex"
+	"fmt"
+	"net"
+	"regexp"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+// Dialer opens a runner to a host; the production value wraps Dial. Tests swap
+// it for a fake transport.
+type Dialer func(ctx context.Context, cred Credentials) (runner, string, error)
+
+func defaultDialer(ctx context.Context, cred Credentials) (runner, string, error) {
+	c, learned, err := Dial(ctx, cred)
+	if err != nil {
+		return nil, learned, err
+	}
+	return c, learned, nil
+}
+
+// Manager owns the AWG2 server config + peers and the SSH-driven operations
+// against the VPS. Methods are safe for concurrent use.
+//
+// The two hottest read paths — Telegram-proxy FallbackUp / awgroute TunnelUp —
+// only need to know "is the client autostart on?" and "is the profile
+// enabled?". Going through Config() (which locks + deep-clones the whole
+// ServerConfig with Peers/Zones/Domains/IPs) for one bool is wasteful when
+// the Telegram path runs that check per blocked-DC dial. We mirror the two
+// bools into atomic.Bool fields that hot paths read with one Load(), no lock,
+// no allocation. Writers (SetConfig/SetClientEnabled/SetEnabled) keep the
+// mirror in sync under m.mu.
+type Manager struct {
+	mu         sync.Mutex
+	cfg        *ServerConfig
+	applied    *ServerConfig // last deployed wire config while a desired update is pending; persistence lives in the service wrapper
+	lastDep    *DeployResult
+	lastStatus *Status
+	deploying  bool
+	dial       Dialer
+
+	clientEnabled atomic.Bool // mirror of cfg.Client.Enabled — hot-path Telegram + awgroute
+	enabled       atomic.Bool // mirror of cfg.Enabled
+}
+
+func NewManager(cfg *ServerConfig) *Manager {
+	cfg.Normalize()
+	m := &Manager{cfg: cfg, dial: defaultDialer}
+	m.clientEnabled.Store(cfg.Client.Enabled)
+	m.enabled.Store(cfg.Enabled)
+	return m
+}
+
+// ClientEnabled is the hot-path read for "should the local router come up as
+// an AWG client?". One atomic.Load — zero lock, zero clone.
+func (m *Manager) ClientEnabled() bool { return m.clientEnabled.Load() }
+
+// Enabled is the hot-path read for "is this server profile selectable?".
+func (m *Manager) Enabled() bool { return m.enabled.Load() }
+
+// PeerStatus is a peer's live state parsed from `awg show <iface> dump`.
+type PeerStatus struct {
+	ID              string `json:"id"`
+	Name            string `json:"name"`
+	PublicKey       string `json:"public_key"`
+	Endpoint        string `json:"endpoint"`
+	LatestHandshake int64  `json:"latest_handshake"`
+	RxBytes         int64  `json:"rx_bytes"`
+	TxBytes         int64  `json:"tx_bytes"`
+	Online          bool   `json:"online"`
+}
+
+// Status is the live server status.
+type Status struct {
+	Reachable  bool         `json:"reachable"`
+	Up         bool         `json:"up"`
+	ListenPort int          `json:"listen_port"`
+	Peers      []PeerStatus `json:"peers"`
+	Error      string       `json:"error,omitempty"`
+}
+
+func (c ServerConfig) clone() ServerConfig {
+	cp := c
+	if c.TrafficObfuscation != nil {
+		on := *c.TrafficObfuscation
+		cp.TrafficObfuscation = &on
+	}
+	if c.Peers == nil {
+		cp.Peers = []Peer{}
+	} else {
+		cp.Peers = append([]Peer{}, c.Peers...)
+	}
+	cp.Routing.Zones = make([]Zone, len(c.Routing.Zones))
+	for i, z := range c.Routing.Zones {
+		z.Domains = append([]string{}, z.Domains...)
+		z.IPs = append([]string{}, z.IPs...)
+		z.SourceIPs = append([]string{}, z.SourceIPs...)
+		cp.Routing.Zones[i] = z
+	}
+	return cp
+}
+
+// Config returns a deep copy of the current config (secrets included).
+func (m *Manager) Config() ServerConfig {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.cfg.clone()
+}
+
+// SetAppliedConfig installs a last-successful deployment snapshot. The service
+// layer persists it separately from the public desired config. Nil clears it.
+func (m *Manager) SetAppliedConfig(cfg *ServerConfig) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if cfg == nil {
+		m.applied = nil
+		return
+	}
+	copy := cfg.clone()
+	m.applied = &copy
+}
+
+func (m *Manager) AppliedConfig() *ServerConfig {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.applied == nil {
+		return nil
+	}
+	copy := m.applied.clone()
+	return &copy
+}
+
+func (m *Manager) PendingApply() bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.applied != nil
+}
+
+// RuntimeConfig keeps watchdog/recovery and exports on the last deployed wire
+// format. Local availability, autostart and routing controls still take effect.
+func (m *Manager) RuntimeConfig() ServerConfig {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.runtimeConfigLocked()
+}
+
+func (m *Manager) runtimeConfigLocked() ServerConfig {
+	desired := m.cfg.clone()
+	if m.applied == nil {
+		return desired
+	}
+	cfg := m.applied.clone()
+	cfg.Enabled = desired.Enabled
+	cfg.Client.Enabled = desired.Client.Enabled
+	cfg.ClientIface = desired.ClientIface
+	cfg.Routing = desired.Routing
+	return cfg
+}
+
+// Redacted returns a deep copy with every secret blanked, for API responses.
+func (m *Manager) Redacted() ServerConfig {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	c := m.cfg.clone()
+	c.PrivateKey = ""
+	c.Conn.Password = ""
+	c.Conn.KeyPEM = ""
+	c.Conn.KeyPass = ""
+	c.Obf.HasHeaderProtectionKey = strings.TrimSpace(c.Obf.HeaderProtectionKey) != ""
+	c.Obf.HeaderProtectionKey = ""
+	for i := range c.Peers {
+		c.Peers[i].HasPrivate = strings.TrimSpace(c.Peers[i].PrivateKey) != ""
+		c.Peers[i].PrivateKey = ""
+		c.Peers[i].PSK = ""
+	}
+	return c
+}
+
+// SetConfig validates and replaces the config. The caller (app layer) is
+// responsible for preserving blank-sent secrets and the generated server keys.
+func (m *Manager) SetConfig(in *ServerConfig) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.deploying {
+		return fmt.Errorf("дождитесь завершения развёртывания сервера")
+	}
+	if strings.TrimSpace(in.Obf.HeaderProtectionKey) == "" {
+		in.Obf.HeaderProtectionKey = m.cfg.Obf.HeaderProtectionKey
+	}
+	in.Normalize()
+	if errs := in.Validate(); len(errs) > 0 {
+		return fmt.Errorf("%s", strings.Join(errs, "; "))
+	}
+	m.cfg = in
+	// Mirror the hot-path booleans under the lock-free atomics so subsequent
+	// ClientEnabled() / Enabled() reads see the swap atomically.
+	m.clientEnabled.Store(in.Client.Enabled)
+	m.enabled.Store(in.Enabled)
+	return nil
+}
+
+// SetRouting updates only the split-routing config (saved independently of the
+// server settings, so it can be edited before the server is even configured).
+func (m *Manager) SetRouting(rc RoutingConfig) {
+	m.mu.Lock()
+	rc.Active = m.cfg.Routing.Active // managed by commit/teardown, not the form — preserve it
+	rc.Normalize()
+	m.cfg.Routing = rc
+	m.mu.Unlock()
+}
+
+// SetRoutingState updates only the split-routing config and its committed/active
+// bit. It deliberately avoids full ServerConfig validation: WARP/imported
+// profiles do not have VPS SSH credentials, but their rules still need edits.
+func (m *Manager) SetRoutingState(rc RoutingConfig, active bool) {
+	m.mu.Lock()
+	rc.Active = active
+	rc.Normalize()
+	m.cfg.Routing = rc
+	m.mu.Unlock()
+}
+
+// SetClientEnabled toggles the local-client autostart flag, persisted so the
+// router tunnel comes back up after a panel restart.
+func (m *Manager) SetClientEnabled(v bool) {
+	m.mu.Lock()
+	m.cfg.Client.Enabled = v
+	m.mu.Unlock()
+	m.clientEnabled.Store(v)
+}
+
+// SetEnabled toggles the profile availability flag used by the server selector.
+func (m *Manager) SetEnabled(v bool) {
+	m.mu.Lock()
+	m.cfg.Enabled = v
+	m.mu.Unlock()
+	m.enabled.Store(v)
+}
+
+// SetRoutingActive marks split-routing as committed/active, persisted so the
+// panel re-applies it automatically after a restart/reboot.
+func (m *Manager) SetRoutingActive(v bool) {
+	m.mu.Lock()
+	m.cfg.Routing.Active = v
+	m.mu.Unlock()
+}
+
+// EnsureRouterPeer makes sure the local Keenetic router has its own client peer.
+// It is intentionally idempotent: imported configs already contain the router
+// peer, while self-hosted VPS configs get one automatically so users do not need
+// to visit a separate clients tab before bringing awg0 up.
+func (m *Manager) EnsureRouterPeer(ctx context.Context) (Peer, bool, error) {
+	m.mu.Lock()
+	p, created, err := m.ensureRouterPeerLocked()
+	if err != nil {
+		m.mu.Unlock()
+		return Peer{}, false, err
+	}
+	if !created {
+		m.mu.Unlock()
+		return p, false, nil
+	}
+	cfg := m.cfg.clone()
+	cred := m.cfg.Conn
+	iface := m.cfg.Interface
+	deployed := m.cfg.DeployedAt > 0
+	dial := m.dial
+	m.mu.Unlock()
+	if deployed {
+		if err := syncPeers(ctx, dial, cred, &cfg, iface); err != nil {
+			return p, true, fmt.Errorf("пир роутера создан, но не применён на сервере: %w", err)
+		}
+	}
+	return p, true, nil
+}
+
+func (m *Manager) EnsureRouterPeerLocal() (Peer, bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.ensureRouterPeerLocked()
+}
+
+func (m *Manager) ensureRouterPeerLocked() (Peer, bool, error) {
+	if m.applied != nil {
+		for _, p := range m.applied.Peers {
+			if p.IsRouter || (m.applied.Client.PeerID != "" && p.ID == m.applied.Client.PeerID) {
+				return p, false, nil
+			}
+		}
+		return Peer{}, false, fmt.Errorf("в применённой конфигурации нет пира роутера; сначала завершите развёртывание сервера")
+	}
+	for i := range m.cfg.Peers {
+		if m.cfg.Peers[i].IsRouter || (m.cfg.Client.PeerID != "" && m.cfg.Peers[i].ID == m.cfg.Client.PeerID) {
+			m.cfg.Peers[i].IsRouter = true
+			m.cfg.Client.PeerID = m.cfg.Peers[i].ID
+			return m.cfg.Peers[i], false, nil
+		}
+	}
+	p, err := m.addPeerLocked(Peer{
+		Name:       "Этот роутер",
+		IsRouter:   true,
+		AllowedIPs: "0.0.0.0/0, ::/0",
+		Keepalive:  25,
+	})
+	if err != nil {
+		return p, false, err
+	}
+	m.cfg.Client.PeerID = p.ID
+	return p, true, nil
+}
+
+// EnsureKeys generates the server keypair and selected obfuscation profile once.
+// Returns true if anything changed (so the caller persists before deploying).
+func (m *Manager) EnsureKeys() (bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if strings.TrimSpace(m.cfg.PrivateKey) != "" {
+		return false, nil
+	}
+	// An ALREADY-DEPLOYED server whose private key went missing is a corrupted
+	// config — regenerating keys (and obf) here would silently change the server
+	// identity and break every existing client/handshake (this exact bug took the
+	// tunnel down). Refuse loudly instead of nuking it. Keys+obf are generated only
+	// for a fresh, never-deployed server.
+	if m.cfg.DeployedAt > 0 {
+		return false, fmt.Errorf("сервер уже развёрнут, но приватный ключ потерян — конфиг повреждён; перегенерация ключей сломала бы существующих клиентов. Восстановите ключ или создайте сервер заново")
+	}
+	priv, pub, err := GenKeypair()
+	if err != nil {
+		return false, err
+	}
+	m.cfg.PrivateKey, m.cfg.PublicKey = priv, pub
+	if m.cfg.UseObfuscation() {
+		var err error
+		if m.cfg.ProtocolVersion == "3.1" {
+			// Explicit configuration may already have generated and persisted the
+			// shared header key. Never rotate it at WG key generation.
+			if !m.cfg.Obf.hasAWG31() {
+				err = RandomizeObf31(&m.cfg.Obf)
+			}
+		} else {
+			err = RandomizeObf(&m.cfg.Obf)
+		}
+		if err != nil {
+			return false, err
+		}
+	}
+	return true, nil
+}
+
+func (m *Manager) LastDeploy() *DeployResult {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.lastDep
+}
+
+// Deploy provisions (or re-provisions) the server over SSH.
+func (m *Manager) Deploy(ctx context.Context, progress func(Step)) (DeployResult, error) {
+	m.mu.Lock()
+	if m.deploying {
+		m.mu.Unlock()
+		return DeployResult{}, fmt.Errorf("деплой уже выполняется")
+	}
+	m.deploying = true
+	cred := m.cfg.Conn
+	cfg := m.cfg.clone()
+	dial := m.dial
+	m.mu.Unlock()
+	defer func() {
+		m.mu.Lock()
+		m.deploying = false
+		m.mu.Unlock()
+	}()
+
+	r, learned, err := dial(ctx, cred)
+	if err != nil {
+		res := DeployResult{Steps: []Step{{Name: "connect", OK: false, Detail: redact(err.Error())}}, Error: redact(err.Error())}
+		m.mu.Lock()
+		m.lastDep = &res
+		m.mu.Unlock()
+		return res, err
+	}
+	defer r.Close()
+
+	res := Deploy(ctx, r, &cfg, progress, func(recoveryCtx context.Context) (runner, error) {
+		fresh, _, err := dial(recoveryCtx, cred)
+		return fresh, err
+	})
+
+	m.mu.Lock()
+	if strings.TrimSpace(m.cfg.Conn.KnownKey) == "" && learned != "" {
+		m.cfg.Conn.KnownKey = learned
+	}
+	if cfg.WANIface != "" {
+		m.cfg.WANIface = cfg.WANIface
+	}
+	if res.OK {
+		m.cfg.DeployedAt = time.Now().Unix()
+		m.cfg.Endpoint = cfg.Endpoint
+		m.applied = nil
+	}
+	m.lastDep = &res
+	m.mu.Unlock()
+	return res, nil
+}
+
+// Status queries the live server over SSH.
+func (m *Manager) LastStatus() *Status {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.lastStatus
+}
+
+func (m *Manager) Status(ctx context.Context) (Status, error) {
+	var st Status
+	defer func() {
+		cp := st
+		m.mu.Lock()
+		m.lastStatus = &cp
+		m.mu.Unlock()
+	}()
+	m.mu.Lock()
+	cred := m.cfg.Conn
+	iface := m.cfg.Interface
+	dial := m.dial
+	byPub := map[string]Peer{}
+	for _, p := range m.cfg.Peers {
+		byPub[p.PublicKey] = p
+	}
+	m.mu.Unlock()
+
+	r, _, err := dial(ctx, cred)
+	if err != nil {
+		st.Error = redact(err.Error())
+		return st, err
+	}
+	defer r.Close()
+	out, _, _ := r.Run(ctx, fmt.Sprintf("awg show %s dump 2>/dev/null", iface))
+	lines := strings.Split(strings.TrimSpace(out), "\n")
+	if len(lines) == 0 || strings.TrimSpace(lines[0]) == "" {
+		st.Reachable = true
+		return st, nil
+	}
+	st.Reachable, st.Up = true, true
+	if f0 := strings.Fields(lines[0]); len(f0) >= 3 {
+		st.ListenPort = atoiSafe(f0[2])
+	}
+	now := time.Now().Unix()
+	for _, ln := range lines[1:] {
+		f := strings.Split(ln, "\t")
+		if len(f) < 7 {
+			continue
+		}
+		ps := PeerStatus{
+			PublicKey:       f[0],
+			Endpoint:        f[2],
+			LatestHandshake: atoi64(f[4]),
+			RxBytes:         atoi64(f[5]),
+			TxBytes:         atoi64(f[6]),
+		}
+		ps.Online = ps.LatestHandshake > 0 && now-ps.LatestHandshake < 180
+		if p, ok := byPub[ps.PublicKey]; ok {
+			ps.ID, ps.Name = p.ID, p.Name
+		}
+		st.Peers = append(st.Peers, ps)
+	}
+	return st, nil
+}
+
+// AddPeer creates a peer (generating keys/PSK/address as needed) and, if the
+// server is already deployed, applies it live via awg syncconf.
+func (m *Manager) AddPeer(ctx context.Context, in Peer) (Peer, error) {
+	m.mu.Lock()
+	in, err := m.addPeerLocked(in)
+	if err != nil {
+		m.mu.Unlock()
+		return Peer{}, err
+	}
+	cfg := m.cfg.clone()
+	cred := m.cfg.Conn
+	iface := m.cfg.Interface
+	deployed := m.cfg.DeployedAt > 0
+	dial := m.dial
+	m.mu.Unlock()
+
+	if deployed {
+		if err := syncPeers(ctx, dial, cred, &cfg, iface); err != nil {
+			return in, fmt.Errorf("пир сохранён, но не применён на сервере: %w", err)
+		}
+	}
+	return in, nil
+}
+
+func (m *Manager) addPeerLocked(in Peer) (Peer, error) {
+	if m.applied != nil || m.deploying {
+		return Peer{}, fmt.Errorf("сначала завершите развёртывание сохранённых настроек сервера")
+	}
+	if strings.TrimSpace(in.PublicKey) == "" {
+		priv, pub, err := GenKeypair()
+		if err != nil {
+			return Peer{}, err
+		}
+		in.PrivateKey, in.PublicKey = priv, pub
+	}
+	if strings.TrimSpace(in.PSK) == "" {
+		psk, err := GenPSK()
+		if err != nil {
+			return Peer{}, err
+		}
+		in.PSK = psk
+	}
+	if in.ID == "" {
+		in.ID = newID()
+	}
+	if strings.TrimSpace(in.Name) == "" {
+		in.Name = "peer-" + in.ID[:4]
+	}
+	if strings.TrimSpace(in.Address) == "" {
+		in.Address = m.nextPeerAddrLocked()
+	}
+	if strings.TrimSpace(in.AllowedIPs) == "" {
+		in.AllowedIPs = "0.0.0.0/0, ::/0"
+	}
+	if in.Keepalive == 0 {
+		in.Keepalive = 25
+	}
+	if m.cfg.RequiresAWG31() && in.KeepaliveRange == "" {
+		in.KeepaliveRange = "25-35"
+	}
+	in.CreatedAt = time.Now().Unix()
+	in.HasPrivate = strings.TrimSpace(in.PrivateKey) != ""
+	m.cfg.Peers = append(m.cfg.Peers, in)
+	return in, nil
+}
+
+// RemovePeer drops a peer and (if deployed) applies the removal live.
+func (m *Manager) RemovePeer(ctx context.Context, id string) error {
+	m.mu.Lock()
+	if m.applied != nil || m.deploying {
+		m.mu.Unlock()
+		return fmt.Errorf("сначала завершите развёртывание сохранённых настроек сервера")
+	}
+	idx := -1
+	for i := range m.cfg.Peers {
+		if m.cfg.Peers[i].ID == id {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		m.mu.Unlock()
+		return fmt.Errorf("пир не найден")
+	}
+	m.cfg.Peers = append(m.cfg.Peers[:idx], m.cfg.Peers[idx+1:]...)
+	cfg := m.cfg.clone()
+	cred := m.cfg.Conn
+	iface := m.cfg.Interface
+	deployed := m.cfg.DeployedAt > 0
+	dial := m.dial
+	m.mu.Unlock()
+
+	if deployed {
+		if err := syncPeers(ctx, dial, cred, &cfg, iface); err != nil {
+			return fmt.Errorf("пир удалён из конфига, но не применён на сервере: %w", err)
+		}
+	}
+	return nil
+}
+
+// ClientConfig renders the .conf a peer uses to connect (emits private key).
+func (m *Manager) ClientConfig(id string) (text, filename string, err error) {
+	text, filename, _, err = m.ClientExport(id, "conf")
+	return text, filename, err
+}
+
+func (m *Manager) ClientExport(id, format string) (text, filename, contentType string, err error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cfg := m.runtimeConfigLocked()
+	for _, p := range cfg.Peers {
+		if p.ID == id {
+			if strings.TrimSpace(p.PrivateKey) == "" {
+				return "", "", "", fmt.Errorf("для этого пира нет приватного ключа (добавьте пир заново)")
+			}
+			return ClientExport(&cfg, p, format)
+		}
+	}
+	return "", "", "", fmt.Errorf("пир не найден")
+}
+
+// RouterPeer returns the peer flagged as this router, or false.
+func (m *Manager) RouterPeer() (Peer, bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	cfg := m.runtimeConfigLocked()
+	for _, p := range cfg.Peers {
+		if p.IsRouter || (cfg.Client.PeerID != "" && p.ID == cfg.Client.PeerID) {
+			return p, true
+		}
+	}
+	return Peer{}, false
+}
+
+func (m *Manager) nextPeerAddrLocked() string {
+	ip, ipnet, err := net.ParseCIDR(strings.TrimSpace(m.cfg.Address))
+	if err != nil || ip.To4() == nil {
+		return ""
+	}
+	used := map[string]bool{ipOnly(m.cfg.Address): true}
+	for _, p := range m.cfg.Peers {
+		used[ipOnly(p.Address)] = true
+	}
+	b := ipnet.IP.To4()
+	for i := 2; i < 255; i++ {
+		cand := fmt.Sprintf("%d.%d.%d.%d", b[0], b[1], b[2], i)
+		if !used[cand] {
+			return cand + "/32"
+		}
+	}
+	return ""
+}
+
+func syncPeers(ctx context.Context, dial Dialer, cred Credentials, cfg *ServerConfig, iface string) error {
+	r, _, err := dial(ctx, cred)
+	if err != nil {
+		return err
+	}
+	defer r.Close()
+	if err := r.Put(ctx, "/etc/amnezia/amneziawg/"+iface+".conf", 0o600, []byte(ServerConf(cfg))); err != nil {
+		return err
+	}
+	_, errOut, err := r.Run(ctx, fmt.Sprintf(`awg-quick strip %[1]s > /tmp/awg-%[1]s.sync 2>/dev/null && awg syncconf %[1]s /tmp/awg-%[1]s.sync
+rc=$?
+rm -f /tmp/awg-%[1]s.sync
+[ "$rc" -eq 0 ] || exit "$rc"
+%[2]s`, iface, serverPostUpCommands(cfg.Subnet, cfg.WANIface, iface)))
+	if err != nil {
+		return fmt.Errorf("%s", strings.TrimSpace(errOut))
+	}
+	return nil
+}
+
+// ---- small helpers ----
+
+var reKey = regexp.MustCompile(`[A-Za-z0-9+/]{43}=`)
+var reHexKey = regexp.MustCompile(`\b[0-9a-fA-F]{64}\b`)
+
+func redact(s string) string {
+	return reHexKey.ReplaceAllString(reKey.ReplaceAllString(s, "***"), "***")
+}
+
+func newID() string {
+	var b [6]byte
+	_, _ = crand.Read(b[:])
+	return hex.EncodeToString(b[:])
+}
+
+var reUnsafeName = regexp.MustCompile(`[^A-Za-z0-9._-]+`)
+
+func safeName(s string) string {
+	s = reUnsafeName.ReplaceAllString(strings.TrimSpace(s), "_")
+	s = strings.Trim(s, "._-")
+	if s == "" {
+		return "peer"
+	}
+	return s
+}
+
+func ipOnly(addr string) string {
+	addr = strings.TrimSpace(addr)
+	if i := strings.IndexByte(addr, '/'); i >= 0 {
+		return addr[:i]
+	}
+	return addr
+}
+
+func atoiSafe(s string) int {
+	n, _ := strconv.Atoi(strings.TrimSpace(s))
+	return n
+}
+
+func atoi64(s string) int64 {
+	n, _ := strconv.ParseInt(strings.TrimSpace(s), 10, 64)
+	return n
+}

@@ -4,6 +4,7 @@
 package app
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -14,13 +15,23 @@ import (
 	"sync"
 	"time"
 
-	"nfqws2strategy/internal/auth"
-	"nfqws2strategy/internal/catalog"
-	"nfqws2strategy/internal/config"
-	"nfqws2strategy/internal/dns"
-	"nfqws2strategy/internal/engine"
-	"nfqws2strategy/internal/store"
-	"nfqws2strategy/internal/tgws"
+	"nfqws2strategy/internal/services/arpspoof"
+	"nfqws2strategy/internal/services/awgroute"
+	"nfqws2strategy/internal/services/blobs"
+	"nfqws2strategy/internal/services/dnsroute"
+	"nfqws2strategy/internal/services/dnsserver"
+	"nfqws2strategy/internal/services/monitor"
+	"nfqws2strategy/internal/services/nfqws2"
+	"nfqws2strategy/internal/services/pihole"
+	"nfqws2strategy/internal/services/portforward"
+	"nfqws2strategy/internal/services/proxy"
+	"nfqws2strategy/internal/services/strategy/core/catalog"
+	"nfqws2strategy/internal/services/strategy/core/engine"
+	"nfqws2strategy/internal/tools/auth"
+	"nfqws2strategy/internal/tools/config"
+	"nfqws2strategy/internal/tools/dns"
+	"nfqws2strategy/internal/tools/logbuf"
+	"nfqws2strategy/internal/tools/store"
 )
 
 type App struct {
@@ -44,25 +55,29 @@ type App struct {
 	sessions         *auth.Sessions
 	authEnabled      bool
 	loggingDisabled  bool
-	httpLogsDisabled bool // suppress the per-request HTTP access log line
+	httpLogsDisabled bool   // suppress the per-request HTTP access log line
+	traceMode        string // "off" | "auto" | "always"
+	selfUpdateMu     sync.Mutex
+	selfUpdate       SelfUpdateStatus
+	panelMu          sync.Mutex
+	panelListener    PanelListener
 
-	tgws   *tgws.Manager       // Telegram MTProto->WS proxy (Telegram tab)
-	socks5 *tgws.Socks5Manager // Telegram SOCKS5 proxy, TGLock-adapted (Telegram tab)
+	proxy     *proxy.Service    // Telegram proxies: MTProto->WS + SOCKS5 (Telegram tab)
+	monitor   *monitor.Service  // live network views: dashboard, conns, devices, traces, pcaps
+	nfqws2    *nfqws2.Manager   // nfqws2 engine file/version/update/reload (nfqws2 tab)
+	awgroute  *awgroute.Service // AWG2 server + router client/split-routing (AWG2 tab)
+	blobs     *blobs.Service    // fake-payload blob store + ClientHello capture (Blobs tab)
+	portfwd   *portforward.Service
+	pihole    *pihole.Service // Pi-hole v6 container (ad-block, DNS sinkhole)
+	arpspoof  *arpspoof.Service
+	dnsServer *dnsserver.Service
 
 	dnsMu      sync.Mutex
 	dnsServers []dns.Server // configured DoH/DoT servers (DNS tab + run matrix)
 
-	traceMu    sync.Mutex
-	traces     map[string]*Trace // recent device network traces (id -> trace)
-	traceOrder []string
+	geoAuto geoAutoState // background geosite.dat / geoip.dat updater (Geo tab)
 
-	pcapMu    sync.Mutex
-	pcaps     map[string]*Pcap // recent tcpdump captures (id -> pcap)
-	pcapOrder []string
-
-	blobCapMu    sync.Mutex
-	blobCaps     map[string]*BlobCapture // recent ClientHello captures (id -> capture)
-	blobCapOrder []string
+	automation *automationRuntime // watchdog + auto-pick (NFQWS2 automation panel)
 }
 
 const (
@@ -76,22 +91,128 @@ func New(cfg *config.Config) (*App, error) {
 	if err != nil {
 		return nil, err
 	}
-	a := &App{Cfg: cfg, store: st, runs: map[string]*Run{}, traces: map[string]*Trace{}, pcaps: map[string]*Pcap{}, blobCaps: map[string]*BlobCapture{}, sessions: auth.NewSessions(sessionTTL)}
-	_ = a.store.Load(customStrategiesFile, &a.custom)
-	_ = a.store.Load(sniDomainsFile, &a.sniDomains)
-	if err := os.MkdirAll(a.blobsDir(), 0o755); err != nil {
+	a := &App{Cfg: cfg, store: st, runs: map[string]*Run{}, sessions: auth.NewSessions(sessionTTL)}
+	a.nfqws2 = nfqws2.New(cfg)
+	if a.blobs, err = blobs.New(cfg, st); err != nil {
 		return nil, err
 	}
+	_ = a.store.Load(customStrategiesFile, &a.custom)
+	_ = a.store.Load(sniDomainsFile, &a.sniDomains)
 	a.initAuth()
 	a.loadRuns()
-	a.initTGWS()
-	a.initSocks5()
+	a.proxy = proxy.New(st)
+	a.portfwd = portforward.New(cfg, st)
+	a.arpspoof = arpspoof.New(cfg, st)
+	a.awgroute = awgroute.New(cfg, st) // creates the manager; may autostart the tunnel + re-apply committed routing
+	// Apply trace policy as soon as the AWG service exists: "always" turns
+	// recording on right away, "off" pins it off; "auto" leaves it to the
+	// TracePane mount/unmount lifecycle. saveSettings already ran in initAuth.
+	switch a.TraceMode() {
+	case "always":
+		a.awgroute.TraceSetEnabled(true)
+	case "off":
+		a.awgroute.TraceSetEnabled(false)
+	}
+	a.monitor = monitor.New(cfg, st, a.proxy, a.awgroute) // dashboard reads the proxy + AWG2 tunnel status
+	a.proxy.SetAWGFallbackProbe(a.proxyTunnelFallbackUp)  // Telegram proxies route ISP-blocked DC1/3/5 via the selected tunnel backend while it is up
+	a.awgroute.SetClientRecoveryHook(func() { a.syncProxyTunnelRoutes(a.proxy.AWGFallback()) })
+	a.syncProxyTunnelRoutes(a.proxy.AWGFallback())
 	a.initDNS()
 	// Repair any sandbox state leaked by a previous unclean exit (stale STRAT_*
 	// iptables chains / orphaned test nfqws2 children). Without this a killed run
 	// leaves an exclude-connmark rule that makes the MAIN nfqws2 skip connections.
 	engine.CleanupSandboxes(cfg, maxThreads)
+	// Clear leaked AWG routing before DNS/Pi-hole initialization. Start recovery
+	// only after initialization, so it cannot block startup on the lifecycle lock.
+	a.awgroute.RepairRouting()
+	if err := a.portfwd.Apply(); err != nil {
+		logbuf.Append("port-forwarding", "warn", err.Error())
+	}
+	a.startGeoAutoLoop()
+	a.initAutomation()
+	a.initPihole()
+	if err := a.arpspoof.Apply(); err != nil {
+		logbuf.Append("arp-spoofing", "warn", err.Error())
+	}
+	a.awgroute.StartClientSupervisor()
+	// Open Telegram listeners and warm their TLS pools only after the startup
+	// route/firewall repair has finished, so local resets do not trigger fronting.
+	a.proxy.StartEnabled()
+	a.dnsServer = dnsserver.New(st, dnsroute.New(cfg, a.awgroute), func(host string) (string, error) {
+		return dnsroute.ResolveLANHost(host, cfg.WANIfaces)
+	})
+	a.dnsServer.StartEnabled()
 	return a, nil
+}
+
+// initPihole loads the persisted Pi-hole config or seeds defaults. The container
+// itself is not touched on boot — install/start is an explicit user action. The
+// chain-toggle hook is wired here so awgroute's DNS proxy upstream swaps live
+// when the user flips DNSChainEnabled in the UI.
+func (a *App) initPihole() {
+	var cfg pihole.Config
+	if err := a.store.Load("pihole.json", &cfg); err != nil || cfg.DataRoot == "" {
+		cfg = pihole.Default()
+		_ = a.store.Save("pihole.json", &cfg)
+	}
+	a.pihole = pihole.New(cfg)
+	// fw3 wipes our LAN-input rule on every reboot — re-apply at boot so the
+	// admin UI (port {ui_port}) stays reachable from the LAN without user action.
+	a.pihole.EnsureFirewall()
+	// Push add-subnet=32,128 into pi-hole's dnsmasq so the AWG2 trace log can
+	// show real LAN client IPs instead of pi-hole's 127.0.0.1 (it's the only
+	// peer our :5354 sees otherwise). Silent best-effort.
+	_ = a.pihole.EnsureAddSubnet()
+	// The bundled xiaomi-docker leaves a stale containerd shim directory on
+	// reboot, so a plain "--restart unless-stopped" doesn't actually bring the
+	// container back. Recover by remove+run if the container is in a bad state.
+	a.pihole.EnsureRunning()
+	// Inverted chain: pi-hole sits at the iptables REDIRECT target (its FTL
+	// port), and forwards to the AWG2 proxy as its only upstream. That keeps
+	// real client IPs in pi-hole's per-client log while still letting the proxy
+	// classify every (non-blocked) query for SNI/zone routing.
+	a.pihole.SetChainChangeHook(func(enabled bool, _ string) {
+		ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+		defer cancel()
+		if enabled {
+			_ = a.pihole.SetUpstreams(ctx, []string{awgroute.DNSProxyUpstreamAddr()})
+		} else {
+			_ = a.pihole.SetUpstreams(ctx, nil) // restore FTL defaults
+		}
+		// Flip the iptables REDIRECT target so toggling actually removes pi-hole
+		// from the data plane (not just from its upstream role) when disabled.
+		a.awgroute.SetDNSChainEnabled(enabled)
+	})
+	// Apply the persisted state at boot so a chain-enabled config survives reboot.
+	a.awgroute.SetDNSChainEnabled(cfg.DNSChainEnabled)
+	if cfg.DNSChainEnabled {
+		// Run async with backoff — EnsureRunning() above can take 1-3 min on a
+		// cold start (image pull/extract), and FTL's :8053 isn't listening
+		// until well after that. A single synchronous SetUpstreams here would
+		// just hit "connection refused", swallow the error, and leave the
+		// persisted chain state silently NOT applied until the user toggles
+		// the UI by hand. Retry every 5s for ~5 min instead.
+		go func() {
+			for delay, total := 5*time.Second, time.Duration(0); total < 5*time.Minute; total += delay {
+				time.Sleep(delay)
+				ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+				err := a.pihole.SetUpstreams(ctx, []string{awgroute.DNSProxyUpstreamAddr()})
+				cancel()
+				if err == nil {
+					return
+				}
+			}
+		}()
+	}
+}
+
+// Pihole exposes the service for the API layer.
+func (a *App) Pihole() *pihole.Service { return a.pihole }
+
+// SavePiholeConfig persists pi-hole settings + applies them.
+func (a *App) SavePiholeConfig(cfg pihole.Config) error {
+	a.pihole.SetConfig(cfg)
+	return a.store.Save("pihole.json", &cfg)
 }
 
 // Shutdown cancels any active run/block check, tears down every test sandbox
@@ -114,9 +235,15 @@ func (a *App) Shutdown() {
 	engine.CleanupSandboxes(a.Cfg, maxThreads)
 	a.StopTGWS()
 	a.StopSocks5()
+	if a.dnsServer != nil {
+		a.dnsServer.Close()
+	}
+	a.arpspoof.Stop()
+	a.awgroute.StopAWG()
+	a.awgroute.TeardownRouting()
+	a.stopGeoAutoLoop()
+	a.stopAutomation()
 }
-
-func (a *App) blobsDir() string { return a.store.Path("blobs") }
 
 // ---------- Lists ----------
 
@@ -230,56 +357,7 @@ func (a *App) DeleteCustomStrategy(id string) error {
 	return a.store.Save(customStrategiesFile, a.custom)
 }
 
-// ---------- Blobs ----------
-
-// Blobs lists available blob names: system blobs plus user-uploaded ones.
-func (a *App) Blobs() (system []string, custom []string) {
-	if entries, err := os.ReadDir(a.Cfg.SystemBlobsDir); err == nil {
-		for _, e := range entries {
-			if !e.IsDir() {
-				system = append(system, e.Name())
-			}
-		}
-	}
-	if names, err := a.store.ListFiles("blobs"); err == nil {
-		custom = names
-	}
-	sort.Strings(system)
-	sort.Strings(custom)
-	return
-}
-
-// resolveBlob maps a selected blob filename to its lua name and absolute path,
-// preferring a custom upload over a system blob of the same name. The lua name is
-// the filename without extension.
-func (a *App) resolveBlob(name string) (luaName, path string, ok bool) {
-	name = filepath.Base(name)
-	if name == "" || name == "." {
-		return "", "", false
-	}
-	path = filepath.Join(a.blobsDir(), name)
-	if _, err := os.Stat(path); err != nil {
-		path = filepath.Join(a.Cfg.SystemBlobsDir, name)
-		if _, err := os.Stat(path); err != nil {
-			return "", "", false
-		}
-	}
-	return luaIdent(strings.TrimSuffix(name, filepath.Ext(name))), path, true
-}
-
-// reNonIdent matches characters not allowed in an nfqws2 blob (Lua) identifier.
-var reNonIdent = regexp.MustCompile(`[^A-Za-z0-9_]`)
-
-// luaIdent turns a blob filename stem into a valid nfqws2 --blob=NAME identifier.
-// Captured/generated blobs are named after the SNI (e.g. clienthello_edge.microsoft.com),
-// and nfqws2 rejects dots/dashes as a "bad identifier", so they're folded to '_'.
-func luaIdent(s string) string {
-	s = reNonIdent.ReplaceAllString(s, "_")
-	if s == "" || (s[0] >= '0' && s[0] <= '9') {
-		s = "b_" + s
-	}
-	return s
-}
+// ---------- Runs: SNI + blob expansion ----------
 
 // reFakeBlobRef matches a fake-payload blob reference inside a desync directive
 // (e.g. ":blob=tls_clienthello"), but not the "--blob=" definition flag.
@@ -339,7 +417,7 @@ func (a *App) buildRunStrategies(base []catalog.Strategy, blobNames []string) []
 	type rb struct{ lua, path string }
 	var blobs []rb
 	for _, n := range blobNames {
-		if lua, path, ok := a.resolveBlob(n); ok {
+		if lua, path, ok := a.blobs.ResolveBlob(n); ok {
 			blobs = append(blobs, rb{lua, path})
 		}
 	}
@@ -364,30 +442,6 @@ func (a *App) buildRunStrategies(base []catalog.Strategy, blobNames []string) []
 		out = append(out, s) // default payload, tested last
 	}
 	return out
-}
-
-// SaveBlob stores an uploaded blob and returns the absolute path to reference
-// it in a strategy via --blob=name:@<path>.
-func (a *App) SaveBlob(name string, data []byte) (string, error) {
-	name, err := sanitizeBlobName(name)
-	if err != nil {
-		return "", err
-	}
-	if err := a.store.WriteBytes(filepath.Join("blobs", name), data); err != nil {
-		return "", err
-	}
-	return filepath.Join(a.blobsDir(), name), nil
-}
-
-// DeleteBlob soft-deletes a custom (user-uploaded) blob by moving it to the
-// recycle bin (TrashedBlobs / RestoreBlob / PurgeBlob). System blobs live
-// outside the data dir and are never touched.
-func (a *App) DeleteBlob(name string) error {
-	name, err := sanitizeBlobName(name)
-	if err != nil {
-		return err
-	}
-	return a.trashBlob(name)
 }
 
 // ---------- Apply strategy to live config ----------

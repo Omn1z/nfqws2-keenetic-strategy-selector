@@ -6,7 +6,7 @@ import { cn } from "@/lib/cn";
 // Variant/size vocabulary kept as the project's (primary/default/ghost/danger + mini)
 // so existing call sites don't change.
 const buttonVariants = cva(
-  "inline-flex items-center justify-center gap-1.5 whitespace-nowrap rounded-lg border font-semibold outline-none transition active:translate-y-px focus-visible:ring-2 focus-visible:ring-ring/40 disabled:pointer-events-none disabled:opacity-50 [&_svg]:pointer-events-none [&_svg]:shrink-0",
+  "inline-flex min-w-0 max-w-full items-center justify-center gap-1.5 rounded-lg border text-center font-semibold leading-tight outline-none transition active:translate-y-px focus-visible:ring-2 focus-visible:ring-ring/40 disabled:pointer-events-none disabled:opacity-50 [overflow-wrap:anywhere] [&_svg]:pointer-events-none [&_svg]:shrink-0",
   {
     variants: {
       variant: {

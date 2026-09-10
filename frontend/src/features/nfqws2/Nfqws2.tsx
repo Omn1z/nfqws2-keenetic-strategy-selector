@@ -7,9 +7,10 @@ import { Button } from "@/components/ui/Button";
 import { Badge } from "@/components/ui/Badge";
 import { FileManager } from "./FileManager";
 import { ConfigPane } from "./ConfigPane";
+import { AutomationPanel } from "./AutomationPanel";
 import type { Nfqws2Version } from "@/types/api";
 
-type Sub = "config" | "scripts" | "lists";
+type Sub = "config" | "scripts" | "lists" | "bypass";
 
 interface ServiceResult { name: string; ok: boolean; detail: string }
 
@@ -30,6 +31,15 @@ export default function Nfqws2() {
       toast("nfqws2: конфиг перечитан (reload, очередь не прервана)", "ok");
     } catch (e) {
       toast("Reload: " + (e as Error).message, "err");
+    }
+  };
+
+  const applyBypass = async () => {
+    try {
+      await api("POST", "/api/nfqws2/bypass/apply", {});
+      toast("NFQUEUE Bypass применён", "ok");
+    } catch (e) {
+      toast("NFQUEUE Bypass: " + (e as Error).message, "err");
     }
   };
 
@@ -74,15 +84,32 @@ export default function Nfqws2() {
         <p className="text-xs text-muted">Редактирование живого движка nfqws2: конфиг, Lua-скрипты обхода и списки доменов/IP. «Применить (reload)» перечитывает списки без обрыва очереди; «Перезапустить» нужен после смены портов, интерфейса или стратегий.</p>
       </Card>
 
+      <div className="mb-4">
+        <AutomationPanel />
+      </div>
+
       <div className="mb-4 inline-flex overflow-hidden rounded-lg border border-line">
         {seg("config", "Конфиг")}
         {seg("scripts", "Скрипты")}
         {seg("lists", "Списки")}
+        {seg("bypass", "Списки NFQUEUE Bypass")}
       </div>
 
       {sub === "config" && <ConfigPane restart={restart} />}
       {sub === "scripts" && <FileManager key="lua" kind="lua" reload={reload} />}
       {sub === "lists" && <FileManager key="list" kind="list" reload={reload} />}
+      {sub === "bypass" && (
+        <FileManager
+          key="bypass"
+          kind="bypass"
+          reload={applyBypass}
+          applyTitle="Применить NFQUEUE Bypass?"
+          applyBody="Пересобрать IPv4-цепочки nfqws2 и заново наложить RETURN-правила из bypass-списков."
+          applyConfirmLabel="Применить bypass"
+          allowCreate={false}
+          allowUpload={false}
+        />
+      )}
     </>
   );
 }

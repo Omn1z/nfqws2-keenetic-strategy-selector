@@ -11,19 +11,32 @@ import { Dropzone } from "@/components/ui/Dropzone";
 import { Input, Textarea } from "@/components/ui/form";
 import type { Nfqws2File, Nfqws2Kind } from "@/types/api";
 
-const DEFAULT_EXT: Record<Nfqws2Kind, string> = { conf: "conf", list: "list", lua: "lua" };
+const DEFAULT_EXT: Record<Nfqws2Kind, string> = { conf: "conf", list: "list", lua: "lua", bypass: "list" };
 const SIZE_WARN = 512 * 1024;
 
 interface Props {
   kind: Nfqws2Kind;
   /** Offer to apply (SIGHUP reload) the live engine after a save. */
   reload: () => Promise<void>;
+  applyTitle?: string;
+  applyBody?: string;
+  applyConfirmLabel?: string;
+  allowCreate?: boolean;
+  allowUpload?: boolean;
 }
 
 /** Reusable file manager for a single nfqws2 file kind (conf / lua / list):
  *  list on the left, monospace editor on the right, with create / upload /
  *  download / delete and (for lists) dedup / clear. */
-export function FileManager({ kind, reload }: Props) {
+export function FileManager({
+  kind,
+  reload,
+  applyTitle = "Применить изменения?",
+  applyBody = "Перезагрузить конфиг nfqws2 (reload, без обрыва очереди).",
+  applyConfirmLabel = "Применить",
+  allowCreate = true,
+  allowUpload = true,
+}: Props) {
   const [files, setFiles] = useState<Nfqws2File[]>([]);
   const [sel, setSel] = useState("");
   const [content, setContent] = useState("");
@@ -70,7 +83,7 @@ export function FileManager({ kind, reload }: Props) {
       setDirty(false);
       toast(`Сохранён ${sel}`, "ok");
       await loadFiles(sel);
-      if (await confirmDialog({ title: "Применить изменения?", body: "Перезагрузить конфиг nfqws2 (reload, без обрыва очереди).", confirmLabel: "Применить", cancelLabel: "Позже" })) await reload();
+      if (await confirmDialog({ title: applyTitle, body: applyBody, confirmLabel: applyConfirmLabel, cancelLabel: "Позже" })) await reload();
     } catch (e) {
       toast((e as Error).message, "err");
     } finally {
@@ -165,10 +178,12 @@ export function FileManager({ kind, reload }: Props) {
   return (
     <div className="flex flex-col gap-5 lg:flex-row lg:items-start">
       <aside className="w-full shrink-0 lg:w-[260px]">
-        <Dropzone multiple onFiles={upload}>
-          <div className="text-[13px] font-medium">Загрузить файл</div>
-          <div className="mt-0.5 text-xs text-muted">перетащите или нажмите · .gz распакуется</div>
-        </Dropzone>
+        {allowUpload && (
+          <Dropzone multiple onFiles={upload}>
+            <div className="text-[13px] font-medium">Загрузить файл</div>
+            <div className="mt-0.5 text-xs text-muted">перетащите или нажмите · .gz распакуется</div>
+          </Dropzone>
+        )}
         <ul className="m-0 mt-3 list-none p-0">
           {files.map((f) => (
             <li
@@ -193,10 +208,12 @@ export function FileManager({ kind, reload }: Props) {
           ))}
           {files.length === 0 && <li className="px-1 py-2 text-xs text-muted">Файлов нет.</li>}
         </ul>
-        <div className="mt-2 flex gap-2">
-          <Input value={newName} onChange={(e) => setNewName(e.target.value)} placeholder={`имя без .${DEFAULT_EXT[kind]}`} onKeyDown={(e) => { if (e.key === "Enter") void create(); }} className="h-9 py-1 text-xs" />
-          <Button onClick={create} disabled={!newName.trim()} title="Создать файл">＋</Button>
-        </div>
+        {allowCreate && (
+          <div className="mt-2 flex gap-2">
+            <Input value={newName} onChange={(e) => setNewName(e.target.value)} placeholder={`имя без .${DEFAULT_EXT[kind]}`} onKeyDown={(e) => { if (e.key === "Enter") void create(); }} className="h-9 py-1 text-xs" />
+            <Button onClick={create} disabled={!newName.trim()} title="Создать файл">＋</Button>
+          </div>
+        )}
       </aside>
 
       <div className="min-w-0 flex-1">
@@ -218,8 +235,8 @@ export function FileManager({ kind, reload }: Props) {
             <Textarea rows={22} value={content} spellCheck={false} onChange={(e) => setBody(e.target.value)} />
             <div className="mt-2.5 flex flex-wrap items-center gap-2">
               <Button variant="primary" onClick={save} disabled={busy || !dirty}>{busy ? "Сохранение…" : "Сохранить"}</Button>
-              {kind === "list" && <Button onClick={dedup} title="Удалить повторяющиеся строки">Дедуп</Button>}
-              {kind === "list" && <Button variant="ghost" onClick={clear}>Очистить</Button>}
+              {(kind === "list" || kind === "bypass") && <Button onClick={dedup} title="Удалить повторяющиеся строки">Дедуп</Button>}
+              {(kind === "list" || kind === "bypass") && <Button variant="ghost" onClick={clear}>Очистить</Button>}
               {!dirty && <span className="text-xs text-muted">сохранено</span>}
             </div>
           </Card>

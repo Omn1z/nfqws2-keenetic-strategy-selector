@@ -1,0 +1,43 @@
+package awgroute
+
+import (
+	"sync"
+
+	"nfqws2strategy/internal/services/awg"
+)
+
+// awgSNITTL is the seconds a SNI-learned IP stays in awg2_sni / sniSeen before
+// re-sight refreshes it. Lives here (tag-free) so the cross-platform cache
+// sweeper in service.go can use it without depending on the linux file.
+const awgSNITTL = 3600
+
+// sourceZoneMatchers is the compiled matcher set for one source-bound zone +
+// the ipset its matches must land in. The DNS proxy / SNI sniffer iterate this
+// slice for each name they see and add the resolved IP to the right per-zone
+// ipset, so CDN-served destinations stay routed correctly as they rotate.
+// Defined in a tag-free file so it's visible to client.go (non-linux too).
+type sourceZoneMatchers struct {
+	Matchers *awg.MatcherSet
+	SetName  string
+}
+
+// sniSniffer passively reads TLS ClientHellos off the LAN bridges and calls onHello
+// with each (destination IP, SNI). SNI-routing uses it to learn which server IPs a
+// matched domain currently lives on and route those IPs through the tunnel — which
+// works even when the device uses encrypted DNS (DoH/DoT) or the site is behind a
+// CDN with rotating IPs (DNS-based matching can't catch either).
+//
+// The packet capture is Linux-only (AF_PACKET, in snisniff_linux.go); on other OSes
+// start() is a no-op (snisniff_other.go). The struct itself is portable so the
+// awgRouteState field compiles everywhere.
+type sniSniffer struct {
+	mu      sync.Mutex
+	fds     []int
+	stopCh  chan struct{}
+	running bool
+	onHello func(dstIP, sni string)
+}
+
+func newSNISniffer(onHello func(dstIP, sni string)) *sniSniffer {
+	return &sniSniffer{onHello: onHello}
+}

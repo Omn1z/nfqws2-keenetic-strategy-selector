@@ -8,15 +8,16 @@ import { cn } from "@/lib/cn";
  * Not wrapped in a <label> (Base UI's hidden input inside a label double-toggles);
  * the optional text is a sibling with its own click + aria-label on the control.
  */
-export function Switch({ checked, onChange, label }: { checked: boolean; onChange: (v: boolean) => void; label?: ReactNode }) {
+export function Switch({ checked, onChange, label, disabled = false }: { checked: boolean; onChange: (v: boolean) => void; label?: ReactNode; disabled?: boolean }) {
   return (
-    <span className="inline-flex items-center gap-2.5 text-[13px] text-ink-soft">
+    <span className={cn("inline-flex items-center gap-2.5 text-[13px] text-ink-soft", disabled && "opacity-50")}>
       <BaseSwitch.Root
         checked={checked}
         onCheckedChange={(v) => onChange(v)}
+        disabled={disabled}
         aria-label={typeof label === "string" ? label : undefined}
         className={cn(
-          "relative h-[22px] w-10 shrink-0 cursor-pointer rounded-full outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring/40",
+          "relative h-[22px] w-10 shrink-0 cursor-pointer rounded-full outline-none transition-colors focus-visible:ring-2 focus-visible:ring-ring/40 disabled:cursor-not-allowed",
           checked ? "bg-accent" : "bg-track",
         )}
       >
@@ -25,7 +26,7 @@ export function Switch({ checked, onChange, label }: { checked: boolean; onChang
         />
       </BaseSwitch.Root>
       {label != null && (
-        <span className="cursor-pointer select-none" onClick={() => onChange(!checked)}>
+        <span className={cn("select-none", disabled ? "cursor-not-allowed" : "cursor-pointer")} onClick={() => { if (!disabled) onChange(!checked); }}>
           {label}
         </span>
       )}

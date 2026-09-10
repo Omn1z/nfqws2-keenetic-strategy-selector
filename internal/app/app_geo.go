@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"nfqws2strategy/internal/geo"
+	"nfqws2strategy/internal/tools/geo"
 )
 
 const geoMetaFile = "geo_meta.json"

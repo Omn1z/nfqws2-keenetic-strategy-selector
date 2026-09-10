@@ -6,7 +6,11 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   build-release:
@@ -15,15 +19,112 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
         with:
-          go-version: '1.22'
+          go-version: '1.25.7'
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
-      - name: Build all architectures
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Test and vet Go packages
+        run: |
+          go test ./...
+          go vet ./...
+      - name: Build frontend and all architectures
         run: sh scripts/build.sh "${GITHUB_REF_NAME:-dev}"
-      - name: Publish release
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
+      - name: Include upstream license
+        run: |
+          cp internal/services/tgws/LICENSE.upstream dist/TGWS-LICENSE.txt
+          cp THIRD_PARTY_NOTICES.md dist/THIRD-PARTY-NOTICES.txt
+      - name: Upload panel artifacts
+        uses: actions/upload-artifact@v4
         with:
-          files: dist/nfqws2-strategy-linux-*
-          generate_release_notes: true
+          name: release-panel
+          path: |
+            dist/nfqws2-strategy-linux-arm64
+            dist/nfqws2-strategy-linux-arm
+            dist/nfqws2-strategy-linux-mipsle
+            dist/nfqws2-strategy-linux-mips
+            dist/TGWS-LICENSE.txt
+            dist/THIRD-PARTY-NOTICES.txt
+          if-no-files-found: error
+          compression-level: 0
+
+  # Pure-Go AmneziaWG 3.1 engine; no C tools or musl are needed on the router.
+  build-engine:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25.7'
+      - name: Build AmneziaWG 3.1 engine
+        run: sh scripts/build-engine.sh
+      - name: Include upstream license
+        run: cp .engine-build/amneziawg-go/LICENSE dist/AMNEZIAWG-LICENSE.txt
+      - name: Upload engine artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-awg-engine
+          path: |
+            dist/awg-engine-linux-*.tar.gz
+            dist/awg-engine-linux-*.tar.gz.sha256
+            dist/AMNEZIAWG-LICENSE.txt
+          if-no-files-found: error
+          compression-level: 0
+
+  publish:
+    needs: [build-release, build-engine]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      RELEASE_TAG: ${{ github.ref_name }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+      - name: Extract changelog and verify release files
+        run: |
+          sh scripts/release-notes.sh "$RELEASE_TAG" CHANGELOG.md > release-notes.md
+          cd dist
+          for arch in arm64 arm mipsle mips; do
+            test -s "nfqws2-strategy-linux-$arch"
+            test -s "awg-engine-linux-$arch.tar.gz"
+            test -s "awg-engine-linux-$arch.tar.gz.sha256"
+            sha256sum --check "awg-engine-linux-$arch.tar.gz.sha256"
+          done
+          test -s TGWS-LICENSE.txt
+          test -s AMNEZIAWG-LICENSE.txt
+          test -s THIRD-PARTY-NOTICES.txt
+          test "$(find . -maxdepth 1 -type f | wc -l)" -eq 15
+          sha256sum nfqws2-strategy-linux-* awg-engine-linux-*.tar.gz \
+            TGWS-LICENSE.txt AMNEZIAWG-LICENSE.txt THIRD-PARTY-NOTICES.txt > SHA256SUMS
+      - name: Upload all assets to a draft and publish
+        run: |
+          prerelease=(--prerelease=false)
+          latest=(--latest)
+          if [[ "$RELEASE_TAG" == *-* ]]; then
+            prerelease=(--prerelease)
+            latest=(--latest=false)
+          fi
+          if is_draft=$(gh release view "$RELEASE_TAG" --json isDraft --jq '.isDraft'); then
+            if [[ "$is_draft" != true ]]; then
+              echo "Release $RELEASE_TAG is already published; refusing to replace its assets." >&2
+              exit 1
+            fi
+            gh release edit "$RELEASE_TAG" --title "$RELEASE_TAG" \
+              --notes-file release-notes.md "${prerelease[@]}" --latest=false
+            gh release upload "$RELEASE_TAG" dist/* --clobber
+          else
+            gh release create "$RELEASE_TAG" dist/* --verify-tag --draft \
+              --title "$RELEASE_TAG" --notes-file release-notes.md "${prerelease[@]}" --latest=false
+          fi
+          find dist -maxdepth 1 -type f -printf '%f\n' | sort > expected-assets.txt
+          gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name' | sort > uploaded-assets.txt
+          diff -u expected-assets.txt uploaded-assets.txt
+          gh release edit "$RELEASE_TAG" --draft=false "${prerelease[@]}" "${latest[@]}"
