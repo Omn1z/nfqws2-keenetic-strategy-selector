@@ -5,8 +5,8 @@ go 1.25.0
 require (
 	github.com/GehirnInc/crypt v0.0.0-20230320061759-8cc1b52080c5
 	github.com/miekg/dns v1.1.72
-	golang.org/x/crypto v0.54.0
-	golang.org/x/mod v0.37.0
+	golang.org/x/crypto v0.55.0
+	golang.org/x/mod v0.40.0
 	golang.org/x/net v0.56.0
 )
 
