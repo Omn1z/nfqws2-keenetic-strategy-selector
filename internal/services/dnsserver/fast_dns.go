@@ -44,6 +44,7 @@ type fastDNSFlight struct {
 	foreground bool
 	running    bool
 	sequence   uint64
+	cancel     context.CancelFunc
 }
 
 type fastDNSEntry struct {
@@ -73,6 +74,7 @@ type FastDNSCache struct {
 	workersOnce sync.Once
 	startOnce   sync.Once
 	sequence    uint64
+	allowed     func(string, string) bool
 }
 
 func NewFastDNSCache(lifetime context.Context, lookup func(context.Context, string, string) ([]string, error), targets func() []FastDNSTarget) *FastDNSCache {
@@ -120,6 +122,9 @@ func (c *FastDNSCache) Lookup(ctx context.Context, route, host string) ([]string
 	}
 	if err := c.lifetime.Err(); err != nil {
 		return nil, err
+	}
+	if c.allowed != nil && !c.allowed(route, host) {
+		return nil, errMethodDisabled
 	}
 	c.startWorkers()
 	c.mu.Lock()
@@ -177,7 +182,7 @@ func (c *FastDNSCache) RefreshSoon(route, host string) {
 		return
 	}
 	e := c.entries[fastDNSKey(route, host)]
-	if e == nil || e.flight != nil {
+	if e == nil || e.flight != nil || c.allowed != nil && !c.allowed(route, host) {
 		return
 	}
 	now := c.now()
@@ -191,6 +196,9 @@ func (c *FastDNSCache) RefreshSoon(route, host string) {
 // entryLocked never evicts an active lookup or a waiting foreground request.
 // A full background warm-up may yield a queued slot to an actual DNS request.
 func (c *FastDNSCache) entryLocked(target FastDNSTarget, foreground bool, now time.Time) *fastDNSEntry {
+	if c.allowed != nil && !c.allowed(target.Route, target.Host) {
+		return nil
+	}
 	key := fastDNSKey(target.Route, target.Host)
 	if e := c.entries[key]; e != nil {
 		return e
@@ -259,7 +267,7 @@ func (c *FastDNSCache) maintain() {
 		c.entryLocked(target, false, now)
 	}
 	for _, e := range c.entries {
-		if e.flight == nil && (!now.Before(e.expires) || e.lastError != "" || e.refreshSoon) && !now.Before(e.retryAt) {
+		if e.flight == nil && (c.allowed == nil || c.allowed(e.target.Route, e.target.Host)) && (!now.Before(e.expires) || e.lastError != "" || e.refreshSoon) && !now.Before(e.retryAt) {
 			c.scheduleLocked(e, false)
 		}
 	}
@@ -291,8 +299,12 @@ func (c *FastDNSCache) worker() {
 		}
 		flight := entry.flight
 		flight.running = true
-		c.mu.Unlock()
 		ctx, cancel := context.WithTimeout(c.lifetime, fastDNSLookupTimeout)
+		flight.cancel = cancel
+		if c.allowed != nil && !c.allowed(entry.target.Route, entry.target.Host) {
+			cancel()
+		}
+		c.mu.Unlock()
 		ips, err := c.lookup(ctx, entry.target.Route, entry.target.Host)
 		if err == nil {
 			err = ctx.Err()
@@ -305,6 +317,12 @@ func (c *FastDNSCache) worker() {
 			}
 		}
 		c.mu.Lock()
+		if c.entries[fastDNSKey(entry.target.Route, entry.target.Host)] != entry {
+			flight.err = errMethodDisabled
+			close(flight.done)
+			c.mu.Unlock()
+			continue
+		}
 		if c.lifetime.Err() != nil {
 			// Do not publish even a successful result after service shutdown.
 			flight.err = c.lifetime.Err()
@@ -394,6 +412,7 @@ func (c *FastDNSCache) Snapshot() FastDNSStatus {
 
 func fastDNSTargets(cfg Config, routes []dnsroute.Route) []FastDNSTarget {
 	eligible := eligibleRoutes(cfg, routes)
+	disabled := disabledMethodSet(cfg.DisabledMethods)
 	targets := make([]FastDNSTarget, 0)
 	seen := make(map[string]bool)
 	add := func(upstream Upstream) bool {
@@ -405,7 +424,7 @@ func fastDNSTargets(cfg Config, routes []dnsroute.Route) []FastDNSTarget {
 			return true
 		}
 		for _, route := range eligible {
-			if !route.Available {
+			if !route.Available || disabled[schedulerKey(route.ID, upstream.Address)] {
 				continue
 			}
 			host := strings.TrimSuffix(strings.ToLower(endpoint.Hostname()), ".")
@@ -442,4 +461,62 @@ func fastDNSTargets(cfg Config, routes []dnsroute.Route) []FastDNSTarget {
 		}
 	}
 	return targets
+}
+
+// pruneDisallowed removes only automatic host/route bootstrap state whose last
+// configured provider was disabled. Other URL profiles sharing the same host
+// keep their cache and refresh work. Running bootstrap requests are canceled.
+func (c *FastDNSCache) pruneDisallowed() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.allowed == nil {
+		return
+	}
+	for key, entry := range c.entries {
+		if c.allowed(entry.target.Route, entry.target.Host) {
+			continue
+		}
+		if flight := entry.flight; flight != nil {
+			if flight.running {
+				flight.cancel()
+			} else {
+				flight.err = errMethodDisabled
+				close(flight.done)
+			}
+		}
+		delete(c.entries, key)
+	}
+}
+
+func fastDNSConfiguredHost(cfg Config, route, host string, allowed func(string, string) bool) bool {
+	host = strings.TrimSuffix(strings.ToLower(host), ".")
+	uses := func(upstream Upstream) bool {
+		if len(upstream.BootstrapIPs) > 0 || !allowed(route, upstream.Address) {
+			return false
+		}
+		endpoint, err := url.Parse(upstream.Address)
+		return err == nil && net.ParseIP(endpoint.Hostname()) == nil && strings.EqualFold(strings.TrimSuffix(endpoint.Hostname(), "."), host)
+	}
+	if uses(cfg.DefaultUpstream) {
+		return true
+	}
+	for _, upstream := range cfg.DefaultPool {
+		if uses(upstream) {
+			return true
+		}
+	}
+	for _, rule := range cfg.Rules {
+		if !rule.Enabled {
+			continue
+		}
+		if uses(rule.Upstream) {
+			return true
+		}
+		for _, upstream := range rule.Pool {
+			if uses(upstream) {
+				return true
+			}
+		}
+	}
+	return false
 }

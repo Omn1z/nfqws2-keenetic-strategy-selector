@@ -7,9 +7,10 @@ import { Card } from "@/components/ui/Card";
 import { Field, Input } from "@/components/ui/form";
 import { Switch } from "@/components/ui/Switch";
 import { toast } from "@/components/ui/Toast";
-import type { DnsServerLogSnapshot, DnsServerSchedulerSnapshot, DnsServerStatus } from "@/types/api";
+import type { DnsServerConfig, DnsServerLogSnapshot, DnsServerSchedulerCandidate, DnsServerSchedulerSnapshot, DnsServerStatus } from "@/types/api";
 import { DnsLogRows } from "./DnsLogRows";
 import { isLogProblem, matchesLogFilter } from "./dnsLogPresentation";
+import { allAvailableSchedulerMethodsDisabled, applyDisabledSchedulerMethods, schedulerMethodKey } from "./schedulerMethods";
 
 const duration = (v: number) => `${Math.round(v)} мс`;
 const clock = (v: string) => {
@@ -29,10 +30,12 @@ function SchedulerPanel({ running }: { running: boolean }) {
   const [snapshot, setSnapshot] = useState<DnsServerSchedulerSnapshot | null>(null);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
+  const [methodBusy, setMethodBusy] = useState("");
+  const changingMethod = useRef(false);
   const requested = useRef({ query: "" as string | null, revision: 0, fetching: false });
   const refresh = async () => {
     const request = requested.current;
-    if (request.fetching || request.query === null || document.hidden) return;
+    if (request.fetching || request.query === null || document.hidden || changingMethod.current) return;
     request.fetching = true; setLoading(true);
     try {
       const path = request.query ? `/api/dnsserver/scheduler?domain=${encodeURIComponent(request.query)}` : "/api/dnsserver/scheduler";
@@ -60,8 +63,28 @@ function SchedulerPanel({ running }: { running: boolean }) {
     if (next === domain) void refresh();
     else { setDomain(next); selectView(next); }
   };
+  const setMethod = async (candidate: DnsServerSchedulerCandidate, enabled: boolean) => {
+    if (changingMethod.current) return;
+    changingMethod.current = true;
+    setMethodBusy(schedulerMethodKey(candidate.upstream, candidate.route));
+    // Replace the request object: an earlier GET must not undo a saved switch.
+    requested.current = { ...requested.current, revision: requested.current.revision + 1, fetching: false };
+    setLoading(false);
+    try {
+      const config = await api<DnsServerConfig>("POST", "/api/dnsserver/scheduler/method", { upstream: candidate.upstream, route: candidate.route, enabled });
+      setSnapshot((current) => current ? applyDisabledSchedulerMethods(current, config.disabled_methods ?? []) : current);
+      setError("");
+    } catch (e) { toast(`Не удалось изменить метод DNS: ${(e as Error).message}`, "err"); }
+    finally {
+      changingMethod.current = false; setMethodBusy("");
+      // The view may have changed while saving. Refresh its current query only.
+      requested.current = { ...requested.current, revision: requested.current.revision + 1, fetching: false };
+      void refresh();
+    }
+  };
   return <Card title="Планировщик DNS" sub="очередь сочетаний маршрута и DoH по сохранённым настройкам">
     <p className="mb-3 text-xs text-muted">Чем больше очков, тем выше приоритет. Быстрые успешные ответы поднимают сочетание в очереди, ошибки и серии неудач опускают его. Приоритет определяет порядок запуска параллельных попыток: готовый ответ не ждёт остальных.</p>
+    <p className="mb-3 text-xs text-muted">Переключатель сразу сохраняет участие пары «DoH + маршрут» во всех пулах и доменах. Выключенный метод не участвует в запросах и фоновых замерах; его можно включить здесь же.</p>
     <div className="mb-3 flex flex-wrap gap-2" role="group" aria-label="Режим планировщика">
       <Button mini variant={mode === "general" ? "primary" : "default"} aria-pressed={mode === "general"} onClick={() => changeMode("general")}>Общий</Button>
       <Button mini variant={mode === "domain" ? "primary" : "default"} aria-pressed={mode === "domain"} onClick={() => changeMode("domain")}>По домену</Button>
@@ -76,17 +99,18 @@ function SchedulerPanel({ running }: { running: boolean }) {
     {snapshot && <>
       <div className="mt-3 flex flex-wrap items-center gap-2 text-xs"><Badge kind="neutral">{snapshot.pool_source === "default" ? "Пул по умолчанию" : `Пул: ${snapshot.pool_source}`}</Badge><span className="text-muted">{mode === "general" ? "Общий планировщик" : snapshot.domain} · Вариантов: {snapshot.candidates.length} · Одновременно: до {snapshot.parallel_limit}</span>{snapshot.active_probes !== undefined && <Badge kind="neutral">Фоновых замеров: {snapshot.active_probes}</Badge>}</div>
       {snapshot.formula && <div className="mt-3 rounded-lg border border-line p-3 text-xs"><p className="mb-1 font-semibold text-ink-soft">Расчёт очков</p><p className="whitespace-pre-wrap [overflow-wrap:anywhere]">{snapshot.formula}</p></div>}
+      {allAvailableSchedulerMethodsDisabled(snapshot) && <p role="status" className="mt-3 text-xs text-warn">Все доступные методы в этом пуле выключены. Для запросов без кэша включите хотя бы один метод.</p>}
       <div className="mt-3 max-h-[34rem] overflow-auto rounded-lg border border-line">
         <table className="w-full min-w-[1040px] text-left text-xs">
-          <thead className="sticky top-0 z-10 bg-card text-muted"><tr>{["Место / маршрут", "DoH", "Очки", "Задержка", "Успешность", "Попытки / ошибки", "Фоновые замеры"].map((label) => <th key={label} className="border-b border-line px-3 py-2 font-semibold">{label}</th>)}</tr></thead>
+          <thead className="sticky top-0 z-10 bg-card text-muted"><tr>{["Вкл. / место / маршрут", "DoH", "Очки", "Задержка", "Успешность", "Попытки / ошибки", "Фоновые замеры"].map((label) => <th key={label} className="border-b border-line px-3 py-2 font-semibold">{label}</th>)}</tr></thead>
           <tbody>{snapshot.candidates.map((v) => <tr key={`${v.route}\n${v.upstream}`} className="border-b border-line last:border-0">
-            <td className="px-3 py-3 align-top"><div className="flex items-center gap-2"><span className="font-semibold tabular-nums">{v.position}.</span><span className="font-semibold">{v.route_name || v.route}</span></div><div className="mt-2"><Badge kind={!v.available ? "warn" : v.successes + v.failures === 0 ? "neutral" : "ok"}>{!v.available ? "недоступен" : v.successes + v.failures === 0 ? "нет замеров" : "доступен"}</Badge></div>{v.exploration && <p className="mt-1 text-muted" title="Повышен приоритет запуска в следующем параллельном запросе">Приоритет проверки</p>}</td>
+            <td className="px-3 py-3 align-top"><div className="flex items-center gap-3"><div className="[&>span>span:last-child]:sr-only"><Switch checked={!v.disabled} disabled={!!methodBusy} onChange={(enabled) => setMethod(v, enabled)} label={`Метод ${v.upstream} через ${v.route_name || v.route}`} /></div><span className="font-semibold tabular-nums">{v.disabled || !v.position ? "—" : `${v.position}.`}</span><span className="font-semibold">{v.route_name || v.route}</span></div><div className="mt-2"><Badge kind={v.disabled ? "neutral" : !v.available ? "warn" : v.successes + v.failures === 0 ? "neutral" : "ok"}>{v.disabled ? "выключен" : !v.available ? "недоступен" : v.successes + v.failures === 0 ? "нет замеров" : "доступен"}</Badge></div>{methodBusy === schedulerMethodKey(v.upstream, v.route) && <p className="mt-1 text-muted" role="status">Сохранение…</p>}{v.exploration && !v.disabled && <p className="mt-1 text-muted" title="Повышен приоритет запуска в следующем параллельном запросе">Приоритет проверки</p>}</td>
             <td className="max-w-64 px-3 py-3 align-top"><code className="[overflow-wrap:anywhere]">{v.upstream}</code>{v.last_error && <p className="mt-2 text-bad [overflow-wrap:anywhere]">{v.last_error}</p>}</td>
             <td className="px-3 py-3 align-top tabular-nums"><p className="text-base font-semibold">{v.score.toFixed(1)}</p><p className="mt-1 text-muted">За задержку: −{v.latency_penalty.toFixed(1)}</p><p className="mt-1 text-muted">За ошибки: −{v.failure_penalty.toFixed(1)}</p></td>
             <td className="px-3 py-3 align-top tabular-nums">{duration(v.latency_ms)}<p className="mt-1 text-muted">{v.successes > 0 ? "сглаженная" : "начальная оценка"}</p></td>
             <td className="px-3 py-3 align-top tabular-nums">{(v.reliability * 100).toFixed(1)}%<p className="mt-1 text-muted">{v.successes + v.failures === 0 ? "начальная оценка" : `Ответов: ${v.successes}`}</p></td>
             <td className="px-3 py-3 align-top tabular-nums"><p>{v.attempts} / <span className={v.failures ? "text-warn" : ""}>{v.failures}</span></p><p className="mt-1 text-muted">Неудач подряд: {v.consecutive_failures}</p><p className="mt-1 text-muted" title="Последний завершённый замер: ответ или ошибка. Отмена это время не обновляет.">Результат: <SchedulerTime value={v.last_result_at} /></p>{v.last_attempt_at && <p className="mt-1 text-muted" title="Последний запуск, в том числе отменённый после победы другого варианта">Запуск: <SchedulerTime value={v.last_attempt_at} /></p>}</td>
-            <td className="px-3 py-3 align-top tabular-nums"><Badge kind={v.probing ? "ok" : "neutral"}>{v.probing ? "измеряется" : !running ? "остановлены" : !v.available ? "нет маршрута" : "ожидание"}</Badge><p className="mt-2 text-muted" title="Последний запуск независимого фонового замера">Запуск: <SchedulerTime value={v.last_probe_at} /></p><p className="mt-1 text-muted" title="Завершённые фоновые замеры">✓ {v.probe_successes ?? 0} · <span className={(v.probe_failures ?? 0) > 0 ? "text-warn" : ""}>! {v.probe_failures ?? 0}</span><span className="sr-only"> — успешных и неудачных замеров</span></p></td>
+            <td className="px-3 py-3 align-top tabular-nums"><Badge kind={!v.disabled && v.probing ? "ok" : "neutral"}>{v.disabled ? "выключены" : v.probing ? "измеряется" : !running ? "остановлены" : !v.available ? "нет маршрута" : "ожидание"}</Badge><p className="mt-2 text-muted" title="Последний запуск независимого фонового замера">Запуск: <SchedulerTime value={v.last_probe_at} /></p><p className="mt-1 text-muted" title="Завершённые фоновые замеры">✓ {v.probe_successes ?? 0} · <span className={(v.probe_failures ?? 0) > 0 ? "text-warn" : ""}>! {v.probe_failures ?? 0}</span><span className="sr-only"> — успешных и неудачных замеров</span></p></td>
           </tr>)}</tbody>
         </table>
         {!snapshot.candidates.length && <p className="p-4 text-xs text-muted">{mode === "general" ? "В пуле по умолчанию пока нет вариантов маршрута и DoH." : "Для выбранного домена пока нет вариантов маршрута и DoH."}</p>}

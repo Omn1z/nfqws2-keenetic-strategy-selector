@@ -38,6 +38,7 @@ type SchedulerCandidate struct {
 	RouteName           string  `json:"route_name"`
 	Upstream            string  `json:"upstream"`
 	Available           bool    `json:"available"`
+	Disabled            bool    `json:"disabled"`
 	Score               float64 `json:"score"`
 	Reliability         float64 `json:"reliability"`
 	LatencyMS           float64 `json:"latency_ms"`
@@ -203,6 +204,7 @@ func rounded(v float64) float64 { return math.Round(v*100) / 100 }
 func (s *Scheduler) orderedLocked(cfg Config, routes []dnsroute.Route, domain string, advance bool) ([]attemptCandidate, string) {
 	pool, source := cfg.upstreamsFor(domain)
 	eligible := eligibleRoutes(cfg, routes)
+	disabled := disabledMethodSet(cfg.DisabledMethods)
 	result := make([]attemptCandidate, 0, len(pool)*len(eligible))
 	for _, upstream := range pool {
 		for _, route := range eligible {
@@ -213,9 +215,13 @@ func (s *Scheduler) orderedLocked(cfg Config, routes []dnsroute.Route, domain st
 			latencyPenalty := math.Min(80, e.latency/20)
 			failurePenalty := math.Min(100, float64(e.consecutiveFailures)*20)
 			view := SchedulerCandidate{Route: route.ID, RouteName: route.Name, Upstream: upstream.Address, Available: route.Available,
-				Score: rounded(100*e.reliability - latencyPenalty - failurePenalty), Reliability: e.reliability, LatencyMS: rounded(e.latency), LatencyPenalty: rounded(latencyPenalty), FailurePenalty: failurePenalty,
+				Disabled: disabled[schedulerKey(route.ID, upstream.Address)],
+				Score:    rounded(100*e.reliability - latencyPenalty - failurePenalty), Reliability: e.reliability, LatencyMS: rounded(e.latency), LatencyPenalty: rounded(latencyPenalty), FailurePenalty: failurePenalty,
 				Attempts: e.attempts, Successes: e.successes, Failures: e.failures, ConsecutiveFailures: e.consecutiveFailures, LastError: e.lastError}
 			view.Probing, view.ProbeAttempts, view.ProbeSuccesses, view.ProbeFailures = e.probing, e.probeAttempts, e.probeSuccesses, e.probeFailures
+			if view.Disabled {
+				view.Probing = false
+			}
 			if !route.Available {
 				view.LastError = route.Error
 			}
@@ -232,13 +238,16 @@ func (s *Scheduler) orderedLocked(cfg Config, routes []dnsroute.Route, domain st
 		}
 	}
 	sort.SliceStable(result, func(i, j int) bool {
+		if result[i].view.Disabled != result[j].view.Disabled {
+			return !result[i].view.Disabled
+		}
 		if result[i].route.Available != result[j].route.Available {
 			return result[i].route.Available
 		}
 		return result[i].view.Score > result[j].view.Score
 	})
 	available := 0
-	for available < len(result) && result[available].route.Available {
+	for available < len(result) && result[available].route.Available && !result[available].view.Disabled {
 		available++
 	}
 	// A continually canceled low-ranked pair must eventually get a chance to
@@ -260,7 +269,9 @@ func (s *Scheduler) orderedLocked(cfg Config, routes []dnsroute.Route, domain st
 		result[0] = candidate
 	}
 	for i := range result {
-		result[i].view.Position = i + 1
+		if !result[i].view.Disabled {
+			result[i].view.Position = i + 1
+		}
 	}
 	return result, source
 }
@@ -270,7 +281,7 @@ func (s *Scheduler) order(cfg Config, routes []dnsroute.Route, domain string) []
 	defer s.mu.Unlock()
 	ordered, _ := s.orderedLocked(cfg, routes, domain, true)
 	available := 0
-	for available < len(ordered) && ordered[available].route.Available {
+	for available < len(ordered) && ordered[available].route.Available && !ordered[available].view.Disabled {
 		available++
 	}
 	return ordered[:available]

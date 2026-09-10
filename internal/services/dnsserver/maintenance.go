@@ -2,6 +2,7 @@ package dnsserver
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	mdns "github.com/miekg/dns"
@@ -47,7 +48,7 @@ func (r *Resolver) runSchedulerProbe() {
 	r.mu.Lock()
 	scheduler, observer := r.scheduler, r.observer
 	r.mu.Unlock()
-	probe, ok := scheduler.nextProbe(r.cfg, r.backend.Routes())
+	probe, ok := scheduler.nextProbe(r.policyConfig(), r.backend.Routes())
 	if !ok {
 		return
 	}
@@ -71,7 +72,7 @@ func (r *Resolver) runSchedulerProbe() {
 	}
 	event.DurationMS = time.Since(started).Milliseconds()
 	event.Success = err == nil
-	event.Canceled = err != nil && r.lifetime.Err() != nil
+	event.Canceled = err != nil && (r.lifetime.Err() != nil || errors.Is(err, errMethodDisabled))
 	if err != nil && !event.Canceled {
 		event.Error = err.Error()
 	}

@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"mime"
@@ -87,16 +88,19 @@ type Resolver struct {
 	cancelObserver  func(CancellationSummary)
 	fastDNS         *FastDNSCache
 	maintenanceOnce sync.Once
+	methods         *methodPolicy
 }
 
 func NewResolver(cfg Config, backend Backend) *Resolver {
 	lifetime, cancel := context.WithCancel(context.Background())
 	r := &Resolver{cfg: cloneConfig(cfg), backend: backend, cache: map[string]dnsCacheEntry{}, endpoints: map[string]endpointEntry{}, clients: map[string]*http.Client{}, ipCursor: map[string]int{}, attempts: make(chan struct{}, maxConcurrentRouteAttempts), lifetime: lifetime, cancel: cancel, now: time.Now, scheduler: NewScheduler()}
+	r.methods = newMethodPolicy(cfg.DisabledMethods)
 	if cfg.FastDNS {
 		r.fastDNS = NewFastDNSCache(lifetime, func(ctx context.Context, route, host string) ([]string, error) {
 			ips, _, err := r.lookupEndpointIPs(ctx, route, host)
 			return ips, err
-		}, func() []FastDNSTarget { return fastDNSTargets(r.cfg, r.backend.Routes()) })
+		}, func() []FastDNSTarget { return fastDNSTargets(r.policyConfig(), r.backend.Routes()) })
+		r.fastDNS.allowed = func(route, host string) bool { return fastDNSConfiguredHost(r.cfg, route, host, r.methods.allowed) }
 	}
 	return r
 }
@@ -128,7 +132,7 @@ func (r *Resolver) SchedulerSnapshot(domain string) SchedulerSnapshot {
 	r.mu.Lock()
 	scheduler := r.scheduler
 	r.mu.Unlock()
-	return scheduler.Snapshot(r.cfg, r.backend.Routes(), domain)
+	return scheduler.Snapshot(r.policyConfig(), r.backend.Routes(), domain)
 }
 
 func (r *Resolver) Close() {
@@ -203,7 +207,7 @@ func (r *Resolver) Resolve(ctx context.Context, raw []byte) ([]byte, Outcome, er
 	r.mu.Lock()
 	scheduler, observer, cancelObserver := r.scheduler, r.observer, r.cancelObserver
 	r.mu.Unlock()
-	ordered := scheduler.order(r.cfg, r.backend.Routes(), domain)
+	ordered := scheduler.order(r.policyConfig(), r.backend.Routes(), domain)
 	type result struct {
 		index int
 		msg   *mdns.Msg
@@ -234,16 +238,23 @@ func (r *Resolver) Resolve(ctx context.Context, raw []byte) ([]byte, Outcome, er
 				<-r.attempts
 				return
 			}
+			methodCtx, releaseMethod, methodErr := r.methods.begin(ctx, candidate.route.ID, candidate.upstream.Address)
+			if methodErr != nil {
+				<-r.attempts
+				results <- result{index: index, err: methodErr}
+				continue
+			}
 			scheduler.started(candidate.route.ID, candidate.upstream.Address)
 			workers.Add(1)
 			go func(index int, candidate attemptCandidate) {
 				defer workers.Done()
+				defer releaseMethod()
 				started := time.Now()
-				attempt, stop := context.WithTimeout(ctx, time.Duration(r.cfg.TimeoutSeconds)*time.Second)
+				attempt, stop := context.WithTimeout(methodCtx, time.Duration(r.cfg.TimeoutSeconds)*time.Second)
 				resp, err := r.exchangeEndpoint(attempt, candidate.route.ID, candidate.upstream, wire, query)
 				stop()
 				<-r.attempts
-				event := AttemptEvent{Domain: domain, Type: mdns.TypeToString[query.Question[0].Qtype], Route: candidate.route.ID, RouteName: candidate.route.Name, Upstream: candidate.upstream.Address, DurationMS: time.Since(started).Milliseconds(), Success: err == nil, Canceled: err != nil && (ctx.Err() != nil || r.lifetime.Err() != nil)}
+				event := AttemptEvent{Domain: domain, Type: mdns.TypeToString[query.Question[0].Qtype], Route: candidate.route.ID, RouteName: candidate.route.Name, Upstream: candidate.upstream.Address, DurationMS: time.Since(started).Milliseconds(), Success: err == nil, Canceled: err != nil && (ctx.Err() != nil || r.lifetime.Err() != nil || errors.Is(err, errMethodDisabled) || errors.Is(context.Cause(methodCtx), errMethodDisabled))}
 				if err != nil && !event.Canceled {
 					event.Error = err.Error()
 				}
@@ -293,7 +304,7 @@ collect:
 		}
 	}
 	if len(failures) == 0 {
-		failures = append(failures, "нет доступной очереди NFQWS или включённых AWG-подключений")
+		failures = append(failures, "нет доступных включённых методов в выбранном пуле DoH: проверьте выключенные методы, NFQWS и AWG-подключения")
 	}
 	if ctx.Err() != nil {
 		failures = append(failures, ctx.Err().Error())
@@ -328,6 +339,19 @@ func validateResponse(raw []byte, query *mdns.Msg) (*mdns.Msg, error) {
 }
 
 func (r *Resolver) exchangeEndpoint(ctx context.Context, route string, u Upstream, wire []byte, q *mdns.Msg) (*mdns.Msg, error) {
+	methodCtx, release, err := r.methods.begin(ctx, route, u.Address)
+	if err != nil {
+		return nil, err
+	}
+	defer release()
+	response, err := r.exchangeEnabledEndpoint(methodCtx, route, u, wire, q)
+	if errors.Is(context.Cause(methodCtx), errMethodDisabled) {
+		return nil, errMethodDisabled
+	}
+	return response, err
+}
+
+func (r *Resolver) exchangeEnabledEndpoint(ctx context.Context, route string, u Upstream, wire []byte, q *mdns.Msg) (*mdns.Msg, error) {
 	endpoint, _ := url.Parse(u.Address)
 	ips, err := r.endpointIPs(ctx, route, u, endpoint.Hostname())
 	if err != nil {
@@ -538,9 +562,18 @@ func (r *Resolver) lookupEndpointIPs(ctx context.Context, route, host string) ([
 	var errs []string
 	for _, base := range []string{"https://1.1.1.1/dns-query", "https://8.8.8.8/dns-query"} {
 		endpoint, _ := url.Parse(base)
-		probe, done := context.WithTimeout(ctx, time.Second)
+		methodCtx, release, methodErr := r.methods.begin(ctx, route, base)
+		if methodErr != nil {
+			errs = append(errs, base+": "+methodErr.Error())
+			continue
+		}
+		probe, done := context.WithTimeout(methodCtx, time.Second)
 		body, err := r.doH(probe, route, endpoint, endpoint.Hostname(), wire)
 		done()
+		if errors.Is(context.Cause(methodCtx), errMethodDisabled) {
+			err = errMethodDisabled
+		}
+		release()
 		if err != nil {
 			errs = append(errs, err.Error())
 			continue

@@ -325,6 +325,7 @@ export interface AwgFallbackView { value: string; servers: AwgFallbackServer[] }
 
 // ---- Local DNS service. Upstreams are DoH; listeners accept UDP/TCP DNS. ----
 export interface DnsServerUpstream { address: string; bootstrap_ips: string[] }
+export interface DnsServerDisabledMethod { upstream: string; route: string }
 export interface DnsServerRule {
   id: string;
   enabled: boolean;
@@ -341,6 +342,7 @@ export interface DnsServerConfig {
   default_pool?: DnsServerUpstream[];
   logging_enabled: boolean;
   fast_dns: boolean;
+  disabled_methods?: DnsServerDisabledMethod[];
   awg_fallback: string;
   timeout_seconds: number;
   cache_size: number;
@@ -421,6 +423,7 @@ export interface DnsServerSchedulerCandidate {
   route_name: string;
   upstream: string;
   available: boolean;
+  disabled?: boolean;
   score: number;
   reliability: number;
   latency_ms: number;

@@ -25,6 +25,7 @@ type schedulerProbe struct {
 
 func schedulerProbeCandidates(cfg Config, routes []dnsroute.Route) []schedulerProbe {
 	eligible := eligibleRoutes(cfg, routes)
+	disabled := disabledMethodSet(cfg.DisabledMethods)
 	result := make([]schedulerProbe, 0)
 	seen := make(map[string]bool)
 	addPool := func(domain string, qtype uint16) {
@@ -32,7 +33,7 @@ func schedulerProbeCandidates(cfg Config, routes []dnsroute.Route) []schedulerPr
 		for _, upstream := range pool {
 			for _, route := range eligible {
 				key := schedulerKey(route.ID, upstream.Address)
-				if !route.Available || seen[key] {
+				if !route.Available || seen[key] || disabled[key] {
 					continue
 				}
 				seen[key] = true

@@ -30,6 +30,9 @@ func (s *Server) dnsServerConfig(w http.ResponseWriter, r *http.Request) {
 	current := s.app.DNSServer().Config()
 	cfg.DNSPort = current.DNSPort
 	cfg.LoggingEnabled = current.LoggingEnabled
+	// Method switches belong to the scheduler. Saving a stale DNS form must
+	// never turn a disabled route/provider pair back on, even if it sent [].
+	cfg.DisabledMethods = current.DisabledMethods
 	cfg.CacheTTLSeconds = current.CacheTTLSeconds
 	if in.CacheTTLSeconds != nil {
 		cfg.CacheTTLSeconds = *in.CacheTTLSeconds
@@ -116,6 +119,32 @@ func (s *Server) dnsServerScheduler(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 	writeJSON(w, 200, snapshot)
 }
+
+func (s *Server) dnsServerMethod(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Upstream string `json:"upstream"`
+		Route    string `json:"route"`
+		Enabled  *bool  `json:"enabled"`
+	}
+	if err := readJSON(r, &in); err != nil {
+		httpErr(w, http.StatusBadRequest, err)
+		return
+	}
+	if in.Enabled == nil {
+		httpErr(w, http.StatusBadRequest, fmt.Errorf("укажите enabled"))
+		return
+	}
+	s.portsMu.Lock()
+	defer s.portsMu.Unlock()
+	service := s.app.DNSServer()
+	if err := service.SetMethodEnabled(in.Upstream, in.Route, *in.Enabled); err != nil {
+		httpErr(w, http.StatusBadRequest, err)
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, http.StatusOK, service.Config())
+}
+
 func (s *Server) dnsServerStart(w http.ResponseWriter, r *http.Request) {
 	s.portsMu.Lock()
 	defer s.portsMu.Unlock()
