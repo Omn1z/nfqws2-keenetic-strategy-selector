@@ -450,7 +450,11 @@ func (svc *Service) awgClearMultiPolicyOS() {
 		table := awgMultiTableBase + i
 		mark := awgMultiMark(i)
 		pref := awgMultiPrefBySlot(i)
-		_, _ = awgRun("while ip rule del pref " + strconv.Itoa(pref) + " 2>/dev/null; do :; done")
+		// Scope the pref-based delete to our own selector: a bare `ip rule del pref N`
+		// removes ANY rule at that priority, and 71..134 overlaps the priorities
+		// Keenetic uses for its own access-policy rules (100+), silently killing
+		// policy routing until the router reboots.
+		_, _ = awgRun("while ip rule del pref " + strconv.Itoa(pref) + " fwmark " + mark + "/" + awgMultiMarkMask + " table " + strconv.Itoa(table) + " 2>/dev/null; do :; done")
 		_, _ = awgRun("while ip rule del fwmark " + mark + "/" + awgMultiMarkMask + " table " + strconv.Itoa(table) + " 2>/dev/null; do :; done")
 		_, _ = awgRun("ip route flush table " + strconv.Itoa(table) + " 2>/dev/null")
 	}
