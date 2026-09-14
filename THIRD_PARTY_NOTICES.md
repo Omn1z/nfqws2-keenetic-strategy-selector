@@ -1,10 +1,12 @@
 # Third-party notices
 
-DNS dependencies added for DNS Server. Exact dependency versions are recorded in go.mod and go.sum. Existing TG WS Proxy and AmneziaWG notices are distributed separately.
+DNS dependencies added for DNS Server. Exact panel dependency versions are recorded in go.mod and go.sum. Existing TG WS Proxy and AmneziaWG notices are distributed separately.
 
-## miekg/dns v1.1.72
+The AmneziaWG engine uses upstream v3.1.20260828, revision b5928efb6ca19f0153958460c3d141f04abc5c2e, with a separately maintained security dependency lock in internal/services/awg/engine-deps.mod and engine-deps.sum. These builds update the Go toolchain and dependencies without modifying the upstream protocol implementation. The same lock is embedded for VPS userspace provisioning.
 
-Source: https://github.com/miekg/dns/tree/v1.1.72
+## miekg/dns v1.1.73
+
+Source: https://github.com/miekg/dns/tree/v1.1.73
 
 BSD 3-Clause License
 

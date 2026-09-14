@@ -3,6 +3,7 @@ package awg
 import (
 	"context"
 	"crypto/sha256"
+	_ "embed"
 	"fmt"
 	"strings"
 	"time"
@@ -216,8 +217,44 @@ func aptInstallScript() string {
 	}, "\n")
 }
 
-// userspaceInstallScript builds exact upstream tags and verifies their Git
-// revisions. Existing executables are accepted only after capability/version
+// The same reviewed dependency files are consumed by router release builds and
+// embedded in the panel for VPS provisioning; no mutable remote lock is fetched.
+//
+//go:embed engine-deps.mod
+var engineDependencyLock string
+
+//go:embed engine-deps.sum
+var engineDependencySums string
+
+func engineDependencyVersion(module string) string {
+	for _, line := range strings.Split(engineDependencyLock, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) >= 2 && fields[0] == module {
+			return fields[1]
+		}
+	}
+	panic("missing version in embedded AWG dependency lock: " + module)
+}
+
+// Check every linked dependency and the toolchain, not just the unchanged AWG
+// protocol version: an older engine can have the same source revision but still
+// carry vulnerable libraries. These exact versions come from the shared lock.
+func userspaceEngineMetadataCheckScript() string {
+	return fmt.Sprintf(`printf '%%s\n' "$metadata" | awk '
+  /^[^\t]/ && $NF == "go%[1]s" { compiler=1 }
+  $1 == "path" && $2 == "github.com/amnezia-vpn/amneziawg-go/v3" { module=1 }
+  $1 == "build" && $2 == "vcs.revision=%[2]s" { revision=1 }
+  $1 == "dep" && $2 == "golang.org/x/crypto" && $3 == "%[3]s" { crypto=1 }
+  $1 == "dep" && $2 == "golang.org/x/net" && $3 == "%[4]s" { network=1 }
+  $1 == "dep" && $2 == "golang.org/x/sys" && $3 == "%[5]s" { systemdep=1 }
+  $1 == "=>" { replaced=1 }
+  END { exit !(compiler && module && revision && crypto && network && systemdep && !replaced) }
+'`, engineDependencyVersion("go"), AWGGoRevision,
+		engineDependencyVersion("golang.org/x/crypto"), engineDependencyVersion("golang.org/x/net"), engineDependencyVersion("golang.org/x/sys"))
+}
+
+// userspaceInstallScript builds exact upstream tags with our dependency lock and
+// verifies their Git revisions. Existing executables pass capability/version
 // checks; amneziawg-go --version is not useful (3.1 still prints 0.0.20250522).
 func userspaceInstallScript() string {
 	return fmt.Sprintf(`set -eu
@@ -228,13 +265,13 @@ apt-get install -y iproute2 iptables curl ca-certificates git make build-essenti
 work=$(mktemp -d /tmp/nfqws-awg.XXXXXXXX)
 trap 'rm -rf "$work"' EXIT HUP INT TERM
 case "$(uname -m)" in
-  x86_64) arch=amd64; checksum=12e6d6a191091ae27dc31f6efc630e3a3b8ba409baf3573d955b196fdf086005 ;;
-  aarch64|arm64) arch=arm64; checksum=ba611a53534135a81067240eff9508cd7e256c560edd5d8c2fef54f083c07129 ;;
+  x86_64) arch=amd64; checksum=d0f743b33e8d8945e6b1f432edd15785c70507121d6e2a723b21285eddf8b57b ;;
+  aarch64|arm64) arch=arm64; checksum=211ffced9dcb9633a55eac6364816ec0ddd951389a740e88fa8b3337971bdda0 ;;
   *) echo 'Unsupported VPS architecture for pinned Go toolchain'; exit 1 ;;
 esac
-runtime=/usr/local/lib/nfqws-awg/go1.25.7
-if ! "$runtime/bin/go" version 2>/dev/null | grep -Fq 'go1.25.7 '; then
-  curl --proto '=https' --tlsv1.2 -fsSL "https://go.dev/dl/go1.25.7.linux-$arch.tar.gz" -o "$work/go.tar.gz"
+runtime=/usr/local/lib/nfqws-awg/go%[8]s
+if ! "$runtime/bin/go" version 2>/dev/null | grep -Fq 'go%[8]s '; then
+  curl --proto '=https' --tlsv1.2 -fsSL "https://go.dev/dl/go%[8]s.linux-$arch.tar.gz" -o "$work/go.tar.gz"
   printf '%%s  %%s\n' "$checksum" "$work/go.tar.gz" | sha256sum -c -
   mkdir -p "$runtime"
   tar -xzf "$work/go.tar.gz" --strip-components=1 -C "$runtime"
@@ -245,14 +282,22 @@ if ! awg --version 2>/dev/null | grep -Fq '%[1]s'; then
   make -C "$work/tools/src" WITH_WGQUICK=yes WITH_SYSTEMDUNITS=yes
   make -C "$work/tools/src" WITH_WGQUICK=yes WITH_SYSTEMDUNITS=yes PREFIX=/usr install
 fi
-if ! "$runtime/bin/go" version -m /usr/bin/amneziawg-go 2>/dev/null | grep -Fq 'github.com/amnezia-vpn/amneziawg-go/v3' ||
-   ! "$runtime/bin/go" version -m /usr/bin/amneziawg-go 2>/dev/null | grep -Fq 'vcs.revision=%[4]s'; then
+engine_current() {
+  metadata=$("$runtime/bin/go" version -m "$1" 2>/dev/null) || return 1
+%[7]s
+}
+if ! engine_current /usr/bin/amneziawg-go; then
   git clone --depth 1 --branch '%[3]s' https://github.com/amnezia-vpn/amneziawg-go "$work/engine"
   [ "$(git -C "$work/engine" rev-parse HEAD)" = '%[4]s' ]
-  (cd "$work/engine" && GOTOOLCHAIN=local CGO_ENABLED=0 "$runtime/bin/go" build -buildvcs=true -trimpath -ldflags '-s -w' -o "$work/amneziawg-go" .)
+  cat > "$work/engine-deps.mod" <<'NFQWS_AWG_MOD'
+%[5]sNFQWS_AWG_MOD
+  cat > "$work/engine-deps.sum" <<'NFQWS_AWG_SUM'
+%[6]sNFQWS_AWG_SUM
+  (cd "$work/engine" && GOTOOLCHAIN=local CGO_ENABLED=0 "$runtime/bin/go" build -modfile="$work/engine-deps.mod" -mod=readonly -buildvcs=true -trimpath -ldflags '-s -w' -o "$work/amneziawg-go" .)
+  engine_current "$work/amneziawg-go"
   install -m755 "$work/amneziawg-go" /usr/bin/amneziawg-go
 fi
-"$runtime/bin/go" version -m /usr/bin/amneziawg-go | grep -Fq 'vcs.revision=%[4]s'
+engine_current /usr/bin/amneziawg-go
 awg --version | grep -F '%[1]s'
 test -x /usr/bin/awg-quick
 mkdir -p /usr/local/libexec
@@ -265,7 +310,8 @@ awk '
 ' /usr/bin/awg-quick > "$work/awg-quick-userspace"
 grep -Fq 'cmd /usr/bin/amneziawg-go' "$work/awg-quick-userspace"
 install -m755 "$work/awg-quick-userspace" /usr/local/libexec/nfqws-awg-quick-userspace
-echo 'userspace %[3]s ready'`, AWGToolsVersion, AWGToolsRevision, AWGGoVersion, AWGGoRevision)
+echo 'userspace %[3]s ready'`, AWGToolsVersion, AWGToolsRevision, AWGGoVersion, AWGGoRevision,
+		engineDependencyLock, engineDependencySums, userspaceEngineMetadataCheckScript(), engineDependencyVersion("go"))
 }
 
 func userspaceServiceScript(iface string) string {

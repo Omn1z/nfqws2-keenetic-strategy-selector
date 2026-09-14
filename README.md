@@ -64,7 +64,7 @@
 ## Установка
 
 ```sh
-wget -qO- https://raw.githubusercontent.com/Omn1z/nfqws2-keenetic-strategy-selector/v1.6.2/packaging/install.sh | sh
+wget -qO- https://raw.githubusercontent.com/Omn1z/nfqws2-keenetic-strategy-selector/v1.6.3/packaging/install.sh | sh
 ```
 
 После установки откройте `http://<IP‑роутера>:8090`.
@@ -246,20 +246,20 @@ keepalive-проба. Без ответа за 90 секунд пересозд�
 ## Обновление
 
 ```sh
-wget -qO- https://raw.githubusercontent.com/Omn1z/nfqws2-keenetic-strategy-selector/v1.6.2/packaging/update.sh | sh
+wget -qO- https://raw.githubusercontent.com/Omn1z/nfqws2-keenetic-strategy-selector/v1.6.3/packaging/update.sh | sh
 ```
 
 ## Удаление
 
 ```sh
-wget -qO- https://raw.githubusercontent.com/Omn1z/nfqws2-keenetic-strategy-selector/v1.6.2/packaging/uninstall.sh | sh
+wget -qO- https://raw.githubusercontent.com/Omn1z/nfqws2-keenetic-strategy-selector/v1.6.3/packaging/uninstall.sh | sh
 # или с удалением данных:
-wget -qO- https://raw.githubusercontent.com/Omn1z/nfqws2-keenetic-strategy-selector/v1.6.2/packaging/uninstall.sh | sh -s -- --purge
+wget -qO- https://raw.githubusercontent.com/Omn1z/nfqws2-keenetic-strategy-selector/v1.6.3/packaging/uninstall.sh | sh -s -- --purge
 ```
 
 ## Сборка из исходников
 
-Нужны Go ≥ 1.25.0 (CI: 1.25.7) и Node 20.19+ или 22.12+ (веб-интерфейс — React 19 + TypeScript + Tailwind на
+Нужны Go ≥ 1.26.0 (рекомендуется и используется в CI: 1.26.8) и Node 20.19+ или 22.12+ (веб-интерфейс — React 19 + TypeScript + Tailwind на
 Vite). Скрипты сборки сами собирают фронтенд (`npm`) в один встраиваемый файл,
 а затем линкуют бинарь.
 
@@ -270,7 +270,7 @@ powershell -File scripts/build.ps1 -Version v1.0.0   # Windows
 
 Бинарники появятся в `dist/` для `arm64`, `arm` (v7), `mipsle`, `mips`.
 
-Движок AmneziaWG собирается отдельно с Go 1.25.7:
+Движок AmneziaWG собирается отдельно с Go 1.26.8:
 
 ```sh
 sh scripts/build-engine.sh
@@ -280,6 +280,17 @@ powershell -File scripts/build-engine.ps1 -Go /path/to/go.exe
 Архивы `awg-engine-linux-<arch>.tar.gz` и обязательные SHA256-файлы появляются
 в `dist/`. Установщик проверяет контрольную сумму, архитектуру и поддержку 3.1
 до замены существующего движка.
+
+Исходники движка закреплены на AmneziaWG `v3.1.20260828`; зависимости для сборки
+роутера и userspace-движка на VPS зафиксированы отдельно в
+`internal/services/awg/engine-deps.mod` и `engine-deps.sum`. Они применяются через
+`-modfile`, без изменения upstream-кода протокола. При обновлении панели уже
+установленный движок заменяется отдельно кнопкой «Обновить движок».
+
+В CI релиз блокируется при найденных уязвимостях используемого Go-кода
+(`govulncheck`) или зависимостей интерфейса (`npm audit`). Проверка движка использует
+сборки с сохранёнными символами для всех четырёх архитектур. Для такой же проверки
+локально задайте `GOVULNCHECK` — путь к исполняемому файлу `govulncheck`.
 
 ## Поддерживаемые архитектуры
 

@@ -22,9 +22,51 @@ func TestEngineBuildInfoDetectsWireCapability(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			bi := &debug.BuildInfo{Main: debug.Module{Path: tc.path, Version: tc.version}, Settings: []debug.BuildSetting{{Key: "GOARCH", Value: "arm64"}, {Key: "vcs.revision", Value: tc.revision}}}
+			bi.GoVersion, bi.Deps = "go1.26.8", patchedEngineDeps()
 			got := engineBuildInfo(bi)
 			if got.AWG3Supported != tc.want31 || got.UpdateAvailable == tc.want31 || got.AwgVersion != tc.wantVersion || got.Arch != "arm64" || !got.Installed || got.TargetVersion != AWGEngineVersion {
 				t.Fatalf("unexpected engine info: %+v", got)
+			}
+		})
+	}
+}
+
+func patchedEngineDeps() []*debug.Module {
+	return []*debug.Module{
+		{Path: "golang.org/x/crypto", Version: "v0.57.0"},
+		{Path: "golang.org/x/net", Version: "v0.59.0"},
+		{Path: "golang.org/x/sys", Version: "v0.48.0"},
+	}
+}
+
+func TestEngineBuildInfoOffersSecurityRebuild(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		edit       func(*debug.BuildInfo)
+		wantUpdate bool
+	}{
+		{"patched build", func(*debug.BuildInfo) {}, false},
+		{"old compiler", func(b *debug.BuildInfo) { b.GoVersion = "go1.25.7" }, true},
+		{"unpatched 1.26", func(b *debug.BuildInfo) { b.GoVersion = "go1.26.7" }, true},
+		{"unpatched 1.27", func(b *debug.BuildInfo) { b.GoVersion = "go1.27.0" }, true},
+		{"patched 1.27", func(b *debug.BuildInfo) { b.GoVersion = "go1.27.1" }, false},
+		{"unknown compiler", func(b *debug.BuildInfo) { b.GoVersion = "" }, true},
+		{"old crypto", func(b *debug.BuildInfo) { b.Deps[0].Version = "v0.56.0" }, true},
+		{"old net", func(b *debug.BuildInfo) { b.Deps[1].Version = "v0.58.0" }, true},
+		{"old sys", func(b *debug.BuildInfo) { b.Deps[2].Version = "v0.47.0" }, true},
+		{"missing metadata", func(b *debug.BuildInfo) { b.Deps = nil }, true},
+		{"newer dependency", func(b *debug.BuildInfo) { b.Deps[0].Version = "v0.58.0" }, false},
+		{"old replacement", func(b *debug.BuildInfo) {
+			b.Deps[0].Replace = &debug.Module{Path: "golang.org/x/crypto", Version: "v0.42.0"}
+		}, true},
+		{"unknown replacement", func(b *debug.BuildInfo) { b.Deps[0].Replace = &debug.Module{Path: "../crypto"} }, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			bi := &debug.BuildInfo{GoVersion: "go1.26.8", Main: debug.Module{Path: "github.com/amnezia-vpn/amneziawg-go/v3", Version: AWGEngineVersion}, Deps: patchedEngineDeps()}
+			tc.edit(bi)
+			info := engineBuildInfo(bi)
+			if !info.AWG3Supported || info.UpdateAvailable != tc.wantUpdate {
+				t.Fatalf("security update must be independent of protocol support: %+v", info)
 			}
 		})
 	}

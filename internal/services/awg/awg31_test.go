@@ -278,7 +278,7 @@ func TestAWG31UserspaceQuickCreationOverride(t *testing.T) {
 		t.Fatal(err)
 	}
 	install := userspaceInstallScript()
-	start, end := strings.Index(install, "awk '\n"), strings.Index(install, "grep -Fq 'cmd /usr/bin/amneziawg-go'")
+	start, end := strings.Index(install, "awk '\n  /^add_if"), strings.Index(install, "grep -Fq 'cmd /usr/bin/amneziawg-go'")
 	if start < 0 || end < start {
 		t.Fatal("userspace override missing")
 	}
