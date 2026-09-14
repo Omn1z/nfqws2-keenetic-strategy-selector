@@ -64,7 +64,7 @@
 ## Установка
 
 ```sh
-wget -qO- https://raw.githubusercontent.com/Omn1z/nfqws2-keenetic-strategy-selector/v1.6.1/packaging/install.sh | sh
+wget -qO- https://raw.githubusercontent.com/Omn1z/nfqws2-keenetic-strategy-selector/v1.6.2/packaging/install.sh | sh
 ```
 
 После установки откройте `http://<IP‑роутера>:8090`.
@@ -246,15 +246,15 @@ keepalive-проба. Без ответа за 90 секунд пересозд�
 ## Обновление
 
 ```sh
-wget -qO- https://raw.githubusercontent.com/Omn1z/nfqws2-keenetic-strategy-selector/v1.6.1/packaging/update.sh | sh
+wget -qO- https://raw.githubusercontent.com/Omn1z/nfqws2-keenetic-strategy-selector/v1.6.2/packaging/update.sh | sh
 ```
 
 ## Удаление
 
 ```sh
-wget -qO- https://raw.githubusercontent.com/Omn1z/nfqws2-keenetic-strategy-selector/v1.6.1/packaging/uninstall.sh | sh
+wget -qO- https://raw.githubusercontent.com/Omn1z/nfqws2-keenetic-strategy-selector/v1.6.2/packaging/uninstall.sh | sh
 # или с удалением данных:
-wget -qO- https://raw.githubusercontent.com/Omn1z/nfqws2-keenetic-strategy-selector/v1.6.1/packaging/uninstall.sh | sh -s -- --purge
+wget -qO- https://raw.githubusercontent.com/Omn1z/nfqws2-keenetic-strategy-selector/v1.6.2/packaging/uninstall.sh | sh -s -- --purge
 ```
 
 ## Сборка из исходников

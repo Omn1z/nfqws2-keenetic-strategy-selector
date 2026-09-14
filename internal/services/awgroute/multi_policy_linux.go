@@ -446,6 +446,12 @@ func (svc *Service) awgClearMultiPolicyOS() {
 	_, _ = awgRun("iptables -w -t mangle -F " + awgMultiChain + " 2>/dev/null")
 	_, _ = awgRun("iptables -w -t mangle -X " + awgMultiChain + " 2>/dev/null")
 	_, _ = awgRun(awgMultiSharedCleanupShell())
+	awgClearMultiRouteRules(awgRun)
+	_, _ = awgRun("for s in $(ipset list -n 2>/dev/null | awk '/^" + awgMultiSetPrefix + "_[0-9][0-9][0-9]$/ {print $1}'); do ipset destroy \"$s\" 2>/dev/null; done")
+}
+
+// Clear every reserved slot, including stale rules from removed tunnels.
+func awgClearMultiRouteRules(run func(string) (string, error)) {
 	for i := 1; i <= awgMultiMax; i++ {
 		table := awgMultiTableBase + i
 		mark := awgMultiMark(i)
@@ -454,11 +460,10 @@ func (svc *Service) awgClearMultiPolicyOS() {
 		// removes ANY rule at that priority, and 71..134 overlaps the priorities
 		// Keenetic uses for its own access-policy rules (100+), silently killing
 		// policy routing until the router reboots.
-		_, _ = awgRun("while ip rule del pref " + strconv.Itoa(pref) + " fwmark " + mark + "/" + awgMultiMarkMask + " table " + strconv.Itoa(table) + " 2>/dev/null; do :; done")
-		_, _ = awgRun("while ip rule del fwmark " + mark + "/" + awgMultiMarkMask + " table " + strconv.Itoa(table) + " 2>/dev/null; do :; done")
-		_, _ = awgRun("ip route flush table " + strconv.Itoa(table) + " 2>/dev/null")
+		_, _ = run("while ip rule del pref " + strconv.Itoa(pref) + " fwmark " + mark + "/" + awgMultiMarkMask + " table " + strconv.Itoa(table) + " 2>/dev/null; do :; done")
+		_, _ = run("while ip rule del fwmark " + mark + "/" + awgMultiMarkMask + " table " + strconv.Itoa(table) + " 2>/dev/null; do :; done")
+		_, _ = run("ip route flush table " + strconv.Itoa(table) + " 2>/dev/null")
 	}
-	_, _ = awgRun("for s in $(ipset list -n 2>/dev/null | awk '/^" + awgMultiSetPrefix + "_[0-9][0-9][0-9]$/ {print $1}'); do ipset destroy \"$s\" 2>/dev/null; done")
 }
 
 func (svc *Service) awgStartMultiPolicyRefresh() {
