@@ -64,10 +64,13 @@
 ## Установка
 
 ```sh
-wget -qO- https://raw.githubusercontent.com/Omn1z/nfqws2-keenetic-strategy-selector/v1.6.3/packaging/install.sh | sh
+wget -qO- https://github.com/Omn1z/nfqws2-keenetic-strategy-selector/releases/latest/download/install.sh | sh
 ```
 
 После установки откройте `http://<IP‑роутера>:8090`.
+
+Ссылки `/releases/latest/download/` всегда ведут к последнему стабильному релизу.
+Команды установки, обновления и удаления не требуют подстановки номера версии.
 
 Сервис ставится как `/opt/etc/init.d/S52nfqws2-strategy` (автостарт), данные — в
 `/opt/etc/nfqws2-strategy/`.
@@ -246,15 +249,15 @@ keepalive-проба. Без ответа за 90 секунд пересозд�
 ## Обновление
 
 ```sh
-wget -qO- https://raw.githubusercontent.com/Omn1z/nfqws2-keenetic-strategy-selector/v1.6.3/packaging/update.sh | sh
+wget -qO- https://github.com/Omn1z/nfqws2-keenetic-strategy-selector/releases/latest/download/update.sh | sh
 ```
 
 ## Удаление
 
 ```sh
-wget -qO- https://raw.githubusercontent.com/Omn1z/nfqws2-keenetic-strategy-selector/v1.6.3/packaging/uninstall.sh | sh
+wget -qO- https://github.com/Omn1z/nfqws2-keenetic-strategy-selector/releases/latest/download/uninstall.sh | sh
 # или с удалением данных:
-wget -qO- https://raw.githubusercontent.com/Omn1z/nfqws2-keenetic-strategy-selector/v1.6.3/packaging/uninstall.sh | sh -s -- --purge
+wget -qO- https://github.com/Omn1z/nfqws2-keenetic-strategy-selector/releases/latest/download/uninstall.sh | sh -s -- --purge
 ```
 
 ## Сборка из исходников

@@ -1,6 +1,6 @@
 #!/bin/sh
 # nfqws2-strategy installer for Keenetic / Entware.
-# Usage:  wget -qO- https://raw.githubusercontent.com/Omn1z/nfqws2-keenetic-strategy-selector/v1.6.2/packaging/install.sh | sh
+# Usage:  wget -qO- https://github.com/Omn1z/nfqws2-keenetic-strategy-selector/releases/latest/download/install.sh | sh
 set -e
 
 # ----- change this before publishing -----

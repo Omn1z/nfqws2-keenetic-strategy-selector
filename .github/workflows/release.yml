@@ -107,6 +107,12 @@ jobs:
           pattern: release-*
           path: dist
           merge-multiple: true
+      - name: Include installation scripts
+        run: |
+          for script in install update uninstall; do
+            sh -n "packaging/$script.sh"
+            cp "packaging/$script.sh" "dist/$script.sh"
+          done
       - name: Extract changelog and verify release files
         run: |
           sh scripts/release-notes.sh "$RELEASE_TAG" CHANGELOG.md > release-notes.md
@@ -120,9 +126,13 @@ jobs:
           test -s TGWS-LICENSE.txt
           test -s AMNEZIAWG-LICENSE.txt
           test -s THIRD-PARTY-NOTICES.txt
-          test "$(find . -maxdepth 1 -type f | wc -l)" -eq 15
+          for script in install update uninstall; do
+            test -s "$script.sh"
+          done
+          test "$(find . -maxdepth 1 -type f | wc -l)" -eq 18
           sha256sum nfqws2-strategy-linux-* awg-engine-linux-*.tar.gz \
-            TGWS-LICENSE.txt AMNEZIAWG-LICENSE.txt THIRD-PARTY-NOTICES.txt > SHA256SUMS
+            TGWS-LICENSE.txt AMNEZIAWG-LICENSE.txt THIRD-PARTY-NOTICES.txt \
+            install.sh update.sh uninstall.sh > SHA256SUMS
       - name: Upload all assets to a draft and publish
         run: |
           prerelease=(--prerelease=false)
