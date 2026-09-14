@@ -72,6 +72,9 @@ wget -qO- https://github.com/Omn1z/nfqws2-keenetic-strategy-selector/releases/la
 Ссылки `/releases/latest/download/` всегда ведут к последнему стабильному релизу.
 Команды установки, обновления и удаления не требуют подстановки номера версии.
 
+Если `wget` выдаёт `not an http or ftp url` для HTTPS-ссылки, замените в команде
+`wget` на `/opt/bin/wget` — версию из Entware с поддержкой HTTPS.
+
 Сервис ставится как `/opt/etc/init.d/S52nfqws2-strategy` (автостарт), данные — в
 `/opt/etc/nfqws2-strategy/`.
 
