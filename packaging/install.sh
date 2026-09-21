@@ -162,9 +162,44 @@ repair_nfqw2_config() {
   "$ENGINE_INIT" restart >/dev/null 2>&1 || true
 }
 
-install_dependencies
-install_engine
-repair_nfqw2_config
+# The upstream OpenWrt init recreates nfqws_pre/nfqws_post on every restart.
+# If the panel has already created its bypass helper, keep it attached after a
+# package upgrade as well as after a normal service restart. This is idempotent
+# and intentionally limited to the native OpenWrt layout.
+ensure_bypass_init_hook() {
+  [ "$PLATFORM" = openwrt ] || return 0
+  bypass=/etc/nfqws2/nfqws-bypass.sh
+  [ -x "$bypass" ] || return 0
+  [ -f "$ENGINE_INIT" ] || return 0
+  marker='# nfqws2-strategy: reapply NFQUEUE bypass'
+  if ! grep -Fq "$marker" "$ENGINE_INIT"; then
+    tmp="$ENGINE_INIT.n2s-new"
+    awk -v marker="$marker" -v helper="$bypass" '
+      { print }
+      $0 ~ /^[[:space:]]*system_config([[:space:]]|$)/ && $0 !~ /system_config[[:space:]]*\(\)/ {
+        print marker
+        print "[ -x '\''" helper "'\'' ] && '\''" helper "'\'' iptables >/dev/null 2>&1 || true"
+        print "[ -x '\''" helper "'\'' ] && '\''" helper "'\'' ip6tables >/dev/null 2>&1 || true"
+      }
+    ' "$ENGINE_INIT" > "$tmp" || { rm -f "$tmp"; return 0; }
+    grep -Fq "$marker" "$tmp" || { rm -f "$tmp"; say "warning: NFQWS2 init has no system_config anchor"; return 0; }
+    [ -f "$ENGINE_INIT.n2s-bak" ] || cp "$ENGINE_INIT" "$ENGINE_INIT.n2s-bak"
+    chmod +x "$tmp"
+    mv "$tmp" "$ENGINE_INIT"
+  fi
+  "$ENGINE_INIT" firewall_iptables >/dev/null 2>&1 || true
+  "$bypass" iptables >/dev/null 2>&1 || true
+  "$bypass" ip6tables >/dev/null 2>&1 || true
+}
+
+if [ "${N2S_SKIP_DEPS:-0}" = 1 ]; then
+  say "skipping package/dependency setup (N2S_SKIP_DEPS=1)"
+else
+  install_dependencies
+  install_engine
+  repair_nfqw2_config
+fi
+ensure_bypass_init_hook
 if [ "${N2S_DEPS_ONLY:-0}" = 1 ]; then
   say "NFQWS2 and runtime dependencies are ready"
   exit 0

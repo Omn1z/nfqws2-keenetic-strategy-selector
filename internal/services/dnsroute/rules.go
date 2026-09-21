@@ -3,9 +3,10 @@ package dnsroute
 import (
 	"fmt"
 	"net"
-	"os"
 	"strconv"
 	"strings"
+
+	routerpath "nfqws2strategy/internal/tools/path"
 )
 
 const (
@@ -24,14 +25,7 @@ const (
 	maxRouteSlots  = 128
 )
 
-var hookPath = dnsHookPath()
-
-func dnsHookPath() string {
-	if _, err := os.Stat("/etc/openwrt_release"); err == nil {
-		return "/etc/nfqws2-strategy/93-nfqws-dns.sh"
-	}
-	return "/opt/etc/ndm/netfilter.d/93-nfqws-dns.sh"
-}
+var hookPath = routerpath.Path(routerpath.DNSHook)
 
 func routeMark(slot int) string     { return fmt.Sprintf("0x%08x", routeMarkBase+uint32(slot)) }
 func routeSelector(slot int) string { return routeMark(slot) + "/" + routeMarkMask }

@@ -10,6 +10,7 @@ import (
 
 	"nfqws2strategy/internal/tools/backup"
 	"nfqws2strategy/internal/tools/logbuf"
+	routerpath "nfqws2strategy/internal/tools/path"
 )
 
 // BackupBuild streams a sealed archive of all selector state into w. Nothing
@@ -70,17 +71,16 @@ func (a *App) BackupRestore(r io.Reader) (int, error) {
 func (a *App) backupRoots() []string {
 	roots := []string{a.dataDir()}
 	paths := []string{
-		"/opt/etc/amnezia/amneziawg",
-		"/etc/amnezia/amneziawg",
-		"/opt/etc/ndm/netfilter.d/90-awg2.sh",
+		routerpath.Path(routerpath.AWGConfigDir),
+		routerpath.Path(routerpath.AWGHook),
 	}
-	if _, err := os.Stat("/etc/openwrt_release"); err == nil {
+	if routerpath.IsOpenWrt() {
 		paths = append(paths,
-			"/etc/nfqws2-strategy/90-awg2.sh",
-			"/etc/nfqws2-strategy/91-awg2-multi.sh",
-			"/etc/nfqws2-strategy/92-awg2-fw4.sh",
-			"/etc/nfqws2-strategy/91-n2s-port-forward.sh",
-			"/etc/nfqws2-strategy/93-nfqws-dns.sh",
+			routerpath.Path(routerpath.AWGHook),
+			routerpath.Path(routerpath.AWGMultiHook),
+			routerpath.Path(routerpath.AWGFW4Hook),
+			routerpath.Path(routerpath.PortForwardHook),
+			routerpath.Path(routerpath.DNSHook),
 		)
 	}
 	for _, p := range paths {
@@ -95,7 +95,7 @@ func (a *App) dataDir() string {
 	if a.Cfg != nil && a.Cfg.DataDir != "" {
 		return a.Cfg.DataDir
 	}
-	return "/opt/etc/nfqws2-strategy"
+	return routerpath.Path(routerpath.DataDir)
 }
 
 func dedupRoots(in []string) []string {

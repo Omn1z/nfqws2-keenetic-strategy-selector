@@ -13,14 +13,16 @@ import (
 	"time"
 
 	"nfqws2strategy/internal/tools/logbuf"
+	routerpath "nfqws2strategy/internal/tools/path"
 	"nfqws2strategy/internal/tools/shell"
 	"nfqws2strategy/internal/tools/strs"
 )
 
 const (
-	hookPath       = ""
-	legacyHookPath = "/opt/etc/ndm/netfilter.d/92-n2s-arp-spoof.sh"
+	hookPath = ""
 )
+
+var legacyHookPath = routerpath.Path(routerpath.ARPSpoofHook)
 
 func (s *Service) applyConfig(cfg Config) error {
 	return s.applyConfigLinux(cfg, true)

@@ -16,6 +16,7 @@ import (
 
 	"nfqws2strategy/internal/tools/logbuf"
 	"nfqws2strategy/internal/tools/netmon"
+	routerpath "nfqws2strategy/internal/tools/path"
 )
 
 // ErrNeedInstall signals that a packet capture needs tcpdump installed; callers
@@ -27,7 +28,11 @@ func Path() string {
 	if p, err := exec.LookPath("tcpdump"); err == nil {
 		return p
 	}
-	for _, p := range []string{"/opt/sbin/tcpdump", "/opt/bin/tcpdump", "/usr/sbin/tcpdump"} {
+	for _, p := range []string{
+		routerpath.Path(routerpath.TcpdumpOptDir, "sbin", "tcpdump"),
+		routerpath.Path(routerpath.TcpdumpOptDir, "bin", "tcpdump"),
+		routerpath.Path(routerpath.TcpdumpSystemDir, "tcpdump"),
+	} {
 		if _, err := os.Stat(p); err == nil {
 			return p
 		}
@@ -100,8 +105,10 @@ func packageManager() (string, bool) {
 	if p, err := exec.LookPath("opkg"); err == nil {
 		return p, false
 	}
-	if _, err := os.Stat("/opt/bin/opkg"); err == nil {
-		return "/opt/bin/opkg", false
+	if opkg := routerpath.Path(routerpath.EntwareOpkg); opkg != "" {
+		if _, err := os.Stat(opkg); err == nil {
+			return opkg, false
+		}
 	}
 	return "", false
 }

@@ -15,6 +15,7 @@ import (
 
 	"nfqws2strategy/internal/services/awg"
 	"nfqws2strategy/internal/tools/config"
+	routerpath "nfqws2strategy/internal/tools/path"
 	"nfqws2strategy/internal/tools/store"
 )
 
@@ -186,8 +187,10 @@ func (svc *Service) TeardownRouting() {
 
 // opkgBin returns the Entware opkg path (used by the AWG2 engine install).
 func opkgBin() string {
-	if _, err := os.Stat("/opt/bin/opkg"); err == nil {
-		return "/opt/bin/opkg"
+	if opkg := routerpath.Path(routerpath.EntwareOpkg); opkg != "" {
+		if _, err := os.Stat(opkg); err == nil {
+			return opkg
+		}
 	}
 	return "opkg"
 }

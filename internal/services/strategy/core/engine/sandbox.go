@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"nfqws2strategy/internal/tools/config"
+	routerpath "nfqws2strategy/internal/tools/path"
 )
 
 const (
@@ -359,12 +360,16 @@ func syslogTail(filter string, n int) string {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	tail := strconv.Itoa(n)
+	logDir := routerpath.Path(routerpath.StrategyLogDir)
 	cmds := []string{
 		"logread 2>/dev/null | grep -iE '" + filter + "' | tail -n " + tail,
 		"dmesg 2>/dev/null | grep -iE '" + filter + "' | tail -n " + tail,
-		"grep -iE '" + filter + "' /var/log/messages 2>/dev/null | tail -n " + tail,
-		"grep -iE '" + filter + "' /opt/var/log/messages 2>/dev/null | tail -n " + tail,
-		"grep -iE '" + filter + "' /opt/var/log/nfqws2.log 2>/dev/null | tail -n " + tail,
+	}
+	if logDir != "" {
+		cmds = append(cmds,
+			"grep -iE '"+filter+"' "+routerpath.Path(routerpath.StrategyLogDir, "messages")+" 2>/dev/null | tail -n "+tail,
+			"grep -iE '"+filter+"' "+routerpath.Path(routerpath.StrategyLogDir, "nfqws2.log")+" 2>/dev/null | tail -n "+tail,
+		)
 	}
 	for _, c := range cmds {
 		out, err := exec.CommandContext(ctx, "sh", "-c", c).Output()

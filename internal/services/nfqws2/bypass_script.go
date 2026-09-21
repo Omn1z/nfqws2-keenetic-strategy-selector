@@ -5,7 +5,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 
+	routerpath "nfqws2strategy/internal/tools/path"
 	"nfqws2strategy/internal/tools/shell"
 )
 
@@ -155,15 +157,16 @@ func ensureBypassScript(name string) error {
 // silently drops the bypass jump.  Entware/Keenetic has its own netfilter hook
 // lifecycle and is intentionally left untouched.
 func ensureBypassPersistence(confDir, initScript, bypassScript string) error {
-	if _, err := os.Stat("/etc/openwrt_release"); err != nil {
-		if _, err = os.Stat("/etc/rc.common"); err != nil {
-			return nil
-		}
+	if !routerpath.IsOpenWrt() {
+		return nil
 	}
 	if _, err := exec.LookPath("uci"); err != nil {
 		return nil
 	}
-	hook := filepath.Join(confDir, "nfqws-bypass-fw4.sh")
+	hook := routerpath.Path(routerpath.NFQWSBypassFW4)
+	if hook == "" || filepath.Dir(hook) != confDir {
+		hook = filepath.Join(confDir, "nfqws-bypass-fw4.sh")
+	}
 	body := fmt.Sprintf("#!/bin/sh\n%s firewall_iptables >/dev/null 2>&1 || true\n%s iptables >/dev/null 2>&1 || true\n", shell.Quote(initScript), shell.Quote(bypassScript))
 	if err := os.WriteFile(hook, []byte(body), 0o755); err != nil {
 		return err
@@ -177,6 +180,102 @@ func ensureBypassPersistence(confDir, initScript, bypassScript string) error {
 		"uci set firewall.nfqws2_bypass_fw4.fw4_compatible=1; uci commit firewall"
 	if out, err := exec.Command("sh", "-c", cmd).CombinedOutput(); err != nil {
 		return fmt.Errorf("uci include: %v: %s", err, out)
+	}
+	return nil
+}
+
+// ensureBypassInitHook keeps the dedicated jump alive across an NFQWS2
+// restart. The upstream init recreates nfqws_pre/nfqws_post after every
+// firewall_iptables call, while the fw4 UCI include only covers firewall
+// reloads. Patch one idempotent post-start line once; package updates are
+// repaired by Manager.Update and the installer.
+func ensureBypassInitHook(initScript, bypassScript string) error {
+	return ensureBypassInitHookOn(initScript, bypassScript, routerpath.IsOpenWrt())
+}
+
+func ensureBypassInitHookOn(initScript, bypassScript string, openwrt bool) error {
+	if !openwrt || initScript == "" || bypassScript == "" {
+		return nil
+	}
+	b, err := os.ReadFile(initScript)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	const marker = "# nfqws2-strategy: reapply NFQUEUE bypass"
+	if strings.Contains(string(b), marker) {
+		return nil
+	}
+	text := string(b)
+	line := marker + "\n[ -x " + shell.Quote(bypassScript) + " ] && " + shell.Quote(bypassScript) + " iptables >/dev/null 2>&1 || true\n[ -x " + shell.Quote(bypassScript) + " ] && " + shell.Quote(bypassScript) + " ip6tables >/dev/null 2>&1 || true"
+	idx := -1
+	offset := 0
+	for _, raw := range strings.SplitAfter(text, "\n") {
+		trimmed := strings.TrimSpace(raw)
+		if strings.HasPrefix(trimmed, "system_config") && !strings.Contains(trimmed, "()") && !strings.HasSuffix(trimmed, "{") {
+			idx = offset
+			break
+		}
+		offset += len(raw)
+	}
+	if idx < 0 {
+		return fmt.Errorf("NFQWS2 init has no system_config post-start anchor")
+	}
+	end := strings.IndexByte(text[idx:], '\n')
+	if end < 0 {
+		return fmt.Errorf("NFQWS2 init has malformed system_config line")
+	}
+	insertAt := idx + end + 1
+	updated := text[:insertAt] + line + "\n" + text[insertAt:]
+	// Keep one pristine copy for rollback. The temporary replacement must have
+	// a different name; otherwise a successful rename would remove the backup
+	// and leave only the already patched script behind.
+	backup := initScript + ".n2s-bak"
+	if _, statErr := os.Stat(backup); os.IsNotExist(statErr) {
+		file, createErr := os.OpenFile(backup, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o755)
+		if createErr != nil && !os.IsExist(createErr) {
+			return createErr
+		}
+		if createErr == nil {
+			if _, writeErr := file.Write(b); writeErr != nil {
+				_ = file.Close()
+				_ = os.Remove(backup)
+				return writeErr
+			}
+			if closeErr := file.Close(); closeErr != nil {
+				_ = os.Remove(backup)
+				return closeErr
+			}
+		}
+		if err := os.Chmod(backup, 0o755); err != nil {
+			return err
+		}
+	} else if statErr != nil {
+		return statErr
+	}
+	tmpFile, err := os.CreateTemp(filepath.Dir(initScript), filepath.Base(initScript)+".n2s-new-")
+	if err != nil {
+		return err
+	}
+	tmp := tmpFile.Name()
+	if _, err := tmpFile.Write([]byte(updated)); err != nil {
+		_ = tmpFile.Close()
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := tmpFile.Close(); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := os.Chmod(tmp, 0o755); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, initScript); err != nil {
+		_ = os.Remove(tmp)
+		return err
 	}
 	return nil
 }

@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"nfqws2strategy/internal/tools/logbuf"
+	routerpath "nfqws2strategy/internal/tools/path"
 	"nfqws2strategy/internal/tools/shell"
 	"nfqws2strategy/internal/tools/strs"
 )
@@ -23,14 +24,7 @@ const (
 	filterChain = "N2S_PFWD_FWD"
 )
 
-var hookPath = portForwardHookPath()
-
-func portForwardHookPath() string {
-	if _, err := os.Stat("/etc/openwrt_release"); err == nil {
-		return "/etc/nfqws2-strategy/91-n2s-port-forward.sh"
-	}
-	return "/opt/etc/ndm/netfilter.d/91-n2s-port-forward.sh"
-}
+var hookPath = routerpath.Path(routerpath.PortForwardHook)
 
 var reIface = regexp.MustCompile(`^[A-Za-z0-9_.:-]+$`)
 

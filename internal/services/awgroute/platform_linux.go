@@ -2,7 +2,11 @@
 
 package awgroute
 
-import "path/filepath"
+import (
+	"path/filepath"
+
+	routerpath "nfqws2strategy/internal/tools/path"
+)
 
 var (
 	awgSetDir         = awgSetDirOS()
@@ -16,29 +20,20 @@ var (
 )
 
 func awgSetDirOS() string {
-	if openWrtOS() {
-		return "/etc/nfqws2-strategy"
-	}
-	return "/opt/etc/nfqws2-strategy"
+	return routerpath.Path(routerpath.AWGSetDir)
 }
 
 func awgHookPathOS(name string) string {
-	if openWrtOS() {
+	if routerpath.IsOpenWrt() {
 		return filepath.Join(awgSetDir, name)
 	}
-	return filepath.Join("/opt/etc/ndm/netfilter.d", name)
+	return filepath.Join(filepath.Dir(routerpath.Path(routerpath.AWGHook)), name)
 }
 
 func awgNfqwsListsDirOS() string {
-	if openWrtOS() {
-		return "/etc/nfqws2/lists"
-	}
-	return "/opt/etc/nfqws2/lists"
+	return routerpath.Path(routerpath.AWGListsDir)
 }
 
 func awgFW4HookPathOS() string {
-	if openWrtOS() {
-		return filepath.Join(awgSetDir, "92-awg2-fw4.sh")
-	}
-	return filepath.Join("/opt/etc/ndm/netfilter.d", "92-awg2-fw4.sh")
+	return routerpath.Path(routerpath.AWGFW4Hook)
 }

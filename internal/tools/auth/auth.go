@@ -11,6 +11,8 @@ import (
 	"sync"
 	"time"
 
+	routerpath "nfqws2strategy/internal/tools/path"
+
 	"github.com/GehirnInc/crypt"
 	_ "github.com/GehirnInc/crypt/apr1_crypt"
 	_ "github.com/GehirnInc/crypt/md5_crypt"
@@ -19,7 +21,12 @@ import (
 )
 
 // Account databases to consult, in order. Same set nfqws-keenetic-web uses.
-var dbFiles = []string{"/opt/etc/shadow", "/etc/shadow", "/opt/etc/passwd", "/etc/passwd"}
+var dbFiles = []string{
+	routerpath.Path(routerpath.AuthEtcDir, "shadow"),
+	routerpath.Path(routerpath.EtcDir, "shadow"),
+	routerpath.Path(routerpath.AuthEtcDir, "passwd"),
+	routerpath.Path(routerpath.EtcDir, "passwd"),
+}
 
 // Verify reports whether user/password matches an account in the system DBs.
 func Verify(user, password string) bool {

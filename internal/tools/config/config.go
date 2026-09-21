@@ -4,6 +4,8 @@ import (
 	"os"
 	"regexp"
 	"strings"
+
+	routerpath "nfqws2strategy/internal/tools/path"
 )
 
 // Config holds runtime configuration. Most networking-related fields are
@@ -42,42 +44,22 @@ type Config struct {
 func Default() *Config {
 	c := &Config{
 		ListenAddr:     ":8090",
-		DataDir:        "/opt/etc/nfqws2-strategy",
-		Nfqws2Conf:     "/opt/etc/nfqws2/nfqws2.conf",
-		NfqwsBin:       "/opt/usr/bin/nfqws2",
+		DataDir:        routerpath.Path(routerpath.DataDir),
+		Nfqws2Conf:     routerpath.Path(routerpath.Nfqws2Conf),
+		NfqwsBin:       routerpath.Path(routerpath.Nfqws2Bin),
 		WANIfaces:      []string{"eth3"},
-		SystemBlobsDir: "/opt/etc/nfqws2/blobs",
-		LuaDir:         "/opt/etc/nfqws2/lua",
+		SystemBlobsDir: routerpath.Path(routerpath.Nfqws2BlobsDir),
+		LuaDir:         routerpath.Path(routerpath.Nfqws2LuaDir),
 		FirstQueue:     200,
 		PortBase:       50000,
 		PortsPerWorker: 200,
 		MainQueue:      300,
-		InitScript:     "/opt/etc/init.d/S52nfqws2-strategy",
-		Nfqws2Init:     "/opt/etc/init.d/S51nfqws2",
+		InitScript:     routerpath.Path(routerpath.StrategyInit),
+		Nfqws2Init:     routerpath.Path(routerpath.Nfqws2Init),
 		Nfqws2Repo:     "nfqws/nfqws2-keenetic",
 		Nfqws2Pkg:      "nfqws2-keenetic",
 	}
-	// The upstream nfqws2 package is installed below /opt on Entware, while
-	// its OpenWrt APK is rooted at /. Keep the router-specific defaults in one
-	// place so the panel can use the same binary on both systems.
-	if isOpenWrt() {
-		c.DataDir = "/etc/nfqws2-strategy"
-		c.Nfqws2Conf = "/etc/nfqws2/nfqws2.conf"
-		c.NfqwsBin = "/usr/bin/nfqws2"
-		c.SystemBlobsDir = "/etc/nfqws2/blobs"
-		c.LuaDir = "/etc/nfqws2/lua"
-		c.InitScript = "/etc/init.d/nfqws2-strategy"
-		c.Nfqws2Init = "/etc/init.d/nfqws2-keenetic"
-	}
 	return c
-}
-
-func isOpenWrt() bool {
-	if _, err := os.Stat("/etc/openwrt_release"); err == nil {
-		return true
-	}
-	_, err := os.Stat("/etc/rc.common")
-	return err == nil
 }
 
 // Anchored at line start (multiline) so commented-out example lines like

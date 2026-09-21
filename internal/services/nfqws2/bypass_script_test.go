@@ -53,3 +53,58 @@ func TestEnsureBypassScriptPreservesVendorHelper(t *testing.T) {
 		t.Fatalf("vendor helper was not made executable: %v", err)
 	}
 }
+
+func TestEnsureBypassInitHookIsIdempotentAndPostSystemConfig(t *testing.T) {
+	dir := t.TempDir()
+	init := filepath.Join(dir, "nfqws2-keenetic")
+	bypass := filepath.Join(dir, "nfqws-bypass.sh")
+	const source = "#!/bin/sh\nstart_service() {\n  firewall_iptables\n  system_config\n}\n"
+	if err := os.WriteFile(init, []byte(source), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureBypassInitHookOn(init, bypass, true); err != nil {
+		t.Fatal(err)
+	}
+	first, err := os.ReadFile(init)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(first)
+	marker := "# nfqws2-strategy: reapply NFQUEUE bypass"
+	if strings.Count(text, marker) != 1 || strings.Index(text, marker) <= strings.Index(text, "system_config") {
+		t.Fatalf("hook placement is wrong: %q", text)
+	}
+	backup, err := os.ReadFile(init + ".n2s-bak")
+	if err != nil {
+		t.Fatalf("original init backup missing: %v", err)
+	}
+	if string(backup) != source {
+		t.Fatalf("init backup was not pristine: %q", backup)
+	}
+	if err := ensureBypassInitHookOn(init, bypass, true); err != nil {
+		t.Fatal(err)
+	}
+	second, err := os.ReadFile(init)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(second) != text {
+		t.Fatal("second application changed an already patched init script")
+	}
+}
+
+func TestEnsureBypassInitHookLeavesUnsupportedPlatformUntouched(t *testing.T) {
+	dir := t.TempDir()
+	init := filepath.Join(dir, "nfqws2-keenetic")
+	const source = "#!/bin/sh\nsystem_config\n"
+	if err := os.WriteFile(init, []byte(source), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := ensureBypassInitHookOn(init, filepath.Join(dir, "bypass"), false); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := os.ReadFile(init)
+	if string(got) != source {
+		t.Fatal("non-OpenWrt init script was modified")
+	}
+}

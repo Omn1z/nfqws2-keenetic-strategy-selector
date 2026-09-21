@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"nfqws2strategy/internal/tools/logbuf"
+	routerpath "nfqws2strategy/internal/tools/path"
 	"nfqws2strategy/internal/tools/shell"
 	"nfqws2strategy/internal/tools/strs"
 )
@@ -63,7 +64,7 @@ func awgFW4ForwardRulesShell(ifaces []string) string {
 // the UCI include is what prevents a later `fw4 reload` from silently dropping
 // the forward accepts.
 func awgEnsureFW4IncludeOS(ifaces []string) {
-	if !openWrtOS() {
+	if !routerpath.IsOpenWrt() {
 		return
 	}
 	script := awgFW4ForwardRulesShell(ifaces)
@@ -92,7 +93,7 @@ func awgEnsureFW4IncludeOS(ifaces []string) {
 }
 
 func awgRemoveFW4IncludeOS() {
-	if !openWrtOS() {
+	if !routerpath.IsOpenWrt() {
 		return
 	}
 	_ = os.Remove(awgFW4HookPath)

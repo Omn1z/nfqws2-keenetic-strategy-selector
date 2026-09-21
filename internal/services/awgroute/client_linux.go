@@ -22,6 +22,7 @@ import (
 
 	"nfqws2strategy/internal/services/awg"
 	"nfqws2strategy/internal/tools/logbuf"
+	routerpath "nfqws2strategy/internal/tools/path"
 	"nfqws2strategy/internal/tools/shell"
 	"nfqws2strategy/internal/tools/strs"
 )
@@ -33,42 +34,12 @@ const awgClientTxQueueLen = 4096
 // one place so an APK install never downloads an engine to a directory that
 // the runtime cannot execute.
 var (
-	awgEngineDir = awgEngineDirOS()
-	awgClientDir = awgClientDirOS()
+	awgEngineDir = routerpath.Path(routerpath.AWGEngineDir)
+	awgClientDir = routerpath.Path(routerpath.AWGConfigDir)
 )
 
-func awgEngineDirOS() string {
-	if openWrtOS() {
-		// Keep an existing Entware engine usable during migration.  OpenWrt
-		// installs new assets in /usr/bin, but earlier panel builds placed the
-		// live daemon below /opt and its config below /opt/etc.
-		for _, dir := range []string{"/usr/bin", "/opt/usr/bin"} {
-			if st, err := os.Stat(filepath.Join(dir, "amneziawg-go")); err == nil && st.Mode().IsRegular() {
-				return dir
-			}
-		}
-		return "/usr/bin"
-	}
-	return "/opt/usr/bin"
-}
-
-func awgClientDirOS() string {
-	if openWrtOS() {
-		for _, dir := range []string{"/etc/amnezia/amneziawg", "/opt/etc/amnezia/amneziawg"} {
-			if st, err := os.Stat(dir); err == nil && st.IsDir() {
-				return dir
-			}
-		}
-		return "/etc/amnezia/amneziawg"
-	}
-	return "/opt/etc/amnezia/amneziawg"
-}
-
 func awgLegacyWatchdogPathOS() string {
-	if openWrtOS() {
-		return ""
-	}
-	return "/opt/etc/init.d/S53awg1-watchdog"
+	return routerpath.Path(routerpath.AWGLegacyWatchdog)
 }
 
 var awgIface = "awg0"
@@ -174,23 +145,18 @@ func (svc *Service) awgEngineInfoOS() EngineInfo {
 	return info
 }
 
-func openWrtOS() bool {
-	_, err := os.Stat("/etc/openwrt_release")
-	return err == nil
-}
-
 func awgTunReadyOS() bool {
 	if _, err := os.Stat("/dev/net/tun"); err != nil {
 		return false
 	}
-	if !openWrtOS() {
+	if !routerpath.IsOpenWrt() {
 		return true
 	}
 	return exec.Command("modprobe", "tun").Run() == nil
 }
 
 func ensureAWGTunOS(ctx context.Context) error {
-	if !openWrtOS() || awgTunReadyOS() {
+	if !routerpath.IsOpenWrt() || awgTunReadyOS() {
 		return nil
 	}
 	if _, err := exec.LookPath("apk"); err != nil {
@@ -214,7 +180,7 @@ func ensureAWGIPSetOS(ctx context.Context) error {
 	}
 
 	var cmd *exec.Cmd
-	if openWrtOS() {
+	if routerpath.IsOpenWrt() {
 		apk, err := exec.LookPath("apk")
 		if err != nil {
 			return fmt.Errorf("OpenWrt: не найден apk для установки ipset")
@@ -229,7 +195,7 @@ func ensureAWGIPSetOS(ctx context.Context) error {
 		return fmt.Errorf("установка ipset: %v: %s", err, strs.LastLines(strings.TrimSpace(string(out)), 4))
 	}
 	// OpenWrt may install the module without loading it into the running kernel.
-	if openWrtOS() {
+	if routerpath.IsOpenWrt() {
 		_ = exec.CommandContext(ctx, "modprobe", "ip_set").Run()
 		_ = exec.CommandContext(ctx, "modprobe", "ip_set_hash_net").Run()
 		_ = exec.CommandContext(ctx, "modprobe", "xt_set").Run()
@@ -256,7 +222,7 @@ func (svc *Service) awgInstallEngineOS() (string, error) {
 	if err := ensureAWGTunOS(opCtx); err != nil {
 		return "", err
 	}
-	if !openWrtOS() {
+	if !routerpath.IsOpenWrt() {
 		_ = exec.Command("sh", "-c", "modprobe tun 2>/dev/null; [ -e /dev/net/tun ] || { mkdir -p /dev/net; mknod /dev/net/tun c 10 200; }").Run()
 	}
 	asset := "awg-engine-linux-" + arch + ".tar.gz"

@@ -23,7 +23,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
-	"path"
+	stdpath "path"
 	"regexp"
 	"sort"
 	"strconv"
@@ -32,6 +32,7 @@ import (
 
 	"nfqws2strategy/internal/tools/config"
 	"nfqws2strategy/internal/tools/logbuf"
+	routerpath "nfqws2strategy/internal/tools/path"
 	"nfqws2strategy/internal/tools/shell"
 	"nfqws2strategy/internal/tools/strs"
 )
@@ -97,7 +98,7 @@ var reEngineVer = regexp.MustCompile(`version\s+(v?[0-9][0-9A-Za-z._-]*)`)
 // dir maps a kind to its server-owned directory (always forward-slash so it's
 // correct regardless of the build OS — these are router paths).
 func (m *Manager) dir(kind string) (string, bool) {
-	confDir := path.Dir(m.cfg.Nfqws2Conf) // /opt/etc/nfqws2
+	confDir := stdpath.Dir(m.cfg.Nfqws2Conf) // /opt/etc/nfqws2
 	switch kind {
 	case "conf":
 		return confDir, true
@@ -118,7 +119,7 @@ func (m *Manager) resolve(kind, name string) (basePath, base string, err error) 
 	if !ok {
 		return "", "", fmt.Errorf("неизвестный тип файла: %q", kind)
 	}
-	base = path.Base(strings.TrimSpace(name))
+	base = stdpath.Base(strings.TrimSpace(name))
 	base = strings.TrimSuffix(base, ".gz")
 	re := nameRe[kind]
 	if re == nil || !re.MatchString(base) {
@@ -408,8 +409,11 @@ func (m *Manager) Bytes(kind, name string) (data []byte, dlName string, err erro
 // out-of-band NFQUEUE bypass rules. Rebuilding first flushes the dedicated
 // bypass chain, dropping stale entries removed from the bypass lists.
 func (m *Manager) ApplyBypass() error {
-	confDir := path.Dir(m.cfg.Nfqws2Conf)
-	bypassScript := confDir + "/nfqws-bypass.sh"
+	confDir := stdpath.Dir(m.cfg.Nfqws2Conf)
+	bypassScript := routerpath.Path(routerpath.NFQWSBypass)
+	if bypassScript == "" || stdpath.Dir(bypassScript) != confDir {
+		bypassScript = stdpath.Join(confDir, "nfqws-bypass.sh")
+	}
 	initScript := m.cfg.Nfqws2Init
 	// The upstream nfqws2 package does not ship this helper on all targets
 	// (notably OpenWrt 25/APK builds).  Generate our small, self-contained
@@ -421,9 +425,12 @@ func (m *Manager) ApplyBypass() error {
 	if err := ensureBypassPersistence(confDir, initScript, bypassScript); err != nil {
 		return fmt.Errorf("prepare NFQUEUE bypass firewall hook: %w", err)
 	}
+	if err := ensureBypassInitHook(initScript, bypassScript); err != nil {
+		return fmt.Errorf("prepare NFQUEUE bypass restart hook: %w", err)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	cmd := shell.Quote(initScript) + " firewall_iptables && " + shell.Quote(bypassScript) + " iptables"
+	cmd := shell.Quote(initScript) + " firewall_iptables && " + shell.Quote(bypassScript) + " iptables && " + shell.Quote(bypassScript) + " ip6tables"
 	out, err := exec.CommandContext(ctx, "sh", "-c", cmd).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("NFQUEUE bypass apply failed: %v: %s", err, strings.TrimSpace(string(out)))
@@ -436,8 +443,10 @@ func packageManager() (string, bool) {
 	if _, err := exec.LookPath("apk"); err == nil {
 		return "apk", true
 	}
-	if _, err := os.Stat("/opt/bin/opkg"); err == nil {
-		return "/opt/bin/opkg", false
+	if opkg := routerpath.Path(routerpath.EntwareOpkg); opkg != "" {
+		if _, err := os.Stat(opkg); err == nil {
+			return opkg, false
+		}
 	}
 	if _, err := exec.LookPath("opkg"); err == nil {
 		return "opkg", false
@@ -629,8 +638,43 @@ func (m *Manager) Update() (string, error) {
 		logbuf.Append("nfqws2", "error", label+": "+err.Error())
 		return detail, fmt.Errorf("%s (%v)", strs.LastLines(detail, 4), err)
 	}
+	if err := m.reapplyBypassAfterUpdate(); err != nil {
+		logbuf.Append("nfqws2", "warn", "NFQUEUE bypass после обновления: "+err.Error())
+		return detail, fmt.Errorf("NFQUEUE bypass после обновления: %w", err)
+	}
 	logbuf.Append("nfqws2", "info", label+": готово")
 	return detail, nil
+}
+
+// reapplyBypassAfterUpdate repairs the upstream NFQWS2 init script after apk
+// replaces it and restores the dedicated jump if the user had configured a
+// bypass list. It is a no-op until the helper exists.
+func (m *Manager) reapplyBypassAfterUpdate() error {
+	if !routerpath.IsOpenWrt() {
+		return nil
+	}
+	confDir := stdpath.Dir(m.cfg.Nfqws2Conf)
+	bypass := routerpath.Path(routerpath.NFQWSBypass)
+	if bypass == "" || stdpath.Dir(bypass) != confDir {
+		bypass = stdpath.Join(confDir, "nfqws-bypass.sh")
+	}
+	if _, err := os.Stat(bypass); err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	if err := ensureBypassInitHook(m.cfg.Nfqws2Init, bypass); err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	cmd := shell.Quote(m.cfg.Nfqws2Init) + " firewall_iptables && " + shell.Quote(bypass) + " iptables && " + shell.Quote(bypass) + " ip6tables"
+	out, err := exec.CommandContext(ctx, "sh", "-c", cmd).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("%v: %s", err, strs.LastLines(strings.TrimSpace(string(out)), 4))
+	}
+	return nil
 }
 
 // ensureAPKFeed makes the signed NFQWS2 repository available to a panel that
@@ -642,7 +686,7 @@ func ensureAPKFeed(ctx context.Context, repo string) error {
 		return fmt.Errorf("invalid NFQWS2 repository: %q", repo)
 	}
 	base := "https://" + parts[0] + ".github.io/" + parts[1]
-	keyPath := "/etc/apk/keys/nfqws2-keenetic.pem"
+	keyPath := routerpath.Path(routerpath.EtcDir, "apk", "keys", "nfqws2-keenetic.pem")
 	keyURL := base + "/openwrt/nfqws2-keenetic.pem"
 	if _, err := os.Stat(keyPath); os.IsNotExist(err) {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, keyURL, nil)
@@ -662,7 +706,7 @@ func ensureAPKFeed(ctx context.Context, repo string) error {
 			}
 			return fmt.Errorf("NFQWS2 repository key: HTTP %d", resp.StatusCode)
 		}
-		if err := os.MkdirAll(path.Dir(keyPath), 0o755); err != nil {
+		if err := os.MkdirAll(stdpath.Dir(keyPath), 0o755); err != nil {
 			return err
 		}
 		tmp := keyPath + ".new"
@@ -674,14 +718,14 @@ func ensureAPKFeed(ctx context.Context, repo string) error {
 			return err
 		}
 	}
-	repoPath := "/etc/apk/repositories.d/nfqws2-keenetic.list"
+	repoPath := routerpath.Path(routerpath.EtcDir, "apk", "repositories.d", "nfqws2-keenetic.list")
 	line := base + "/openwrt/packages.adb\n"
 	old, err := os.ReadFile(repoPath)
 	if err != nil && !os.IsNotExist(err) {
 		return err
 	}
 	if !strings.Contains(string(old), base+"/openwrt/packages.adb") {
-		if err := os.MkdirAll(path.Dir(repoPath), 0o755); err != nil {
+		if err := os.MkdirAll(stdpath.Dir(repoPath), 0o755); err != nil {
 			return err
 		}
 		if len(old) > 0 && old[len(old)-1] != '\n' {
@@ -715,10 +759,7 @@ func (m *Manager) Reload() error {
 
 // readPid reads the engine pidfile (portable: file read only).
 func readPid() (int, error) {
-	pidPath := "/opt/var/run/nfqws2.pid"
-	if _, err := os.Stat("/etc/openwrt_release"); err == nil {
-		pidPath = "/var/run/nfqws2.pid"
-	}
+	pidPath := routerpath.Path(routerpath.Nfqws2PID)
 	b, err := os.ReadFile(pidPath)
 	if err != nil {
 		return 0, err
