@@ -201,6 +201,21 @@ func loadConfig() *config.Config {
 	if v := os.Getenv("N2S_INIT"); v != "" {
 		cfg.InitScript = v
 	}
+	if v := os.Getenv("N2S_NFQWS2_CONF"); v != "" {
+		cfg.Nfqws2Conf = v
+	}
+	if v := os.Getenv("N2S_NFQWS_BIN"); v != "" {
+		cfg.NfqwsBin = v
+	}
+	if v := os.Getenv("N2S_NFQWS2_INIT"); v != "" {
+		cfg.Nfqws2Init = v
+	}
+	if v := os.Getenv("N2S_LUA_DIR"); v != "" {
+		cfg.LuaDir = v
+	}
+	if v := os.Getenv("N2S_SYSTEM_BLOBS_DIR"); v != "" {
+		cfg.SystemBlobsDir = v
+	}
 	cfg.Version = version
 	cfg.Repo = repo
 	return cfg

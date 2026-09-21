@@ -40,7 +40,7 @@ type Config struct {
 }
 
 func Default() *Config {
-	return &Config{
+	c := &Config{
 		ListenAddr:     ":8090",
 		DataDir:        "/opt/etc/nfqws2-strategy",
 		Nfqws2Conf:     "/opt/etc/nfqws2/nfqws2.conf",
@@ -57,6 +57,27 @@ func Default() *Config {
 		Nfqws2Repo:     "nfqws/nfqws2-keenetic",
 		Nfqws2Pkg:      "nfqws2-keenetic",
 	}
+	// The upstream nfqws2 package is installed below /opt on Entware, while
+	// its OpenWrt APK is rooted at /. Keep the router-specific defaults in one
+	// place so the panel can use the same binary on both systems.
+	if isOpenWrt() {
+		c.DataDir = "/etc/nfqws2-strategy"
+		c.Nfqws2Conf = "/etc/nfqws2/nfqws2.conf"
+		c.NfqwsBin = "/usr/bin/nfqws2"
+		c.SystemBlobsDir = "/etc/nfqws2/blobs"
+		c.LuaDir = "/etc/nfqws2/lua"
+		c.InitScript = "/etc/init.d/nfqws2-strategy"
+		c.Nfqws2Init = "/etc/init.d/nfqws2-keenetic"
+	}
+	return c
+}
+
+func isOpenWrt() bool {
+	if _, err := os.Stat("/etc/openwrt_release"); err == nil {
+		return true
+	}
+	_, err := os.Stat("/etc/rc.common")
+	return err == nil
 }
 
 // Anchored at line start (multiline) so commented-out example lines like

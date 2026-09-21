@@ -3,12 +3,12 @@ package dnsroute
 import (
 	"fmt"
 	"net"
+	"os"
 	"strconv"
 	"strings"
 )
 
 const (
-	hookPath      = "/opt/etc/ndm/netfilter.d/93-nfqws-dns.sh"
 	hookSignature = "# NFQWS DNS Server: managed private socket routes"
 	postChain     = "N2S_DNS_POST"
 	preChain      = "N2S_DNS_PRE"
@@ -23,6 +23,15 @@ const (
 	routePriority  = 40
 	maxRouteSlots  = 128
 )
+
+var hookPath = dnsHookPath()
+
+func dnsHookPath() string {
+	if _, err := os.Stat("/etc/openwrt_release"); err == nil {
+		return "/etc/nfqws2-strategy/93-nfqws-dns.sh"
+	}
+	return "/opt/etc/ndm/netfilter.d/93-nfqws-dns.sh"
+}
 
 func routeMark(slot int) string     { return fmt.Sprintf("0x%08x", routeMarkBase+uint32(slot)) }
 func routeSelector(slot int) string { return routeMark(slot) + "/" + routeMarkMask }

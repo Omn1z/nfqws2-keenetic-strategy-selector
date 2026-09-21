@@ -74,23 +74,38 @@ func applyConnOptions(conn net.Conn, bufferSize int) {
 	}
 }
 
-// connectWS opens a TLS+WebSocket connection to host:443 presenting sniDomain
-// as the SNI/Host. Certificate verification is intentionally disabled — the
-// transport secrecy is provided by the MTProto layer, not TLS.
-func connectWS(ctx context.Context, host, sniDomain string, timeout time.Duration, path string, bufferSize int) (*rawWebSocket, error) {
-	return connectWSWithSNI(ctx, host, sniDomain, timeout, path, bufferSize, sniDomain)
+// connectWS opens a secure WebSocket connection to host:443 presenting
+// sniDomain as both the SNI and HTTP Host. The optional secure argument keeps
+// old internal callers source-compatible while exposing upstream's
+// --no-secure fallback (plain WebSocket over host:80).
+func connectWS(ctx context.Context, host, sniDomain string, timeout time.Duration, path string, bufferSize int, secure ...bool) (*rawWebSocket, error) {
+	return connectWSWithSNI(ctx, host, sniDomain, timeout, path, bufferSize, sniDomain, secure...)
 }
 
 // connectWSWithSNI keeps the HTTP Host independent from the TLS server name,
 // as required by the upstream domain-fronting fallback.
-func connectWSWithSNI(ctx context.Context, host, domain string, timeout time.Duration, path string, bufferSize int, sni string) (*rawWebSocket, error) {
+func connectWSWithSNI(ctx context.Context, host, domain string, timeout time.Duration, path string, bufferSize int, sni string, secure ...bool) (*rawWebSocket, error) {
 	if timeout <= 0 || timeout > 10*time.Second {
 		timeout = 10 * time.Second
 	}
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	dialer := &net.Dialer{Timeout: timeout}
-	raw, err := dialer.DialContext(ctx, "tcp", net.JoinHostPort(host, "443"))
+	useTLS := true
+	if len(secure) > 0 {
+		useTLS = secure[0]
+	}
+	port := "80"
+	if useTLS {
+		port = "443"
+	}
+	address := net.JoinHostPort(host, port)
+	// Tests and local relays may supply an explicit port. Production callers
+	// pass a bare IP/domain and continue to use 443/80 above.
+	if h, p, splitErr := net.SplitHostPort(host); splitErr == nil && h != "" && p != "" {
+		address = net.JoinHostPort(h, p)
+	}
+	raw, err := dialer.DialContext(ctx, "tcp", address)
 	if err != nil {
 		return nil, err
 	}
@@ -98,12 +113,20 @@ func connectWSWithSNI(ctx context.Context, host, domain string, timeout time.Dur
 	defer stopClose()
 	applyConnOptions(raw, bufferSize)
 
-	tconn := tls.Client(raw, &tls.Config{ServerName: sni, InsecureSkipVerify: true})
-	deadline, _ := ctx.Deadline()
-	_ = tconn.SetDeadline(deadline)
-	if err := tconn.HandshakeContext(ctx); err != nil {
-		_ = raw.Close()
-		return nil, err
+	var conn net.Conn = raw
+	if useTLS {
+		// Normal endpoints now verify the certificate like upstream v1.10.4.
+		// Domain-fronted attempts deliberately use a different SNI and retain
+		// compatibility with fronts whose certificate does not match Telegram's
+		// HTTP Host header.
+		tconn := tls.Client(raw, &tls.Config{ServerName: sni, InsecureSkipVerify: sni != domain})
+		deadline, _ := ctx.Deadline()
+		_ = tconn.SetDeadline(deadline)
+		if err := tconn.HandshakeContext(ctx); err != nil {
+			_ = raw.Close()
+			return nil, err
+		}
+		conn = tconn
 	}
 
 	keyRaw := make([]byte, 16)
@@ -116,22 +139,24 @@ func connectWSWithSNI(ctx context.Context, host, domain string, timeout time.Dur
 		"Sec-WebSocket-Key: " + wsKey + "\r\n" +
 		"Sec-WebSocket-Version: 13\r\n" +
 		"Sec-WebSocket-Protocol: binary\r\n\r\n"
-	if _, err := tconn.Write([]byte(req)); err != nil {
-		_ = tconn.Close()
+	if _, err := conn.Write([]byte(req)); err != nil {
+		_ = conn.Close()
 		return nil, err
 	}
 
-	br := bufio.NewReaderSize(tconn, 64*1024)
+	br := bufio.NewReaderSize(conn, 64*1024)
 	statusCode, statusLine, headers, err := readWSResponse(br)
 	if err != nil {
-		_ = tconn.Close()
+		_ = conn.Close()
 		return nil, err
 	}
 	if statusCode == 101 {
-		_ = tconn.SetDeadline(time.Time{}) // clear the handshake deadline
-		return &rawWebSocket{conn: tconn, r: br, domain: domain, sni: sni, idleTimeout: wsIdleTimeout}, nil
+		if useTLS {
+			_ = conn.SetDeadline(time.Time{}) // clear the handshake deadline
+		}
+		return &rawWebSocket{conn: conn, r: br, domain: domain, sni: sni, idleTimeout: wsIdleTimeout}, nil
 	}
-	_ = tconn.Close()
+	_ = conn.Close()
 	return nil, &wsHandshakeError{statusCode: statusCode, statusLine: statusLine, location: headers["location"]}
 }
 

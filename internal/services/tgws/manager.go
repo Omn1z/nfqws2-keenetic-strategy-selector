@@ -128,7 +128,8 @@ func (m *Manager) start() error {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	pool := newWSPool(ctx, cfg.PoolSize, cfg.BufferSize, m.stats, cfg.SNIFronting)
-	workerPool := newCFWorkerPool(ctx, cfg.PoolSize, cfg.BufferSize, m.stats)
+	secure := !cfg.DisableSecure
+	workerPool := newCFWorkerPool(ctx, cfg.PoolSize, cfg.BufferSize, m.stats, secure)
 	settings := handlerSettings{
 		secret:        secret,
 		dcRedirects:   copyDC(cfg.DCRedirects),
@@ -136,7 +137,7 @@ func (m *Manager) start() error {
 		fakeTLSDomain: cfg.FakeTLSDomain,
 		proxyProtocol: cfg.ProxyProtocol,
 		forceTestDC:   cfg.ForceTestDC,
-		fallback:      fallbackConfig{cfproxyEnabled: cfg.CFProxy, cfproxyWorkerDomains: append([]string{}, cfg.CFProxyWorkerDomains...), workerPool: workerPool},
+		fallback:      fallbackConfig{cfproxyEnabled: cfg.CFProxy, cfproxyWorkerDomains: append([]string{}, cfg.CFProxyWorkerDomains...), workerPool: workerPool, disableSecure: cfg.DisableSecure},
 		awgAvailable:  m.awgAvailable,
 	}
 	conns := newConnSet()
@@ -177,6 +178,9 @@ func (m *Manager) start() error {
 	}
 
 	log.Printf("tgws: upstream %s listening on :%d (fake-tls=%q, pool=%d)", UpstreamVersion, cfg.Port, censorDomains(cfg.FakeTLSDomain), cfg.PoolSize)
+	if cfg.DisableSecure {
+		log.Printf("tgws: CF proxy/Worker fallback uses plain WebSocket on port 80")
+	}
 	return nil
 }
 

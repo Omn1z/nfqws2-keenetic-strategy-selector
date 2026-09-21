@@ -142,7 +142,7 @@ func TestEffectiveZonesTruncation(t *testing.T) {
 		zone("ru", "exclude", true, "*.ru"),
 		zone("all", "include", true, "*"),
 		zone("dead", "exclude", true, "vk.com"), // shadowed by catch-all → dropped
-		src, // source-bound, kept regardless
+		src,                                     // source-bound, kept regardless
 	}}
 	ez := effectiveZones(r)
 	if len(ez) != 3 {

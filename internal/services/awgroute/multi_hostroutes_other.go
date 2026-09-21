@@ -2,7 +2,8 @@
 
 package awgroute
 
-func (svc *Service) awgApplyMultiHostRoutesOS()   {}
-func (svc *Service) awgClearMultiHostRoutesOS()   {}
-func (svc *Service) awgApplyMultiPolicyOS() error { return nil }
-func (svc *Service) awgClearMultiPolicyOS()       {}
+func (svc *Service) awgApplyMultiHostRoutesOS()          {}
+func (svc *Service) awgApplyMultiHostRoutesOSErr() error { return nil }
+func (svc *Service) awgClearMultiHostRoutesOS()          {}
+func (svc *Service) awgApplyMultiPolicyOS() error        { return nil }
+func (svc *Service) awgClearMultiPolicyOS()              {}

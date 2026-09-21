@@ -69,11 +69,21 @@ func (a *App) BackupRestore(r io.Reader) (int, error) {
 // every plausible location here is safe across different deployments.
 func (a *App) backupRoots() []string {
 	roots := []string{a.dataDir()}
-	for _, p := range []string{
+	paths := []string{
 		"/opt/etc/amnezia/amneziawg",
 		"/etc/amnezia/amneziawg",
 		"/opt/etc/ndm/netfilter.d/90-awg2.sh",
-	} {
+	}
+	if _, err := os.Stat("/etc/openwrt_release"); err == nil {
+		paths = append(paths,
+			"/etc/nfqws2-strategy/90-awg2.sh",
+			"/etc/nfqws2-strategy/91-awg2-multi.sh",
+			"/etc/nfqws2-strategy/92-awg2-fw4.sh",
+			"/etc/nfqws2-strategy/91-n2s-port-forward.sh",
+			"/etc/nfqws2-strategy/93-nfqws-dns.sh",
+		)
+	}
+	for _, p := range paths {
 		if _, err := os.Stat(p); err == nil {
 			roots = append(roots, p)
 		}

@@ -114,7 +114,7 @@ export function TopBar({ authEnabled, onMenu }: { authEnabled: boolean; onMenu: 
   const n2sUpdateFlow = async () => {
     const target = n2s?.latest;
     if (!target) return;
-    setN2sUpdating({ target, msg: "Выполняется opkg upgrade (может занять до минуты)…" });
+    setN2sUpdating({ target, msg: "Выполняется обновление пакета (может занять до минуты)…" });
     try {
       const r = await api<{ ok: boolean; output: string; error?: string }>("POST", "/api/nfqws2/update");
       if (!r.ok) { setN2sUpdating(null); toast("Обновление nfqws2: " + (r.error || "ошибка"), "err"); return; }

@@ -3,6 +3,7 @@ package tgws
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/tls"
@@ -301,5 +302,104 @@ func TestWSIdleProbeTLSReadTimeoutDoesNotPoisonConnection(t *testing.T) {
 				t.Fatal(err)
 			}
 		})
+	}
+}
+
+// TestConnectWSPlain exercises upstream's --no-secure path without binding a
+// privileged port: connectWSWithSNI accepts host:port for local relays/tests
+// while production callers continue to pass a bare host.
+func TestConnectWSPlain(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	request := make(chan string, 1)
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		_ = conn.SetReadDeadline(time.Now().Add(time.Second))
+		br := bufio.NewReader(conn)
+		var b strings.Builder
+		for {
+			line, readErr := br.ReadString('\n')
+			b.WriteString(line)
+			if readErr != nil || line == "\r\n" {
+				break
+			}
+		}
+		request <- b.String()
+		_, _ = io.WriteString(conn, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+	}()
+
+	ws, err := connectWSWithSNI(context.Background(), ln.Addr().String(), "plain.example", time.Second, "/apiws", 0, "plain.example", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ws.close()
+	select {
+	case req := <-request:
+		if !strings.HasPrefix(req, "GET /apiws HTTP/1.1\r\n") || !strings.Contains(req, "Host: plain.example\r\n") {
+			t.Fatalf("unexpected request: %q", req)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("plain WS server did not receive request")
+	}
+}
+
+func TestConnectWSSecure(t *testing.T) {
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	template := &x509.Certificate{SerialNumber: big.NewInt(2), NotBefore: time.Now().Add(-time.Hour), NotAfter: time.Now().Add(time.Hour)}
+	der, err := x509.CreateCertificate(rand.Reader, template, template, publicKey, privateKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cert := tls.Certificate{Certificate: [][]byte{der}, PrivateKey: privateKey}
+	ln, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{Certificates: []tls.Certificate{cert}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	request := make(chan string, 1)
+	go func() {
+		conn, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		br := bufio.NewReader(conn)
+		var b strings.Builder
+		for {
+			line, readErr := br.ReadString('\n')
+			b.WriteString(line)
+			if readErr != nil || line == "\r\n" {
+				break
+			}
+		}
+		request <- b.String()
+		_, _ = io.WriteString(conn, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+	}()
+
+	// A different SNI models upstream's SNI-fronting path. The client still
+	// performs a TLS handshake, while hostname verification is intentionally
+	// disabled for this fronted connection.
+	ws, err := connectWSWithSNI(context.Background(), ln.Addr().String(), "telegram.example", time.Second, "/apiws", 0, "front.example")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ws.close()
+	select {
+	case req := <-request:
+		if !strings.Contains(req, "Host: telegram.example\r\n") {
+			t.Fatalf("unexpected request: %q", req)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("secure WS server did not receive request")
 	}
 }

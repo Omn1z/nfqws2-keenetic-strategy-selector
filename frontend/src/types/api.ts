@@ -277,6 +277,7 @@ export interface TgwsConfig {
   proxy_protocol: boolean;
   force_test_dc: boolean;
   sni_fronting: boolean;
+  disable_secure: boolean;
   cfproxy: boolean;
   cfproxy_user_domain: string;
   cfproxy_worker_domain: string;
@@ -839,7 +840,7 @@ export interface Pcap {
 /** POST /api/devices/{ip}/pcap → a started capture, or a prompt to install tcpdump first. */
 export type PcapStart = Pcap | { need_install: true; package: string };
 
-/** POST /api/system/install → opkg result. */
+/** POST /api/system/install → apk/opkg result. */
 export interface InstallResult {
   ok: boolean;
   output: string;

@@ -32,6 +32,7 @@ import (
 
 	"nfqws2strategy/internal/tools/config"
 	"nfqws2strategy/internal/tools/logbuf"
+	"nfqws2strategy/internal/tools/shell"
 	"nfqws2strategy/internal/tools/strs"
 )
 
@@ -56,7 +57,7 @@ type File struct {
 // VersionInfo reports the installed engine version and (optionally) the latest
 // available release.
 type VersionInfo struct {
-	Package   string `json:"package"`         // opkg package version, e.g. "1.1.5"
+	Package   string `json:"package"`         // apk/opkg package version, e.g. "1.1.5"
 	Engine    string `json:"engine"`          // binary --version, e.g. "v0.9.5.1"
 	Latest    string `json:"latest"`          // newest release (v-stripped)
 	Available bool   `json:"available"`       // Latest newer than Package
@@ -67,7 +68,6 @@ type VersionInfo struct {
 const (
 	readCap   = 8 << 20  // cap a single in-editor read
 	uploadCap = 16 << 20 // cap an upload
-	pidFile   = "/opt/var/run/nfqws2.pid"
 )
 
 // allowed base extensions per kind (without the leading dot, .gz already stripped).
@@ -405,17 +405,25 @@ func (m *Manager) Bytes(kind, name string) (data []byte, dlName string, err erro
 }
 
 // ApplyBypass rebuilds nfqws2's IPv4 firewall chains and reapplies the
-// out-of-band NFQUEUE bypass rules. Rebuilding first drops stale RETURN rules
-// for entries the user removed from the bypass lists.
+// out-of-band NFQUEUE bypass rules. Rebuilding first flushes the dedicated
+// bypass chain, dropping stale entries removed from the bypass lists.
 func (m *Manager) ApplyBypass() error {
-	const bypassScript = "/opt/etc/nfqws2/nfqws-bypass.sh"
-	const initScript = "/opt/etc/init.d/S51nfqws2"
-	if _, err := os.Stat(bypassScript); err != nil {
-		return fmt.Errorf("NFQUEUE bypass script not found: %w", err)
+	confDir := path.Dir(m.cfg.Nfqws2Conf)
+	bypassScript := confDir + "/nfqws-bypass.sh"
+	initScript := m.cfg.Nfqws2Init
+	// The upstream nfqws2 package does not ship this helper on all targets
+	// (notably OpenWrt 25/APK builds).  Generate our small, self-contained
+	// helper on first use so the Bypass tab works after a clean install too.
+	// Existing vendor helpers are preserved and only made executable.
+	if err := ensureBypassScript(bypassScript); err != nil {
+		return fmt.Errorf("prepare NFQUEUE bypass script: %w", err)
+	}
+	if err := ensureBypassPersistence(confDir, initScript, bypassScript); err != nil {
+		return fmt.Errorf("prepare NFQUEUE bypass firewall hook: %w", err)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
-	cmd := initScript + " firewall_iptables && " + bypassScript + " iptables"
+	cmd := shell.Quote(initScript) + " firewall_iptables && " + shell.Quote(bypassScript) + " iptables"
 	out, err := exec.CommandContext(ctx, "sh", "-c", cmd).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("NFQUEUE bypass apply failed: %v: %s", err, strings.TrimSpace(string(out)))
@@ -424,11 +432,98 @@ func (m *Manager) ApplyBypass() error {
 	return nil
 }
 
-func opkgBin() string {
-	if _, err := os.Stat("/opt/bin/opkg"); err == nil {
-		return "/opt/bin/opkg"
+func packageManager() (string, bool) {
+	if _, err := exec.LookPath("apk"); err == nil {
+		return "apk", true
 	}
-	return "opkg"
+	if _, err := os.Stat("/opt/bin/opkg"); err == nil {
+		return "/opt/bin/opkg", false
+	}
+	if _, err := exec.LookPath("opkg"); err == nil {
+		return "opkg", false
+	}
+	return "", false
+}
+
+func parseAPKPackageVersion(output, pkg string) string {
+	lines := strings.Split(output, "\n")
+	versionLine := func(raw string) string {
+		line := strings.TrimSpace(raw)
+		if len(line) > 1 && line[0] >= '0' && line[0] <= '9' && strings.HasSuffix(line, ":") {
+			return strings.TrimSpace(strings.TrimSuffix(line, ":"))
+		}
+		return ""
+	}
+	// When repositories contain a newer candidate, `apk policy` can list it
+	// before the installed version. Prefer the version explicitly marked by
+	// the local database.
+	for i, raw := range lines {
+		if !strings.Contains(raw, "lib/apk/db/installed") {
+			continue
+		}
+		for j := i - 1; j >= 0; j-- {
+			if version := versionLine(lines[j]); version != "" {
+				return version
+			}
+		}
+	}
+	for _, raw := range lines {
+		line := strings.TrimSpace(raw)
+		if version := versionLine(line); version != "" {
+			return version
+		}
+		prefix := pkg + "-"
+		if strings.HasPrefix(line, prefix) {
+			rest := strings.TrimSpace(strings.TrimPrefix(line, prefix))
+			if i := strings.IndexByte(rest, ' '); i > 0 {
+				rest = rest[:i]
+			}
+			if strings.HasSuffix(rest, "description:") {
+				rest = strings.TrimSpace(strings.TrimSuffix(rest, "description:"))
+			}
+			if rest != "" {
+				return rest
+			}
+		}
+	}
+	return ""
+}
+
+func parseAPKInstalledVersion(output string) string {
+	lines := strings.Split(output, "\n")
+	for i, raw := range lines {
+		if !strings.Contains(raw, "lib/apk/db/installed") {
+			continue
+		}
+		for j := i - 1; j >= 0; j-- {
+			line := strings.TrimSpace(lines[j])
+			if len(line) > 1 && line[0] >= '0' && line[0] <= '9' && strings.HasSuffix(line, ":") {
+				return strings.TrimSpace(strings.TrimSuffix(line, ":"))
+			}
+		}
+	}
+	return ""
+}
+
+func apkPackageVersion(ctx context.Context, apk, pkg string) string {
+	// OpenWrt's apk `info -v` prints the package description, not a
+	// machine-readable version. `policy` keeps the installed version on its
+	// own line (for example `1.2.8:`) next to the local database marker. The
+	// info form is a compatibility fallback, but candidates without that marker
+	// are deliberately ignored.
+	for _, args := range [][]string{{"policy", pkg}, {"info", "-a", pkg}} {
+		out, err := exec.CommandContext(ctx, apk, args...).CombinedOutput()
+		if err != nil && len(out) == 0 {
+			continue
+		}
+		// Only a local-database marker proves installation.  The generic policy
+		// output also lists repository candidates, which must not make the UI
+		// report a missing engine as installed.
+		if version := parseAPKInstalledVersion(string(out)); version != "" {
+			return version
+		}
+	}
+	return ""
 }
 
 // Version reports the installed package + engine versions (fast, local).
@@ -436,14 +531,28 @@ func (m *Manager) Version() VersionInfo {
 	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
 	defer cancel()
 	info := VersionInfo{}
-	if out, err := exec.CommandContext(ctx, "sh", "-c",
-		opkgBin()+" status "+m.cfg.Nfqws2Pkg+" | awk -F': ' '/^Version:/{print $2}'").Output(); err == nil {
-		info.Package = strings.TrimSpace(string(out))
+	if pm, apk := packageManager(); pm != "" {
+		var out []byte
+		var err error
+		if apk {
+			info.Package = apkPackageVersion(ctx, pm, m.cfg.Nfqws2Pkg)
+		} else {
+			out, err = exec.CommandContext(ctx, "sh", "-c",
+				pm+" status "+m.cfg.Nfqws2Pkg+" | awk -F': ' '/^Version:/{print $2}'").Output()
+		}
+		if !apk && err == nil {
+			info.Package = strings.TrimSpace(string(out))
+		}
 	}
 	if out, err := exec.CommandContext(ctx, m.cfg.NfqwsBin, "--version").CombinedOutput(); err == nil {
 		if mm := reEngineVer.FindStringSubmatch(string(out)); mm != nil {
 			info.Engine = mm[1]
 		}
+	}
+	// A manually copied binary is still a valid NFQWS2 installation. Keep the
+	// UI useful even when no package database entry exists.
+	if info.Package == "" && info.Engine != "" {
+		info.Package = strings.TrimPrefix(info.Engine, "v")
 	}
 	return info
 }
@@ -483,27 +592,106 @@ func (m *Manager) CheckUpdate() VersionInfo {
 	}
 	info.Latest = strings.TrimPrefix(rel.TagName, "v")
 	info.URL = rel.HTMLURL
-	info.Available = info.Latest != "" && info.Package != "" && info.Latest != info.Package
+	// An APK/opkg package may be absent on a fresh panel install.  Still expose
+	// the release as actionable: the update endpoint uses `add`/`install` and
+	// therefore doubles as the NFQWS2 installer from the UI.
+	info.Available = info.Latest != "" && (info.Package == "" || info.Latest != info.Package)
 	return info
 }
 
-// Update upgrades ONLY the engine package via opkg (never the abandoned web
+// Update upgrades ONLY the engine package via the platform package manager (never the abandoned web
 // package, never a router reboot). It briefly bounces nfqws2. Returns trimmed
 // command output.
 func (m *Manager) Update() (string, error) {
-	opkg := opkgBin()
-	script := opkg + " update && " + opkg + " upgrade " + m.cfg.Nfqws2Pkg
-	logbuf.Append("nfqws2", "info", "opkg upgrade "+m.cfg.Nfqws2Pkg+"…")
+	pm, apk := packageManager()
+	if pm == "" {
+		return "", fmt.Errorf("package manager not found (apk/opkg)")
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 600*time.Second)
 	defer cancel()
+	if apk {
+		if err := ensureAPKFeed(ctx, m.cfg.Nfqws2Repo); err != nil {
+			return "", err
+		}
+	}
+	var script, label string
+	if apk {
+		script = pm + " update && " + pm + " add --upgrade " + m.cfg.Nfqws2Pkg
+		label = "apk install/upgrade " + m.cfg.Nfqws2Pkg
+	} else {
+		script = pm + " update && " + pm + " install " + m.cfg.Nfqws2Pkg
+		label = "opkg install/upgrade " + m.cfg.Nfqws2Pkg
+	}
+	logbuf.Append("nfqws2", "info", label+"…")
 	out, err := exec.CommandContext(ctx, "sh", "-c", script).CombinedOutput()
 	detail := strs.LastLines(strings.TrimSpace(string(out)), 20)
 	if err != nil {
-		logbuf.Append("nfqws2", "error", "opkg upgrade: "+err.Error())
+		logbuf.Append("nfqws2", "error", label+": "+err.Error())
 		return detail, fmt.Errorf("%s (%v)", strs.LastLines(detail, 4), err)
 	}
-	logbuf.Append("nfqws2", "info", "opkg upgrade: готово")
+	logbuf.Append("nfqws2", "info", label+": готово")
 	return detail, nil
+}
+
+// ensureAPKFeed makes the signed NFQWS2 repository available to a panel that
+// predates the unified installer.  It is intentionally idempotent and leaves
+// all firmware-provided repositories untouched.
+func ensureAPKFeed(ctx context.Context, repo string) error {
+	parts := strings.SplitN(strings.TrimSpace(repo), "/", 2)
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return fmt.Errorf("invalid NFQWS2 repository: %q", repo)
+	}
+	base := "https://" + parts[0] + ".github.io/" + parts[1]
+	keyPath := "/etc/apk/keys/nfqws2-keenetic.pem"
+	keyURL := base + "/openwrt/nfqws2-keenetic.pem"
+	if _, err := os.Stat(keyPath); os.IsNotExist(err) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, keyURL, nil)
+		if err != nil {
+			return fmt.Errorf("NFQWS2 repository key: %w", err)
+		}
+		req.Header.Set("User-Agent", "nfqws2-strategy")
+		resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
+		if err != nil {
+			return fmt.Errorf("NFQWS2 repository key: %w", err)
+		}
+		data, readErr := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK || readErr != nil || len(data) == 0 {
+			if readErr != nil {
+				return fmt.Errorf("NFQWS2 repository key: %w", readErr)
+			}
+			return fmt.Errorf("NFQWS2 repository key: HTTP %d", resp.StatusCode)
+		}
+		if err := os.MkdirAll(path.Dir(keyPath), 0o755); err != nil {
+			return err
+		}
+		tmp := keyPath + ".new"
+		if err := os.WriteFile(tmp, data, 0o644); err != nil {
+			return err
+		}
+		if err := os.Rename(tmp, keyPath); err != nil {
+			_ = os.Remove(tmp)
+			return err
+		}
+	}
+	repoPath := "/etc/apk/repositories.d/nfqws2-keenetic.list"
+	line := base + "/openwrt/packages.adb\n"
+	old, err := os.ReadFile(repoPath)
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	if !strings.Contains(string(old), base+"/openwrt/packages.adb") {
+		if err := os.MkdirAll(path.Dir(repoPath), 0o755); err != nil {
+			return err
+		}
+		if len(old) > 0 && old[len(old)-1] != '\n' {
+			old = append(old, '\n')
+		}
+		if err := os.WriteFile(repoPath, append(old, []byte(line)...), 0o644); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // Reload sends SIGHUP to the live nfqws2 daemon so it re-reads its config and
@@ -527,13 +715,17 @@ func (m *Manager) Reload() error {
 
 // readPid reads the engine pidfile (portable: file read only).
 func readPid() (int, error) {
-	b, err := os.ReadFile(pidFile)
+	pidPath := "/opt/var/run/nfqws2.pid"
+	if _, err := os.Stat("/etc/openwrt_release"); err == nil {
+		pidPath = "/var/run/nfqws2.pid"
+	}
+	b, err := os.ReadFile(pidPath)
 	if err != nil {
 		return 0, err
 	}
 	pid, err := strconv.Atoi(strings.TrimSpace(string(b)))
 	if err != nil || pid <= 0 {
-		return 0, fmt.Errorf("некорректный pid в %s", pidFile)
+		return 0, fmt.Errorf("некорректный pid в %s", pidPath)
 	}
 	return pid, nil
 }

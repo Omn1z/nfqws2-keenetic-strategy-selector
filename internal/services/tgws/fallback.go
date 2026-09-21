@@ -12,6 +12,7 @@ type fallbackConfig struct {
 	cfproxyEnabled       bool
 	cfproxyWorkerDomains []string
 	workerPool           *cfWorkerPool
+	disableSecure        bool
 }
 
 // attemptFallback tries each enabled fallback in order: CF worker, CF proxy
@@ -29,7 +30,7 @@ func attemptFallback(ctx context.Context, client io.Reader, clientWriter io.Writ
 		}
 	}
 	if cfg.cfproxyEnabled && !isTest {
-		if cfProxy(ctx, client, clientWriter, closeClient, relayInit, dc, reenc, stats, bal, splitter) {
+		if cfProxy(ctx, client, clientWriter, closeClient, relayInit, dc, reenc, stats, bal, splitter, cfg.disableSecure) {
 			return true
 		}
 	}
@@ -63,7 +64,7 @@ func cfWorker(ctx context.Context, client io.Reader, clientWriter io.Writer, clo
 				return false
 			}
 			log.Printf("tgws: DC%d -> CF worker %s", dc, censorDomains(candidate))
-			w, err := connectWS(ctx, candidate, candidate, 10*time.Second, cfWorkerPath(dc, targetIP), 0)
+			w, err := connectWS(ctx, candidate, candidate, 10*time.Second, cfWorkerPath(dc, targetIP), 0, !cfg.disableSecure)
 			if err == nil {
 				ws = w
 				break
@@ -91,7 +92,7 @@ func cfWorker(ctx context.Context, client io.Reader, clientWriter io.Writer, clo
 
 func cfProxy(ctx context.Context, client io.Reader, clientWriter io.Writer, closeClient func(),
 	relayInit []byte, dc int, reenc *reencryptionContext, stats *Stats,
-	bal *domainBalancer, splitter *messageSplitter) bool {
+	bal *domainBalancer, splitter *messageSplitter, disableSecure bool) bool {
 
 	var ws *rawWebSocket
 	chosen := ""
@@ -100,7 +101,7 @@ func cfProxy(ctx context.Context, client io.Reader, clientWriter io.Writer, clos
 			return false
 		}
 		domain := "kws" + itoa(dc) + "." + base
-		w, err := connectWS(ctx, domain, domain, 10*time.Second, "/apiws", 0)
+		w, err := connectWS(ctx, domain, domain, 10*time.Second, "/apiws", 0, !disableSecure)
 		if err == nil {
 			ws = w
 			chosen = base

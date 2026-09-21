@@ -42,11 +42,6 @@ const (
 	awgChain    = "AWG2_MARK"
 	awgSetInc   = "awg2_inc"
 	awgSetExc   = "awg2_exc"
-	// awgHookPath is the Keenetic ndm netfilter.d hook that re-installs our
-	// iptables state after each firewall rebuild. Prefixed 90- to run after
-	// Keenetic's own setup (and our nfqws2's 100- hook is independent).
-	awgHookPath = "/opt/etc/ndm/netfilter.d/90-awg2.sh"
-
 	// Domain-mask DNS proxy: transparently intercepts LAN :53 (via an iptables
 	// REDIRECT in the hook) and adds the IPs of matching names to the ipset.
 	// Bind 0.0.0.0 because iptables REDIRECT rewrites dst-IP to the primary IP
@@ -82,6 +77,9 @@ func (svc *Service) awgApplyRoutingOS() error {
 	}
 	if err := svc.awgEnsureClientUpForRouting("применения маршрутизации"); err != nil {
 		return fmt.Errorf("туннель awg0 не поднят — автоподнятие не удалось: %w", err)
+	}
+	if err := ensureAWGIPSetOS(svc.clientOpContext()); err != nil {
+		return fmt.Errorf("OpenWrt/маршрутизация: %w", err)
 	}
 	if other := awgMarkCollision(); other != "" {
 		return fmt.Errorf("на роутере уже есть ip rule с пересекающейся fwmark (%s) — применение отменено во избежание конфликта с policy-routing роутера", other)
@@ -176,6 +174,9 @@ func (svc *Service) awgRefreshRoutingOS() error {
 	if err := svc.awgEnsureClientUpForRouting("обновления зон"); err != nil {
 		logbuf.Append("awg2", "warn", "зоны сохранены, но туннель не поднялся автоматически: "+err.Error())
 		return err
+	}
+	if err := ensureAWGIPSetOS(svc.clientOpContext()); err != nil {
+		return fmt.Errorf("OpenWrt/маршрутизация: %w", err)
 	}
 	endpointIP := resolveHostIP(hostOf(cfg.Endpoint))
 	gw, wandev := awgDefaultRoute()

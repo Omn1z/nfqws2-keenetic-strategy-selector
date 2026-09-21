@@ -1,4 +1,4 @@
-# Cross-compile static binaries for common Keenetic/Entware architectures (Windows dev).
+# Cross-compile static binaries for common Keenetic/Entware/OpenWrt architectures (Windows dev).
 # Usage: powershell -File scripts/build.ps1 [-Version v1.0.0]
 param([string]$Version = "dev")
 
@@ -31,4 +31,5 @@ Build "arm64"  $null  $null        "arm64"
 Build "arm"    "7"    $null        "arm"
 Build "mipsle" $null  "softfloat"  "mipsle"
 Build "mips"   $null  "softfloat"  "mips"
+Build "amd64"  $null  $null         "amd64"
 Remove-Item Env:GOOS,Env:GOARCH,Env:CGO_ENABLED,Env:GOARM,Env:GOMIPS -ErrorAction SilentlyContinue

@@ -409,6 +409,7 @@ func awgFirewallHook(mode, endpointIP, wandev string, mtu int, dnsRedirect, chai
 	s.WriteString(ap("ip6tables", "mangle", "FORWARD", mssRule("i")))
 	s.WriteString(ins("ip6tables", "filter", "FORWARD", "-i "+awgIface+" -j ACCEPT"))
 	s.WriteString(ins("ip6tables", "filter", "FORWARD", "-o "+awgIface+" -j ACCEPT"))
+	s.WriteString(awgFW4ForwardRulesShell([]string{awgIface}))
 	for _, ln := range strings.Split(strings.TrimSpace(v6FilterExtras.String()), "\n") {
 		if strings.TrimSpace(ln) != "" {
 			s.WriteString("ip6tables -t filter " + ln + " 2>/dev/null || true\n")
@@ -455,6 +456,7 @@ func awgWriteHook(mode, endpointIP, wandev string, mtu int, dnsRedirect, chainEn
 	if err := os.WriteFile(awgHookPath, []byte(awgFirewallHook(mode, endpointIP, wandev, mtu, dnsRedirect, chainEnabled, tunnelV6, zones)), 0o755); err != nil {
 		return err
 	}
+	awgEnsureFW4IncludeOS([]string{awgIface})
 	if out, err := awgRun("sh " + awgHookPath); err != nil {
 		logbuf.Append("awg2", "warn", "firewall-хук: "+strs.LastLines(out, 2))
 	}

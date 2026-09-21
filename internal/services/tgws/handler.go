@@ -129,7 +129,9 @@ type clientHandler struct {
 }
 
 func newClientHandler(ctx context.Context, s handlerSettings, pool *wsPool, stats *Stats, bal *domainBalancer) *clientHandler {
-	return &clientHandler{ctx: ctx, settings: s, pool: pool, stats: stats, bal: bal, cooldown: newCooldownTracker(), connect: connectWS}
+	return &clientHandler{ctx: ctx, settings: s, pool: pool, stats: stats, bal: bal, cooldown: newCooldownTracker(), connect: func(ctx context.Context, host, domain string, timeout time.Duration, path string, bufferSize int) (*rawWebSocket, error) {
+		return connectWS(ctx, host, domain, timeout, path, bufferSize, true)
+	}}
 }
 
 func (h *clientHandler) handle(conn net.Conn) {

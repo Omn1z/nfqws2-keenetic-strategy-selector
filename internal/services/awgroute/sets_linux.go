@@ -120,18 +120,6 @@ func ipsetAddBatcher(ch <-chan ipsetAddReq) {
 // ipset membership for split-routing + on-disk persistence so the learned IPs and
 // the DNS proxy's seen-domains cache survive a panel restart / reboot.
 
-const (
-	awgSetDir     = "/opt/etc/nfqws2-strategy"
-	awgRecentFile = awgSetDir + "/awg2_recent.json"
-	// awgFMWMarker is the one-shot upgrade marker. Its absence on the first
-	// awgBuildSetsForce call after upgrading to first-match-wins triggers a
-	// fixup: flush awg2_inc/exc/_6, drop awg2_recent.json, force-rebuild
-	// ignoring lastZonesHash. Without this, stale entries from the old
-	// exclude-wins era would keep RETURNing tunnel traffic for IPs that
-	// under the new semantics should be marked through awg0.
-	awgFMWMarker = awgSetDir + "/.awg2_fmw_v1"
-)
-
 // awgEffectiveMode, isMaskEntry, awgUsesDNSProxy and the catch-all helpers live in
 // mode.go (build-tag-free, so they can be unit-tested on any platform).
 

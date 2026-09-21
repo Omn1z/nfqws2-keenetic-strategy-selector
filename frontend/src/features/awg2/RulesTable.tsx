@@ -275,7 +275,7 @@ function RuleEditModal({ zone, tunnels, defaultTunnelID, onClose, onSave }: { zo
           </div>
         </Field>
         <Field label="Что матчит — домены, маски и IP (по строке)"
-          hint="Префиксы xray-стиля: domain:vk.com (суффикс), full:exact.com (точный), geosite:cn / geoip:cn, regexp:^.*\.foo$ (Go regex), keyword:foo (substring), list:user (читает /opt/etc/nfqws2/lists/user.list)">
+          hint="Префиксы xray-стиля: domain:vk.com (суффикс), full:exact.com (точный), geosite:cn / geoip:cn, regexp:^.*\.foo$ (Go regex), keyword:foo (substring), list:user (читает список nfqws2 на роутере)">
           <Textarea rows={6} value={matches}
             placeholder={"youtube.com\n*ip*\ndomain:vk.com\ngeosite:cn\nregexp:^.*\\.googlevideo\\.com$\n104.18.0.0/16"}
             onChange={(e) => {

@@ -24,6 +24,9 @@ type Config struct {
 	ProxyProtocol bool `json:"proxy_protocol"`
 	ForceTestDC   bool `json:"force_test_dc"`
 	SNIFronting   bool `json:"sni_fronting"` // opt-in: some fronts upgrade WS but never relay MTProto
+	// DisableSecure switches CF proxy/Worker fallback connections to plain
+	// WebSocket over port 80, matching upstream's --no-secure escape hatch.
+	DisableSecure bool `json:"disable_secure"`
 
 	CFProxy              bool     `json:"cfproxy"`
 	CFProxyUserDomain    string   `json:"cfproxy_user_domain"`

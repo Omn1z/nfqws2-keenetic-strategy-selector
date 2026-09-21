@@ -425,6 +425,10 @@ func (svc *Service) awgServerSummaries() []AWG2ServerSummary {
 		if cs := svc.awgClientStatusManagerOS(srv.Manager); cs != nil {
 			sum.Client = cs
 			sum.Connected = cs.Connected
+			// Imported profiles (including WARP) do not have a remote SSH
+			// manager status. Their local userspace UAPI handshake is the
+			// authoritative reachability signal.
+			sum.Reachable = sum.Reachable || cs.Connected
 		}
 		out = append(out, sum)
 	}
@@ -577,7 +581,9 @@ func (svc *Service) AWG2SetRoutingRules(rc awg.RoutingConfig) error {
 		srv.Manager.SetRoutingState(next, mode != "off" && len(next.Zones) > 0)
 	}
 	svc.awgSave()
-	svc.awgApplyMultiHostRoutesOS()
+	if err := svc.awgApplyMultiHostRoutesOSErr(); err != nil {
+		return err
+	}
 	return nil
 }
 

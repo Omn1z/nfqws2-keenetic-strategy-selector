@@ -467,7 +467,7 @@ func (a *App) ApplyStrategyToConfig(argLine string, restart bool) error {
 		return err
 	}
 	if restart {
-		c := exec.Command("/opt/etc/init.d/S51nfqws2", "restart")
+		c := exec.Command(a.Cfg.Nfqws2Init, "restart")
 		if o, err := c.CombinedOutput(); err != nil {
 			return fmt.Errorf("restart failed: %v: %s", err, strings.TrimSpace(string(o)))
 		}

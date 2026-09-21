@@ -16,8 +16,8 @@ import (
 
 // nfqws2 hostlist/ipset directory — the same plain-text files the bypass engine
 // uses for its DPI filters. Reusing them as AWG zone sources via `list:NAME` so
-// the user doesn't maintain two copies of the same list.
-const awgNfqwsListsDir = "/opt/etc/nfqws2/lists"
+// the user doesn't maintain two copies of the same list. The path follows the
+// platform: /etc on OpenWrt and /opt/etc on Entware/Keenetic.
 
 // expandEntries walks a zone's Domains slice and resolves any xray-style prefix
 // (`domain:`, `full:`, `geosite:CATEGORY`, `geoip:CATEGORY`, `list:NAME`) into
@@ -110,7 +110,7 @@ func (svc *Service) expandEntriesUncached(in []string) (domains, ips []string) {
 			name := strings.TrimSpace(raw[len("list:"):])
 			entries := readNfqwsList(name)
 			if len(entries) == 0 {
-				logbuf.Append("awg2", "warn", "zone: список \""+name+"\" пустой или не найден в /opt/etc/nfqws2/lists/")
+				logbuf.Append("awg2", "warn", "zone: список \""+name+"\" пустой или не найден в "+awgNfqwsListsDir+"/")
 			}
 			for _, e := range entries {
 				pushAuto(e)
@@ -138,7 +138,7 @@ func (svc *Service) expandEntriesUncached(in []string) (domains, ips []string) {
 	return
 }
 
-// readNfqwsList reads /opt/etc/nfqws2/lists/<name>.list (.gz auto-detected and
+// readNfqwsList reads the platform's nfqws2 lists directory/<name>.list (.gz auto-detected and
 // transparently decompressed), returning one entry per non-empty non-comment line.
 // Returns an empty slice on any error — by design: a missing list is a soft fail
 // that the apply path surfaces as "list is empty", not a hard error.

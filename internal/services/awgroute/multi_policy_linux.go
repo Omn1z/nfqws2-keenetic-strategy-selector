@@ -17,7 +17,6 @@ import (
 )
 
 const (
-	awgMultiHookPath  = "/opt/etc/ndm/netfilter.d/91-awg2-multi.sh"
 	awgMultiChain     = "AWG2_MULTI"
 	awgMultiSetPrefix = "awgm"
 	awgMultiTableBase = 900
@@ -58,6 +57,9 @@ func (svc *Service) awgApplyMultiPolicyOS() error {
 	if len(rules) == 0 || len(tunnels) == 0 {
 		awgSetAccel(true)
 		return nil
+	}
+	if err := ensureAWGIPSetOS(svc.clientOpContext()); err != nil {
+		return fmt.Errorf("multi-routing: %w", err)
 	}
 	if err := awgWriteMultiSets(rules); err != nil {
 		return err
@@ -302,6 +304,11 @@ func awgWriteMultiHook(tunnels []awgMultiTunnel, rules []awgMultiRule, dnsRedire
 	if err := os.WriteFile(awgMultiHookPath, []byte(hook), 0o755); err != nil {
 		return err
 	}
+	ifaces := make([]string, 0, len(tunnels))
+	for _, t := range tunnels {
+		ifaces = append(ifaces, t.Iface)
+	}
+	awgEnsureFW4IncludeOS(ifaces)
 	if out, err := awgRun("sh " + awgMultiHookPath); err != nil {
 		return fmt.Errorf("firewall hook: %v: %s", err, out)
 	}
@@ -355,18 +362,21 @@ func awgMultiFirewallHook(tunnels []awgMultiTunnel, rules []awgMultiRule, dnsRed
 	s.WriteString("AWGMV4\n")
 	s.WriteString("iptables -w -t mangle -I PREROUTING 1 -j " + awgMultiChain + "\n")
 	s.WriteString("iptables -w -t mangle -I OUTPUT 1 -j " + awgMultiChain + "\n")
+	fw4Ifaces := make([]string, 0, len(tunnels))
 	for _, t := range tunnels {
 		mss := t.MTU - 40
 		if mss <= 0 {
 			mss = 1240
 		}
 		ms := strconv.Itoa(mss)
+		fw4Ifaces = append(fw4Ifaces, t.Iface)
 		s.WriteString("iptables -w -t nat -A POSTROUTING -o " + t.Iface + " -j MASQUERADE 2>/dev/null || true\n")
 		s.WriteString("iptables -w -A FORWARD -i " + t.Iface + " -j ACCEPT 2>/dev/null || true\n")
 		s.WriteString("iptables -w -A FORWARD -o " + t.Iface + " -j ACCEPT 2>/dev/null || true\n")
 		s.WriteString("iptables -w -t mangle -A FORWARD -o " + t.Iface + " -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss " + ms + " 2>/dev/null || true\n")
 		s.WriteString("iptables -w -t mangle -A FORWARD -i " + t.Iface + " -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss " + ms + " 2>/dev/null || true\n")
 	}
+	s.WriteString(awgFW4ForwardRulesShell(fw4Ifaces))
 	if dnsRedirect {
 		redirectPort := awgDNSPort
 		if chainEnabled {
@@ -424,6 +434,7 @@ func (svc *Service) awgClearLegacyPolicyOS() {
 	svc.route.refreshWG.Wait()
 	svc.awgStopDNSProxy()
 	svc.awgStopSNISniff()
+	awgRemoveFW4IncludeOS()
 	_ = os.Remove(awgHookPath)
 	_, _ = awgRun("while iptables -w -t mangle -D PREROUTING -j " + awgChain + " 2>/dev/null; do :; done")
 	_, _ = awgRun("while iptables -w -t mangle -D OUTPUT -j " + awgChain + " 2>/dev/null; do :; done")
@@ -440,6 +451,7 @@ func (svc *Service) awgClearLegacyPolicyOS() {
 func (svc *Service) awgClearMultiPolicyOS() {
 	svc.awgStopMultiPolicyRefresh()
 	svc.awgStopDNSProxy()
+	awgRemoveFW4IncludeOS()
 	_ = os.Remove(awgMultiHookPath)
 	_, _ = awgRun("while iptables -w -t mangle -D PREROUTING -j " + awgMultiChain + " 2>/dev/null; do :; done")
 	_, _ = awgRun("while iptables -w -t mangle -D OUTPUT -j " + awgMultiChain + " 2>/dev/null; do :; done")

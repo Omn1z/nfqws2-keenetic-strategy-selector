@@ -104,7 +104,7 @@ export default function Nfqws2() {
           kind="bypass"
           reload={applyBypass}
           applyTitle="Применить NFQUEUE Bypass?"
-          applyBody="Пересобрать IPv4-цепочки nfqws2 и заново наложить RETURN-правила из bypass-списков."
+          applyBody="Пересобрать IPv4-цепочки nfqws2 и заново наложить правила пропуска из bypass-списков."
           applyConfirmLabel="Применить bypass"
           allowCreate={false}
           allowUpload={false}

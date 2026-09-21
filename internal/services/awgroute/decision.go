@@ -38,18 +38,18 @@ import (
 type Route string
 
 const (
-	RouteUnknown Route = ""        // no rule matched (caller falls back to effective mode)
-	RouteTunnel  Route = "tunnel"  // packet marked → table 998 → awg0
-	RouteDirect  Route = "direct"  // unmarked → main → wandev
+	RouteUnknown Route = ""       // no rule matched (caller falls back to effective mode)
+	RouteTunnel  Route = "tunnel" // packet marked → table 998 → awg0
+	RouteDirect  Route = "direct" // unmarked → main → wandev
 )
 
 // RouteDecision is the result of one first-match-wins lookup. Callers never
 // look at internals of zones / matchers / tunnelV6 — they just consume this.
 type RouteDecision struct {
-	Route       Route // tunnel / direct / unknown (no match)
-	RuleIdx     int   // 1-based rule position for traces ("правило #3"); 0 = no match
-	BlockAAAA   bool  // pre-computed: true if AAAA must be stripped for this name
-	SourceBound bool  // matched via a source-bound rule (per-device)
+	Route       Route  // tunnel / direct / unknown (no match)
+	RuleIdx     int    // 1-based rule position for traces ("правило #3"); 0 = no match
+	BlockAAAA   bool   // pre-computed: true if AAAA must be stripped for this name
+	SourceBound bool   // matched via a source-bound rule (per-device)
 	SourceSet   string // per-zone ipset name when SourceBound (e.g. "awg2_z0")
 }
 

@@ -13,8 +13,6 @@ import (
 	"nfqws2strategy/internal/tools/logbuf"
 )
 
-const awgHostRoutesFile = awgSetDir + "/awg2_hostroutes.json"
-
 type awgHostRoute struct {
 	Dest  string `json:"dest"`
 	Iface string `json:"iface"`
@@ -22,10 +20,14 @@ type awgHostRoute struct {
 }
 
 func (svc *Service) awgApplyMultiHostRoutesOS() {
-	svc.awgClearMultiHostRoutesOS()
-	if err := svc.awgApplyMultiPolicyOS(); err != nil {
+	if err := svc.awgApplyMultiHostRoutesOSErr(); err != nil {
 		logbuf.Append("awg2", "warn", "multi-routing: "+err.Error())
 	}
+}
+
+func (svc *Service) awgApplyMultiHostRoutesOSErr() error {
+	svc.awgClearMultiHostRoutesOS()
+	return svc.awgApplyMultiPolicyOS()
 }
 
 func (svc *Service) awgApplyLegacyMultiHostRoutesOS() {

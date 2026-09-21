@@ -26,6 +26,7 @@ interface Form {
   proxy_protocol: boolean;
   force_test_dc: boolean;
   sni_fronting: boolean;
+  disable_secure: boolean;
   cfproxy_user_domain: string;
   cfproxy_worker_domain: string;
 }
@@ -48,14 +49,14 @@ const parseDC = (text: string): Record<string, string> => {
 const toForm = (c: TgwsConfig): Form => ({
   port: String(c.port || 1433), secret: c.secret || "", dc: dcText(c.dc_redirects), fake_tls_domain: c.fake_tls_domain || "",
   link_host: c.link_host || "", pool_size: String(c.pool_size ?? 4), buffer_size: String(c.buffer_size || 262144),
-  cfproxy: !!c.cfproxy, proxy_protocol: !!c.proxy_protocol, force_test_dc: !!c.force_test_dc, sni_fronting: !!c.sni_fronting,
+  cfproxy: !!c.cfproxy, proxy_protocol: !!c.proxy_protocol, force_test_dc: !!c.force_test_dc, sni_fronting: !!c.sni_fronting, disable_secure: !!c.disable_secure,
   cfproxy_user_domain: c.cfproxy_user_domains?.join("\n") ?? c.cfproxy_user_domain ?? "",
   cfproxy_worker_domain: c.cfproxy_worker_domains?.join("\n") ?? c.cfproxy_worker_domain ?? "",
 });
 const collect = (f: Form) => ({
   port: parseInt(f.port, 10) || 1433, secret: f.secret.trim(), dc_redirects: parseDC(f.dc), fake_tls_domain: f.fake_tls_domain.trim(),
   link_host: f.link_host.trim(), pool_size: parseInt(f.pool_size, 10) || 0, buffer_size: parseInt(f.buffer_size, 10) || 262144,
-  cfproxy: f.cfproxy, proxy_protocol: f.proxy_protocol, force_test_dc: f.force_test_dc, sni_fronting: f.sni_fronting,
+  cfproxy: f.cfproxy, proxy_protocol: f.proxy_protocol, force_test_dc: f.force_test_dc, sni_fronting: f.sni_fronting, disable_secure: f.disable_secure,
   cfproxy_user_domains: f.cfproxy_user_domain.split(/[\s,;]+/).filter(Boolean),
   cfproxy_worker_domains: f.cfproxy_worker_domain.split(/[\s,;]+/).filter(Boolean),
 });
@@ -125,6 +126,7 @@ export default function MtProto() {
           <ToggleField label="CF fallback" checked={form.cfproxy} onChange={(v) => set("cfproxy", v)} />
           <ToggleField label="PROXY protocol" checked={form.proxy_protocol} onChange={(v) => set("proxy_protocol", v)} />
           <ToggleField label="Резервный SNI" checked={form.sni_fronting} onChange={(v) => set("sni_fronting", v)} />
+          <ToggleField label="CF без TLS (порт 80)" checked={form.disable_secure} onChange={(v) => set("disable_secure", v)} />
           <ToggleField label="Тестовые DC Telegram" checked={form.force_test_dc} onChange={(v) => set("force_test_dc", v)} />
         </div>
         <p className="text-xs text-muted">Тестовые DC нужны для тестовой среды Telegram. Для обычного аккаунта оставьте этот переключатель выключенным.</p>

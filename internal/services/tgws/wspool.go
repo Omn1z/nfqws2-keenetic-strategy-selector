@@ -87,8 +87,10 @@ func newWSPool(ctx context.Context, target, buffer int, stats *Stats, fronting .
 		domains:     map[poolKey][]string{},
 		failures:    map[poolKey]int{},
 		refillAfter: map[poolKey]time.Time{},
-		dial:        connectWSWithSNI,
 		dialSlots:   make(chan struct{}, poolDialConcurrency),
+	}
+	p.dial = func(ctx context.Context, host, domain string, timeout time.Duration, path string, bufferSize int, sni string) (*rawWebSocket, error) {
+		return connectWSWithSNI(ctx, host, domain, timeout, path, bufferSize, sni, true)
 	}
 	p.frontingEnabled = len(fronting) > 0 && fronting[0]
 	// Upstream resets this preference before starting each proxy instance.
@@ -401,7 +403,7 @@ type cfWorkerPool struct {
 	dial           wsDialFunc
 }
 
-func newCFWorkerPool(ctx context.Context, target, buffer int, stats *Stats) *cfWorkerPool {
+func newCFWorkerPool(ctx context.Context, target, buffer int, stats *Stats, secureOpt ...bool) *cfWorkerPool {
 	if target < 0 {
 		target = 0
 	}
@@ -411,8 +413,16 @@ func newCFWorkerPool(ctx context.Context, target, buffer int, stats *Stats) *cfW
 	if stats == nil {
 		stats = &Stats{}
 	}
-	return &cfWorkerPool{ctx: ctx, target: target, buffer: buffer, stats: stats,
-		idle: map[cfPoolKey][]pooledWorkerWS{}, refilling: map[cfPoolKey]uint64{}, dial: connectWSWithSNI}
+	secure := true
+	if len(secureOpt) > 0 {
+		secure = secureOpt[0]
+	}
+	p := &cfWorkerPool{ctx: ctx, target: target, buffer: buffer, stats: stats,
+		idle: map[cfPoolKey][]pooledWorkerWS{}, refilling: map[cfPoolKey]uint64{}}
+	p.dial = func(ctx context.Context, host, domain string, timeout time.Duration, path string, bufferSize int, sni string) (*rawWebSocket, error) {
+		return connectWSWithSNI(ctx, host, domain, timeout, path, bufferSize, sni, secure)
+	}
+	return p
 }
 
 func (p *cfWorkerPool) acquire(dc int, targetIP string, domains []string) (*rawWebSocket, string) {

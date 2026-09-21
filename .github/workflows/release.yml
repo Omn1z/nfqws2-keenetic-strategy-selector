@@ -55,6 +55,7 @@ jobs:
             dist/nfqws2-strategy-linux-arm
             dist/nfqws2-strategy-linux-mipsle
             dist/nfqws2-strategy-linux-mips
+            dist/nfqws2-strategy-linux-amd64
             dist/TGWS-LICENSE.txt
             dist/THIRD-PARTY-NOTICES.txt
           if-no-files-found: error
@@ -123,13 +124,17 @@ jobs:
             test -s "awg-engine-linux-$arch.tar.gz.sha256"
             sha256sum --check "awg-engine-linux-$arch.tar.gz.sha256"
           done
+          # The panel is also published for x86_64 OpenWrt hosts. The
+          # userspace AWG engine remains limited to router architectures
+          # supported by its runtime integration.
+          test -s nfqws2-strategy-linux-amd64
           test -s TGWS-LICENSE.txt
           test -s AMNEZIAWG-LICENSE.txt
           test -s THIRD-PARTY-NOTICES.txt
           for script in install update uninstall; do
             test -s "$script.sh"
           done
-          test "$(find . -maxdepth 1 -type f | wc -l)" -eq 18
+          test "$(find . -maxdepth 1 -type f | wc -l)" -eq 19
           sha256sum nfqws2-strategy-linux-* awg-engine-linux-*.tar.gz \
             TGWS-LICENSE.txt AMNEZIAWG-LICENSE.txt THIRD-PARTY-NOTICES.txt \
             install.sh update.sh uninstall.sh > SHA256SUMS

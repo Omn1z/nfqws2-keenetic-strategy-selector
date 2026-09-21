@@ -1,8 +1,8 @@
 # TG WS Proxy upstream
 
 The in-process Go MTProto proxy is synchronized with
-[Flowseal/tg-ws-proxy v1.10.2](https://github.com/Flowseal/tg-ws-proxy/tree/v1.10.2),
-commit `f200e33fd283143a9f101d62aaf9d8c1468a23fe` (2026-09-07).
+[Flowseal/tg-ws-proxy v1.10.4](https://github.com/Flowseal/tg-ws-proxy/tree/v1.10.4),
+commit `70b982da2ca75637b61f281170e4ed57df763db8` (2026-09-21).
 
 The upstream network implementation is ported into Go, rather than launched as
 a separate Python process. Its MIT license is included in `LICENSE.upstream`.
@@ -16,6 +16,8 @@ Synchronized behavior:
 - Per-IP timeout cooldown, per-DC retry cooldown and redirect fallback.
 - Multiple CF proxy/Worker domains, updated bundled domains and hourly refresh
   of the upstream domain list. Invalid responses preserve the current pool.
+- Verified TLS for ordinary CF/Telegram endpoints and an opt-in plain HTTP
+  WebSocket mode (`disable_secure`) for fronts that only expose port 80.
 - Automatic test-DC detection and optional forced test mode, including separate
   test endpoints and the `/apiws_test` path.
 - Listener recovery, session diagnostics and masking of fallback domains in logs.
