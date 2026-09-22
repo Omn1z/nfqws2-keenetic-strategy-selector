@@ -76,8 +76,10 @@ func TestSetRoutingRulesActivatesFallbackOnlyConnection(t *testing.T) {
 		TunnelID:          "primary",
 		FallbackTunnelIDs: []string{"backup", "backup"},
 		Route:             "tunnel",
-		Domains:           []string{"example.com"},
-		Enabled:           true,
+		// Keep the rule match empty: this test exercises persistence and
+		// activation without asking the host running the test to install ipsets.
+		Domains: []string{},
+		Enabled: true,
 	}}})
 	if err != nil {
 		t.Fatal(err)
