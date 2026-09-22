@@ -120,15 +120,19 @@ type ClientConfig struct {
 // Mode is the legacy field name. Old configs use "include"/"exclude"; we
 // migrate to Route on first read in RouteValue() so both names coexist.
 type Zone struct {
-	Name      string   `json:"name"`
-	TunnelID  string   `json:"tunnel_id,omitempty"` // AWG2 connection used by this rule when Route=="tunnel".
-	Order     int      `json:"order,omitempty"`     // Global routing priority across all tunnels (1 = top).
-	Route     string   `json:"route,omitempty"`     // "tunnel" | "direct" — new vocabulary
-	Mode      string   `json:"mode,omitempty"`      // legacy: "include" (→ tunnel) | "exclude" (→ direct)
-	Domains   []string `json:"domains"`
-	IPs       []string `json:"ips"`
-	SourceIPs []string `json:"source_ips"` // per-source-device filter: if non-empty, the zone applies ONLY to packets from these LAN IPs/CIDRs. Empty = whole LAN (the historical default).
-	Enabled   bool     `json:"enabled"`
+	Name     string `json:"name"`
+	TunnelID string `json:"tunnel_id,omitempty"` // AWG2 connection used by this rule when Route=="tunnel".
+	// FallbackTunnelIDs is an ordered list of backup connections for this rule.
+	// The primary TunnelID is always tried first; the first connected backup is
+	// selected when it is unavailable. An empty list keeps the legacy behavior.
+	FallbackTunnelIDs []string `json:"fallback_tunnel_ids,omitempty"`
+	Order             int      `json:"order,omitempty"` // Global routing priority across all tunnels (1 = top).
+	Route             string   `json:"route,omitempty"` // "tunnel" | "direct" — new vocabulary
+	Mode              string   `json:"mode,omitempty"`  // legacy: "include" (→ tunnel) | "exclude" (→ direct)
+	Domains           []string `json:"domains"`
+	IPs               []string `json:"ips"`
+	SourceIPs         []string `json:"source_ips"` // per-source-device filter: if non-empty, the zone applies ONLY to packets from these LAN IPs/CIDRs. Empty = whole LAN (the historical default).
+	Enabled           bool     `json:"enabled"`
 }
 
 // RouteValue returns the rule's effective route in the new vocabulary,
@@ -295,6 +299,9 @@ func (r *RoutingConfig) Normalize() {
 		}
 		if r.Zones[i].IPs == nil {
 			r.Zones[i].IPs = []string{}
+		}
+		if r.Zones[i].FallbackTunnelIDs == nil {
+			r.Zones[i].FallbackTunnelIDs = []string{}
 		}
 		// Per-zone include/exclude: a zone with no explicit mode inherits the OLD
 		// global routing mode (pre-migration), defaulting to include.

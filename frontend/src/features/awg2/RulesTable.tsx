@@ -30,6 +30,7 @@ const routeOf = (z: AwgZone): Route =>
 const ROUTE_LABEL: Record<Route, string> = { tunnel: "Через VPN", direct: "Мимо VPN" };
 const ROUTE_KIND: Record<Route, "ok" | "warn"> = { tunnel: "ok", direct: "warn" };
 const tunnelLabel = (s?: Awg2ServerSummary) => s ? `${s.label || s.id}${s.client_iface ? ` · ${s.client_iface}` : ""}` : "туннель не выбран";
+const tunnelStatus = (s?: Awg2ServerSummary) => s?.connected ? " · connected" : s && !s.enabled ? " · выключен" : "";
 
 const zoneLines = (z: AwgZone) => [...(z.domains || []), ...(z.ips || [])];
 const splitRaw = (s: string) => s.split("\n");
@@ -50,8 +51,8 @@ export default function RulesTable({ r, setR, st, reload }: Props) {
   const [copyOpen, setCopyOpen] = useState(false);
 
   const zones = r.zones || [];
-  const tunnels = useMemo(() => (st.servers || []).filter((s) => s.enabled && (s.imported || s.deployed || s.endpoint)), [st.servers]);
-  const defaultTunnelID = tunnels.find((s) => s.connected)?.id || tunnels[0]?.id || st.active_server_id || "";
+  const tunnels = useMemo(() => (st.servers || []).filter((s) => s.imported || s.deployed || s.endpoint), [st.servers]);
+  const defaultTunnelID = tunnels.find((s) => s.connected && s.enabled)?.id || tunnels.find((s) => s.enabled)?.id || st.active_server_id || "";
   const tunnelByID = useMemo(() => new Map((st.servers || []).map((s) => [s.id, s] as const)), [st.servers]);
 
   // persist runs after every rule action so the table behaves like pi-hole's
@@ -73,7 +74,11 @@ export default function RulesTable({ r, setR, st, reload }: Props) {
   // applyOp builds the next config from `r`, applies it to local state, then
   // persists. Wrapped so every action is one line.
   const applyOp = (op: (zs: AwgZone[]) => AwgZone[]) => {
-    const nextZones = op(zones).map((z, i) => ({ ...z, tunnel_id: z.tunnel_id || defaultTunnelID, order: i + 1 }));
+    const nextZones = op(zones).map((z, i) => {
+      const tunnelID = z.tunnel_id || defaultTunnelID;
+      const fallback = cleanArr(z.fallback_tunnel_ids || []).filter((id, j, a) => id !== tunnelID && a.indexOf(id) === j);
+      return { ...z, tunnel_id: tunnelID, fallback_tunnel_ids: routeOf(z) === "tunnel" ? fallback : [], order: i + 1 };
+    });
     const next: AwgRoutingConfig = { ...r, zones: nextZones };
     setR(next);
     void persist(next);
@@ -87,7 +92,7 @@ export default function RulesTable({ r, setR, st, reload }: Props) {
   };
   const dup = (i: number) =>
     applyOp((zs) => {
-      const clone: AwgZone = { ...zs[i], name: zs[i].name + " (копия)" };
+      const clone: AwgZone = { ...zs[i], fallback_tunnel_ids: [...(zs[i].fallback_tunnel_ids || [])], name: zs[i].name + " (копия)" };
       return [...zs.slice(0, i + 1), clone, ...zs.slice(i + 1)];
     });
   const del = async (i: number) => {
@@ -153,7 +158,17 @@ export default function RulesTable({ r, setR, st, reload }: Props) {
                   <td className="px-2 py-1.5">
                     <button type="button" className="text-left font-medium text-ink hover:underline" onClick={() => setEditIdx(i)}>{z.name || "(без имени)"}</button>
                   </td>
-                  <td className="px-2 py-1.5 text-[11px] text-ink-soft">{tunnelLabel(tunnelByID.get(z.tunnel_id || defaultTunnelID))}</td>
+                  <td className="px-2 py-1.5 text-[11px] text-ink-soft">
+                    {(() => {
+                      const ids = [z.tunnel_id || defaultTunnelID, ...(z.fallback_tunnel_ids || [])].filter(Boolean);
+                      return <span title={ids.map((id) => tunnelLabel(tunnelByID.get(id))).join(" → ")}>
+                        {ids.map((id, n) => <span key={`${id}-${n}`}>
+                          {n > 0 && <span className="mx-1 text-muted">→</span>}
+                          {tunnelLabel(tunnelByID.get(id))}{tunnelStatus(tunnelByID.get(id))}
+                        </span>)}
+                      </span>;
+                    })()}
+                  </td>
                   <td className="px-2 py-1.5"><Badge kind={ROUTE_KIND[route]}>{ROUTE_LABEL[route]}</Badge></td>
                   <td className="px-2 py-1.5 font-mono text-[11px]">
                     {matches.length === 0 ? <span className="text-muted">—</span> : (
@@ -195,6 +210,8 @@ export default function RulesTable({ r, setR, st, reload }: Props) {
         В колонке «Что матчит» можно вписывать вперемешку: домены/маски (<code>youtube.com</code>, <code>*ip*</code>,
         <code>regexp:^.*\.foo$</code>, <code>geosite:cn</code>, <code>list:user</code>), IPv4 и подсети (<code>104.18.0.0/16</code>).
         Источники задают, к каким LAN-устройствам правило применяется (пусто = ко всем).
+        В редакторе правила можно добавить <b>Fallback Connection List</b>: подключения проверяются по порядку,
+        а после восстановления основного туннеля приоритет возвращается автоматически.
       </p>
 
       {editIdx !== null && zones[editIdx] && (
@@ -218,7 +235,7 @@ export default function RulesTable({ r, setR, st, reload }: Props) {
 }
 
 function RuleEditModal({ zone, tunnels, defaultTunnelID, onClose, onSave }: { zone: AwgZone; tunnels: Awg2ServerSummary[]; defaultTunnelID: string; onClose: () => void; onSave: (patch: Partial<AwgZone>) => void }) {
-  const [z, setZ] = useState<AwgZone>({ ...zone, tunnel_id: zone.tunnel_id || defaultTunnelID, route: routeOf(zone) });
+  const [z, setZ] = useState<AwgZone>({ ...zone, fallback_tunnel_ids: [...(zone.fallback_tunnel_ids || [])], tunnel_id: zone.tunnel_id || defaultTunnelID, route: routeOf(zone) });
   const [devices, setDevices] = useState<Device[]>([]);
   useEffect(() => {
     void (async () => {
@@ -229,6 +246,9 @@ function RuleEditModal({ zone, tunnels, defaultTunnelID, onClose, onSave }: { zo
     })();
   }, []);
   const matches = (z.domains || []).join("\n") + ((z.ips || []).length ? "\n" + (z.ips || []).join("\n") : "");
+  const fallbackIDs = cleanArr(z.fallback_tunnel_ids || []).filter((id, i, a) => id !== z.tunnel_id && a.indexOf(id) === i);
+  const fallbackOptions = tunnels.filter((s) => s.id !== z.tunnel_id && !fallbackIDs.includes(s.id));
+  const updateFallback = (ids: string[]) => setZ({ ...z, fallback_tunnel_ids: ids });
 
   const save = () => {
     const lines = cleanArr(splitRaw(matches));
@@ -237,6 +257,7 @@ function RuleEditModal({ zone, tunnels, defaultTunnelID, onClose, onSave }: { zo
     onSave({
       name: z.name,
       tunnel_id: z.tunnel_id || defaultTunnelID,
+      fallback_tunnel_ids: z.route === "tunnel" ? fallbackIDs : [],
       route: z.route as Route,
       mode: z.route === "direct" ? "exclude" : "include", // legacy backward compat
       domains,
@@ -258,9 +279,9 @@ function RuleEditModal({ zone, tunnels, defaultTunnelID, onClose, onSave }: { zo
           <Input value={z.name} onChange={(e) => setZ({ ...z, name: e.target.value })} placeholder="напр. youtube → VPN" />
         </Field>
         <Field label="Туннель">
-          <select value={z.tunnel_id || defaultTunnelID} onChange={(e) => setZ({ ...z, tunnel_id: e.target.value })} className="w-full rounded border border-line bg-panel px-2 py-1.5 text-[13px]">
+          <select value={z.tunnel_id || defaultTunnelID} onChange={(e) => setZ({ ...z, tunnel_id: e.target.value, fallback_tunnel_ids: fallbackIDs.filter((id) => id !== e.target.value) })} className="w-full rounded border border-line bg-panel px-2 py-1.5 text-[13px]">
             {tunnels.map((s) => (
-              <option key={s.id} value={s.id}>{tunnelLabel(s)}{s.connected ? " · connected" : ""}</option>
+              <option key={s.id} value={s.id}>{tunnelLabel(s)}{tunnelStatus(s)}</option>
             ))}
           </select>
         </Field>
@@ -274,6 +295,29 @@ function RuleEditModal({ zone, tunnels, defaultTunnelID, onClose, onSave }: { zo
             ))}
           </div>
         </Field>
+        {z.route === "tunnel" && (
+          <Field label="Fallback Connection List"
+            hint="Порядок слева направо: сначала основной туннель, затем резервные. При потере handshake выбирается первое доступное соединение; после восстановления приоритет возвращается автоматически.">
+            <div className="space-y-1.5 rounded border border-line bg-panel-soft/50 p-2">
+              {fallbackIDs.length === 0 ? <div className="text-[11px] text-muted">Резервные подключения не заданы.</div> : fallbackIDs.map((id, i) => {
+                const s = tunnels.find((item) => item.id === id);
+                return <div key={`${id}-${i}`} className="flex items-center gap-1.5 rounded border border-line bg-panel px-1.5 py-1">
+                  <span className="w-5 text-center text-[11px] text-muted">{i + 1}</span>
+                  <span className="min-w-0 flex-1 truncate text-[12px]">{tunnelLabel(s) || id}{tunnelStatus(s)}</span>
+                  <Button mini variant="ghost" onClick={() => i > 0 && updateFallback([...fallbackIDs.slice(0, i - 1), fallbackIDs[i], fallbackIDs[i - 1], ...fallbackIDs.slice(i + 1)])} disabled={i === 0} title="Выше">▲</Button>
+                  <Button mini variant="ghost" onClick={() => i < fallbackIDs.length - 1 && updateFallback([...fallbackIDs.slice(0, i), fallbackIDs[i + 1], fallbackIDs[i], ...fallbackIDs.slice(i + 2)])} disabled={i === fallbackIDs.length - 1} title="Ниже">▼</Button>
+                  <Button mini variant="danger" onClick={() => updateFallback(fallbackIDs.filter((_, j) => j !== i))} title="Удалить из списка">✕</Button>
+                </div>;
+              })}
+              {fallbackOptions.length > 0 && (
+                <select value="" onChange={(e) => { if (e.target.value) updateFallback([...fallbackIDs, e.target.value]); }} className="w-full rounded border border-line bg-panel px-2 py-1.5 text-[12px]">
+                  <option value="">+ Добавить резервное подключение…</option>
+                  {fallbackOptions.map((s) => <option key={s.id} value={s.id}>{tunnelLabel(s)}{tunnelStatus(s)}</option>)}
+                </select>
+              )}
+            </div>
+          </Field>
+        )}
         <Field label="Что матчит — домены, маски и IP (по строке)"
           hint="Префиксы xray-стиля: domain:vk.com (суффикс), full:exact.com (точный), geosite:cn / geoip:cn, regexp:^.*\.foo$ (Go regex), keyword:foo (substring), list:user (читает список nfqws2 на роутере)">
           <Textarea rows={6} value={matches}

@@ -465,6 +465,16 @@ func (svc *Service) awgRoutingRules() []awg.Zone {
 			if z.TunnelID == "" {
 				z.TunnelID = srv.ID
 			}
+			if z.RouteValue() == "tunnel" {
+				candidates := fallbackCandidates(z.TunnelID, z.FallbackTunnelIDs)
+				if len(candidates) > 1 {
+					z.FallbackTunnelIDs = candidates[1:]
+				} else {
+					z.FallbackTunnelIDs = nil
+				}
+			} else {
+				z.FallbackTunnelIDs = nil
+			}
 			if z.Domains == nil {
 				z.Domains = []string{}
 			}
@@ -535,6 +545,7 @@ func (svc *Service) AWG2SetRoutingRules(rc awg.RoutingConfig) error {
 		byID[srv.ID] = srv
 	}
 	part := map[string][]awg.Zone{}
+	referenced := map[string]bool{}
 	for i, z := range rc.Zones {
 		z.TunnelID = strings.TrimSpace(z.TunnelID)
 		if z.TunnelID == "" {
@@ -545,6 +556,20 @@ func (svc *Service) AWG2SetRoutingRules(rc awg.RoutingConfig) error {
 		}
 		if z.Route != "tunnel" && z.Route != "direct" {
 			z.Route = z.RouteValue()
+		}
+		if z.Route == "tunnel" {
+			fallbacks, err := normalizeFallbackTunnelIDs(z.TunnelID, z.FallbackTunnelIDs, func(id string) bool {
+				return byID[id] != nil
+			})
+			if err != nil {
+				return fmt.Errorf("правило %q: %w", z.Name, err)
+			}
+			z.FallbackTunnelIDs = fallbacks
+		} else {
+			// A direct rule never consults a VPN connection. Drop stale
+			// selections so switching it back to tunnel cannot resurrect an
+			// accidental, half-edited list.
+			z.FallbackTunnelIDs = nil
 		}
 		if z.Mode != "include" && z.Mode != "exclude" {
 			if z.Route == "direct" {
@@ -564,6 +589,12 @@ func (svc *Service) AWG2SetRoutingRules(rc awg.RoutingConfig) error {
 			z.SourceIPs = []string{}
 		}
 		part[z.TunnelID] = append(part[z.TunnelID], z)
+		referenced[z.TunnelID] = true
+		if z.Route == "tunnel" {
+			for _, id := range z.FallbackTunnelIDs {
+				referenced[id] = true
+			}
+		}
 	}
 	mode := rc.Mode
 	if mode == "" || mode == "include" || mode == "exclude" {
@@ -578,7 +609,9 @@ func (svc *Service) AWG2SetRoutingRules(rc awg.RoutingConfig) error {
 		next.DomainSource = rc.DomainSource
 		next.SNIRouting = rc.SNIRouting
 		next.TraceEnabled = rc.TraceEnabled
-		srv.Manager.SetRoutingState(next, mode != "off" && len(next.Zones) > 0)
+		// Backup-only connections have no zones of their own, but must stay
+		// active so the selector can move traffic to them and back again.
+		srv.Manager.SetRoutingState(next, mode != "off" && (len(next.Zones) > 0 || referenced[srv.ID]))
 	}
 	svc.awgSave()
 	if err := svc.awgApplyMultiHostRoutesOSErr(); err != nil {
@@ -752,6 +785,33 @@ func (svc *Service) AWG2DeleteServer(id string) error {
 		svc.awg = svc.servers[svc.activeID].Manager
 	}
 	svc.mu.Unlock()
+	// A deleted connection may still be present in another rule's fallback
+	// queue. Remove that dangling reference while retaining the remaining
+	// priority order; otherwise the next rules save would fail validation.
+	for _, other := range svc.serverSnapshot() {
+		cfg := other.Manager.Config()
+		changed := false
+		for i := range cfg.Routing.Zones {
+			z := &cfg.Routing.Zones[i]
+			kept := make([]string, 0, len(z.FallbackTunnelIDs))
+			zoneChanged := false
+			for _, candidate := range z.FallbackTunnelIDs {
+				if strings.TrimSpace(candidate) == id {
+					zoneChanged = true
+					continue
+				}
+				kept = append(kept, candidate)
+			}
+			if zoneChanged {
+				changed = true
+				z.FallbackTunnelIDs = kept
+			}
+		}
+		if changed {
+			activeState := cfg.Routing.Active
+			other.Manager.SetRoutingState(cfg.Routing, activeState)
+		}
+	}
 	svc.syncActiveAWGIface()
 	svc.route.tunnelUpAt.Store(0)
 	svc.awgSave()

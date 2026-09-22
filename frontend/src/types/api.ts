@@ -492,6 +492,8 @@ export interface AwgPeer {
 export interface AwgZone {
   name: string;
   tunnel_id?: string;
+  /** Ordered backups: primary tunnel_id is tried first, then these IDs. */
+  fallback_tunnel_ids?: string[];
   order?: number;
   route?: "tunnel" | "direct";
   mode?: string; // legacy: "include"|"exclude"

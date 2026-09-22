@@ -92,6 +92,18 @@ func (svc *Service) awgBuildMultiPolicyWithResolve(resolve bool) ([]awgMultiRule
 	}
 	tunnelByID := map[string]*awgMultiTunnel{}
 	tunnelOrder := []string{}
+	connected := map[string]bool{}
+	connectedKnown := map[string]bool{}
+	isConnected := func(srv *managedServer) bool {
+		if srv == nil {
+			return false
+		}
+		if !connectedKnown[srv.ID] {
+			connected[srv.ID] = svc.tunnelUpForManagedServer(srv)
+			connectedKnown[srv.ID] = true
+		}
+		return connected[srv.ID]
+	}
 	getTunnel := func(srv *managedServer) *awgMultiTunnel {
 		if srv == nil {
 			return nil
@@ -137,13 +149,10 @@ func (svc *Service) awgBuildMultiPolicyWithResolve(resolve bool) ([]awgMultiRule
 		tunnelOrder = append(tunnelOrder, srv.ID)
 		return t
 	}
-
-	out := []awgMultiRule{}
-	for i, z := range svc.awgRoutingRules() {
-		if !z.Enabled {
-			continue
-		}
-		srv := servers[strings.TrimSpace(z.TunnelID)]
+	// Allocate slots in configured server order before resolving rules. A
+	// failover must change only the selected interface, not every fwmark/table
+	// number on the router.
+	for _, srv := range svc.serverSnapshot() {
 		if srv == nil {
 			continue
 		}
@@ -151,11 +160,46 @@ func (svc *Service) awgBuildMultiPolicyWithResolve(resolve bool) ([]awgMultiRule
 		if !cfg.Enabled || !cfg.Client.Enabled || cfg.Routing.Mode == "off" || !cfg.Routing.Active {
 			continue
 		}
+		_ = getTunnel(srv)
+	}
+
+	out := []awgMultiRule{}
+	for i, z := range svc.awgRoutingRules() {
+		if !z.Enabled {
+			continue
+		}
+		primaryID := strings.TrimSpace(z.TunnelID)
+		srv := servers[primaryID]
+		if srv == nil {
+			continue
+		}
 		route := z.RouteValue()
 		var tun *awgMultiTunnel
 		if route == "tunnel" {
+			selectedID := primaryID
+			if len(z.FallbackTunnelIDs) > 0 {
+				selectedID = selectFallbackTunnelID(primaryID, z.FallbackTunnelIDs,
+					func(id string) bool {
+						candidate := servers[id]
+						if candidate == nil {
+							return false
+						}
+						cfg := candidate.Manager.RuntimeConfig()
+						return cfg.Enabled && cfg.Client.Enabled && cfg.Routing.Mode != "off" && cfg.Routing.Active
+					},
+					func(id string) bool { return isConnected(servers[id]) },
+				)
+			}
+			if selectedID != primaryID {
+				srv = servers[selectedID]
+			}
 			tun = getTunnel(srv)
 			if tun == nil {
+				continue
+			}
+		} else {
+			cfg := srv.Manager.RuntimeConfig()
+			if !cfg.Enabled || !cfg.Client.Enabled || cfg.Routing.Mode == "off" || !cfg.Routing.Active {
 				continue
 			}
 		}
@@ -188,16 +232,6 @@ func (svc *Service) awgBuildMultiPolicyWithResolve(resolve bool) ([]awgMultiRule
 	// the cleanup step below removes the legacy awg0 rules and LAN traffic through
 	// the active server loses the exact fast-path/MTU guardrails the old datapath
 	// installed.
-	for _, srv := range svc.serverSnapshot() {
-		if srv == nil {
-			continue
-		}
-		cfg := srv.Manager.RuntimeConfig()
-		if !cfg.Enabled || !cfg.Client.Enabled || cfg.Routing.Mode == "off" || !cfg.Routing.Active {
-			continue
-		}
-		_ = getTunnel(srv)
-	}
 	tunnels := make([]awgMultiTunnel, 0, len(tunnelOrder))
 	for _, id := range tunnelOrder {
 		if t := tunnelByID[id]; t != nil {
@@ -547,17 +581,12 @@ func (svc *Service) awgStopMultiPolicyRefresh() {
 }
 
 func (svc *Service) awgBuildMultiTunnelsOnly() []awgMultiTunnel {
-	servers := map[string]*managedServer{}
-	for _, srv := range svc.serverSnapshot() {
-		servers[srv.ID] = srv
-	}
 	tunnelByID := map[string]*awgMultiTunnel{}
 	tunnelOrder := []string{}
-	for _, z := range svc.awgRoutingRules() {
-		if !z.Enabled || z.RouteValue() != "tunnel" {
-			continue
-		}
-		srv := servers[strings.TrimSpace(z.TunnelID)]
+	// Keep every active interface in the same deterministic order as the full
+	// policy builder. A connection used only as a fallback still needs its route
+	// table refreshed after an endpoint re-resolution.
+	for _, srv := range svc.serverSnapshot() {
 		if srv == nil {
 			continue
 		}

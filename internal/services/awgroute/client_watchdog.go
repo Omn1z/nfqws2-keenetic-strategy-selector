@@ -24,17 +24,19 @@ const (
 // before waiting for ops, so a WARP scan cannot hold the user off for minutes.
 // Refresh loops use TryLock: teardown can join them while it owns ops.
 type clientSupervisor struct {
-	ops         sync.Mutex
-	mu          sync.Mutex
-	ctx         context.Context
-	cancel      context.CancelFunc
-	stop        chan struct{}
-	wg          sync.WaitGroup
-	stopping    atomic.Bool
-	waiters     atomic.Int32
-	states      map[*awg.Manager]clientRecovery
-	onRecovered func()
-	driver      clientDriver
+	ops                   sync.Mutex
+	mu                    sync.Mutex
+	ctx                   context.Context
+	cancel                context.CancelFunc
+	stop                  chan struct{}
+	wg                    sync.WaitGroup
+	stopping              atomic.Bool
+	waiters               atomic.Int32
+	states                map[*awg.Manager]clientRecovery
+	onRecovered           func()
+	driver                clientDriver
+	fallbackSignature     string
+	fallbackSignatureSeen bool
 }
 
 // Driver boundary permits lifecycle tests without router/network side effects.
@@ -318,6 +320,9 @@ func (svc *Service) checkClients() {
 		}
 		svc.checkClient(srv)
 		unlock()
+	}
+	if svc.refreshFallbackRoutingIfNeeded() {
+		logbuf.Append("awg2", "info", "fallback-маршрутизация: выбранное подключение изменилось, правила обновлены")
 	}
 }
 
