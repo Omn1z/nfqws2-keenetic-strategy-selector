@@ -276,6 +276,29 @@ AmneziaWG, затем выберите **«Перейти на AWG 3.1» → «�
 формат своего сервера. Если развёртывание не завершилось, роутер сохраняет
 последнюю применённую конфигурацию, в том числе после перезапуска панели.
 
+Если на Keenetic/Entware установка движка из панели завершается сообщением
+`скачивание движка: context deadline exceeded`, архив можно скачать работающим
+на роутере `wget` и установить после проверки контрольной суммы:
+
+```sh
+mkdir -p /opt/tmp/awg2-install
+cd /opt/tmp/awg2-install || exit 1
+base=https://github.com/Omn1z/nfqws2-keenetic-strategy-selector/releases/latest/download
+wget -O awg-engine-linux-arm64.tar.gz "$base/awg-engine-linux-arm64.tar.gz" || exit 1
+wget -O awg-engine-linux-arm64.tar.gz.sha256 "$base/awg-engine-linux-arm64.tar.gz.sha256" || exit 1
+sha256sum -c awg-engine-linux-arm64.tar.gz.sha256 || exit 1
+tar -xzf awg-engine-linux-arm64.tar.gz amneziawg-go || exit 1
+cp amneziawg-go /opt/usr/bin/amneziawg-go.new || exit 1
+chmod 755 /opt/usr/bin/amneziawg-go.new || exit 1
+mv -f /opt/usr/bin/amneziawg-go.new /opt/usr/bin/amneziawg-go || exit 1
+```
+
+Эти команды предназначены для ARM64; на другой архитектуре выберите соответствующий
+файл релиза. После установки обновите страницу панели; при замене уже работающего
+движка переподключите активные туннели. Если `wget` не может
+получить архив, передайте архив и `.sha256` с компьютера по SCP в тот же каталог
+и начните с проверки `sha256sum`.
+
 Фоновая проверка охватывает все включённые туннели каждые 10 секунд. Если нет
 свежего хендшейка и приёма данных в течение 5 минут, сначала отправляется
 keepalive-проба. Без ответа за 90 секунд пересоздаётся только проблемный туннель.

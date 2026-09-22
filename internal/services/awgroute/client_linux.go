@@ -228,21 +228,7 @@ func (svc *Service) awgInstallEngineOS() (string, error) {
 	asset := "awg-engine-linux-" + arch + ".tar.gz"
 	base := "https://github.com/" + svc.cfg.Repo + "/releases/latest/download/"
 	logbuf.Append("awg2", "info", "скачивание движка "+asset+"…")
-	data, err := httpGetBytes(opCtx, base+asset, 90*time.Second)
-	if err != nil {
-		return "", fmt.Errorf("скачивание движка: %w", err)
-	}
-	sumTxt, err := httpGetBytes(opCtx, base+asset+".sha256", 20*time.Second)
-	if err != nil {
-		return "", fmt.Errorf("не удалось получить контрольную сумму движка: %w", err)
-	}
-	if fields := strings.Fields(string(sumTxt)); len(fields) == 0 || !strings.EqualFold(fields[0], fmt.Sprintf("%x", sha256.Sum256(data))) {
-		return "", fmt.Errorf("контрольная сумма движка не совпала")
-	}
-	if err := opCtx.Err(); err != nil {
-		return "", err
-	}
-	if err := extractEngine(data, awgEngineDir); err != nil {
+	if err := installAWGEngineFromRelease(opCtx, base+asset, awgEngineDir, !routerpath.IsOpenWrt(), awgWgetCandidates()); err != nil {
 		return "", err
 	}
 	// Split-routing needs ipset. Installation is best-effort here because the
@@ -559,10 +545,154 @@ func uapiRequestIfaceContext(ctx context.Context, iface, req string) (string, er
 
 // ---- helpers ----
 
-func httpGetBytes(parent context.Context, url string, timeout time.Duration) ([]byte, error) {
+const (
+	awgArchiveMaxBytes  = 32 << 20
+	awgChecksumMaxBytes = 4 << 10
+)
+
+type awgWgetCommand struct {
+	path string
+	args []string
+}
+
+// Only a verified archive reaches extractEngine, which atomically replaces
+// the existing executable after validating the complete gzip stream.
+func installAWGEngineFromRelease(ctx context.Context, archiveURL, dir string, preferWget bool, wget []awgWgetCommand) error {
+	data, err := downloadAWGAsset(ctx, archiveURL, awgArchiveMaxBytes, preferWget, wget)
+	if err != nil {
+		return fmt.Errorf("скачивание движка: %w", err)
+	}
+	sumTxt, err := downloadAWGAsset(ctx, archiveURL+".sha256", awgChecksumMaxBytes, preferWget, wget)
+	if err != nil {
+		return fmt.Errorf("не удалось получить контрольную сумму движка: %w", err)
+	}
+	if fields := strings.Fields(string(sumTxt)); len(fields) == 0 || !strings.EqualFold(fields[0], fmt.Sprintf("%x", sha256.Sum256(data))) {
+		return fmt.Errorf("контрольная сумма движка не совпала")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return extractEngine(data, dir)
+}
+
+func awgWgetCandidates() []awgWgetCommand {
+	var commands []awgWgetCommand
+	if info, err := os.Stat("/opt/bin/wget"); err == nil && info.Mode().IsRegular() && info.Mode()&0o111 != 0 {
+		commands = append(commands, awgWgetCommand{path: "/opt/bin/wget"})
+	}
+	if info, err := os.Stat("/bin/busybox"); err == nil && info.Mode().IsRegular() && info.Mode()&0o111 != 0 {
+		commands = append(commands, awgWgetCommand{path: "/bin/busybox", args: []string{"wget"}})
+	}
+	if path, err := exec.LookPath("wget"); err == nil && path != "/opt/bin/wget" {
+		commands = append(commands, awgWgetCommand{path: path})
+	}
+	return commands
+}
+
+// On some Entware routers wget works where Go's HTTPS fetch stalls.
+// OpenWrt keeps the Go client first and uses wget only after a failure.
+func downloadAWGAsset(parent context.Context, url string, maxBytes int64, preferWget bool, wget []awgWgetCommand) ([]byte, error) {
+	if err := parent.Err(); err != nil {
+		return nil, err
+	}
+	var errors []string
+	tryHTTP := func() ([]byte, error) {
+		data, err := httpGetBytes(parent, url, 90*time.Second, maxBytes)
+		if err != nil {
+			errors = append(errors, "Go HTTP: "+err.Error())
+		}
+		return data, err
+	}
+	tryWget := func() ([]byte, error) {
+		if len(wget) == 0 {
+			errors = append(errors, "wget не найден")
+			return nil, fmt.Errorf("wget не найден")
+		}
+		data, err := wgetGetBytes(parent, url, maxBytes, wget)
+		if err != nil {
+			errors = append(errors, "wget: "+err.Error())
+		}
+		return data, err
+	}
+	first, second := tryHTTP, tryWget
+	firstName, secondName := "Go HTTP", "wget"
+	if preferWget {
+		first, second = tryWget, tryHTTP
+		firstName, secondName = secondName, firstName
+	}
+	if data, err := first(); err == nil {
+		return data, nil
+	}
+	if err := parent.Err(); err != nil {
+		return nil, err
+	}
+	logbuf.Append("awg2", "warn", "загрузка AWG2 через "+firstName+" не удалась; пробуем "+secondName)
+	if data, err := second(); err == nil {
+		return data, nil
+	}
+	if err := parent.Err(); err != nil {
+		return nil, err
+	}
+	return nil, fmt.Errorf("%s", strings.Join(errors, "; "))
+}
+
+func wgetGetBytes(parent context.Context, url string, maxBytes int64, commands []awgWgetCommand) ([]byte, error) {
+	timeout := 2 * time.Minute
+	if maxBytes > awgChecksumMaxBytes {
+		timeout = 8 * time.Minute
+	}
 	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
-	req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
+	var errors []string
+	for _, candidate := range commands {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		args := append(append([]string{}, candidate.args...), "-q", "-O", "-", url)
+		cmd := exec.CommandContext(ctx, candidate.path, args...)
+		stdout, err := cmd.StdoutPipe()
+		if err != nil {
+			errors = append(errors, candidate.path+": "+err.Error())
+			continue
+		}
+		var stderr bytes.Buffer
+		cmd.Stderr = &stderr
+		if err := cmd.Start(); err != nil {
+			_ = stdout.Close()
+			errors = append(errors, candidate.path+": "+err.Error())
+			continue
+		}
+		data, readErr := io.ReadAll(io.LimitReader(stdout, maxBytes+1))
+		if int64(len(data)) > maxBytes {
+			_ = cmd.Process.Kill()
+			_ = cmd.Wait()
+			return nil, fmt.Errorf("файл больше лимита %d байт", maxBytes)
+		}
+		waitErr := cmd.Wait()
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if readErr == nil && waitErr == nil && len(data) > 0 {
+			return data, nil
+		}
+		if readErr == nil && waitErr == nil {
+			errors = append(errors, candidate.path+": пустой ответ")
+		} else if readErr != nil {
+			errors = append(errors, candidate.path+": "+readErr.Error())
+		} else {
+			errors = append(errors, fmt.Sprintf("%s: %v %s", candidate.path, waitErr, strings.TrimSpace(stderr.String())))
+		}
+	}
+	return nil, fmt.Errorf("%s", strings.Join(errors, "; "))
+}
+
+func httpGetBytes(parent context.Context, url string, timeout time.Duration, maxBytes int64) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(parent, timeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
 	req.Header.Set("User-Agent", "nfqws2-strategy")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -572,7 +702,17 @@ func httpGetBytes(parent context.Context, url string, timeout time.Duration) ([]
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("HTTP %d для %s", resp.StatusCode, url)
 	}
-	return io.ReadAll(io.LimitReader(resp.Body, 128<<20))
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(data)) > maxBytes {
+		return nil, fmt.Errorf("файл больше лимита %d байт", maxBytes)
+	}
+	if len(data) == 0 {
+		return nil, fmt.Errorf("пустой ответ для %s", url)
+	}
+	return data, nil
 }
 
 func writeFile0600(path, content string) error {
