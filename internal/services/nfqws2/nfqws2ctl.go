@@ -20,6 +20,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -28,6 +29,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"nfqws2strategy/internal/tools/config"
@@ -39,7 +41,8 @@ import (
 
 // Manager owns the nfqws2 engine's on-disk files + package version/update/reload.
 type Manager struct {
-	cfg *config.Config
+	cfg      *config.Config
+	bypassMu sync.Mutex
 }
 
 // New builds a Manager reading the live app config (router paths + package name).
@@ -405,22 +408,31 @@ func (m *Manager) Bytes(kind, name string) (data []byte, dlName string, err erro
 	return nil, "", fmt.Errorf("файл не найден: %s", base)
 }
 
-// ApplyBypass rebuilds nfqws2's IPv4 firewall chains and reapplies the
-// out-of-band NFQUEUE bypass rules. Rebuilding first flushes the dedicated
-// bypass chain, dropping stale entries removed from the bypass lists.
+// ApplyBypass resolves domains with bounded concurrency, then rebuilds the
+// NFQWS2 chains and reapplies the out-of-band NFQUEUE bypass rules. The
+// firewall hooks read only the resolved cache, so Keenetic netfilter reloads
+// do not spend minutes resolving the list before bypass starts working.
 func (m *Manager) ApplyBypass() error {
+	m.bypassMu.Lock()
+	defer m.bypassMu.Unlock()
+	return m.applyBypass()
+}
+
+func (m *Manager) applyBypass() error {
 	confDir := stdpath.Dir(m.cfg.Nfqws2Conf)
-	bypassScript := routerpath.Path(routerpath.NFQWSBypass)
-	if bypassScript == "" || stdpath.Dir(bypassScript) != confDir {
-		bypassScript = stdpath.Join(confDir, "nfqws-bypass.sh")
-	}
+	bypassScript := stdpath.Join(confDir, "nfqws-strategy-bypass.sh")
 	initScript := m.cfg.Nfqws2Init
-	// The upstream nfqws2 package does not ship this helper on all targets
-	// (notably OpenWrt 25/APK builds).  Generate our small, self-contained
-	// helper on first use so the Bypass tab works after a clean install too.
-	// Existing vendor helpers are preserved and only made executable.
+	// Keep the package-owned helper separate from the vendor's much slower
+	// nfqws-bypass.sh. The latter is preserved for other consumers.
 	if err := ensureBypassScript(bypassScript); err != nil {
 		return fmt.Errorf("prepare NFQUEUE bypass script: %w", err)
+	}
+	resolved, failed, invalid, err := prepareBypassResolved(confDir, net.DefaultResolver.LookupIPAddr)
+	if err != nil {
+		return fmt.Errorf("resolve NFQUEUE bypass domains: %w", err)
+	}
+	if failed > 0 || invalid > 0 {
+		logbuf.Append("nfqws2", "warn", fmt.Sprintf("NFQUEUE bypass: %d DNS failures, %d invalid domains", failed, invalid))
 	}
 	if err := ensureBypassPersistence(confDir, initScript, bypassScript); err != nil {
 		return fmt.Errorf("prepare NFQUEUE bypass firewall hook: %w", err)
@@ -428,14 +440,70 @@ func (m *Manager) ApplyBypass() error {
 	if err := ensureBypassInitHook(initScript, bypassScript); err != nil {
 		return fmt.Errorf("prepare NFQUEUE bypass restart hook: %w", err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	cmd := shell.Quote(initScript) + " firewall_iptables && " + shell.Quote(bypassScript) + " iptables && " + shell.Quote(bypassScript) + " ip6tables"
 	out, err := exec.CommandContext(ctx, "sh", "-c", cmd).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("NFQUEUE bypass apply failed: %v: %s", err, strings.TrimSpace(string(out)))
 	}
-	logbuf.Append("nfqws2", "info", "NFQUEUE bypass applied")
+	logbuf.Append("nfqws2", "info", fmt.Sprintf("NFQUEUE bypass applied (%d resolved IPs)", resolved))
+	return nil
+}
+
+// RestoreBypass repairs hooks after a panel self-update or router restart. A
+// current resolved cache is reused immediately; an old/missing cache triggers
+// the full apply. This lets upgrades from the vendor helper become effective
+// without asking the user to revisit the Bypass tab.
+func (m *Manager) RestoreBypass() error {
+	confDir := stdpath.Dir(m.cfg.Nfqws2Conf)
+	listDir := stdpath.Join(confDir, "lists")
+	domains := stdpath.Join(listDir, "nfqueue_bypass_domains.list")
+	ipList := stdpath.Join(listDir, "nfqueue_bypass_ips.list")
+	cache := stdpath.Join(listDir, "nfqueue_bypass_resolved.list")
+	hasList := false
+	for _, name := range []string{domains, ipList} {
+		if _, err := os.Stat(name); err == nil {
+			hasList = true
+		} else if !os.IsNotExist(err) {
+			return err
+		}
+	}
+	if !hasList {
+		return nil
+	}
+	cacheInfo, err := os.Stat(cache)
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	domainInfo, domainErr := os.Stat(domains)
+	if domainErr != nil && !os.IsNotExist(domainErr) {
+		return domainErr
+	}
+	if os.IsNotExist(err) || (os.IsNotExist(domainErr) && cacheInfo.Size() > 0) || (domainErr == nil &&
+		(domainInfo.ModTime().After(cacheInfo.ModTime()) || (domainInfo.Size() > 0 && cacheInfo.Size() == 0))) {
+		return m.ApplyBypass()
+	}
+	m.bypassMu.Lock()
+	defer m.bypassMu.Unlock()
+	bypassScript := stdpath.Join(confDir, "nfqws-strategy-bypass.sh")
+	if err := ensureBypassScript(bypassScript); err != nil {
+		return err
+	}
+	if err := ensureBypassPersistence(confDir, m.cfg.Nfqws2Init, bypassScript); err != nil {
+		return err
+	}
+	if err := ensureBypassInitHook(m.cfg.Nfqws2Init, bypassScript); err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	cmd := shell.Quote(bypassScript) + " iptables && " + shell.Quote(bypassScript) + " ip6tables"
+	out, err := exec.CommandContext(ctx, "sh", "-c", cmd).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("NFQUEUE bypass restore failed: %v: %s", err, strings.TrimSpace(string(out)))
+	}
+	logbuf.Append("nfqws2", "info", "NFQUEUE bypass restored from resolved cache")
 	return nil
 }
 
@@ -646,33 +714,17 @@ func (m *Manager) Update() (string, error) {
 	return detail, nil
 }
 
-// reapplyBypassAfterUpdate repairs the upstream NFQWS2 init script after apk
-// replaces it and restores the dedicated jump if the user had configured a
-// bypass list. It is a no-op until the helper exists.
+// reapplyBypassAfterUpdate repairs the upstream NFQWS2 init script after a
+// package update on either router family and restores the configured bypass.
 func (m *Manager) reapplyBypassAfterUpdate() error {
-	if !routerpath.IsOpenWrt() {
-		return nil
-	}
 	confDir := stdpath.Dir(m.cfg.Nfqws2Conf)
-	bypass := routerpath.Path(routerpath.NFQWSBypass)
-	if bypass == "" || stdpath.Dir(bypass) != confDir {
-		bypass = stdpath.Join(confDir, "nfqws-bypass.sh")
-	}
-	if _, err := os.Stat(bypass); err != nil {
-		if os.IsNotExist(err) {
-			return nil
+	bypass := stdpath.Join(confDir, "nfqws-strategy-bypass.sh")
+	for _, name := range []string{bypass, stdpath.Join(confDir, "lists", "nfqueue_bypass_domains.list"), stdpath.Join(confDir, "lists", "nfqueue_bypass_ips.list")} {
+		if _, err := os.Stat(name); err == nil {
+			return m.ApplyBypass()
+		} else if !os.IsNotExist(err) {
+			return err
 		}
-		return err
-	}
-	if err := ensureBypassInitHook(m.cfg.Nfqws2Init, bypass); err != nil {
-		return err
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	cmd := shell.Quote(m.cfg.Nfqws2Init) + " firewall_iptables && " + shell.Quote(bypass) + " iptables && " + shell.Quote(bypass) + " ip6tables"
-	out, err := exec.CommandContext(ctx, "sh", "-c", cmd).CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("%v: %s", err, strs.LastLines(strings.TrimSpace(string(out)), 4))
 	}
 	return nil
 }

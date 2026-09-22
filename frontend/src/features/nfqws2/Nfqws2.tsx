@@ -35,12 +35,7 @@ export default function Nfqws2() {
   };
 
   const applyBypass = async () => {
-    try {
-      await api("POST", "/api/nfqws2/bypass/apply", {});
-      toast("NFQUEUE Bypass применён", "ok");
-    } catch (e) {
-      toast("NFQUEUE Bypass: " + (e as Error).message, "err");
-    }
+    await api("POST", "/api/nfqws2/bypass/apply", {});
   };
 
   const restart = async () => {
@@ -103,9 +98,6 @@ export default function Nfqws2() {
           key="bypass"
           kind="bypass"
           reload={applyBypass}
-          applyTitle="Применить NFQUEUE Bypass?"
-          applyBody="Пересобрать IPv4-цепочки nfqws2 и заново наложить правила пропуска из bypass-списков."
-          applyConfirmLabel="Применить bypass"
           allowCreate={false}
           allowUpload={false}
         />

@@ -172,6 +172,11 @@ func cmdServe(args []string) {
 	}
 	a.SetPanelListener(srv)
 	log.Printf("nfqws2-strategy %s listening on %s (data: %s)", version, srv.Address(), cfg.DataDir)
+	go func() {
+		if err := a.RestoreNfqws2Bypass(); err != nil {
+			log.Printf("NFQUEUE bypass startup restore: %v", err)
+		}
+	}()
 
 	sigc := make(chan os.Signal, 1)
 	signal.Notify(sigc, os.Interrupt, syscall.SIGTERM)

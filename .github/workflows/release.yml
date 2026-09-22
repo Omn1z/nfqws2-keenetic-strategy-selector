@@ -29,6 +29,10 @@ jobs:
         run: |
           go test ./...
           go vet ./...
+      - name: Test installation hooks
+        run: |
+          sh packaging/test-bypass-hooks.sh
+          sh packaging/test-update.sh
       - name: Check reachable Go vulnerabilities for Linux
         env:
           GOOS: linux

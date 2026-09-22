@@ -78,14 +78,21 @@ export function FileManager({
   const save = async () => {
     if (!sel) return;
     setBusy(true);
+    let saved = false;
     try {
       await api("POST", "/api/nfqws2/file", { kind, name: sel, content });
+      saved = true;
       setDirty(false);
-      toast(`Сохранён ${sel}`, "ok");
       await loadFiles(sel);
-      if (await confirmDialog({ title: applyTitle, body: applyBody, confirmLabel: applyConfirmLabel, cancelLabel: "Позже" })) await reload();
+      if (kind === "bypass") {
+        await reload();
+        toast(`Сохранён и применён ${sel}`, "ok");
+      } else {
+        toast(`Сохранён ${sel}`, "ok");
+        if (await confirmDialog({ title: applyTitle, body: applyBody, confirmLabel: applyConfirmLabel, cancelLabel: "Позже" })) await reload();
+      }
     } catch (e) {
-      toast((e as Error).message, "err");
+      toast(saved && kind === "bypass" ? `Список сохранён, но bypass не применён: ${(e as Error).message}` : (e as Error).message, "err");
     } finally {
       setBusy(false);
     }

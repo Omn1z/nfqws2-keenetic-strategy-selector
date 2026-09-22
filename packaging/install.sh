@@ -26,6 +26,7 @@ if [ -f /etc/openwrt_release ] || { [ -f /etc/rc.common ] && [ -d /etc/init.d ];
   RUN_DIR=/var/run
   ENGINE_INIT=/etc/init.d/nfqws2-keenetic
   ENGINE_BIN=/usr/bin/nfqws2
+  ENGINE_CONF=/etc/nfqws2
   if command -v apk >/dev/null 2>&1; then
     PM=apk
     say "detected OpenWrt (apk)"
@@ -46,6 +47,7 @@ else
   RUN_DIR=/opt/var/run
   ENGINE_INIT=/opt/etc/init.d/S51nfqws2
   ENGINE_BIN=/opt/usr/bin/nfqws2
+  ENGINE_CONF=/opt/etc/nfqws2
   PM=opkg
   command -v opkg >/dev/null 2>&1 || die "OpenWrt was not detected and opkg is missing (is this Entware?)"
   say "detected Keenetic/Entware"
@@ -138,6 +140,7 @@ install_engine() {
     opkg update && opkg install nfqws2-keenetic || die "NFQWS2 installation failed"
   fi
   [ -x "$ENGINE_BIN" ] && [ -x "$ENGINE_INIT" ] || die "NFQWS2 package did not install its binary/service"
+  ensure_bypass_init_hook
   if [ "$PLATFORM" = openwrt ]; then
     "$ENGINE_INIT" enable || die "cannot enable NFQWS2 service"
   fi
@@ -162,36 +165,94 @@ repair_nfqw2_config() {
   "$ENGINE_INIT" restart >/dev/null 2>&1 || true
 }
 
-# The upstream OpenWrt init recreates nfqws_pre/nfqws_post on every restart.
-# If the panel has already created its bypass helper, keep it attached after a
-# package upgrade as well as after a normal service restart. This is idempotent
-# and intentionally limited to the native OpenWrt layout.
+# Both upstream init scripts recreate nfqws_pre/nfqws_post on restart. Repair
+# only our tagged block; the package's vendor nfqws-bypass.sh stays untouched.
+# Migrate old blocks even before the new panel creates its owned helper, so an
+# update never invokes the older vendor helper from our post-start hook.
 ensure_bypass_init_hook() {
-  [ "$PLATFORM" = openwrt ] || return 0
-  bypass=/etc/nfqws2/nfqws-bypass.sh
-  [ -x "$bypass" ] || return 0
+  bypass="$ENGINE_CONF/nfqws-strategy-bypass.sh"
+  fw4_hook="$ENGINE_CONF/nfqws-bypass-fw4.sh"
+  ndm_hook="${ENGINE_CONF%/*}/ndm/netfilter.d/101-nfqws2-bypass.sh"
   [ -f "$ENGINE_INIT" ] || return 0
   marker='# nfqws2-strategy: reapply NFQUEUE bypass'
-  if ! grep -Fq "$marker" "$ENGINE_INIT"; then
-    tmp="$ENGINE_INIT.n2s-new"
-    awk -v marker="$marker" -v helper="$bypass" '
-      { print }
-      $0 ~ /^[[:space:]]*system_config([[:space:]]|$)/ && $0 !~ /system_config[[:space:]]*\(\)/ {
-        print marker
-        print "[ -x '\''" helper "'\'' ] && '\''" helper "'\'' iptables >/dev/null 2>&1 || true"
-        print "[ -x '\''" helper "'\'' ] && '\''" helper "'\'' ip6tables >/dev/null 2>&1 || true"
+  if [ ! -f "$bypass" ] && [ ! -f "$fw4_hook" ] && [ ! -f "$ndm_hook" ] &&
+     ! grep -Fq "$marker" "$ENGINE_INIT"; then
+    return 0
+  fi
+  tmp=$(mktemp "$ENGINE_INIT.n2s-new.XXXXXX") || return 1
+  if ! awk -v marker="$marker" -v helper="$bypass" '
+    function block() {
+      print marker
+      print "[ -x '\''" helper "'\'' ] && '\''" helper "'\'' iptables >/dev/null 2>&1 || true"
+      print "[ -x '\''" helper "'\'' ] && '\''" helper "'\'' ip6tables >/dev/null 2>&1 || true"
+    }
+    function own(line, family) {
+      return line ~ /^[[:space:]]*\[ -x / && index(line, " ] && ") &&
+        (index(line, "/nfqws-bypass.sh") || index(line, "/nfqws-strategy-bypass.sh")) &&
+        index(line, " " family " >/dev/null 2>&1 || true")
+    }
+    { lines[NR]=$0; trimmed=$0; sub(/^[[:space:]]+/, "", trimmed); sub(/[[:space:]]+$/, "", trimmed)
+      if (trimmed == marker) { if (tag) bad=1; tag=NR }
+      if (!anchor && trimmed ~ /^system_config([[:space:]]|$)/ && trimmed !~ /system_config[[:space:]]*\(\)/) anchor=NR
+    }
+    END {
+      if (bad || (tag && (!own(lines[tag+1], "iptables") || !own(lines[tag+2], "ip6tables"))) || (!tag && !anchor)) exit 1
+      for (i=1; i<=NR; i++) {
+        if (i==tag) { block(); i+=2; continue }
+        print lines[i]
+        if (!tag && i==anchor) block()
       }
-    ' "$ENGINE_INIT" > "$tmp" || { rm -f "$tmp"; return 0; }
-    grep -Fq "$marker" "$tmp" || { rm -f "$tmp"; say "warning: NFQWS2 init has no system_config anchor"; return 0; }
+    }
+  ' "$ENGINE_INIT" > "$tmp"; then
+    rm -f "$tmp"
+    say "warning: cannot safely repair NFQWS2 bypass hook (unknown block or no system_config anchor)"
+    return 1
+  fi
+  if cmp -s "$ENGINE_INIT" "$tmp" 2>/dev/null; then
+    rm -f "$tmp"
+  else
     [ -f "$ENGINE_INIT.n2s-bak" ] || cp "$ENGINE_INIT" "$ENGINE_INIT.n2s-bak"
     chmod +x "$tmp"
     mv "$tmp" "$ENGINE_INIT"
   fi
-  "$ENGINE_INIT" firewall_iptables >/dev/null 2>&1 || true
+
+  if [ "$PLATFORM" = openwrt ]; then
+    cat > "$fw4_hook" <<EOF
+#!/bin/sh
+[ -x '$bypass' ] || exit 0
+'$ENGINE_INIT' firewall_iptables >/dev/null 2>&1 || true
+'$ENGINE_INIT' firewall_ip6tables >/dev/null 2>&1 || true
+'$bypass' iptables >/dev/null || true
+'$bypass' ip6tables >/dev/null || true
+EOF
+    chmod +x "$fw4_hook"
+    if command -v uci >/dev/null 2>&1; then
+      uci -q show firewall.nfqws2_bypass_fw4 >/dev/null 2>&1 || uci set firewall.nfqws2_bypass_fw4=include
+      uci set firewall.nfqws2_bypass_fw4.type=script
+      uci set "firewall.nfqws2_bypass_fw4.path=$fw4_hook"
+      uci set firewall.nfqws2_bypass_fw4.fw4_compatible=1
+      uci commit firewall
+    fi
+  else
+    mkdir -p "${ndm_hook%/*}"
+    cat > "$ndm_hook" <<EOF
+#!/bin/sh
+[ "\${table:-}" = mangle ] || exit 0
+case "\${type:-}" in iptables|ip6tables) ;; *) exit 0 ;; esac
+[ -x '$bypass' ] || exit 0
+'$bypass' "\$type" >/dev/null || true
+EOF
+    chmod +x "$ndm_hook"
+  fi
+  # The owned helper only rewrites its own chain/jumps, without vendor DNS or
+  # a full engine firewall rebuild. The panel refreshes its DNS cache on apply.
+  [ -x "$bypass" ] || return 0
   "$bypass" iptables >/dev/null 2>&1 || true
   "$bypass" ip6tables >/dev/null 2>&1 || true
 }
 
+# Replace old tagged vendor calls before any package/config restart.
+ensure_bypass_init_hook
 if [ "${N2S_SKIP_DEPS:-0}" = 1 ]; then
   say "skipping package/dependency setup (N2S_SKIP_DEPS=1)"
 else
