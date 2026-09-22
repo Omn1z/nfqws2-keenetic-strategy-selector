@@ -442,13 +442,22 @@ func (m *Manager) applyBypass() error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
-	cmd := shell.Quote(initScript) + " firewall_iptables && " + shell.Quote(bypassScript) + " iptables && " + shell.Quote(bypassScript) + " ip6tables"
+	cmd := nfqws2BypassApplyCommand(initScript, bypassScript)
 	out, err := exec.CommandContext(ctx, "sh", "-c", cmd).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("NFQUEUE bypass apply failed: %v: %s", err, strings.TrimSpace(string(out)))
 	}
 	logbuf.Append("nfqws2", "info", fmt.Sprintf("NFQUEUE bypass applied (%d resolved IPs)", resolved))
 	return nil
+}
+
+func nfqws2BypassApplyCommand(initScript, bypassScript string) string {
+	init := shell.Quote(initScript)
+	helper := shell.Quote(bypassScript)
+	// The IPv6 command is a successful no-op when IPV6_ENABLED=0. When enabled,
+	// create its nfqws chains before the helper tries to attach bypass jumps.
+	return init + " firewall_iptables && " + init + " firewall_ip6tables && " +
+		helper + " iptables && " + helper + " ip6tables"
 }
 
 // RestoreBypass repairs hooks after a panel self-update or router restart. A
@@ -691,14 +700,7 @@ func (m *Manager) Update() (string, error) {
 			return "", err
 		}
 	}
-	var script, label string
-	if apk {
-		script = pm + " update && " + pm + " add --upgrade " + m.cfg.Nfqws2Pkg
-		label = "apk install/upgrade " + m.cfg.Nfqws2Pkg
-	} else {
-		script = pm + " update && " + pm + " install " + m.cfg.Nfqws2Pkg
-		label = "opkg install/upgrade " + m.cfg.Nfqws2Pkg
-	}
+	script, label := nfqws2InstallCommand(pm, m.cfg.Nfqws2Pkg, apk)
 	logbuf.Append("nfqws2", "info", label+"…")
 	out, err := exec.CommandContext(ctx, "sh", "-c", script).CombinedOutput()
 	detail := strs.LastLines(strings.TrimSpace(string(out)), 20)
@@ -712,6 +714,24 @@ func (m *Manager) Update() (string, error) {
 	}
 	logbuf.Append("nfqws2", "info", label+": готово")
 	return detail, nil
+}
+
+// nfqws2InstallCommand installs NFQWS2's runtime modules and concrete nft
+// providers before the engine on OpenWrt 25. The upstream package declares
+// only virtual iptables/busybox dependencies, which omit NFQUEUE/connbytes
+// modules and cannot be resolved by apk on a fresh router.
+func nfqws2InstallCommand(pm, pkg string, apk bool) (script, label string) {
+	manager := shell.Quote(pm)
+	if !apk {
+		return manager + " update && " + manager + " install " + shell.Quote(pkg), "opkg install/upgrade " + pkg
+	}
+	// Keep this list aligned with packaging/install.sh so the panel's Install
+	// button and the unified installer work on the same fresh OpenWrt image.
+	const dependencies = "ca-certificates curl ip-full ipset kmod-ipt-ipset kmod-tun " +
+		"iptables-nft iptables-mod-nfqueue iptables-mod-conntrack-extra iptables-mod-ipopt " +
+		"iptables-mod-extra iptables-mod-filter ip6tables-nft ip6tables-extra ip6tables-mod-nat"
+	return manager + " update && " + manager + " add " + dependencies +
+		" && " + manager + " add --upgrade " + shell.Quote(pkg), "apk install/upgrade " + pkg
 }
 
 // reapplyBypassAfterUpdate repairs the upstream NFQWS2 init script after a

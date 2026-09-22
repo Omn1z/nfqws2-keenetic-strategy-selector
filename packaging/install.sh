@@ -102,9 +102,12 @@ install_dependencies() {
   if [ "$PM" = apk ]; then
     # apk uses the native firmware feeds for kernel modules. Never force a
     # mismatching kernel package or replace the router's configured feeds.
+    # OpenWrt 25 apk cannot choose a provider for the virtual iptables and
+    # ip6tables names on a fresh router. The nft variants also provide the
+    # iptables-restore commands used by the NFQUEUE bypass helper.
     apk --update-cache add ca-certificates curl ip-full ipset kmod-ipt-ipset kmod-tun \
-      iptables iptables-mod-nfqueue iptables-mod-conntrack-extra iptables-mod-ipopt \
-      iptables-mod-extra iptables-mod-filter ip6tables ip6tables-extra ip6tables-mod-nat \
+      iptables-nft iptables-mod-nfqueue iptables-mod-conntrack-extra iptables-mod-ipopt \
+      iptables-mod-extra iptables-mod-filter ip6tables-nft ip6tables-extra ip6tables-mod-nat \
       || die "dependency installation failed; check feed availability and firmware/kernel versions"
   elif [ "$PLATFORM" = openwrt ]; then
     opkg update || die "package feed refresh failed"
