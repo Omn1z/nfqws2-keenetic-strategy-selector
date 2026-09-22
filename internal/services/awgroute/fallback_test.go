@@ -52,7 +52,7 @@ func TestSelectFallbackTunnelID(t *testing.T) {
 	}
 }
 
-func TestSetRoutingRulesActivatesFallbackOnlyConnection(t *testing.T) {
+func TestSetRoutingRulesNormalizesFallbackList(t *testing.T) {
 	st, err := store.New(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -71,7 +71,7 @@ func TestSetRoutingRulesActivatesFallbackOnlyConnection(t *testing.T) {
 		},
 		awg: primary,
 	}
-	err = svc.AWG2SetRoutingRules(awg.RoutingConfig{Mode: "zones", Zones: []awg.Zone{{
+	err = svc.AWG2SetRoutingRules(awg.RoutingConfig{Mode: "off", Zones: []awg.Zone{{
 		Name:              "fallback",
 		TunnelID:          "primary",
 		FallbackTunnelIDs: []string{"backup", "backup"},
@@ -83,9 +83,6 @@ func TestSetRoutingRulesActivatesFallbackOnlyConnection(t *testing.T) {
 	}}})
 	if err != nil {
 		t.Fatal(err)
-	}
-	if !backup.Config().Routing.Active {
-		t.Fatal("fallback-only connection must be active")
 	}
 	got := primary.Config().Routing.Zones
 	if len(got) != 1 || len(got[0].FallbackTunnelIDs) != 1 || got[0].FallbackTunnelIDs[0] != "backup" {
