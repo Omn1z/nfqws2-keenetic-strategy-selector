@@ -2,9 +2,11 @@ package awgroute
 
 import (
 	"net"
-	"nfqws2strategy/internal/services/awg"
 	"sort"
 	"strings"
+	"sync"
+
+	"nfqws2strategy/internal/services/awg"
 )
 
 func (svc *Service) awgMultiRuleEntriesWithLookup(z awg.Zone, lookup func(string) []string) ([]string, bool, bool) {
@@ -31,7 +33,44 @@ func (svc *Service) awgMultiRuleEntriesWithLookup(z awg.Zone, lookup func(string
 			staticOK = true
 		}
 	}
-	for _, d := range expDomains {
+	// A geosite/list can expand into thousands of names. Resolve them with the
+	// same bounded concurrency as the legacy ipset builder, then consume the
+	// answers in rule order so matching and cache behavior remain deterministic.
+	answers := make([][]string, len(expDomains))
+	queries := make([]int, 0, len(expDomains))
+	for i, raw := range expDomains {
+		d := strings.TrimSpace(raw)
+		if d != "" && !awgIsCatchAll(d) && !isMaskEntry(d) {
+			queries = append(queries, i)
+		}
+	}
+	if len(queries) < 8 {
+		for _, i := range queries {
+			answers[i] = lookup(strings.TrimSpace(expDomains[i]))
+		}
+	} else {
+		workers := len(queries)
+		if workers > 32 {
+			workers = 32
+		}
+		jobs := make(chan int)
+		var wg sync.WaitGroup
+		for range workers {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for i := range jobs {
+					answers[i] = lookup(strings.TrimSpace(expDomains[i]))
+				}
+			}()
+		}
+		for _, i := range queries {
+			jobs <- i
+		}
+		close(jobs)
+		wg.Wait()
+	}
+	for i, d := range expDomains {
 		d = strings.TrimSpace(d)
 		if d == "" {
 			continue
@@ -44,7 +83,7 @@ func (svc *Service) awgMultiRuleEntriesWithLookup(z awg.Zone, lookup func(string
 		if isMaskEntry(d) {
 			continue
 		}
-		for _, ip := range lookup(d) {
+		for _, ip := range answers[i] {
 			if _, ok := sharedCDNProvider(ip); ok {
 				svc.awgNoteSharedCDNSkip("multi-resolve", ip)
 				continue

@@ -10,21 +10,42 @@ interface ApiError {
   error?: string;
 }
 
+const AWG_RULES_TIMEOUT_MS = 180_000;
+const awgRulesMutation = (method: string, path: string) =>
+  method.toUpperCase() === "POST" &&
+  /^\/api\/awg2\/routing\/rules(?:\/(?:copy|insert-top))?$/.test(path);
+
 export async function api<T = unknown>(method: string, path: string, body?: unknown): Promise<T> {
   const opt: RequestInit = { method };
   if (body !== undefined) {
     opt.headers = { "Content-Type": "application/json" };
     opt.body = JSON.stringify(body);
   }
-  const res = await fetch(path, opt);
-  if (res.status === 401) {
-    onUnauthorized();
-    throw new Error("Требуется вход");
+  const controller = awgRulesMutation(method, path) ? new AbortController() : null;
+  if (controller) opt.signal = controller.signal;
+  let timedOut = false;
+  const timeout = controller ? globalThis.setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, AWG_RULES_TIMEOUT_MS) : null;
+  try {
+    const res = await fetch(path, opt);
+    if (res.status === 401) {
+      onUnauthorized();
+      throw new Error("Требуется вход");
+    }
+    const txt = await res.text();
+    const data = txt ? JSON.parse(txt) : null;
+    if (!res.ok) throw new Error((data as ApiError)?.error || res.statusText);
+    return data as T;
+  } catch (error) {
+    if (timedOut && error instanceof Error && error.name === "AbortError") {
+      throw new Error("Ожидание ответа превысило 3 минуты; проверьте состояние правил перед повторной попыткой — сохранение могло завершиться.");
+    }
+    throw error;
+  } finally {
+    if (timeout !== null) globalThis.clearTimeout(timeout);
   }
-  const txt = await res.text();
-  const data = txt ? JSON.parse(txt) : null;
-  if (!res.ok) throw new Error((data as ApiError)?.error || res.statusText);
-  return data as T;
 }
 
 export async function uploadForm<T = unknown>(path: string, form: FormData): Promise<T> {

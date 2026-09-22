@@ -358,10 +358,10 @@ func awgMultiFirewallHook(tunnels []awgMultiTunnel, rules []awgMultiRule, dnsRed
 	s.WriteString("#!/bin/sh\n")
 	s.WriteString("set -e\n")
 	s.WriteString("# AWG2 multi-tunnel policy routing hook - managed by nfqws2-strategy.\n")
-	s.WriteString("while iptables -w -t mangle -D PREROUTING -j " + awgMultiChain + " 2>/dev/null; do :; done\n")
-	s.WriteString("while iptables -w -t mangle -D OUTPUT -j " + awgMultiChain + " 2>/dev/null; do :; done\n")
-	s.WriteString("iptables -w -t mangle -N " + awgMultiChain + " 2>/dev/null || true\n")
-	s.WriteString("iptables -w -t mangle -F " + awgMultiChain + " 2>/dev/null || true\n")
+	s.WriteString("while iptables -w 5 -t mangle -D PREROUTING -j " + awgMultiChain + " 2>/dev/null; do :; done\n")
+	s.WriteString("while iptables -w 5 -t mangle -D OUTPUT -j " + awgMultiChain + " 2>/dev/null; do :; done\n")
+	s.WriteString("iptables -w 5 -t mangle -N " + awgMultiChain + " 2>/dev/null || true\n")
+	s.WriteString("iptables -w 5 -t mangle -F " + awgMultiChain + " 2>/dev/null || true\n")
 	s.WriteString(awgMultiSharedCleanupShell())
 	s.WriteString("IPTABLES_RESTORE='iptables-restore --noflush'\n")
 	s.WriteString("if iptables-restore --help 2>&1 | grep -q -- ' -w'; then IPTABLES_RESTORE='iptables-restore -w 5 --noflush'; fi\n")
@@ -394,8 +394,8 @@ func awgMultiFirewallHook(tunnels []awgMultiTunnel, rules []awgMultiRule, dnsRed
 	s.WriteString("$IPTABLES_RESTORE <<'AWGMV4'\n")
 	s.WriteString(doc.String())
 	s.WriteString("AWGMV4\n")
-	s.WriteString("iptables -w -t mangle -I PREROUTING 1 -j " + awgMultiChain + "\n")
-	s.WriteString("iptables -w -t mangle -I OUTPUT 1 -j " + awgMultiChain + "\n")
+	s.WriteString("iptables -w 5 -t mangle -I PREROUTING 1 -j " + awgMultiChain + "\n")
+	s.WriteString("iptables -w 5 -t mangle -I OUTPUT 1 -j " + awgMultiChain + "\n")
 	fw4Ifaces := make([]string, 0, len(tunnels))
 	for _, t := range tunnels {
 		mss := t.MTU - 40
@@ -404,11 +404,11 @@ func awgMultiFirewallHook(tunnels []awgMultiTunnel, rules []awgMultiRule, dnsRed
 		}
 		ms := strconv.Itoa(mss)
 		fw4Ifaces = append(fw4Ifaces, t.Iface)
-		s.WriteString("iptables -w -t nat -A POSTROUTING -o " + t.Iface + " -j MASQUERADE 2>/dev/null || true\n")
-		s.WriteString("iptables -w -A FORWARD -i " + t.Iface + " -j ACCEPT 2>/dev/null || true\n")
-		s.WriteString("iptables -w -A FORWARD -o " + t.Iface + " -j ACCEPT 2>/dev/null || true\n")
-		s.WriteString("iptables -w -t mangle -A FORWARD -o " + t.Iface + " -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss " + ms + " 2>/dev/null || true\n")
-		s.WriteString("iptables -w -t mangle -A FORWARD -i " + t.Iface + " -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss " + ms + " 2>/dev/null || true\n")
+		s.WriteString("iptables -w 5 -t nat -A POSTROUTING -o " + t.Iface + " -j MASQUERADE 2>/dev/null || true\n")
+		s.WriteString("iptables -w 5 -A FORWARD -i " + t.Iface + " -j ACCEPT 2>/dev/null || true\n")
+		s.WriteString("iptables -w 5 -A FORWARD -o " + t.Iface + " -j ACCEPT 2>/dev/null || true\n")
+		s.WriteString("iptables -w 5 -t mangle -A FORWARD -o " + t.Iface + " -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss " + ms + " 2>/dev/null || true\n")
+		s.WriteString("iptables -w 5 -t mangle -A FORWARD -i " + t.Iface + " -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss " + ms + " 2>/dev/null || true\n")
 	}
 	s.WriteString(awgFW4ForwardRulesShell(fw4Ifaces))
 	if dnsRedirect {
@@ -431,8 +431,8 @@ func awgMultiFirewallHook(tunnels []awgMultiTunnel, rules []awgMultiRule, dnsRed
 func awgMultiSharedCleanupShell() string {
 	return `cleanup_awg2_shared() {
   fam=$1; tbl=$2; chn=$3; target=$4
-  for n in $("${fam}" -w -t "${tbl}" -L "${chn}" -v --line-numbers 2>/dev/null | awk -v target="${target}" '$4 == target && ($7 ~ /^awg[0-9][0-9]*$/ || $8 ~ /^awg[0-9][0-9]*$/) {print $1}' | sort -rn); do
-    "${fam}" -w -t "${tbl}" -D "${chn}" "${n}" 2>/dev/null || true
+  for n in $("${fam}" -w 5 -t "${tbl}" -L "${chn}" -v --line-numbers 2>/dev/null | awk -v target="${target}" '$4 == target && ($7 ~ /^awg[0-9][0-9]*$/ || $8 ~ /^awg[0-9][0-9]*$/) {print $1}' | sort -rn); do
+    "${fam}" -w 5 -t "${tbl}" -D "${chn}" "${n}" 2>/dev/null || true
   done
 }
 cleanup_awg2_shared iptables nat POSTROUTING MASQUERADE
@@ -470,10 +470,10 @@ func (svc *Service) awgClearLegacyPolicyOS() {
 	svc.awgStopSNISniff()
 	awgRemoveFW4IncludeOS()
 	_ = os.Remove(awgHookPath)
-	_, _ = awgRun("while iptables -w -t mangle -D PREROUTING -j " + awgChain + " 2>/dev/null; do :; done")
-	_, _ = awgRun("while iptables -w -t mangle -D OUTPUT -j " + awgChain + " 2>/dev/null; do :; done")
-	_, _ = awgRun("while ip6tables -w -t mangle -D PREROUTING -j " + awgChain + "6 2>/dev/null; do :; done")
-	_, _ = awgRun("while ip6tables -w -t mangle -D OUTPUT -j " + awgChain + "6 2>/dev/null; do :; done")
+	_, _ = awgRun("while iptables -w 5 -t mangle -D PREROUTING -j " + awgChain + " 2>/dev/null; do :; done")
+	_, _ = awgRun("while iptables -w 5 -t mangle -D OUTPUT -j " + awgChain + " 2>/dev/null; do :; done")
+	_, _ = awgRun("while ip6tables -w 5 -t mangle -D PREROUTING -j " + awgChain + "6 2>/dev/null; do :; done")
+	_, _ = awgRun("while ip6tables -w 5 -t mangle -D OUTPUT -j " + awgChain + "6 2>/dev/null; do :; done")
 	_, _ = awgRun("iptables -t mangle -F " + awgChain + " 2>/dev/null")
 	_, _ = awgRun("iptables -t mangle -X " + awgChain + " 2>/dev/null")
 	_, _ = awgRun("ip6tables -t mangle -F " + awgChain + "6 2>/dev/null")
@@ -487,28 +487,34 @@ func (svc *Service) awgClearMultiPolicyOS() {
 	svc.awgStopDNSProxy()
 	awgRemoveFW4IncludeOS()
 	_ = os.Remove(awgMultiHookPath)
-	_, _ = awgRun("while iptables -w -t mangle -D PREROUTING -j " + awgMultiChain + " 2>/dev/null; do :; done")
-	_, _ = awgRun("while iptables -w -t mangle -D OUTPUT -j " + awgMultiChain + " 2>/dev/null; do :; done")
-	_, _ = awgRun("iptables -w -t mangle -F " + awgMultiChain + " 2>/dev/null")
-	_, _ = awgRun("iptables -w -t mangle -X " + awgMultiChain + " 2>/dev/null")
+	_, _ = awgRun("while iptables -w 5 -t mangle -D PREROUTING -j " + awgMultiChain + " 2>/dev/null; do :; done")
+	_, _ = awgRun("while iptables -w 5 -t mangle -D OUTPUT -j " + awgMultiChain + " 2>/dev/null; do :; done")
+	_, _ = awgRun("iptables -w 5 -t mangle -F " + awgMultiChain + " 2>/dev/null")
+	_, _ = awgRun("iptables -w 5 -t mangle -X " + awgMultiChain + " 2>/dev/null")
 	_, _ = awgRun(awgMultiSharedCleanupShell())
 	awgClearMultiRouteRules(awgRun)
 	_, _ = awgRun("for s in $(ipset list -n 2>/dev/null | awk '/^" + awgMultiSetPrefix + "_[0-9][0-9][0-9]$/ {print $1}'); do ipset destroy \"$s\" 2>/dev/null; done")
 }
 
-// Clear every reserved slot, including stale rules from removed tunnels.
+// Clear every reserved slot, including stale rules from removed tunnels. Run
+// eight slots per shell: keeping the full range preserves restart cleanup,
+// while 8 shells instead of 192 avoids repeated fork+pipe setup on routers.
 func awgClearMultiRouteRules(run func(string) (string, error)) {
-	for i := 1; i <= awgMultiMax; i++ {
-		table := awgMultiTableBase + i
-		mark := awgMultiMark(i)
-		pref := awgMultiPrefBySlot(i)
-		// Scope the pref-based delete to our own selector: a bare `ip rule del pref N`
-		// removes ANY rule at that priority, and 71..134 overlaps the priorities
-		// Keenetic uses for its own access-policy rules (100+), silently killing
-		// policy routing until the router reboots.
-		_, _ = run("while ip rule del pref " + strconv.Itoa(pref) + " fwmark " + mark + "/" + awgMultiMarkMask + " table " + strconv.Itoa(table) + " 2>/dev/null; do :; done")
-		_, _ = run("while ip rule del fwmark " + mark + "/" + awgMultiMarkMask + " table " + strconv.Itoa(table) + " 2>/dev/null; do :; done")
-		_, _ = run("ip route flush table " + strconv.Itoa(table) + " 2>/dev/null")
+	const batchSlots = 8
+	for first := 1; first <= awgMultiMax; first += batchSlots {
+		var commands strings.Builder
+		for i := first; i < first+batchSlots && i <= awgMultiMax; i++ {
+			table := awgMultiTableBase + i
+			mark := awgMultiMark(i)
+			pref := awgMultiPrefBySlot(i)
+			// Scope the pref-based delete to our own selector: a bare `ip rule del pref N`
+			// removes ANY rule at that priority, and 71..134 overlaps the priorities
+			// Keenetic uses for its own access-policy rules (100+).
+			commands.WriteString("while ip rule del pref " + strconv.Itoa(pref) + " fwmark " + mark + "/" + awgMultiMarkMask + " table " + strconv.Itoa(table) + " 2>/dev/null; do :; done\n")
+			commands.WriteString("while ip rule del fwmark " + mark + "/" + awgMultiMarkMask + " table " + strconv.Itoa(table) + " 2>/dev/null; do :; done\n")
+			commands.WriteString("ip route flush table " + strconv.Itoa(table) + " 2>/dev/null\n")
+		}
+		_, _ = run(commands.String())
 	}
 }
 

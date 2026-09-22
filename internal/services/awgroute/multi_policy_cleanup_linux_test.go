@@ -24,9 +24,21 @@ type cleanupRuleTable struct {
 	rules   []cleanupRule
 	flushed map[int]int
 	deleted int
+	calls   int
 }
 
 func (rt *cleanupRuleTable) run(command string) (string, error) {
+	rt.t.Helper()
+	rt.calls++
+	for _, line := range strings.Split(strings.TrimSpace(command), "\n") {
+		if _, err := rt.runLine(line); err != nil {
+			return "", err
+		}
+	}
+	return "", nil
+}
+
+func (rt *cleanupRuleTable) runLine(command string) (string, error) {
 	rt.t.Helper()
 	if strings.HasPrefix(command, "ip route flush table ") {
 		words := strings.Fields(command)
@@ -138,6 +150,9 @@ func TestMultiRuleCleanupPreservesKeeneticAndForeignRules(t *testing.T) {
 		rt.rules = append(rt.rules, own, own, own, legacy, legacy)
 	}
 	awgClearMultiRouteRules(rt.run)
+	if rt.calls != 8 {
+		t.Fatalf("cleanup ran %d shells, want 8 batches", rt.calls)
+	}
 	if !reflect.DeepEqual(rt.rules, keep) {
 		t.Fatalf("foreign rules changed or AWG rules remain:\ngot  %#v\nwant %#v", rt.rules, keep)
 	}
@@ -150,6 +165,9 @@ func TestMultiRuleCleanupPreservesKeeneticAndForeignRules(t *testing.T) {
 		}
 	}
 	awgClearMultiRouteRules(rt.run)
+	if rt.calls != 16 {
+		t.Fatalf("repeated cleanup ran %d shells, want 16 batches", rt.calls)
+	}
 	if !reflect.DeepEqual(rt.rules, keep) || rt.deleted != 64*5 {
 		t.Fatal("repeating cleanup changed the remaining foreign rules")
 	}

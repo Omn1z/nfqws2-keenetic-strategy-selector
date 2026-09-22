@@ -2,7 +2,44 @@
 
 package awgroute
 
-import "testing"
+import (
+	"context"
+	"errors"
+	"os/exec"
+	"testing"
+	"time"
+)
+
+func TestAWGRunShellDeadlineKillsChild(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	_, err := awgRunShell(ctx, "sleep 5 & wait", "")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("shell error = %v, want deadline exceeded", err)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("shell waited for child after deadline: %s", elapsed)
+	}
+}
+
+func TestAWGRunShellOrphanCannotHoldOutputPipe(t *testing.T) {
+	start := time.Now()
+	_, err := awgRunShell(context.Background(), "sleep 5 &", "")
+	if !errors.Is(err, exec.ErrWaitDelay) {
+		t.Fatalf("shell error = %v, want output-pipe wait limit", err)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("orphan held output pipe for %s", elapsed)
+	}
+}
+
+func TestAWGRunShellFeedsStdin(t *testing.T) {
+	out, err := awgRunShell(context.Background(), "cat", "create awgm_000 hash:net\n")
+	if err != nil || out != "create awgm_000 hash:net" {
+		t.Fatalf("shell stdin got output %q, error %v", out, err)
+	}
+}
 
 func TestSelectDefaultRouteKeepsGatewayAndDeviceFromSameLine(t *testing.T) {
 	for name, out := range map[string]string{

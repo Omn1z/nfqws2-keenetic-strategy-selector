@@ -26,7 +26,10 @@ func (svc *Service) awgApplyMultiHostRoutesOS() {
 }
 
 func (svc *Service) awgApplyMultiHostRoutesOSErr() error {
-	svc.awgClearMultiHostRoutesOS()
+	// awgApplyMultiPolicyOS clears the multi-policy itself. Only the old
+	// host-route format needs removing here; otherwise every rules save runs
+	// the expensive 64-slot policy cleanup twice.
+	svc.awgClearLegacyHostRoutesOS()
 	return svc.awgApplyMultiPolicyOS()
 }
 
@@ -52,11 +55,15 @@ func (svc *Service) awgApplyLegacyMultiHostRoutesOS() {
 }
 
 func (svc *Service) awgClearMultiHostRoutesOS() {
+	svc.awgClearLegacyHostRoutesOS()
+	svc.awgClearMultiPolicyOS()
+}
+
+func (svc *Service) awgClearLegacyHostRoutesOS() {
 	for _, r := range awgLoadHostRoutes() {
 		awgDelHostRoute(r)
 	}
 	_ = os.Remove(awgHostRoutesFile)
-	svc.awgClearMultiPolicyOS()
 }
 
 func (svc *Service) awgDesiredHostRoutes() []awgHostRoute {

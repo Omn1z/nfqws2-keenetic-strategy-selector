@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo } from "react";
+import { useState, useEffect, useMemo, useRef } from "react";
 import { api } from "@/lib/api";
 import { cn } from "@/lib/cn";
 import { Badge } from "@/components/ui/Badge";
@@ -49,6 +49,8 @@ interface Props {
 export default function RulesTable({ r, setR, st, reload }: Props) {
   const [editIdx, setEditIdx] = useState<number | null>(null);
   const [copyOpen, setCopyOpen] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const saveInFlight = useRef(false);
 
   const zones = r.zones || [];
   const tunnels = useMemo(() => (st.servers || []).filter((s) => s.imported || s.deployed || s.endpoint), [st.servers]);
@@ -69,17 +71,23 @@ export default function RulesTable({ r, setR, st, reload }: Props) {
       await reload();
     } catch (e) {
       toast((e as Error).message, "err");
+    } finally {
+      saveInFlight.current = false;
+      setSaving(false);
     }
   };
   // applyOp builds the next config from `r`, applies it to local state, then
   // persists. Wrapped so every action is one line.
   const applyOp = (op: (zs: AwgZone[]) => AwgZone[]) => {
+    if (saveInFlight.current) return;
     const nextZones = op(zones).map((z, i) => {
       const tunnelID = z.tunnel_id || defaultTunnelID;
       const fallback = cleanArr(z.fallback_tunnel_ids || []).filter((id, j, a) => id !== tunnelID && a.indexOf(id) === j);
       return { ...z, tunnel_id: tunnelID, fallback_tunnel_ids: routeOf(z) === "tunnel" ? fallback : [], order: i + 1 };
     });
     const next: AwgRoutingConfig = { ...r, zones: nextZones };
+    saveInFlight.current = true;
+    setSaving(true);
     setR(next);
     void persist(next);
   };
@@ -122,7 +130,8 @@ export default function RulesTable({ r, setR, st, reload }: Props) {
         <h3 className="text-[14px] font-semibold">Правила маршрутизации</h3>
         <span className="text-[11px] text-muted">{zones.length} шт. · приоритет сверху вниз</span>
         <div className="ml-auto flex items-center gap-2">
-          <Button mini variant="primary" onClick={add}>+ правило</Button>
+          {saving && <span className="text-[11px] text-muted">Сохраняем…</span>}
+          <Button mini variant="primary" onClick={add} disabled={saving}>+ правило</Button>
         </div>
       </div>
 
@@ -156,7 +165,7 @@ export default function RulesTable({ r, setR, st, reload }: Props) {
                 <tr key={i} className={cn("border-t border-line", i % 2 ? "bg-panel-soft/40" : "")}>
                   <td className="px-2 py-1.5 text-center font-mono tabular-nums text-muted">{i + 1}</td>
                   <td className="px-2 py-1.5">
-                    <button type="button" className="text-left font-medium text-ink hover:underline" onClick={() => setEditIdx(i)}>{z.name || "(без имени)"}</button>
+                    <button type="button" className="text-left font-medium text-ink hover:underline disabled:opacity-50" onClick={() => setEditIdx(i)} disabled={saving}>{z.name || "(без имени)"}</button>
                   </td>
                   <td className="px-2 py-1.5 text-[11px] text-ink-soft">
                     {(() => {
@@ -187,15 +196,15 @@ export default function RulesTable({ r, setR, st, reload }: Props) {
                     )}
                   </td>
                   <td className="px-2 py-1.5 text-center">
-                    <Switch checked={!!z.enabled} onChange={(v) => setZ(i, { enabled: v })} />
+                    <Switch checked={!!z.enabled} onChange={(v) => setZ(i, { enabled: v })} disabled={saving} />
                   </td>
                   <td className="px-2 py-1.5">
                     <div className="flex items-center justify-end gap-1">
-                      <Button mini variant="ghost" onClick={() => move(i, -1)} disabled={i === 0} title="Выше">▲</Button>
-                      <Button mini variant="ghost" onClick={() => move(i, +1)} disabled={i === zones.length - 1} title="Ниже">▼</Button>
-                      <Button mini variant="ghost" onClick={() => setEditIdx(i)} title="Изменить">✎</Button>
-                      <Button mini variant="ghost" onClick={() => dup(i)} title="Дублировать">⎘</Button>
-                      <Button mini variant="danger" onClick={() => void del(i)} title="Удалить">✕</Button>
+                      <Button mini variant="ghost" onClick={() => move(i, -1)} disabled={saving || i === 0} title="Выше">▲</Button>
+                      <Button mini variant="ghost" onClick={() => move(i, +1)} disabled={saving || i === zones.length - 1} title="Ниже">▼</Button>
+                      <Button mini variant="ghost" onClick={() => setEditIdx(i)} disabled={saving} title="Изменить">✎</Button>
+                      <Button mini variant="ghost" onClick={() => dup(i)} disabled={saving} title="Дублировать">⎘</Button>
+                      <Button mini variant="danger" onClick={() => void del(i)} disabled={saving} title="Удалить">✕</Button>
                     </div>
                   </td>
                 </tr>
@@ -220,7 +229,8 @@ export default function RulesTable({ r, setR, st, reload }: Props) {
           tunnels={tunnels}
           defaultTunnelID={defaultTunnelID}
           onClose={() => setEditIdx(null)}
-          onSave={(patch) => { setZ(editIdx, patch); setEditIdx(null); }}
+          saving={saving}
+          onSave={(patch) => { if (saveInFlight.current) return; setZ(editIdx, patch); setEditIdx(null); }}
         />
       )}
       {copyOpen && (
@@ -234,7 +244,7 @@ export default function RulesTable({ r, setR, st, reload }: Props) {
   );
 }
 
-function RuleEditModal({ zone, tunnels, defaultTunnelID, onClose, onSave }: { zone: AwgZone; tunnels: Awg2ServerSummary[]; defaultTunnelID: string; onClose: () => void; onSave: (patch: Partial<AwgZone>) => void }) {
+function RuleEditModal({ zone, tunnels, defaultTunnelID, onClose, onSave, saving }: { zone: AwgZone; tunnels: Awg2ServerSummary[]; defaultTunnelID: string; onClose: () => void; onSave: (patch: Partial<AwgZone>) => void; saving: boolean }) {
   const [z, setZ] = useState<AwgZone>({ ...zone, fallback_tunnel_ids: [...(zone.fallback_tunnel_ids || [])], tunnel_id: zone.tunnel_id || defaultTunnelID, route: routeOf(zone) });
   const [devices, setDevices] = useState<Device[]>([]);
   useEffect(() => {
@@ -271,7 +281,7 @@ function RuleEditModal({ zone, tunnels, defaultTunnelID, onClose, onSave }: { zo
     <Modal title={`Правило: ${z.name || "(без имени)"}`} onClose={onClose} actions={
       <>
         <Button variant="ghost" onClick={onClose}>Отмена</Button>
-        <Button variant="primary" onClick={save}>Сохранить</Button>
+        <Button variant="primary" onClick={save} disabled={saving}>Сохранить</Button>
       </>
     }>
       <div className="space-y-3">

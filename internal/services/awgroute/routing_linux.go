@@ -407,8 +407,8 @@ func (svc *Service) awgTeardownRoutingOS() error {
 	svc.awgStopSNISniff()      // stop the SNI sniffer (closes its AF_PACKET sockets)
 	awgSetAccel(true)          // restore Keenetic's NAT accelerators (off only while routing active)
 	_ = os.Remove(awgHookPath) // stop Keenetic's ndm from re-adding our rules
-	_, _ = awgRun("while iptables -w -t mangle -D PREROUTING -j " + awgChain + " 2>/dev/null; do :; done")
-	_, _ = awgRun("while iptables -w -t mangle -D OUTPUT -j " + awgChain + " 2>/dev/null; do :; done")
+	_, _ = awgRun("while iptables -w 5 -t mangle -D PREROUTING -j " + awgChain + " 2>/dev/null; do :; done")
+	_, _ = awgRun("while iptables -w 5 -t mangle -D OUTPUT -j " + awgChain + " 2>/dev/null; do :; done")
 	_, _ = awgRun("iptables -t mangle -F " + awgChain + " 2>/dev/null")
 	_, _ = awgRun("iptables -t mangle -X " + awgChain + " 2>/dev/null")
 	_, _ = awgRun("ip rule del fwmark " + awgMarkRule + " table " + awgTable + " 2>/dev/null")
@@ -433,8 +433,8 @@ func (svc *Service) awgTeardownRoutingOS() error {
 	// rule + route, per-zone v6 ipsets). Per-zone v4 sets persist across teardown
 	// by design (they're rebuilt by awgBuildSourceSets on next apply), so we leave
 	// the v6 counterparts alone the same way.
-	_, _ = awgRun("while ip6tables -w -t mangle -D PREROUTING -j " + awgChain + "6 2>/dev/null; do :; done")
-	_, _ = awgRun("while ip6tables -w -t mangle -D OUTPUT -j " + awgChain + "6 2>/dev/null; do :; done")
+	_, _ = awgRun("while ip6tables -w 5 -t mangle -D PREROUTING -j " + awgChain + "6 2>/dev/null; do :; done")
+	_, _ = awgRun("while ip6tables -w 5 -t mangle -D OUTPUT -j " + awgChain + "6 2>/dev/null; do :; done")
 	_, _ = awgRun("ip6tables -t mangle -F " + awgChain + "6 2>/dev/null")
 	_, _ = awgRun("ip6tables -t mangle -X " + awgChain + "6 2>/dev/null")
 	_, _ = awgRun("ip -6 rule del fwmark " + awgMarkRule + " table " + awgTable + " 2>/dev/null")

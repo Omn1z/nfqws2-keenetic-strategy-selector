@@ -4,8 +4,10 @@ package awgroute
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
+	"os"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -64,7 +66,40 @@ func awgRunCheck(cmd string) error {
 func awgRun(cmd string) (string, error) {
 	ctx, cancel := contextTimeout(15 * time.Second)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, "sh", "-c", cmd).CombinedOutput()
+	return awgRunShell(ctx, cmd, "")
+}
+
+// CommandContext normally kills only sh. A child such as `iptables -w` can
+// retain CombinedOutput's pipe after sh exits, leaving the caller blocked well
+// past the deadline. Give each shell its own process group and kill the whole
+// group on cancellation. WaitDelay also bounds a pipe held by an orphan child.
+func awgRunShell(ctx context.Context, command, stdin string) (string, error) {
+	c := exec.CommandContext(ctx, "sh", "-c", command)
+	c.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	c.WaitDelay = time.Second
+	c.Cancel = func() error {
+		if c.Process == nil {
+			return os.ErrProcessDone
+		}
+		if err := syscall.Kill(-c.Process.Pid, syscall.SIGKILL); err != nil {
+			if errors.Is(err, syscall.ESRCH) {
+				return os.ErrProcessDone
+			}
+			return err
+		}
+		return nil
+	}
+	if stdin != "" {
+		c.Stdin = strings.NewReader(stdin)
+	}
+	out, err := c.CombinedOutput()
+	if errors.Is(err, exec.ErrWaitDelay) && c.Process != nil {
+		// The shell exited but a descendant still holds the output pipe.
+		_ = syscall.Kill(-c.Process.Pid, syscall.SIGKILL)
+	}
+	if ctx.Err() != nil {
+		err = ctx.Err()
+	}
 	return strings.TrimSpace(string(out)), err
 }
 
@@ -108,10 +143,7 @@ func awgRunStdin(cmd, stdin string) (string, error) {
 	// ipset restore for a full geoip:ru can be ~25k lines; allow a generous timeout.
 	ctx, cancel := contextTimeout(90 * time.Second)
 	defer cancel()
-	c := exec.CommandContext(ctx, "sh", "-c", cmd)
-	c.Stdin = strings.NewReader(stdin)
-	out, err := c.CombinedOutput()
-	return strings.TrimSpace(string(out)), err
+	return awgRunShell(ctx, cmd, stdin)
 }
 
 // awgIfaceHasGlobalV6 reports whether the tunnel interface has any global-scope
