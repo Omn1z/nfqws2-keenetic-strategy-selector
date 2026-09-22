@@ -87,6 +87,29 @@ HTTPS-клиент, модули Netfilter/IPSet/TUN и подписанный �
 - Keenetic/Entware: `/opt/etc/init.d/S52nfqws2-strategy` и `/opt/etc/nfqws2-strategy/`;
 - OpenWrt: `/etc/init.d/nfqws2-strategy` и `/etc/nfqws2-strategy/`.
 
+Если обновление старой версии на ARM64 обрывается после строки `downloading ...arm64`
+сообщениями `Segmentation fault` и `download failed`, сохраните файлы релиза
+через Entware `wget` и передайте установщику уже загруженный бинарник:
+
+```sh
+mkdir -p /opt/tmp/n2s-upgrade
+cd /opt/tmp/n2s-upgrade || exit 1
+base=https://github.com/Omn1z/nfqws2-keenetic-strategy-selector/releases/latest/download
+/opt/bin/wget -O install.sh "$base/install.sh" || exit 1
+/opt/bin/wget -O nfqws2-strategy-linux-arm64 "$base/nfqws2-strategy-linux-arm64" || exit 1
+/opt/bin/wget -O SHA256SUMS "$base/SHA256SUMS" || exit 1
+grep ' install.sh$' SHA256SUMS > CHECKSUMS || exit 1
+grep ' nfqws2-strategy-linux-arm64$' SHA256SUMS >> CHECKSUMS || exit 1
+sha256sum -c CHECKSUMS || exit 1
+N2S_BIN_SRC="$(pwd)/nfqws2-strategy-linux-arm64" sh ./install.sh
+/opt/usr/bin/n2s version
+```
+
+Если `/opt/bin/wget` тоже падает, загрузите эти три файла на компьютер и
+передайте по SCP в `/opt/tmp/n2s-upgrade/`. На роутере перейдите в этот каталог
+и выполните команды начиная с создания файла `CHECKSUMS`. Переустановка старой
+версии и удаление конфигурации не требуются.
+
 На OpenWrt процесс остаётся в foreground под `procd`, поэтому падение панели
 автоматически приводит к повторному запуску.
 

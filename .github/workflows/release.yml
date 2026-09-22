@@ -33,6 +33,7 @@ jobs:
         run: |
           sh packaging/test-bypass-hooks.sh
           sh packaging/test-install-deps.sh
+          sh packaging/test-download-fallback.sh
           sh packaging/test-update.sh
       - name: Check reachable Go vulnerabilities for Linux
         env:

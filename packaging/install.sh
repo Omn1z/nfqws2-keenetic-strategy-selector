@@ -88,13 +88,48 @@ URL="https://github.com/$REPO/releases/latest/download/$ASSET"
 say "arch=$arch_raw -> $ASSET"
 
 fetch() {
-  if command -v curl >/dev/null 2>&1; then
-    curl -fSL "$1" -o "$2"
-  elif command -v wget >/dev/null 2>&1; then
-    wget -O "$2" "$1"
-  else
-    die "need curl or wget"
-  fi
+  (
+    fetch_url=$1
+    fetch_dest=$2
+    fetch_dir=$(mktemp -d "$fetch_dest.n2s-download.XXXXXX") || exit 1
+    fetch_part="$fetch_dir/payload"
+    trap 'rm -f "$fetch_part"; rmdir "$fetch_dir" 2>/dev/null || true' 0
+    trap 'exit 129' 1
+    trap 'exit 130' 2
+    trap 'exit 143' 15
+    if command -v curl >/dev/null 2>&1; then
+      if curl -fSL "$fetch_url" -o "$fetch_part" && [ -s "$fetch_part" ] &&
+         mv -f "$fetch_part" "$fetch_dest"; then
+        exit 0
+      fi
+      rm -f "$fetch_part"
+    fi
+    # Entware curl can segfault on older Keenetic installations. Prefer Entware
+    # wget for HTTPS, then the firmware's BusyBox applet as an independent retry.
+    fetch_entware_wget=${N2S_ENTWARE_WGET:-/opt/bin/wget}
+    if [ -x "$fetch_entware_wget" ]; then
+      if "$fetch_entware_wget" -O "$fetch_part" "$fetch_url" &&
+         [ -s "$fetch_part" ] && mv -f "$fetch_part" "$fetch_dest"; then
+        exit 0
+      fi
+      rm -f "$fetch_part"
+    fi
+    fetch_busybox=${N2S_BUSYBOX:-/bin/busybox}
+    if [ -x "$fetch_busybox" ]; then
+      if "$fetch_busybox" wget -O "$fetch_part" "$fetch_url" &&
+         [ -s "$fetch_part" ] && mv -f "$fetch_part" "$fetch_dest"; then
+        exit 0
+      fi
+      rm -f "$fetch_part"
+    fi
+    if command -v wget >/dev/null 2>&1; then
+      if wget -O "$fetch_part" "$fetch_url" && [ -s "$fetch_part" ] &&
+         mv -f "$fetch_part" "$fetch_dest"; then
+        exit 0
+      fi
+    fi
+    exit 1
+  )
 }
 
 install_dependencies() {
