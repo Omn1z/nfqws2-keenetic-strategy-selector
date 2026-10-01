@@ -38,6 +38,7 @@ type Outcome struct {
 	BlockCategory string `json:"block_category,omitempty"`
 	BlockRule     string `json:"block_rule,omitempty"`
 	BlockSource   string `json:"block_source,omitempty"`
+	BlockDomain   string `json:"block_domain,omitempty"`
 	Error         string `json:"error,omitempty"`
 }
 
@@ -196,11 +197,7 @@ func (r *Resolver) Resolve(ctx context.Context, raw []byte) ([]byte, Outcome, er
 	}
 	if blocker := r.blocker.Load(); blocker != nil {
 		if match, blocked := blocker.MatchDNS(domain, q.Question[0].Qtype); blocked {
-			out.Blocked = true
-			out.BlockCategory = match.Category
-			out.BlockRule = match.Rule
-			out.BlockSource = match.Source
-			out.Route = "blocked"
+			out.setBlocked(domain, match)
 			wire, err := blockedReply(q)
 			return wire, out, err
 		}
@@ -218,6 +215,13 @@ func (r *Resolver) Resolve(ctx context.Context, raw []byte) ([]byte, Outcome, er
 		out.Cached = true
 		out.Route = route
 		out.Upstream = upstream
+		if r.blocker.Load() != nil {
+			var response mdns.Msg
+			if err := response.Unpack(cached); err == nil && r.filterResponse(q, &response, &out) {
+				answer, err := blockedReply(q)
+				return answer, out, err
+			}
+		}
 		return cached, out, nil
 	}
 	ctx, cancel := context.WithTimeout(ctx, 25*time.Second)
@@ -309,6 +313,10 @@ collect:
 			cancel()
 			out.Route = route.ID
 			out.Upstream = candidate.upstream.Address
+			if r.filterResponse(q, result.msg, &out) {
+				answer, err := blockedReply(q)
+				return answer, out, err
+			}
 			r.cachePut(key, result.msg, route.ID, candidate.upstream.Address, cacheGeneration)
 			result.msg.Id = q.Id
 			answer, err := result.msg.Pack()

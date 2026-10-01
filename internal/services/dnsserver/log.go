@@ -16,6 +16,7 @@ type LogEntry struct {
 	BlockCategory string `json:"block_category,omitempty"`
 	BlockRule     string `json:"block_rule,omitempty"`
 	BlockSource   string `json:"block_source,omitempty"`
+	BlockDomain   string `json:"block_domain,omitempty"`
 	ID            uint64 `json:"id"`
 	Time          string `json:"time"`
 	Level         string `json:"level"`
@@ -144,6 +145,7 @@ func normalizeLogEntry(entry LogEntry) LogEntry {
 	entry.Route = boundedLogString(entry.Route, 128)
 	entry.BlockCategory = boundedLogString(entry.BlockCategory, 16)
 	entry.BlockRule = boundedLogString(entry.BlockRule, 2048)
+	entry.BlockDomain = boundedLogString(entry.BlockDomain, 253)
 	entry.BlockSource = boundedLogString(entry.BlockSource, 64)
 	entry.Message = boundedLogString(entry.Message, 2048)
 	if entry.DurationMS < 0 {

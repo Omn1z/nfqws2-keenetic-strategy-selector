@@ -352,11 +352,12 @@ func (s *Service) exchange(ctx context.Context, run *serviceRun, q []byte) ([]by
 	}
 	if err != nil {
 		entry.Level, entry.Event, entry.Message = "error", "error", err.Error()
-	} else if out.Cached {
-		entry.Event = "cache"
 	} else if out.Blocked {
 		entry.Event = "blocked"
 		entry.BlockCategory, entry.BlockRule, entry.BlockSource = out.BlockCategory, out.BlockRule, out.BlockSource
+		entry.BlockDomain = out.BlockDomain
+	} else if out.Cached {
+		entry.Event = "cache"
 	}
 	s.logs.Append(entry)
 	// Transport succeeded even for SERVFAIL: clients receive a DNS error, and
@@ -399,6 +400,7 @@ type TestResult struct {
 	BlockCategory string   `json:"block_category,omitempty"`
 	BlockRule     string   `json:"block_rule,omitempty"`
 	BlockSource   string   `json:"block_source,omitempty"`
+	BlockDomain   string   `json:"block_domain,omitempty"`
 	OK            bool     `json:"ok"`
 	Domain        string   `json:"domain"`
 	Type          string   `json:"type"`
@@ -417,11 +419,12 @@ func (s *Service) Test(ctx context.Context, domain, kind string) TestResult {
 		result.Error = err.Error()
 		return result
 	}
-	typeCode := mdns.TypeA
-	if kind == "AAAA" {
-		typeCode = mdns.TypeAAAA
-	} else if kind != "A" && kind != "" {
-		result.Error = "тип должен быть A или AAAA"
+	if kind == "" {
+		kind = "A"
+	}
+	typeCode, validType := mdns.StringToType[kind]
+	if !validType || (typeCode != mdns.TypeA && typeCode != mdns.TypeAAAA && typeCode != mdns.TypeCNAME && typeCode != mdns.TypeHTTPS && typeCode != mdns.TypeSVCB) {
+		result.Error = "тип должен быть A, AAAA, CNAME, HTTPS или SVCB"
 		return result
 	}
 	s.mu.RLock()
@@ -440,6 +443,7 @@ func (s *Service) Test(ctx context.Context, domain, kind string) TestResult {
 	result.Route = out.Route
 	result.Upstream = out.Upstream
 	result.Blocked, result.BlockCategory, result.BlockRule, result.BlockSource = out.Blocked, out.BlockCategory, out.BlockRule, out.BlockSource
+	result.BlockDomain = out.BlockDomain
 	result.Error = out.Error
 	result.DurationMS = time.Since(started).Milliseconds()
 	if err != nil {

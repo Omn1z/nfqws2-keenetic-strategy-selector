@@ -178,29 +178,30 @@ func TestFilteringMetadataFailureStillPublishesValidMatcher(t *testing.T) {
 	}
 }
 
-func TestFilteringTwoDamagedCachesCanBeRepairedIndependently(t *testing.T) {
+func TestFilteringOversizedAdGuardCacheCanBeRepaired(t *testing.T) {
 	m, r := filterFixture(t)
 	cfg := copyFilteringConfig(&m.cfg)
-	cfg.Lists = []string{"adguard-dns", "hagezi-light"}
-	for _, id := range cfg.Lists {
-		if err := m.store.WriteBytes("dns-blocklists/"+id+".txt", make([]byte, maxFilteringSourceBytes+1)); err != nil {
-			t.Fatal(err)
-		}
+	cfg.CustomRules = []BlockingRule{{Domain: "manual.example", Category: BlockCategoryAds}}
+	if err := m.store.WriteBytes("dns-blocklists/adguard-dns.txt", make([]byte, maxFilteringSourceBytes+1)); err != nil {
+		t.Fatal(err)
 	}
 	if err := m.Configure(&cfg); err != nil {
 		t.Fatal(err)
+	}
+	if _, ok := m.Blocker().Match("manual.example"); !ok {
+		t.Fatal("damaged cache disabled manual rules")
 	}
 	if err := m.install(m.revision, cfg, "adguard-dns", filterData("ads", 1000), r); err != nil {
 		t.Fatal(err)
 	}
 	if _, ok := m.Blocker().Match("ads0.example"); !ok {
-		t.Fatal("other corrupt cache prevented repairing AdGuard")
-	}
-	if err := m.install(m.revision, cfg, "hagezi-light", filterData("tracker", 1000), r); err != nil {
-		t.Fatal(err)
+		t.Fatal("AdGuard cache repair did not activate rules")
 	}
 	if !m.Status().Ready {
-		t.Fatalf("not ready after both repairs: %+v", m.Status())
+		t.Fatalf("not ready after repair: %+v", m.Status())
+	}
+	if _, ok := m.Blocker().Match("manual.example"); !ok {
+		t.Fatal("AdGuard cache repair lost manual rules")
 	}
 }
 
@@ -229,7 +230,7 @@ func TestFilteringUpdateCancelsOnConfigurationChange(t *testing.T) {
 		t.Fatal("update never started")
 	}
 	cfg := copyFilteringConfig(&m.cfg)
-	cfg.Lists = []string{"hagezi-light"}
+	cfg.Allowlist = []string{"trusted.example"}
 	if err := m.Configure(&cfg); err != nil {
 		t.Fatal(err)
 	}
@@ -255,10 +256,10 @@ func TestFilteringUpdateCancelsOnConfigurationChange(t *testing.T) {
 	}
 }
 
-func TestFilteringSyntaxDamagedCacheDoesNotPreventOtherFeedRepair(t *testing.T) {
+func TestFilteringRetiredCacheDoesNotPreventAdGuardRepair(t *testing.T) {
 	m, r := filterFixture(t)
 	cfg := copyFilteringConfig(&m.cfg)
-	cfg.Lists = []string{"adguard-dns", "hagezi-light"}
+	cfg.CustomRules = []BlockingRule{{Domain: "manual.example", Category: BlockCategoryAds}}
 	if err := m.store.WriteBytes("dns-blocklists/hagezi-light.txt", []byte(strings.Repeat("x", (1<<20)+1))); err != nil {
 		t.Fatal(err)
 	}
@@ -269,6 +270,6 @@ func TestFilteringSyntaxDamagedCacheDoesNotPreventOtherFeedRepair(t *testing.T) 
 		t.Fatal(err)
 	}
 	if _, ok := m.Blocker().Match("ads0.example"); !ok {
-		t.Fatal("syntax error in another cache blocked recovery")
+		t.Fatal("retired cache blocked AdGuard recovery")
 	}
 }

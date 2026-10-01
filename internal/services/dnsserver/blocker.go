@@ -3,6 +3,7 @@ package dnsserver
 import (
 	"bufio"
 	"bytes"
+	"crypto/sha256"
 	"fmt"
 	"net"
 	"strings"
@@ -38,8 +39,8 @@ type BlockMatch struct {
 type BlockMatcherStats struct {
 	Rules   int            `json:"rules"`
 	Sources map[string]int `json:"sources"`
-	// Ignored counts non-comment source lines not loaded as active DNS rules;
-	// for AdGuard this also includes duplicates and browser-only syntax.
+	// Ignored counts non-comment source lines not loaded by the DNS engine.
+	// Loaded AdGuard rules include exceptions, badfilter directives and duplicates.
 	Ignored     map[string]int `json:"ignored"`
 	Approximate bool           `json:"approximate,omitempty"`
 }
@@ -53,11 +54,12 @@ type blockSnapshot struct {
 	domains         map[string]blockEntry
 	subdomains      map[string]blockEntry // *.example.com does not include example.com
 	netseer         map[string]blockEntry // bounded pattern, one label beneath xy/xz.fbcdn.net
-	allow           map[string]struct{} // explicit user allowlist always wins
-	sourceAllow     map[string]struct{} // downloaded exceptions yield to custom blocks
+	allow           map[string]struct{}   // explicit user allowlist always wins
+	sourceAllow     map[string]struct{}   // downloaded exceptions yield to custom blocks
 	adguard         *urlfilter.DNSEngine
 	adguardID       string
 	adguardCategory string
+	adguardHash     [sha256.Size]byte
 	stats           BlockMatcherStats
 }
 
@@ -66,8 +68,18 @@ type blockSnapshot struct {
 type Blocker struct{ snapshot atomic.Pointer[blockSnapshot] }
 
 func NewBlockMatcher(sources []BlockSource, custom []BlockingRule, allow []string) (*Blocker, error) {
+	return newBlockMatcher(sources, custom, allow, nil)
+}
+
+// newBlockMatcher builds a separate snapshot while sharing an unchanged
+// downloaded AdGuard engine with the last good matcher.
+func newBlockMatcher(sources []BlockSource, custom []BlockingRule, allow []string, previous *Blocker) (*Blocker, error) {
 	b := &Blocker{}
-	if err := b.Replace(sources, custom, allow); err != nil {
+	var prior *blockSnapshot
+	if previous != nil {
+		prior = previous.snapshot.Load()
+	}
+	if err := b.replace(sources, custom, allow, prior); err != nil {
 		return nil, err
 	}
 	return b, nil
@@ -77,19 +89,23 @@ func (b *Blocker) Replace(sources []BlockSource, custom []BlockingRule, allow []
 	if b == nil {
 		return fmt.Errorf("DNS blocker is nil")
 	}
+	return b.replace(sources, custom, allow, b.snapshot.Load())
+}
+
+func (b *Blocker) replace(sources []BlockSource, custom []BlockingRule, allow []string, previous *blockSnapshot) error {
 	snap := &blockSnapshot{
-		domains:    make(map[string]blockEntry),
-		subdomains: make(map[string]blockEntry),
-		netseer:    make(map[string]blockEntry),
-		allow:      make(map[string]struct{}),
+		domains:     make(map[string]blockEntry),
+		subdomains:  make(map[string]blockEntry),
+		netseer:     make(map[string]blockEntry),
+		allow:       make(map[string]struct{}),
 		sourceAllow: make(map[string]struct{}),
-		stats:      BlockMatcherStats{Sources: make(map[string]int), Ignored: make(map[string]int)},
+		stats:       BlockMatcherStats{Sources: make(map[string]int), Ignored: make(map[string]int)},
 	}
 	if len(sources) > 3 {
 		return fmt.Errorf("не более трёх списков DNS-блокировки")
 	}
 	seenIDs := make(map[string]struct{}, len(sources))
-	for index, source := range sources {
+	for _, source := range sources {
 		if len(source.Data) > 8<<20 {
 			return fmt.Errorf("список DNS-блокировки %s превышает 8 МиБ", source.ID)
 		}
@@ -106,20 +122,31 @@ func (b *Blocker) Replace(sources []BlockSource, custom []BlockingRule, allow []
 			return fmt.Errorf("список %s: %w", id, err)
 		}
 		if id == "adguard-dns" {
-			list := filterlist.NewString(&filterlist.StringConfig{RulesText: string(source.Data), ID: rules.ListID(index + 1), IgnoreCosmetic: true})
-			storage, err := filterlist.NewRuleStorage([]filterlist.Interface{list})
-			if err != nil {
-				return fmt.Errorf("список %s: %w", id, err)
+			snap.adguardHash = sha256.Sum256(source.Data)
+			if previous != nil && previous.adguard != nil && previous.adguardID == id && previous.adguardHash == snap.adguardHash {
+				snap.adguard = previous.adguard
+				snap.stats.Sources[id] = previous.stats.Sources[id]
+				if ignored := previous.stats.Ignored[id]; ignored > 0 {
+					snap.stats.Ignored[id] = ignored
+				}
+			} else {
+				// This engine owns only the AdGuard source, so its list ID is
+				// independent of the order of other selected feeds.
+				list := filterlist.NewString(&filterlist.StringConfig{RulesText: string(source.Data), ID: rules.ListID(1), IgnoreCosmetic: true})
+				storage, err := filterlist.NewRuleStorage([]filterlist.Interface{list})
+				if err != nil {
+					return fmt.Errorf("список %s: %w", id, err)
+				}
+				// String storage owns no files. Engine references keep it alive
+				// until every snapshot and in-flight lookup releases the engine.
+				snap.adguard = urlfilter.NewDNSEngine(storage)
+				count := int(snap.adguard.RulesCount())
+				snap.stats.Sources[id] = count
+				if candidates := countRuleLines(source.Data); candidates > count {
+					snap.stats.Ignored[id] = candidates - count
+				}
 			}
-			// String storage owns no files. Keep it alive with the engine until
-			// the immutable snapshot is no longer referenced by any lookup.
-			snap.adguard = urlfilter.NewDNSEngine(storage)
 			snap.adguardID, snap.adguardCategory = id, category
-			count := int(snap.adguard.RulesCount())
-			snap.stats.Sources[id] = count
-			if candidates := countRuleLines(source.Data); candidates > count {
-				snap.stats.Ignored[id] = candidates - count
-			}
 			continue
 		}
 		seen := make(map[string]struct{})
@@ -302,8 +329,8 @@ func normalizeAllowDomain(raw string) (string, error) {
 }
 
 func normalizeFilteringConfig(cfg *FilteringConfig) error {
-	if len(cfg.Lists) > 3 || len(cfg.CustomRules) > 2000 || len(cfg.Allowlist) > 2000 {
-		return fmt.Errorf("слишком много списков или пользовательских правил DNS-блокировки")
+	if len(cfg.CustomRules) > 2000 || len(cfg.Allowlist) > 2000 {
+		return fmt.Errorf("слишком много пользовательских правил DNS-блокировки")
 	}
 	seenLists := make(map[string]struct{}, len(cfg.Lists))
 	lists := make([]string, 0, len(cfg.Lists))
@@ -311,6 +338,12 @@ func normalizeFilteringConfig(cfg *FilteringConfig) error {
 		id := strings.TrimSpace(raw)
 		if id == "" || len(id) > 100 {
 			return fmt.Errorf("неверный ID списка DNS-блокировки")
+		}
+		// Migrate previously supported feeds so their removal does not reject
+		// saved DNS settings. Unrecognized IDs still fail validation below.
+		switch id {
+		case "hagezi-light", "hagezi-normal", "hagezi-pro", "oisd-small", "blocklist-ads", "blocklist-tracking":
+			id = "adguard-dns"
 		}
 		if _, ok := filteringList(id); !ok {
 			return fmt.Errorf("неизвестный список DNS-блокировки %q", id)
@@ -431,20 +464,36 @@ func (b *Blocker) Match(raw string) (BlockMatch, bool) {
 // MatchDNS applies DNS-type modifiers in AdGuard rules when a real question
 // type is available. Match is retained for domain-only diagnostics.
 func (b *Blocker) MatchDNS(raw string, qtype uint16) (BlockMatch, bool) {
+	return b.matchDNS(raw, qtype, false)
+}
+
+func (b *Blocker) matchDNS(raw string, qtype uint16, answer bool) (BlockMatch, bool) {
+	match, blocked, _ := b.evaluateDNS(raw, qtype, answer)
+	return match, blocked
+}
+
+// evaluateDNS distinguishes an exception from a domain with no matching rule.
+// Response filtering uses the exception to permit the complete original answer.
+func (b *Blocker) evaluateDNS(raw string, qtype uint16, answer bool) (BlockMatch, bool, bool) {
 	if b == nil {
-		return BlockMatch{}, false
+		return BlockMatch{}, false, false
 	}
 	snap := b.snapshot.Load()
 	if snap == nil {
-		return BlockMatch{}, false
+		return BlockMatch{}, false, false
 	}
 	domain, ok := normalizedLookupDomain(raw)
+	if !ok && answer {
+		if ip := net.ParseIP(raw); ip != nil {
+			domain, ok = ip.String(), true
+		}
+	}
 	if !ok {
-		return BlockMatch{}, false
+		return BlockMatch{}, false, false
 	}
 	for suffix := domain; ; {
 		if _, allowed := snap.allow[suffix]; allowed {
-			return BlockMatch{}, false
+			return BlockMatch{}, false, true
 		}
 		i := strings.IndexByte(suffix, '.')
 		if i < 0 {
@@ -482,11 +531,11 @@ func (b *Blocker) MatchDNS(raw string, qtype uint16) (BlockMatch, bool) {
 		}
 	}
 	if hasCustom {
-		return custom.BlockMatch, true
+		return custom.BlockMatch, true, false
 	}
 	for suffix := domain; ; {
 		if _, allowed := snap.sourceAllow[suffix]; allowed {
-			return BlockMatch{}, false
+			return BlockMatch{}, false, true
 		}
 		i := strings.IndexByte(suffix, '.')
 		if i < 0 {
@@ -495,32 +544,32 @@ func (b *Blocker) MatchDNS(raw string, qtype uint16) (BlockMatch, bool) {
 		suffix = suffix[i+1:]
 	}
 	if snap.adguard != nil {
-		result, _ := snap.adguard.MatchRequest(&urlfilter.DNSRequest{Hostname: domain, DNSType: qtype})
+		result, _ := snap.adguard.MatchRequest(&urlfilter.DNSRequest{Hostname: domain, DNSType: qtype, Answer: answer})
 		if result.NetworkRule != nil {
 			if result.NetworkRule.Whitelist {
-				return BlockMatch{}, false
+				return BlockMatch{}, false, true
 			}
 			match := BlockMatch{Category: snap.adguardCategory, Rule: result.NetworkRule.Text(), Source: snap.adguardID}
 			if hasList {
 				match.Category = combineBlockCategories(match.Category, list.Category)
 			}
-			return match, true
+			return match, true, false
 		}
 		for _, hostRule := range result.HostRulesV4 {
 			if hostRule.IP.IsUnspecified() || hostRule.IP.IsLoopback() {
-				return BlockMatch{Category: snap.adguardCategory, Rule: hostRule.Text(), Source: snap.adguardID}, true
+				return BlockMatch{Category: snap.adguardCategory, Rule: hostRule.Text(), Source: snap.adguardID}, true, false
 			}
 		}
 		for _, hostRule := range result.HostRulesV6 {
 			if hostRule.IP.IsUnspecified() || hostRule.IP.IsLoopback() {
-				return BlockMatch{Category: snap.adguardCategory, Rule: hostRule.Text(), Source: snap.adguardID}, true
+				return BlockMatch{Category: snap.adguardCategory, Rule: hostRule.Text(), Source: snap.adguardID}, true, false
 			}
 		}
 	}
 	if hasList {
-		return list.BlockMatch, true
+		return list.BlockMatch, true, false
 	}
-	return BlockMatch{}, false
+	return BlockMatch{}, false, false
 }
 
 // ASCII DNS queries use a zero-allocation fast path. Unicode source rules and

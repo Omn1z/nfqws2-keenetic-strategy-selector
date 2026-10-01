@@ -139,12 +139,15 @@ func (m *FilterManager) readCache(id string) ([]byte, error) {
 // A valid HTTP prefix can still be a truncated filter. Check each cached feed
 // independently, so a damaged second feed cannot prevent repairing the first.
 func (m *FilterManager) build(cfg FilteringConfig, replacement string, data []byte) (*Blocker, []string, error) {
+	m.mu.Lock()
+	previous := m.blocker
+	m.mu.Unlock()
 	sources, failures := m.sources(cfg, replacement, data)
-	blocker, err := NewBlockMatcher(sources, cfg.CustomRules, cfg.Allowlist)
+	blocker, err := newBlockMatcher(sources, cfg.CustomRules, cfg.Allowlist, previous)
 	if err != nil {
 		valid := make([]BlockSource, 0, len(sources))
 		for _, source := range sources {
-			_, sourceErr := NewBlockMatcher([]BlockSource{source}, nil, nil)
+			_, sourceErr := newBlockMatcher([]BlockSource{source}, nil, nil, previous)
 			if sourceErr != nil && source.ID != replacement {
 				failures = append(failures, source.ID+": "+sourceErr.Error())
 				continue
@@ -155,7 +158,7 @@ func (m *FilterManager) build(cfg FilteringConfig, replacement string, data []by
 			return nil, failures, err
 		}
 		sources = valid
-		blocker, err = NewBlockMatcher(sources, cfg.CustomRules, cfg.Allowlist)
+		blocker, err = newBlockMatcher(sources, cfg.CustomRules, cfg.Allowlist, previous)
 		if err != nil {
 			return nil, failures, err
 		}
@@ -177,7 +180,7 @@ func (m *FilterManager) build(cfg FilteringConfig, replacement string, data []by
 		valid = append(valid, source)
 	}
 	if len(valid) != len(sources) {
-		blocker, err = NewBlockMatcher(valid, cfg.CustomRules, cfg.Allowlist)
+		blocker, err = newBlockMatcher(valid, cfg.CustomRules, cfg.Allowlist, blocker)
 	}
 	return blocker, failures, err
 }
@@ -192,6 +195,9 @@ func (m *FilterManager) ConfigurePersist(cfg *FilteringConfig, persist func() er
 	m.opMu.Lock()
 	defer m.opMu.Unlock()
 	cp := copyFilteringConfig(cfg)
+	if err := normalizeFilteringConfig(&cp); err != nil {
+		return err
+	}
 	var failures []string
 	var blocker *Blocker
 	var err error

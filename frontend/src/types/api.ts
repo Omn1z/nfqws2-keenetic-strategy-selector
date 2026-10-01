@@ -437,6 +437,7 @@ export interface DnsServerTestResult {
   block_category?: DnsBlockCategory;
   block_rule?: string;
   block_source?: string;
+  block_domain?: string;
 }
 export interface DnsServerLogEntry {
   id: number;
@@ -453,6 +454,7 @@ export interface DnsServerLogEntry {
   block_category?: DnsBlockCategory;
   block_rule?: string;
   block_source?: string;
+  block_domain?: string;
 }
 export interface DnsServerLogSnapshot {
   enabled: boolean;

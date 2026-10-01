@@ -191,11 +191,11 @@ test("empty logs produce no synthetic console rows", () => {
 test("a local DNS block has its own presentation and is searchable without counting as a provider error", () => {
   const blocked = entry(1, {
     event: "blocked", level: "warn", route: "blocked", domain: "metrics.example.com",
-    block_category: "trackers", block_source: "adguard-dns", block_rule: "*.example.com",
+    block_category: "trackers", block_source: "adguard-dns", block_rule: "*.example.com", block_domain: "target.analytics.test",
   });
   assert.equal(isLogProblem(blocked), false);
   assert.deepEqual(logEventPresentation(blocked), { symbol: "⊠", label: "Заблокировано локально", tone: "warn" });
-  for (const query of ["блок", "trackers", "adguard-dns", "*.example.com"]) {
+  for (const query of ["блок", "trackers", "adguard-dns", "*.example.com", "target.analytics.test"]) {
     assert.equal(matchesLogFilter(blocked, query), true, query);
   }
 });

@@ -74,7 +74,7 @@ export default function DnsServer() {
   const [filterUpdating, setFilterUpdating] = useState(false);
   const [loadError, setLoadError] = useState("");
   const [domain, setDomain] = useState("claude.ai");
-  const [queryType, setQueryType] = useState<"A" | "AAAA">("A");
+  const [queryType, setQueryType] = useState<"A" | "AAAA" | "CNAME" | "HTTPS" | "SVCB">("A");
   const [testing, setTesting] = useState(false);
   const [test, setTest] = useState<DnsServerTestResult | null>(null);
   const loaded = useRef(false);
@@ -254,14 +254,14 @@ export default function DnsServer() {
       <Card title="Проверка DNS" sub="использует сохранённые настройки">
         <div className="flex flex-wrap items-end gap-3">
           <Field label="Домен" className="min-w-[180px] flex-1"><Input value={domain} disabled={testing} onChange={(e) => setDomain(e.target.value)} placeholder="claude.ai" autoCapitalize="none" spellCheck={false} /></Field>
-          <Field label="Тип записи" className="w-36"><Select value={queryType} disabled={testing} onChange={(e) => setQueryType(e.target.value as "A" | "AAAA")}><option value="A">A · IPv4</option><option value="AAAA">AAAA · IPv6</option></Select></Field>
+          <Field label="Тип записи" className="w-36"><Select value={queryType} disabled={testing} onChange={(e) => setQueryType(e.target.value as typeof queryType)}><option value="A">A · IPv4</option><option value="AAAA">AAAA · IPv6</option><option value="CNAME">CNAME · псевдоним</option><option value="HTTPS">HTTPS</option><option value="SVCB">SVCB</option></Select></Field>
           <Button disabled={busy || testing || dirty || !live.running || !domain.trim()} onClick={lookup}>{testing ? "Проверка…" : "Проверить"}</Button>
         </div>
         {!live.running && <p className="mt-2 text-xs text-muted">Для проверки включите DNS-сервер.</p>}
         {dirty && <p className="mt-2 text-xs text-muted">Для проверки сначала сохраните изменения.</p>}
         {test && <div role="status" className="mt-3 rounded-lg border border-line p-3 text-xs">
           <div className="flex flex-wrap items-center gap-2"><Badge kind={test.blocked ? "warn" : test.ok ? "ok" : "bad"}>{test.blocked ? "Заблокировано локально" : test.ok ? "Ответ получен" : "Ошибка"}</Badge><span>{test.domain} · {test.type} · {Math.round(test.duration_ms)} мс</span></div>
-          {test.blocked ? <p className="mt-2 [overflow-wrap:anywhere]">Ответ сформирован локально, DoH-провайдер не вызывался.{test.block_category ? ` Категория: ${test.block_category === "ads" ? "реклама" : test.block_category === "mixed" ? "реклама и трекеры" : "трекеры"}` : ""}{test.block_source ? ` · Источник: ${test.block_source}` : ""}{test.block_rule ? ` · Правило: ${test.block_rule}` : ""}</p>
+          {test.blocked ? <p className="mt-2 [overflow-wrap:anywhere]">Ответ NXDOMAIN сформирован локально.{test.block_domain && test.block_domain !== test.domain ? ` В ответе DNS заблокирован адрес: ${test.block_domain}.` : ""}{test.block_category ? ` Категория: ${test.block_category === "ads" ? "реклама" : test.block_category === "mixed" ? "реклама и трекеры" : "трекеры"}` : ""}{test.block_source ? ` · Источник: ${test.block_source}` : ""}{test.block_rule ? ` · Правило: ${test.block_rule}` : ""}</p>
             : <p className="mt-2 [overflow-wrap:anywhere]">Маршрут: {routeName(test.route)} · DNS: {test.upstream || "—"}</p>}
           {test.answers?.length > 0 && <pre className="mt-2 whitespace-pre-wrap font-mono text-xs [overflow-wrap:anywhere]">{test.answers.join("\n")}</pre>}
           {test.error && !test.blocked && <p className="mt-2 text-bad [overflow-wrap:anywhere]">{test.error}</p>}

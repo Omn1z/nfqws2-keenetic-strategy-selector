@@ -32,6 +32,27 @@ func TestFetchFilteringSourceRejectsUnknownURLAndDoesNotUseWANWithoutVPN(t *test
 	}
 }
 
+func TestFetchFilteringSourceRejectsRetiredPublisherURLs(t *testing.T) {
+	backend := &resolverTestBackend{routes: []dnsroute.Route{{ID: "nfqws", Available: true}}}
+	r := NewResolver(Default(), backend)
+	defer r.Close()
+	for _, sourceURL := range []string{
+		"https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/wildcard/light-onlydomains.txt",
+		"https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/wildcard/multi-onlydomains.txt",
+		"https://cdn.jsdelivr.net/gh/hagezi/dns-blocklists@latest/wildcard/pro-onlydomains.txt",
+		"https://small.oisd.nl/domainswild2",
+		"https://blocklistproject.github.io/Lists/alt-version/ads-nl.txt",
+		"https://blocklistproject.github.io/Lists/alt-version/tracking-nl.txt",
+	} {
+		if _, err := r.FetchFilteringSource(context.Background(), sourceURL); err == nil || !strings.Contains(err.Error(), "каталоге") {
+			t.Fatalf("retired source URL accepted: %s: %v", sourceURL, err)
+		}
+	}
+	if calls := backend.dialCalls(); len(calls) != 0 {
+		t.Fatalf("retired publisher contacted network: %v", calls)
+	}
+}
+
 func TestFetchFilteringIPRejectsPrivateEndpointBeforeDial(t *testing.T) {
 	backend := &resolverTestBackend{}
 	r := NewResolver(Default(), backend)

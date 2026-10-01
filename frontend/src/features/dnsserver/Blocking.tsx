@@ -64,7 +64,7 @@ type Props = {
 export function Blocking({ value, onChange, status, savedEnabled, running, disabled, updateBusy, unsaved, onUpdate }: Props) {
   const change = (patch: Partial<BlockingForm>) => onChange({ ...value, ...patch });
   const selected = new Set(value.lists);
-  const catalog = status?.lists ?? [];
+  const catalog = (status?.lists ?? []).filter((item) => item.id === "adguard-dns");
   const unknown = value.lists.filter((id) => !catalog.some((item) => item.id === id));
   const ignored = status?.ignored_rules ?? 0;
   return <Card title="Блокировка рекламы и трекеров" sub="локальная проверка DNS до обращения к DoH">
@@ -73,7 +73,7 @@ export function Blocking({ value, onChange, status, savedEnabled, running, disab
       <Badge kind={!running || !savedEnabled ? "neutral" : status?.ready ? "ok" : "warn"}>{!running ? "DNS-сервер выключен" : !savedEnabled ? "сейчас выключено" : status?.ready ? "блокировка действует" : "правила не готовы"}</Badge>
       <span className="text-xs text-muted">Выбор сохраняется кнопкой «Сохранить настройки» ниже.</span>
     </div>
-    <p className="mt-3 text-xs text-muted">Блокировка действует только для устройств, которые используют этот DNS-сервер. Она отвечает локально и не отправляет заблокированный домен внешнему DNS-провайдеру.</p>
+    <p className="mt-3 text-xs text-muted">Блокировка действует для устройств, которые используют этот DNS-сервер. Запрещённый домен получает локальный ответ NXDOMAIN без обращения к внешнему DNS. Если исходный домен разрешён, фильтр также проверяет CNAME и IP в полученном ответе.</p>
 
     <div className="mt-4 rounded-lg border border-line p-3 text-xs">
       <div className="flex flex-wrap items-center gap-x-4 gap-y-2">
@@ -81,18 +81,18 @@ export function Blocking({ value, onChange, status, savedEnabled, running, disab
         <span>Последнее обновление: {dateLabel(status?.last_updated ?? "")}</span>
         {ignored > 0 && <span title="Неподдерживаемые, повторяющиеся или неиспользуемые записи; пустые строки и комментарии не считаются">Пропущено строк: {fmtNum(ignored)}</span>}
         {status?.updating && <Badge kind="neutral">Обновляются…</Badge>}
-        <Button mini disabled={disabled || updateBusy || Boolean(status?.updating)} onClick={onUpdate}>{updateBusy || status?.updating ? "Обновление…" : "Обновить списки"}</Button>
+        <Button mini disabled={disabled || updateBusy || Boolean(status?.updating)} onClick={onUpdate}>{updateBusy || status?.updating ? "Обновление…" : "Обновить AdGuard"}</Button>
       </div>
-      {unsaved && <p className="mt-2 text-muted">Обновление использует сохранённый выбор списков. Несохранённые изменения формы сохранятся на экране.</p>}
+      {unsaved && <p className="mt-2 text-muted">Обновление использует сохранённую настройку AdGuard. Несохранённые изменения формы сохранятся на экране.</p>}
       {status?.last_error && <p role="alert" className="mt-2 text-bad [overflow-wrap:anywhere]">Ошибка обновления: {status.last_error}</p>}
-      {running && savedEnabled && !status?.ready && !status?.updating && <p className="mt-2 text-warn">Правила ещё не готовы. Проверьте выбранные списки и выполните обновление.</p>}
+      {running && savedEnabled && !status?.ready && !status?.updating && <p className="mt-2 text-warn">Правила ещё не готовы. Проверьте настройку AdGuard и выполните обновление.</p>}
     </div>
 
-    <h3 className="mt-5 text-sm font-semibold">Готовые списки</h3>
-    <p className="mt-1 text-xs text-muted">Начните с одного списка. AdGuard блокирует рекламу и трекеры; HaGeZi Light подходит для роутеров с небольшой памятью.</p>
+    <h3 className="mt-5 text-sm font-semibold">Официальный фильтр AdGuard</h3>
+    <p className="mt-1 text-xs text-muted">AdGuard DNS filter блокирует рекламу и трекеры. Снимите флажок, чтобы использовать только собственные правила и исключения.</p>
     <div className="mt-2 space-y-2">
       {catalog.map((item) => <div key={item.id} className="flex gap-3 rounded-lg border border-line p-3 text-xs">
-        <input id={`dns-filter-${item.id}`} type="checkbox" className="mt-0.5 size-4 shrink-0 accent-accent" checked={selected.has(item.id)} disabled={disabled || (!selected.has(item.id) && value.lists.length >= 3)} onChange={(event) => change({ lists: event.target.checked ? [...value.lists, item.id] : value.lists.filter((id) => id !== item.id) })} />
+        <input id={`dns-filter-${item.id}`} type="checkbox" className="mt-0.5 size-4 shrink-0 accent-accent" checked={selected.has(item.id)} disabled={disabled} onChange={(event) => change({ lists: event.target.checked ? [item.id] : [] })} />
         <span className="min-w-0 flex-1">
           <span className="flex flex-wrap items-center gap-2"><label htmlFor={`dns-filter-${item.id}`} className="cursor-pointer font-semibold text-ink-soft">{item.name}</label><Badge kind="neutral">{categoryName[item.category] ?? item.category}</Badge><span className="text-muted">{fmtNum(item.rules)} правил</span></span>
           {item.description && <span className="mt-1 block text-muted">{item.description}</span>}
@@ -104,10 +104,9 @@ export function Blocking({ value, onChange, status, savedEnabled, running, disab
           {item.last_error && <span className="mt-1 block text-bad [overflow-wrap:anywhere]">Ошибка списка: {item.last_error}</span>}
         </span>
       </div>)}
-      {!catalog.length && <p className="rounded-lg border border-line p-3 text-xs text-muted">Каталог списков пока недоступен. Ручные правила можно настроить ниже.</p>}
-      {catalog.length > 0 && unknown.length > 0 && <p className="text-xs text-warn">Сохранённые списки отсутствуют в каталоге: {unknown.join(", ")}. Уберите их из настроек или проверьте версию сервера.</p>}
+      {!catalog.length && <p className="rounded-lg border border-line p-3 text-xs text-muted">Фильтр AdGuard пока недоступен. Ручные правила можно настроить ниже.</p>}
+      {catalog.length > 0 && unknown.length > 0 && <p className="text-xs text-warn">Сохранённый источник отсутствует в каталоге: {unknown.join(", ")}. Измените флажок AdGuard и сохраните настройки.</p>}
     </div>
-    <p className="mt-2 text-xs text-muted">Можно выбрать до трёх списков. Несколько больших списков требуют больше памяти роутера.</p>
 
     <div className="mt-5 grid gap-4 lg:grid-cols-2">
       <Field label="Собственные правила" hint="по одному на строку">

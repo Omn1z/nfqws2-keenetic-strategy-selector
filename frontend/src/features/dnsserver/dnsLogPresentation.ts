@@ -23,7 +23,7 @@ export function shortProvider(address: string): string {
 
 export function matchesLogFilter(entry: DnsServerLogEntry, query: string, routeName: (id: string) => string = (id) => id): boolean {
   const meta = logEventPresentation(entry);
-  return [entry.domain, entry.qtype, entry.route, entry.route ? routeName(entry.route) : "", entry.upstream, entry.message, entry.event, entry.block_category, entry.block_rule, entry.block_source, meta.label, meta.symbol]
+  return [entry.domain, entry.qtype, entry.route, entry.route ? routeName(entry.route) : "", entry.upstream, entry.message, entry.event, entry.block_category, entry.block_rule, entry.block_source, entry.block_domain, meta.label, meta.symbol]
     .filter(Boolean).join(" ").toLowerCase().includes(query.trim().toLowerCase());
 }
 

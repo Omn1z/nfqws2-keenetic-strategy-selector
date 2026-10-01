@@ -11,9 +11,9 @@ export function DnsStatistics({ stats, cache }: { stats: DnsServerStats; cache: 
     { label: "Ошибок", value: fmtNum(stats.failures) },
     { label: "Записей в кэше", value: `${fmtNum(cache.entries)} / ${fmtNum(cache.capacity)}`, hint: cache.capacity ? `Хранение до ${fmtNum(cache.ttl_seconds)} сек.` : "Кэш выключен" },
     { label: "Заблокировано", value: fmtNum(stats.blocked_total ?? 0) },
-    { label: "Реклама", value: fmtNum(stats.blocked_ads ?? 0) },
-    { label: "Трекеры", value: fmtNum(stats.blocked_trackers ?? 0) },
-    { label: "Смешанные", value: fmtNum(stats.blocked_mixed ?? 0) },
+    { label: "Реклама", value: fmtNum(stats.blocked_ads ?? 0), hint: "Правила категории ads" },
+    { label: "Трекеры", value: fmtNum(stats.blocked_trackers ?? 0), hint: "Правила категории trackers" },
+    { label: "Реклама и трекеры", value: fmtNum(stats.blocked_mixed ?? 0), hint: "AdGuard и правила категории mixed" },
   ];
   return (
     <>
@@ -24,7 +24,7 @@ export function DnsStatistics({ stats, cache }: { stats: DnsServerStats; cache: 
           {hint && <p className="mt-1 text-[11px] text-muted">{hint}</p>}
         </div>)}
       </div>
-      <p className="mt-2 text-xs text-muted">Счётчики блокировки: DNS-запросы; с запуска DNS-сервера; не число рекламных баннеров. Сохранение настроек DNS перезапускает сервер и сбрасывает счётчики.</p>
+      <p className="mt-2 text-xs text-muted">Счётчики показывают заблокированные DNS-запросы с запуска сервера, включая блокировки CNAME и IP в ответах. AdGuard не разделяет правила на рекламу и трекеры, поэтому его блокировки входят в общий счётчик «Реклама и трекеры». Сохранение настроек DNS перезапускает сервер и сбрасывает счётчики.</p>
     </>
   );
 }

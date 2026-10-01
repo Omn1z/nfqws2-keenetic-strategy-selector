@@ -24,6 +24,7 @@ function EntryDetails({ entry, routeName }: { entry: DnsServerLogEntry; routeNam
     {entry.block_category && <span>Категория: {entry.block_category === "ads" ? "реклама" : entry.block_category === "mixed" ? "реклама и трекеры" : "трекеры"}</span>}
     {entry.block_source && <span>Источник: {entry.block_source}</span>}
     {entry.block_rule && <span>Правило: {entry.block_rule}</span>}
+    {entry.block_domain && entry.block_domain !== entry.domain && <span>Заблокировано в ответе DNS: {entry.block_domain}</span>}
   </div>;
 }
 
