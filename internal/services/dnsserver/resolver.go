@@ -30,11 +30,15 @@ type Backend interface {
 }
 
 type Outcome struct {
-	Domain   string `json:"domain"`
-	Route    string `json:"route"`
-	Upstream string `json:"upstream"`
-	Cached   bool   `json:"cached"`
-	Error    string `json:"error,omitempty"`
+	Domain        string `json:"domain"`
+	Route         string `json:"route"`
+	Upstream      string `json:"upstream"`
+	Cached        bool   `json:"cached"`
+	Blocked       bool   `json:"blocked,omitempty"`
+	BlockCategory string `json:"block_category,omitempty"`
+	BlockRule     string `json:"block_rule,omitempty"`
+	BlockSource   string `json:"block_source,omitempty"`
+	Error         string `json:"error,omitempty"`
 }
 
 type CacheStatus struct {
@@ -89,6 +93,7 @@ type Resolver struct {
 	fastDNS         *FastDNSCache
 	maintenanceOnce sync.Once
 	methods         *methodPolicy
+	blocker         atomic.Pointer[Blocker]
 }
 
 func NewResolver(cfg Config, backend Backend) *Resolver {
@@ -112,6 +117,10 @@ func (r *Resolver) SetScheduler(scheduler *Scheduler) {
 	r.mu.Lock()
 	r.scheduler = scheduler
 	r.mu.Unlock()
+}
+
+func (r *Resolver) SetBlocker(blocker *Blocker) {
+	r.blocker.Store(blocker)
 }
 
 func (r *Resolver) SetAttemptObserver(observer func(AttemptEvent)) {
@@ -184,6 +193,17 @@ func (r *Resolver) Resolve(ctx context.Context, raw []byte) ([]byte, Outcome, er
 	if err := ctx.Err(); err != nil {
 		out.Error = err.Error()
 		return nil, out, err
+	}
+	if blocker := r.blocker.Load(); blocker != nil {
+		if match, blocked := blocker.MatchDNS(domain, q.Question[0].Qtype); blocked {
+			out.Blocked = true
+			out.BlockCategory = match.Category
+			out.BlockRule = match.Rule
+			out.BlockSource = match.Source
+			out.Route = "blocked"
+			wire, err := blockedReply(q)
+			return wire, out, err
+		}
 	}
 	pool, _ := r.cfg.upstreamsFor(domain)
 	out.Upstream = pool[0].Address
@@ -317,6 +337,29 @@ collect:
 	err = fmt.Errorf("DNS недоступен: %s", strings.Join(failures, "; "))
 	out.Error = err.Error()
 	return nil, out, err
+}
+
+func blockedReply(q *mdns.Msg) ([]byte, error) {
+	// Caller fills Outcome. This helper deliberately has no DNSSEC proof: a
+	// local policy answer must never pretend to be authenticated upstream data.
+	response := new(mdns.Msg)
+	response.SetRcode(q, mdns.RcodeNameError)
+	response.Authoritative = false
+	response.AuthenticatedData = false
+	response.RecursionAvailable = true
+	response.Answer = nil
+	response.Ns = []mdns.RR{&mdns.SOA{
+		Hdr:     mdns.RR_Header{Name: q.Question[0].Name, Rrtype: mdns.TypeSOA, Class: mdns.ClassINET, Ttl: 60},
+		Ns:      "ns.invalid.",
+		Mbox:    "hostmaster.invalid.",
+		Serial:  0,
+		Refresh: 3600,
+		Retry:   600,
+		Expire:  86400,
+		Minttl:  60,
+	}}
+	wire, err := response.Pack()
+	return wire, err
 }
 
 func validateResponse(raw []byte, query *mdns.Msg) (*mdns.Msg, error) {

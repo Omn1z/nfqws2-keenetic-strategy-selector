@@ -41,12 +41,15 @@ func decodeDNSConfigRequest(t *testing.T, payload map[string]any) dnsServerConfi
 func TestDNSConfigOldPOSTPreservesIndependentSettings(t *testing.T) {
 	current := dnsserver.Default()
 	current.RouteMode = dnsserver.RouteModeVPNOnly
+	current.Filtering.Enabled = true
+	current.Filtering.Allowlist = []string{"allowed.example"}
 	current.CacheTTLSeconds = 1234
 	current.DefaultPool = []dnsserver.Upstream{{Address: "https://9.9.9.9/dns-query"}}
 	current.Rules[0].Pool = []dnsserver.Upstream{{Address: "https://8.8.8.8/dns-query"}}
 	current.DisabledMethods = []dnsserver.DisabledMethod{{Upstream: current.DefaultUpstream.Address, Route: "nfqws"}}
 	payload := dnsConfigPayload(t, current)
 	delete(payload, "route_mode")
+	delete(payload, "filtering")
 	delete(payload, "fast_dns")
 	delete(payload, "cache_ttl_seconds")
 	delete(payload, "default_pool")
@@ -65,6 +68,9 @@ func TestDNSConfigOldPOSTPreservesIndependentSettings(t *testing.T) {
 	}
 	if !reflect.DeepEqual(merged.DisabledMethods, current.DisabledMethods) || !reflect.DeepEqual(merged.DefaultPool, current.DefaultPool) || !reflect.DeepEqual(merged.Rules[0].Pool, current.Rules[0].Pool) {
 		t.Fatalf("old request reset methods or pools: %+v", merged)
+	}
+	if !reflect.DeepEqual(merged.Filtering, current.Filtering) {
+		t.Fatalf("old request reset filtering: %+v", merged.Filtering)
 	}
 	if err := merged.NormalizeValidate(); err != nil {
 		t.Fatalf("merged old request should remain valid: %v", err)

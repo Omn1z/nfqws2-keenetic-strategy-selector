@@ -157,7 +157,7 @@ export function DnsDiagnostics({ loggingEnabled, running, routes, onLoggingChang
   useEffect(() => {
     if (follow && !paused && consoleRef.current) consoleRef.current.scrollTop = consoleRef.current.scrollHeight;
   }, [logs?.last_id, follow, paused, problemsOnly, filter]);
-  const routeName = (id: string) => routes.find((v) => v.id === id)?.name || (id === "nfqws" ? "NFQWS" : id === "cache" ? "Кэш" : id);
+  const routeName = (id: string) => routes.find((v) => v.id === id)?.name || (id === "nfqws" ? "NFQWS" : id === "cache" ? "Кэш" : id === "blocked" ? "Локальная блокировка" : id);
   const entries = (logs?.entries ?? []).filter((entry) => (!problemsOnly || isLogProblem(entry)) && matchesLogFilter(entry, filter, routeName));
   const maxLogKiB = Math.round((logs?.max_bytes || 128 * 1024) / 1024);
   return <>
@@ -169,7 +169,7 @@ export function DnsDiagnostics({ loggingEnabled, running, routes, onLoggingChang
         <Button mini disabled={busy || !logs?.entries.length} onClick={() => mutate("logs/clear", {})}>Очистить журнал</Button>
       </div>
       <div className="my-3 flex flex-wrap items-center gap-4 text-xs"><Switch checked={follow} onChange={setFollow} label="Автопрокрутка" /><Switch checked={problemsOnly} onChange={setProblemsOnly} label="Только ошибки" />{logs && <span className="text-muted">{(logs.bytes / 1024).toFixed(1)} / {maxLogKiB} КиБ · Записей: {logs.entries.length}{logs.dropped > 0 ? ` · Удалено старых: ${logs.dropped}` : ""}</span>}</div>
-      <div className="mb-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px] text-muted" aria-label="Обозначения журнала"><span><b className="text-ok">✓</b> ответ</span><span><b className="text-accent">⚡</b> кэш</span><span><b>⊘ ×N</b> отмены без штрафа</span><span><b className="text-bad">!</b> ошибка</span><span className="ml-auto">⌄ подробности</span></div>
+      <div className="mb-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px] text-muted" aria-label="Обозначения журнала"><span><b className="text-ok">✓</b> ответ</span><span><b className="text-accent">⚡</b> кэш</span><span><b className="text-warn">⊠</b> локальная блокировка</span><span><b>⊘ ×N</b> отмены без штрафа</span><span><b className="text-bad">!</b> ошибка</span><span className="ml-auto">⌄ подробности</span></div>
       {paused && <p className="mb-3 text-xs text-warn">Просмотр приостановлен. Сервер продолжает записывать события, если логирование включено.</p>}
       {error && <p role="alert" className="mb-3 text-xs text-bad">Не удалось обновить журнал: {error}</p>}
       <div ref={consoleRef} role="log" aria-label="Журнал DNS" aria-live="off" tabIndex={0} className="h-80 overflow-auto rounded-lg border border-line bg-input px-3 py-1 font-mono text-[11px] leading-relaxed">

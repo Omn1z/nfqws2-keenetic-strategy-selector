@@ -277,6 +277,7 @@ func (s *Server) routes() {
 	m.HandleFunc("GET /api/dnsserver/logs", s.dnsServerLogs)
 	m.HandleFunc("POST /api/dnsserver/logs/clear", s.dnsServerClearLogs)
 	m.HandleFunc("POST /api/dnsserver/cache/clear", s.dnsServerClearCache)
+	m.HandleFunc("POST /api/dnsserver/filtering/update", s.dnsServerUpdateFiltering)
 	m.HandleFunc("POST /api/dnsserver/logging", s.dnsServerLogging)
 	m.HandleFunc("GET /api/dnsserver/scheduler", s.dnsServerScheduler)
 	m.HandleFunc("POST /api/dnsserver/scheduler/method", s.dnsServerMethod)

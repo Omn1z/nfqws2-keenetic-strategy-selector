@@ -21,6 +21,9 @@ function EntryDetails({ entry, routeName }: { entry: DnsServerLogEntry; routeNam
     {entry.route && <span>{routeName(entry.route)}{routeName(entry.route) !== entry.route ? ` (${entry.route})` : ""}</span>}
     {entry.upstream && <span>{entry.upstream}</span>}
     {entry.duration_ms !== undefined && <span>{Math.round(entry.duration_ms)} мс</span>}
+    {entry.block_category && <span>Категория: {entry.block_category === "ads" ? "реклама" : entry.block_category === "mixed" ? "реклама и трекеры" : "трекеры"}</span>}
+    {entry.block_source && <span>Источник: {entry.block_source}</span>}
+    {entry.block_rule && <span>Правило: {entry.block_rule}</span>}
   </div>;
 }
 
@@ -28,7 +31,7 @@ function EventRow({ entry, routeName }: { entry: DnsServerLogEntry; routeName: (
   const meta = logEventPresentation(entry);
   const message = compactLogMessage(entry);
   const problem = isLogProblem(entry);
-  const hasDetails = Boolean(entry.upstream || entry.route);
+  const hasDetails = Boolean(entry.upstream || entry.route || entry.block_category || entry.block_source || entry.block_rule);
   const content = <>
     <div className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
       <EntryTime entry={entry} />
@@ -36,7 +39,8 @@ function EventRow({ entry, routeName }: { entry: DnsServerLogEntry; routeName: (
       {entry.domain ? <><span className="font-semibold text-ink-soft">{entry.domain}</span>{entry.qtype && <span className="text-muted">{entry.qtype}</span>}</> : <span className={tones[meta.tone]}>{meta.label}</span>}
       {entry.count !== undefined && <span className="text-muted">×{logCount(entry)}</span>}
       {entry.upstream && <span className="min-w-0 text-muted" title={entry.upstream}>{shortProvider(entry.upstream)}</span>}
-      {entry.route && entry.route !== "cache" && <span className="rounded bg-line-soft px-1.5 text-ink-soft" title={entry.route}>{routeName(entry.route)}</span>}
+      {entry.route && entry.route !== "cache" && entry.route !== "blocked" && <span className="rounded bg-line-soft px-1.5 text-ink-soft" title={entry.route}>{routeName(entry.route)}</span>}
+      {entry.event === "blocked" && <span className="text-warn">{entry.block_category === "ads" ? "реклама" : entry.block_category === "mixed" ? "реклама и трекеры" : entry.block_category === "trackers" ? "трекеры" : "локально"}{entry.block_source ? ` · ${entry.block_source}` : ""}{entry.block_rule ? ` · ${entry.block_rule}` : ""}</span>}
       {entry.duration_ms !== undefined && <span className="ml-auto shrink-0 text-muted tabular-nums">{Math.round(entry.duration_ms)} мс</span>}
       {hasDetails && <><span className="text-[10px] text-muted group-open:hidden" aria-hidden="true">⌄</span><span className="hidden text-[10px] text-muted group-open:inline" aria-hidden="true">⌃</span></>}
     </div>
@@ -44,7 +48,7 @@ function EventRow({ entry, routeName }: { entry: DnsServerLogEntry; routeName: (
   </>;
   const className = "group border-b border-line/60 py-1 last:border-0 [overflow-wrap:anywhere]";
   return hasDetails ? <details className={className}>
-    <summary className="cursor-pointer list-none [&::-webkit-details-marker]:hidden" title="Показать полный DoH и маршрут">{content}</summary>
+    <summary className="cursor-pointer list-none [&::-webkit-details-marker]:hidden" title="Показать подробности DNS-события">{content}</summary>
     <div className="mt-1 border-l border-line pl-3"><EntryDetails entry={entry} routeName={routeName} /></div>
   </details> : <div className={className}>{content}</div>;
 }

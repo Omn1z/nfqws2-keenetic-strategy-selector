@@ -43,6 +43,10 @@ func (in dnsServerConfigRequest) merge(current dnsserver.Config) dnsserver.Confi
 	if in.RouteMode != nil {
 		cfg.RouteMode = *in.RouteMode
 	}
+	// Forms opened before DNS filtering existed must preserve the saved rules.
+	if cfg.Filtering == nil {
+		cfg.Filtering = current.Filtering
+	}
 	// Older open tabs do not know about pools. Only an explicit empty array
 	// removes additional providers; unrelated edits must keep the saved pool.
 	if cfg.DefaultPool == nil {
@@ -81,6 +85,14 @@ func (s *Server) dnsServerConfig(w http.ResponseWriter, r *http.Request) {
 func (s *Server) dnsServerClearCache(w http.ResponseWriter, r *http.Request) {
 	s.app.DNSServer().ClearCache()
 	writeJSON(w, 200, s.app.DNSServer().Status())
+}
+
+func (s *Server) dnsServerUpdateFiltering(w http.ResponseWriter, r *http.Request) {
+	if err := s.app.DNSServer().UpdateFiltering(); err != nil {
+		httpErr(w, http.StatusBadRequest, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, s.app.DNSServer().Status())
 }
 
 func (s *Server) dnsServerLogs(w http.ResponseWriter, r *http.Request) {

@@ -52,6 +52,7 @@ jobs:
         run: |
           cp internal/services/tgws/LICENSE.upstream dist/TGWS-LICENSE.txt
           cp THIRD_PARTY_NOTICES.md dist/THIRD-PARTY-NOTICES.txt
+          cp THIRD_PARTY_LICENSES/AdGuard-urlfilter-GPL-3.0.txt dist/ADGUARD-URLFILTER-LICENSE.txt
       - name: Upload panel artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -64,6 +65,7 @@ jobs:
             dist/nfqws2-strategy-linux-amd64
             dist/TGWS-LICENSE.txt
             dist/THIRD-PARTY-NOTICES.txt
+            dist/ADGUARD-URLFILTER-LICENSE.txt
           if-no-files-found: error
           compression-level: 0
 
@@ -137,12 +139,14 @@ jobs:
           test -s TGWS-LICENSE.txt
           test -s AMNEZIAWG-LICENSE.txt
           test -s THIRD-PARTY-NOTICES.txt
+          test -s ADGUARD-URLFILTER-LICENSE.txt
           for script in install update uninstall; do
             test -s "$script.sh"
           done
-          test "$(find . -maxdepth 1 -type f | wc -l)" -eq 19
+          test "$(find . -maxdepth 1 -type f | wc -l)" -eq 20
           sha256sum nfqws2-strategy-linux-* awg-engine-linux-*.tar.gz \
             TGWS-LICENSE.txt AMNEZIAWG-LICENSE.txt THIRD-PARTY-NOTICES.txt \
+            ADGUARD-URLFILTER-LICENSE.txt \
             install.sh update.sh uninstall.sh > SHA256SUMS
       - name: Upload all assets to a draft and publish
         run: |

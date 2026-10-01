@@ -2,6 +2,12 @@
 
 DNS dependencies added for DNS Server. Exact panel dependency versions are recorded in go.mod and go.sum. Existing TG WS Proxy and AmneziaWG notices are distributed separately.
 
+## AdGuard urlfilter v0.23.4
+
+Source: https://github.com/AdguardTeam/urlfilter/tree/v0.23.4
+
+License: GNU General Public License, version 3. The complete license text is in `THIRD_PARTY_LICENSES/AdGuard-urlfilter-GPL-3.0.txt`. The DNS filtering feature uses this library to interpret the official AdGuard DNS filter, including exception and modifier rules.
+
 The AmneziaWG engine uses upstream v3.1.20260828, revision b5928efb6ca19f0153958460c3d141f04abc5c2e, with a separately maintained security dependency lock in internal/services/awg/engine-deps.mod and engine-deps.sum. These builds update the Go toolchain and dependencies without modifying the upstream protocol implementation. The same lock is embedded for VPS userspace provisioning.
 
 ## miekg/dns v1.1.73

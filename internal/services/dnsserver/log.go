@@ -13,17 +13,20 @@ import (
 const MaxLogBytes = 128 * 1024
 
 type LogEntry struct {
-	ID         uint64 `json:"id"`
-	Time       string `json:"time"`
-	Level      string `json:"level"`
-	Event      string `json:"event"`
-	Domain     string `json:"domain,omitempty"`
-	QType      string `json:"qtype,omitempty"`
-	Upstream   string `json:"upstream,omitempty"`
-	Route      string `json:"route,omitempty"`
-	DurationMS int64  `json:"duration_ms,omitempty"`
-	Count      int    `json:"count,omitempty"`
-	Message    string `json:"message,omitempty"`
+	BlockCategory string `json:"block_category,omitempty"`
+	BlockRule     string `json:"block_rule,omitempty"`
+	BlockSource   string `json:"block_source,omitempty"`
+	ID            uint64 `json:"id"`
+	Time          string `json:"time"`
+	Level         string `json:"level"`
+	Event         string `json:"event"`
+	Domain        string `json:"domain,omitempty"`
+	QType         string `json:"qtype,omitempty"`
+	Upstream      string `json:"upstream,omitempty"`
+	Route         string `json:"route,omitempty"`
+	DurationMS    int64  `json:"duration_ms,omitempty"`
+	Count         int    `json:"count,omitempty"`
+	Message       string `json:"message,omitempty"`
 }
 
 type LogSnapshot struct {
@@ -139,6 +142,9 @@ func normalizeLogEntry(entry LogEntry) LogEntry {
 	entry.QType = boundedLogString(entry.QType, 24)
 	entry.Upstream = boundedLogString(entry.Upstream, 2048)
 	entry.Route = boundedLogString(entry.Route, 128)
+	entry.BlockCategory = boundedLogString(entry.BlockCategory, 16)
+	entry.BlockRule = boundedLogString(entry.BlockRule, 2048)
+	entry.BlockSource = boundedLogString(entry.BlockSource, 64)
 	entry.Message = boundedLogString(entry.Message, 2048)
 	if entry.DurationMS < 0 {
 		entry.DurationMS = 0

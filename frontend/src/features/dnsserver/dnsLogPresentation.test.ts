@@ -187,3 +187,15 @@ test("filtering summarized cancellation rows retains matching domains and only t
 test("empty logs produce no synthetic console rows", () => {
   assert.deepEqual(groupLogRows([]), []);
 });
+
+test("a local DNS block has its own presentation and is searchable without counting as a provider error", () => {
+  const blocked = entry(1, {
+    event: "blocked", level: "warn", route: "blocked", domain: "metrics.example.com",
+    block_category: "trackers", block_source: "adguard-dns", block_rule: "*.example.com",
+  });
+  assert.equal(isLogProblem(blocked), false);
+  assert.deepEqual(logEventPresentation(blocked), { symbol: "⊠", label: "Заблокировано локально", tone: "warn" });
+  for (const query of ["блок", "trackers", "adguard-dns", "*.example.com"]) {
+    assert.equal(matchesLogFilter(blocked, query), true, query);
+  }
+});

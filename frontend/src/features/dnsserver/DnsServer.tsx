@@ -11,14 +11,15 @@ import { Switch } from "@/components/ui/Switch";
 import { UpstreamPool, collectUpstream, upstreamForm, type UpstreamForm } from "./UpstreamPool";
 import { DnsDiagnostics } from "./DnsDiagnostics";
 import { DnsStatistics } from "./DnsStatistics";
+import { Blocking, blockingForm, collectBlocking, type BlockingForm } from "./Blocking";
 import { DomainGroups } from "./DomainGroups";
 import { collectRuleGroups, groupRules, type RuleGroupForm } from "./ruleGroups";
 import type { DnsServerConfig, DnsServerStatus, DnsServerTestResult } from "@/types/api";
 
 type RouteMode = "auto" | "vpn_only";
-type Form = Omit<DnsServerConfig, "dns_port" | "logging_enabled" | "timeout_seconds" | "cache_size" | "cache_ttl_seconds" | "default_upstream" | "default_pool" | "rules" | "route_mode"> & {
+type Form = Omit<DnsServerConfig, "dns_port" | "logging_enabled" | "timeout_seconds" | "cache_size" | "cache_ttl_seconds" | "default_upstream" | "default_pool" | "rules" | "route_mode" | "filtering"> & {
   timeout_seconds: string; cache_size: string; cache_ttl_seconds: string;
-  default_pool: UpstreamForm[]; groups: RuleGroupForm[]; route_mode: RouteMode;
+  default_pool: UpstreamForm[]; groups: RuleGroupForm[]; route_mode: RouteMode; filtering: BlockingForm;
 };
 const toForm = (c: DnsServerConfig): Form => ({
   enabled: c.enabled, listen_host: c.listen_host,
@@ -29,6 +30,7 @@ const toForm = (c: DnsServerConfig): Form => ({
   cache_ttl_seconds: String(c.cache_ttl_seconds ?? 3600),
   default_pool: [c.default_upstream, ...(c.default_pool ?? [])].map(upstreamForm),
   groups: groupRules(c.rules ?? []),
+  filtering: blockingForm(c.filtering),
 });
 const integer = (value: string, name: string, min: number, max: number) => {
   if (!/^\d+$/.test(value) || Number(value) < min || Number(value) > max) throw new Error(`${name}: укажите целое число от ${min} до ${max}`);
@@ -39,7 +41,7 @@ const timeLabel = (value: string) => {
   return Number.isNaN(date.getTime()) ? value : date.toLocaleTimeString("ru-RU", { hour12: false });
 };
 const collect = (f: Form): Omit<DnsServerConfig, "dns_port" | "logging_enabled"> => {
-  const { groups, ...config } = f;
+  const { groups, filtering, ...config } = f;
   return {
     ...config, listen_host: f.listen_host.trim() || "auto",
     awg_fallback: f.route_mode === "vpn_only" && f.awg_fallback === "off" ? "auto" : f.awg_fallback,
@@ -47,6 +49,7 @@ const collect = (f: Form): Omit<DnsServerConfig, "dns_port" | "logging_enabled">
     cache_ttl_seconds: integer(f.cache_ttl_seconds, "Время хранения кэша", 1, 86400),
     default_upstream: collectUpstream(f.default_pool[0]), default_pool: f.default_pool.slice(1).map(collectUpstream),
     rules: collectRuleGroups(groups),
+    filtering: collectBlocking(filtering),
   };
 };
 
@@ -68,6 +71,7 @@ export default function DnsServer() {
   const [form, setForm] = useState<Form | null>(null);
   const [busy, setBusy] = useState(false);
   const [clearing, setClearing] = useState(false);
+  const [filterUpdating, setFilterUpdating] = useState(false);
   const [loadError, setLoadError] = useState("");
   const [domain, setDomain] = useState("claude.ai");
   const [queryType, setQueryType] = useState<"A" | "AAAA">("A");
@@ -118,6 +122,19 @@ export default function DnsServer() {
     } catch (e) { toast((e as Error).message, "err"); }
     finally { acting.current = false; setBusy(false); setClearing(false); }
   };
+  const updateFiltering = async () => {
+    if (acting.current) return;
+    acting.current = true;
+    const revision = ++mutation.current;
+    setFilterUpdating(true);
+    try {
+      const v = await api<DnsServerStatus>("POST", "/api/dnsserver/filtering/update", {});
+      // Refresh live status only: the user may have unsaved changes in the form.
+      if (revision === mutation.current) { setLive(v); setLoadError(""); }
+      toast("Обновление списков запущено", "ok");
+    } catch (e) { toast((e as Error).message, "err"); }
+    finally { acting.current = false; setFilterUpdating(false); }
+  };
   const set = <K extends keyof Form>(key: K, value: Form[K]) => setForm((f) => f ? { ...f, [key]: value } : f);
   const setRouteMode = (mode: RouteMode) => setForm((f) => f ? {
     ...f, route_mode: mode, awg_fallback: mode === "vpn_only" && f.awg_fallback === "off" ? "auto" : f.awg_fallback,
@@ -137,7 +154,7 @@ export default function DnsServer() {
   const selectedTunnelAvailable = form.awg_fallback === "auto"
     ? tunnels.some((r) => r.available)
     : tunnels.some((r) => r.id.slice(4) === form.awg_fallback && r.available);
-  const routeName = (id?: string) => live.routes?.find((r) => r.id === id)?.name || (id === "nfqws" ? "NFQWS" : id === "cache" ? "Кэш" : id || "—");
+  const routeName = (id?: string) => live.routes?.find((r) => r.id === id)?.name || (id === "nfqws" ? "NFQWS" : id === "cache" ? "Кэш" : id === "blocked" ? "Локальная блокировка" : id || "—");
 
   return (
     <>
@@ -152,7 +169,7 @@ export default function DnsServer() {
         {loadError && <p role="alert" className="mt-3 text-xs text-warn">Не удалось обновить состояние: {loadError}</p>}
       </Card>
 
-      <Card title="Статистика" sub="с последнего запуска DNS-сервера" head={<Button mini disabled={busy || testing || !live.cache.entries} onClick={clearCache}>{clearing ? "Очистка…" : "Очистить кэш"}</Button>}>
+      <Card title="Статистика" sub="с запуска DNS-сервера" head={<Button mini disabled={busy || testing || !live.cache.entries} onClick={clearCache}>{clearing ? "Очистка…" : "Очистить кэш"}</Button>}>
         <DnsStatistics stats={live.stats} cache={live.cache} />
         <p className="mt-3 text-xs text-muted">Очистка кэша сохраняет статистику и настройки. Новые запросы снова заполняют кэш.</p>
         {live.stats.last_domain && <p className="mt-2 text-xs text-muted [overflow-wrap:anywhere]">Последний запрос: {live.stats.last_domain} · {routeName(live.stats.last_route)} · {live.stats.last_upstream || "—"}</p>}
@@ -176,6 +193,8 @@ export default function DnsServer() {
         </Card>
 
         <DomainGroups value={form.groups} onChange={(groups) => set("groups", groups)} disabled={busy || testing} />
+
+        <Blocking value={form.filtering} onChange={(filtering) => set("filtering", filtering)} status={live.filtering} savedEnabled={live.config.filtering?.enabled ?? false} running={live.running} disabled={busy || testing} updateBusy={filterUpdating} unsaved={dirty} onUpdate={updateFiltering} />
 
         <Card title="Ускорение и обход блокировок DNS">
           <p className="mb-3 text-xs text-muted">Если ответа нет в кэше, DoH из подходящего пула запрашиваются через маршруты выбранного режима. Планировщик ставит быстрые и надёжные сочетания «маршрут + DoH» первыми. Попытки запускаются параллельно; первый корректный ответ возвращается сразу, остальные отменяются.</p>
@@ -241,10 +260,11 @@ export default function DnsServer() {
         {!live.running && <p className="mt-2 text-xs text-muted">Для проверки включите DNS-сервер.</p>}
         {dirty && <p className="mt-2 text-xs text-muted">Для проверки сначала сохраните изменения.</p>}
         {test && <div role="status" className="mt-3 rounded-lg border border-line p-3 text-xs">
-          <div className="flex flex-wrap items-center gap-2"><Badge kind={test.ok ? "ok" : "bad"}>{test.ok ? "Ответ получен" : "Ошибка"}</Badge><span>{test.domain} · {test.type} · {Math.round(test.duration_ms)} мс</span></div>
-          <p className="mt-2 [overflow-wrap:anywhere]">Маршрут: {routeName(test.route)} · DNS: {test.upstream || "—"}</p>
+          <div className="flex flex-wrap items-center gap-2"><Badge kind={test.blocked ? "warn" : test.ok ? "ok" : "bad"}>{test.blocked ? "Заблокировано локально" : test.ok ? "Ответ получен" : "Ошибка"}</Badge><span>{test.domain} · {test.type} · {Math.round(test.duration_ms)} мс</span></div>
+          {test.blocked ? <p className="mt-2 [overflow-wrap:anywhere]">Ответ сформирован локально, DoH-провайдер не вызывался.{test.block_category ? ` Категория: ${test.block_category === "ads" ? "реклама" : test.block_category === "mixed" ? "реклама и трекеры" : "трекеры"}` : ""}{test.block_source ? ` · Источник: ${test.block_source}` : ""}{test.block_rule ? ` · Правило: ${test.block_rule}` : ""}</p>
+            : <p className="mt-2 [overflow-wrap:anywhere]">Маршрут: {routeName(test.route)} · DNS: {test.upstream || "—"}</p>}
           {test.answers?.length > 0 && <pre className="mt-2 whitespace-pre-wrap font-mono text-xs [overflow-wrap:anywhere]">{test.answers.join("\n")}</pre>}
-          {test.error && <p className="mt-2 text-bad [overflow-wrap:anywhere]">{test.error}</p>}
+          {test.error && !test.blocked && <p className="mt-2 text-bad [overflow-wrap:anywhere]">{test.error}</p>}
         </div>}
       </Card>
 

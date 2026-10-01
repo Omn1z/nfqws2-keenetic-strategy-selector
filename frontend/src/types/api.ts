@@ -327,6 +327,37 @@ export interface AwgFallbackView { value: string; servers: AwgFallbackServer[] }
 // ---- Local DNS service. Upstreams are DoH; listeners accept UDP/TCP DNS. ----
 export interface DnsServerUpstream { address: string; bootstrap_ips: string[] }
 export interface DnsServerDisabledMethod { upstream: string; route: string }
+export type DnsBlockCategory = "ads" | "trackers" | "mixed";
+export interface DnsCustomBlockRule { domain: string; category: DnsBlockCategory }
+export interface DnsFilteringConfig {
+  enabled: boolean;
+  lists: string[];
+  custom_rules: DnsCustomBlockRule[];
+  allowlist: string[];
+}
+export interface DnsFilteringListStatus {
+  id: string;
+  name: string;
+  category: DnsBlockCategory;
+  url: string;
+  homepage: string;
+  description: string;
+  selected: boolean;
+  rules: number;
+  last_updated: string;
+  last_error: string;
+}
+export interface DnsFilteringStatus {
+  enabled: boolean;
+  ready: boolean;
+  rules: number;
+  ignored_rules?: number;
+  approximate?: boolean;
+  updating: boolean;
+  last_updated: string;
+  last_error: string;
+  lists: DnsFilteringListStatus[];
+}
 export interface DnsServerRule {
   id: string;
   enabled: boolean;
@@ -350,6 +381,7 @@ export interface DnsServerConfig {
   cache_size: number;
   cache_ttl_seconds: number;
   rules: DnsServerRule[];
+  filtering?: DnsFilteringConfig;
 }
 export interface DnsServerStats {
   queries: number;
@@ -357,6 +389,10 @@ export interface DnsServerStats {
   nfqws_success: number;
   awg_success: number;
   failures: number;
+  blocked_total?: number;
+  blocked_ads?: number;
+  blocked_trackers?: number;
+  blocked_mixed?: number;
   last_domain?: string;
   last_route?: string;
   last_upstream?: string;
@@ -385,6 +421,7 @@ export interface DnsServerStatus {
   stats: DnsServerStats;
   cache: DnsServerCache;
   fast_dns?: DnsServerFastDNSStatus;
+  filtering?: DnsFilteringStatus;
   routes: { id: string; name: string; interface: string; available: boolean; error?: string }[];
 }
 export interface DnsServerTestResult {
@@ -396,6 +433,10 @@ export interface DnsServerTestResult {
   answers: string[];
   duration_ms: number;
   error?: string;
+  blocked?: boolean;
+  block_category?: DnsBlockCategory;
+  block_rule?: string;
+  block_source?: string;
 }
 export interface DnsServerLogEntry {
   id: number;
@@ -409,6 +450,9 @@ export interface DnsServerLogEntry {
   duration_ms?: number;
   message?: string;
   count?: number;
+  block_category?: DnsBlockCategory;
+  block_rule?: string;
+  block_source?: string;
 }
 export interface DnsServerLogSnapshot {
   enabled: boolean;

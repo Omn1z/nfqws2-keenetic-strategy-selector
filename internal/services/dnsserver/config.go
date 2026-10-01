@@ -29,6 +29,20 @@ type Rule struct {
 	Pool              []Upstream `json:"pool"`
 }
 
+// Filtering is optional so configurations saved before DNS blocking existed
+// continue to resolve every domain until the user enables the feature.
+type FilteringConfig struct {
+	Enabled     bool           `json:"enabled"`
+	Lists       []string       `json:"lists"`
+	CustomRules []BlockingRule `json:"custom_rules"`
+	Allowlist   []string       `json:"allowlist"`
+}
+
+type BlockingRule struct {
+	Domain   string `json:"domain"`
+	Category string `json:"category"`
+}
+
 type Config struct {
 	Enabled         bool             `json:"enabled"`
 	ListenHost      string           `json:"listen_host"`
@@ -39,6 +53,7 @@ type Config struct {
 	FastDNS         bool             `json:"fast_dns"`
 	AWGFallback     string           `json:"awg_fallback"`
 	RouteMode       string           `json:"route_mode"`
+	Filtering       *FilteringConfig `json:"filtering,omitempty"`
 	TimeoutSeconds  int              `json:"timeout_seconds"`
 	CacheSize       int              `json:"cache_size"`
 	CacheTTLSeconds int              `json:"cache_ttl_seconds"`
@@ -50,7 +65,7 @@ func Default() Config {
 	u := Upstream{Address: "https://xbox-dns.ru/dns-query", BootstrapIPs: []string{}}
 	c := Config{ListenHost: "auto", DNSPort: 5355,
 		DefaultUpstream: Upstream{Address: "https://1.1.1.1/dns-query", BootstrapIPs: []string{}},
-		AWGFallback:     "auto", RouteMode: RouteModeAuto, TimeoutSeconds: 3, CacheSize: 512, CacheTTLSeconds: 3600, LoggingEnabled: true, FastDNS: true, DefaultPool: []Upstream{}, DisabledMethods: []DisabledMethod{}}
+		AWGFallback:     "auto", RouteMode: RouteModeAuto, Filtering: DefaultFilteringConfig(), TimeoutSeconds: 3, CacheSize: 512, CacheTTLSeconds: 3600, LoggingEnabled: true, FastDNS: true, DefaultPool: []Upstream{}, DisabledMethods: []DisabledMethod{}}
 	for i, domain := range []string{"claude.com", "grok.com", "claude.ai"} {
 		c.Rules = append(c.Rules, Rule{ID: fmt.Sprintf("rule-%d", i+1), Enabled: true, Domain: domain, IncludeSubdomains: true, Upstream: u})
 	}
@@ -217,6 +232,12 @@ func (c *Config) NormalizeValidate() error {
 		return err
 	}
 	c.DisabledMethods = methods
+	if c.Filtering == nil {
+		c.Filtering = DefaultFilteringConfig()
+	}
+	if err := normalizeFilteringConfig(c.Filtering); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -283,6 +304,13 @@ func cloneConfig(c Config) Config {
 	for i := range c.Rules {
 		c.Rules[i].Upstream.BootstrapIPs = append([]string{}, c.Rules[i].Upstream.BootstrapIPs...)
 		c.Rules[i].Pool = cloneUpstreams(c.Rules[i].Pool)
+	}
+	if c.Filtering != nil {
+		filtering := *c.Filtering
+		filtering.Lists = append([]string{}, filtering.Lists...)
+		filtering.CustomRules = append([]BlockingRule{}, filtering.CustomRules...)
+		filtering.Allowlist = append([]string{}, filtering.Allowlist...)
+		c.Filtering = &filtering
 	}
 	return c
 }

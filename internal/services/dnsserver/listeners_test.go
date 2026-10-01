@@ -19,15 +19,17 @@ func protocolTestQuery() []byte {
 func protocolTestPort(t *testing.T) int {
 	t.Helper()
 	for i := 0; i < 20; i++ {
-		tcp, err := net.Listen("tcp", "127.0.0.1:0")
+		// Windows can exclude UDP ports that remain allocatable to TCP.
+		// Reserve UDP first so the OS chooses a usable DNS port for both.
+		udp, err := net.ListenPacket("udp", "127.0.0.1:0")
 		if err != nil {
 			t.Fatal(err)
 		}
-		port := tcp.Addr().(*net.TCPAddr).Port
-		udp, err := net.ListenPacket("udp", tcp.Addr().String())
-		tcp.Close()
+		port := udp.LocalAddr().(*net.UDPAddr).Port
+		tcp, err := net.Listen("tcp", udp.LocalAddr().String())
+		udp.Close()
 		if err == nil {
-			udp.Close()
+			tcp.Close()
 			return port
 		}
 	}

@@ -2,6 +2,7 @@ package dnsserver
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"os"
 	"strconv"
@@ -17,20 +18,25 @@ import (
 const configFile = "dnsserver.json"
 
 type Stats struct {
-	Queries      uint64 `json:"queries"`
-	CacheHits    uint64 `json:"cache_hits"`
-	NFQWSSuccess uint64 `json:"nfqws_success"`
-	AWGSuccess   uint64 `json:"awg_success"`
-	Failures     uint64 `json:"failures"`
-	LastDomain   string `json:"last_domain"`
-	LastRoute    string `json:"last_route"`
-	LastUpstream string `json:"last_upstream"`
-	LastError    string `json:"last_error"`
+	BlockedTotal    uint64 `json:"blocked_total"`
+	BlockedAds      uint64 `json:"blocked_ads"`
+	BlockedTrackers uint64 `json:"blocked_trackers"`
+	BlockedMixed    uint64 `json:"blocked_mixed"`
+	Queries         uint64 `json:"queries"`
+	CacheHits       uint64 `json:"cache_hits"`
+	NFQWSSuccess    uint64 `json:"nfqws_success"`
+	AWGSuccess      uint64 `json:"awg_success"`
+	Failures        uint64 `json:"failures"`
+	LastDomain      string `json:"last_domain"`
+	LastRoute       string `json:"last_route"`
+	LastUpstream    string `json:"last_upstream"`
+	LastError       string `json:"last_error"`
 }
 type Endpoints struct {
 	DNS string `json:"dns"`
 }
 type Status struct {
+	Filtering  FilteringStatus  `json:"filtering"`
 	Config     Config           `json:"config"`
 	Running    bool             `json:"running"`
 	ListenHost string           `json:"listen_host"`
@@ -60,6 +66,7 @@ type Service struct {
 	stats         Stats
 	logs          *LogBuffer
 	scheduler     *Scheduler
+	filtering     *FilterManager
 	active        *serviceRun
 	controlCancel context.CancelFunc
 }
@@ -90,6 +97,11 @@ func New(st *store.Store, backend Backend, resolveHost func(string) (string, err
 	} else {
 		s.lastError = err.Error()
 	}
+	var filterErr error
+	s.filtering, filterErr = NewFilterManager(st, s.cfg.Filtering)
+	if filterErr != nil {
+		s.lastError = "загрузка DNS-фильтров: " + filterErr.Error()
+	}
 	s.host, _ = s.resolveHost(s.cfg.ListenHost)
 	s.logs.SetEnabled(s.cfg.LoggingEnabled)
 	if s.lastError != "" {
@@ -110,6 +122,7 @@ func (s *Service) Status() Status {
 		st.FastDNS.Enabled = s.cfg.FastDNS
 	}
 	s.mu.RUnlock()
+	st.Filtering = s.filtering.Status()
 	st.Routes = s.backend.Routes()
 	if st.Routes == nil {
 		st.Routes = []dnsroute.Route{}
@@ -138,7 +151,7 @@ func (s *Service) setConfigLocked(cfg Config) error {
 	if err := validateNoSelfUpstream(cfg, host); err != nil {
 		return err
 	}
-	if err := s.store.Save(configFile, cfg); err != nil {
+	if err := s.filtering.ConfigurePersist(cfg.Filtering, func() error { return s.store.Save(configFile, cfg) }); err != nil {
 		return err
 	}
 	s.stopLocked()
@@ -231,6 +244,7 @@ func (s *Service) startRunLocked(parent context.Context) error {
 	run := &serviceRun{cancel: cancel, failure: make(chan error, 1)}
 	cfg.ListenHost = host // concrete bind address also protects upstream dialing from loops
 	run.resolver = NewResolver(cfg, s.backend)
+	run.resolver.SetBlocker(s.filtering.Blocker())
 	run.resolver.SetScheduler(s.scheduler)
 	run.resolver.SetAttemptObserver(s.recordAttempt)
 	run.resolver.SetCancellationObserver(s.recordCancellations)
@@ -271,6 +285,7 @@ func (s *Service) startRunLocked(parent context.Context) error {
 	logbuf.Append("dnsserver", "info", "DNS Server запущен на "+host)
 	s.logs.Append(LogEntry{Level: "info", Event: "start", Message: "DNS запущен на " + net.JoinHostPort(host, strconv.Itoa(cfg.DNSPort))})
 	run.resolver.StartMaintenance()
+	s.filtering.Start(ctx, run.resolver)
 	return nil
 }
 
@@ -296,7 +311,7 @@ func allowLANClients(host string) func(net.IP) bool {
 func (s *Service) exchange(ctx context.Context, run *serviceRun, q []byte) ([]byte, Outcome, error) {
 	started := time.Now()
 	resp, out, err := run.resolver.Resolve(ctx, q)
-	if err == nil {
+	if err == nil && !out.Blocked {
 		resp, err = s.backend.ObserveAnswer(ctx, out.Domain, resp, ContextClientIP(ctx))
 	}
 	if err != nil {
@@ -312,6 +327,16 @@ func (s *Service) exchange(ctx context.Context, run *serviceRun, q []byte) ([]by
 		s.stats.LastError = out.Error
 		if err != nil {
 			s.stats.Failures++
+		} else if out.Blocked {
+			s.stats.BlockedTotal++
+			switch out.BlockCategory {
+			case BlockCategoryAds:
+				s.stats.BlockedAds++
+			case BlockCategoryTrackers:
+				s.stats.BlockedTrackers++
+			default:
+				s.stats.BlockedMixed++
+			}
 		} else if out.Cached {
 			s.stats.CacheHits++
 		} else if out.Route == "nfqws" {
@@ -329,6 +354,9 @@ func (s *Service) exchange(ctx context.Context, run *serviceRun, q []byte) ([]by
 		entry.Level, entry.Event, entry.Message = "error", "error", err.Error()
 	} else if out.Cached {
 		entry.Event = "cache"
+	} else if out.Blocked {
+		entry.Event = "blocked"
+		entry.BlockCategory, entry.BlockRule, entry.BlockSource = out.BlockCategory, out.BlockRule, out.BlockSource
 	}
 	s.logs.Append(entry)
 	// Transport succeeded even for SERVFAIL: clients receive a DNS error, and
@@ -367,14 +395,18 @@ func (s *Service) stopLocked() {
 func (s *Service) Close() { s.opMu.Lock(); defer s.opMu.Unlock(); s.stopLocked() }
 
 type TestResult struct {
-	OK         bool     `json:"ok"`
-	Domain     string   `json:"domain"`
-	Type       string   `json:"type"`
-	Route      string   `json:"route"`
-	Upstream   string   `json:"upstream"`
-	Answers    []string `json:"answers"`
-	DurationMS int64    `json:"duration_ms"`
-	Error      string   `json:"error,omitempty"`
+	Blocked       bool     `json:"blocked"`
+	BlockCategory string   `json:"block_category,omitempty"`
+	BlockRule     string   `json:"block_rule,omitempty"`
+	BlockSource   string   `json:"block_source,omitempty"`
+	OK            bool     `json:"ok"`
+	Domain        string   `json:"domain"`
+	Type          string   `json:"type"`
+	Route         string   `json:"route"`
+	Upstream      string   `json:"upstream"`
+	Answers       []string `json:"answers"`
+	DurationMS    int64    `json:"duration_ms"`
+	Error         string   `json:"error,omitempty"`
 }
 
 func (s *Service) Test(ctx context.Context, domain, kind string) TestResult {
@@ -407,6 +439,7 @@ func (s *Service) Test(ctx context.Context, domain, kind string) TestResult {
 	result.Type = mdns.TypeToString[typeCode]
 	result.Route = out.Route
 	result.Upstream = out.Upstream
+	result.Blocked, result.BlockCategory, result.BlockRule, result.BlockSource = out.Blocked, out.BlockCategory, out.BlockRule, out.BlockSource
 	result.Error = out.Error
 	result.DurationMS = time.Since(started).Milliseconds()
 	if err != nil {
@@ -423,4 +456,21 @@ func (s *Service) Test(ctx context.Context, domain, kind string) TestResult {
 	}
 	result.OK = result.Error == "" && (msg.Rcode == mdns.RcodeSuccess || msg.Rcode == mdns.RcodeNameError)
 	return result
+}
+
+// UpdateFiltering queues an update without holding the HTTP request open.
+func (s *Service) UpdateFiltering() error {
+	s.opMu.Lock()
+	defer s.opMu.Unlock()
+	s.mu.RLock()
+	run := s.active
+	s.mu.RUnlock()
+	if run == nil {
+		return fmt.Errorf("включите DNS-сервер перед обновлением списков")
+	}
+	if !s.filtering.Status().Enabled {
+		return fmt.Errorf("включите и сохраните блокировку рекламы и трекеров")
+	}
+	s.filtering.Trigger(run.resolver.lifetime, run.resolver)
+	return nil
 }
