@@ -20,6 +20,7 @@ func TestEntwareLayout(t *testing.T) {
 		Nfqws2Init:      filepath.Join(root, "opt", "etc", "init.d", "S51nfqws2"),
 		StrategyBin:     filepath.Join(root, "opt", "usr", "bin", "n2s"),
 		StrategyInit:    filepath.Join(root, "opt", "etc", "init.d", "S52nfqws2-strategy"),
+		TLSCertDir:      filepath.Join(root, "opt", "etc", "ssl", "certs"),
 		AWGEngineDir:    filepath.Join(root, "opt", "usr", "bin"),
 		AWGConfigDir:    filepath.Join(root, "opt", "etc", "amnezia", "amneziawg"),
 		AWGHook:         filepath.Join(root, "opt", "etc", "ndm", "netfilter.d", "90-awg2.sh"),
@@ -45,6 +46,9 @@ func TestOpenWrtNativeLayout(t *testing.T) {
 	}
 	if got := r.Path(Nfqws2Conf); got != filepath.Join(root, "etc", "nfqws2", "nfqws2.conf") {
 		t.Fatalf("conf path = %q", got)
+	}
+	if got := r.Path(TLSCertDir); got != filepath.Join(root, "etc", "ssl", "certs") {
+		t.Fatalf("TLS certificate directory = %q", got)
 	}
 	if got := r.Path(AWGHook); got != filepath.Join(root, "etc", "nfqws2-strategy", "90-awg2.sh") {
 		t.Fatalf("AWG hook = %q", got)

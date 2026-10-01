@@ -16,6 +16,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"nfqws2strategy/internal/tools/tlsroots"
 )
 
 // wsHandshakeError carries the HTTP status from a failed WS upgrade so the
@@ -49,6 +51,11 @@ const wsIdleTimeout = 180 * time.Second
 
 const wsMaxMessageLen = 16 * 1024 * 1024
 const wsIdleProbeTimeout = 2 * time.Millisecond
+
+// Share bounded session tickets across native, CF and Worker endpoints. Pool
+// rotation and client reconnects can resume TLS without another full key exchange.
+var wsTLSSessions = tls.NewLRUClientSessionCache(64)
+var wsFrontedTLSSessions = tls.NewLRUClientSessionCache(8)
 
 // rawWebSocket is a bare-bones RFC 6455 client: binary frames, masked
 // client->server, fragmented messages, ping/pong handling and bounded frames.
@@ -85,16 +92,41 @@ func connectWS(ctx context.Context, host, sniDomain string, timeout time.Duratio
 // connectWSWithSNI keeps the HTTP Host independent from the TLS server name,
 // as required by the upstream domain-fronting fallback.
 func connectWSWithSNI(ctx context.Context, host, domain string, timeout time.Duration, path string, bufferSize int, sni string, secure ...bool) (*rawWebSocket, error) {
-	if timeout <= 0 || timeout > 10*time.Second {
-		timeout = 10 * time.Second
-	}
-	ctx, cancel := context.WithTimeout(ctx, timeout)
-	defer cancel()
-	dialer := &net.Dialer{Timeout: timeout}
 	useTLS := true
 	if len(secure) > 0 {
 		useTLS = secure[0]
 	}
+	var tlsTemplate *tls.Config
+	if useTLS {
+		sessions := wsTLSSessions
+		if sni != domain {
+			// Never mix tickets issued under different verification policies.
+			sessions = wsFrontedTLSSessions
+		}
+		tlsTemplate = &tls.Config{RootCAs: tlsroots.Pool(), ClientSessionCache: sessions}
+	}
+	return connectWSWithTLSConfig(ctx, host, domain, timeout, path, bufferSize, sni, useTLS, tlsTemplate)
+}
+
+// A template supplies immutable trust and session storage. Endpoint identity
+// and ordinary certificate verification remain controlled by the connection.
+func connectWSWithTLSConfig(ctx context.Context, host, domain string, timeout time.Duration, path string, bufferSize int, sni string, useTLS bool, tlsTemplate *tls.Config) (*rawWebSocket, error) {
+	if timeout <= 0 || timeout > 10*time.Second {
+		timeout = 10 * time.Second
+	}
+	// Waiting for local capacity must not consume the endpoint's network
+	// timeout and make a healthy upstream appear to have timed out.
+	queueTimeout := min(timeout, time.Second)
+	queueCtx, cancelQueue := context.WithTimeout(ctx, queueTimeout)
+	releaseHandshake, err := wsHandshakes.acquire(queueCtx)
+	cancelQueue()
+	if err != nil {
+		return nil, err
+	}
+	defer releaseHandshake()
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	dialer := &net.Dialer{Timeout: timeout}
 	port := "80"
 	if useTLS {
 		port = "443"
@@ -119,7 +151,12 @@ func connectWSWithSNI(ctx context.Context, host, domain string, timeout time.Dur
 		// Domain-fronted attempts deliberately use a different SNI and retain
 		// compatibility with fronts whose certificate does not match Telegram's
 		// HTTP Host header.
-		tconn := tls.Client(raw, &tls.Config{ServerName: sni, InsecureSkipVerify: sni != domain})
+		tlsConfig := &tls.Config{}
+		if tlsTemplate != nil {
+			tlsConfig = tlsTemplate.Clone()
+		}
+		tlsConfig.ServerName, tlsConfig.InsecureSkipVerify = sni, sni != domain
+		tconn := tls.Client(raw, tlsConfig)
 		deadline, _ := ctx.Deadline()
 		_ = tconn.SetDeadline(deadline)
 		if err := tconn.HandshakeContext(ctx); err != nil {

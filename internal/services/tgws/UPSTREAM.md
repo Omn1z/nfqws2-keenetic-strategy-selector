@@ -25,9 +25,16 @@ Synchronized behavior:
 Keenetic adaptations retained: LAN listener and port defaults, disabled service
 on first install, existing secrets/links, JSON persistence and web controls,
 shared AWG fallback routes, and the SOCKS5 frontend using the shared WS transport.
-The host starts the proxies after route/firewall initialization; background
-native pool dials are limited to four simultaneous attempts to avoid connection
-bursts on a router. Pool capacity remains configurable independently.
+The host starts the proxies after route/firewall initialization. All native,
+CF and Worker WebSocket setups share a limit of four simultaneous attempts;
+established streams release their slot. Waiting is bounded and does not mark an
+endpoint as unreachable. Pool capacity remains configurable independently.
+Bounded TLS session caches reduce repeated key exchanges during pool rotation;
+verified and opt-in domain-fronted connections use separate caches. Native trust
+is supplemented with Entware's CA files once, preserving explicit SSL_CERT_FILE
+and SSL_CERT_DIR overrides and ordinary certificate/hostname verification.
+The upload splitter reads plaintext already produced by the bridge, avoiding a
+third AES pass while preserving MTProto frame boundaries and ciphertext.
 SNI fronting is opt-in (`sni_fronting`, off by default): live tests on Keenetic
 showed that a fronted HTTP 101 can succeed while MTProto receives no response.
 The upstream mechanism remains available in the UI for networks that need it.

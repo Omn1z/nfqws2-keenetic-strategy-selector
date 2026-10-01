@@ -212,11 +212,12 @@ func (p *wsPool) refill(key poolKey, targetIP string, domains []string, generati
 
 	var wg sync.WaitGroup
 	results := make([]*rawWebSocket, needed)
+	failures := make([]error, needed)
 	for i := 0; i < needed; i++ {
 		wg.Add(1)
 		go func(idx int) {
 			defer wg.Done()
-			results[idx] = p.connectOne(targetIP, domains)
+			results[idx], failures[idx] = p.connectOneResult(targetIP, domains)
 		}(i)
 	}
 	wg.Wait()
@@ -242,10 +243,24 @@ func (p *wsPool) refill(key poolKey, targetIP string, domains []string, generati
 		delete(p.failures, key)
 		delete(p.refillAfter, key)
 	} else {
-		p.failures[key]++
-		delay := poolRefillBackoff(p.failures[key])
+		queueOnly := true
+		for _, err := range failures {
+			if !isWSHandshakeQueueError(err) {
+				queueOnly = false
+				break
+			}
+		}
+		delay := time.Second
+		if !queueOnly {
+			p.failures[key]++
+			delay = poolRefillBackoff(p.failures[key])
+		}
 		p.refillAfter[key] = time.Now().Add(delay)
-		log.Printf("tgws: WS pool refill failed DC%d media=%t; retry in %s", key.dc, key.media, delay)
+		if queueOnly {
+			log.Printf("tgws: WS pool refill waiting for local setup capacity DC%d media=%t; retry in %s", key.dc, key.media, delay)
+		} else {
+			log.Printf("tgws: WS pool refill failed DC%d media=%t; retry in %s", key.dc, key.media, delay)
+		}
 	}
 	p.mu.Unlock()
 }
@@ -310,47 +325,73 @@ func (p *wsPool) rotate(now time.Time) {
 }
 
 func (p *wsPool) connectOne(targetIP string, domains []string) *rawWebSocket {
+	ws, _ := p.connectOneResult(targetIP, domains)
+	return ws
+}
+
+func (p *wsPool) connectOneResult(targetIP string, domains []string) (*rawWebSocket, error) {
 	// Warm all configured DC/media buckets without starting their entire TLS
 	// burst at once on a router. A slot covers both ordinary and fronted
 	// attempts; foreground client dials do not enter this background queue.
 	if p.ctx.Err() != nil {
-		return nil
+		return nil, p.ctx.Err()
 	}
 	select {
 	case p.dialSlots <- struct{}{}:
 		defer func() { <-p.dialSlots }()
 	case <-p.ctx.Done():
-		return nil
+		return nil, p.ctx.Err()
 	}
 	// Cancellation can win simultaneously with an available slot.
 	if p.ctx.Err() != nil {
-		return nil
+		return nil, p.ctx.Err()
 	}
+	var lastFailure error
 	for index, domain := range domains {
 		frontedFirst := p.frontingEnabled && p.tryFrontingFirst.Load()
 		if frontedFirst {
-			if ws := p.connectFronted(targetIP, domain); ws != nil {
+			ws, err := p.connectFrontedResult(targetIP, domain)
+			if ws != nil {
 				logAlternatePooledDomain(ws, index, targetIP, domains)
-				return ws
+				return ws, nil
 			}
+			if isWSHandshakeQueueError(err) {
+				if lastFailure != nil {
+					return nil, lastFailure
+				}
+				return nil, err
+			}
+			lastFailure = err
 		}
 		ws, err := p.dial(p.ctx, targetIP, domain, 8*time.Second, "/apiws", p.buffer, domain)
 		if err == nil {
 			p.tryFrontingFirst.Store(false)
 			logAlternatePooledDomain(ws, index, targetIP, domains)
-			return ws
+			return ws, nil
 		}
+		if isWSHandshakeQueueError(err) {
+			if lastFailure != nil {
+				return nil, lastFailure
+			}
+			return nil, err
+		}
+		lastFailure = err
 		if hs, ok := err.(*wsHandshakeError); ok && hs.isRedirect() {
 			continue
 		}
 		if p.frontingEnabled && !frontedFirst && shouldTryFronting(err) {
-			ws := p.connectFronted(targetIP, domain)
+			ws, _ := p.connectFrontedResult(targetIP, domain)
 			logAlternatePooledDomain(ws, index, targetIP, domains)
-			return ws
+			if ws != nil {
+				return ws, nil
+			}
+			// The ordinary attempt already failed over the network. Preserve
+			// that cause even if its fronted retry waits for local capacity.
+			return nil, err
 		}
-		return nil
+		return nil, err
 	}
-	return nil
+	return nil, lastFailure
 }
 
 func logAlternatePooledDomain(ws *rawWebSocket, index int, targetIP string, domains []string) {
@@ -361,6 +402,9 @@ func logAlternatePooledDomain(ws *rawWebSocket, index int, targetIP string, doma
 }
 
 func shouldTryFronting(err error) bool {
+	if isWSHandshakeQueueError(err) {
+		return false
+	}
 	var ne net.Error
 	// Match upstream's timeout/reset-only fallback. An EOF from the ordinary
 	// endpoint must not populate the pool with a fronted HTTP 101 connection
@@ -369,16 +413,21 @@ func shouldTryFronting(err error) bool {
 }
 
 func (p *wsPool) connectFronted(targetIP, domain string) *rawWebSocket {
+	ws, _ := p.connectFrontedResult(targetIP, domain)
+	return ws
+}
+
+func (p *wsPool) connectFrontedResult(targetIP, domain string) (*rawWebSocket, error) {
 	if !p.frontingEnabled {
-		return nil
+		return nil, nil
 	}
 	ws, err := p.dial(p.ctx, targetIP, domain, 7*time.Second, "/apiws", p.buffer, frontingSNI)
 	if err != nil {
-		return nil
+		return nil, err
 	}
 	p.stats.connectionsFronting.Add(1)
 	p.tryFrontingFirst.Store(true)
-	return ws
+	return ws, nil
 }
 
 type cfPoolKey struct {
@@ -495,6 +544,9 @@ func (p *cfWorkerPool) refill(key cfPoolKey, domains []string, generation uint64
 	for _, domain := range p.availableDomains(domains) {
 		ws, err := p.dial(p.ctx, domain, domain, 8*time.Second, cfWorkerPath(key.dc, key.targetIP), p.buffer, domain)
 		if err != nil {
+			if isWSHandshakeQueueError(err) {
+				return
+			}
 			p.reportFailure(domain, err)
 			continue
 		}

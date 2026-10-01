@@ -69,6 +69,9 @@ func cfWorker(ctx context.Context, client io.Reader, clientWriter io.Writer, clo
 				ws = w
 				break
 			}
+			if isWSHandshakeQueueError(err) {
+				return false
+			}
 			if cfg.workerPool != nil {
 				cfg.workerPool.reportFailure(candidate, err)
 			}
@@ -106,6 +109,9 @@ func cfProxy(ctx context.Context, client io.Reader, clientWriter io.Writer, clos
 			ws = w
 			chosen = base
 			break
+		}
+		if isWSHandshakeQueueError(err) {
+			return false
 		}
 		log.Printf("tgws: DC%d CF %s failed: %s", dc, censorDomains(base), censorDomains(err.Error()))
 	}

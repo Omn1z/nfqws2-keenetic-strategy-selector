@@ -54,6 +54,7 @@ const (
 	TcpdumpSystemDir  Key = "tcpdump_system_dir"
 	EtcDir            Key = "etc_dir"
 	AuthEtcDir        Key = "auth_etc_dir"
+	TLSCertDir        Key = "tls_cert_dir"
 	EntwareOpkg       Key = "entware_opkg"
 )
 
@@ -86,6 +87,7 @@ func NewAt(root string) *Resolver {
 	values := map[Key]string{
 		EtcDir:           opt("/etc"),
 		AuthEtcDir:       opt("/etc"),
+		TLSCertDir:       opt("/etc/ssl/certs"),
 		StrategyRunDir:   opt("/var/run"),
 		StrategyLogDir:   opt("/var/log"),
 		TcpdumpOptDir:    opt("/opt"),
@@ -123,6 +125,7 @@ func NewAt(root string) *Resolver {
 		values[AWGConfigDir] = firstExistingDir(root, "/etc/amnezia/amneziawg", "/opt/etc/amnezia/amneziawg", "")
 	} else {
 		values[AuthEtcDir] = opt("/opt/etc")
+		values[TLSCertDir] = opt("/opt/etc/ssl/certs")
 		values[DataDir] = opt("/opt/etc/nfqws2-strategy")
 		values[Nfqws2Conf] = opt("/opt/etc/nfqws2/nfqws2.conf")
 		values[Nfqws2Bin] = opt("/opt/usr/bin/nfqws2")

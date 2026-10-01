@@ -11,9 +11,9 @@ import (
 )
 
 // messageSplitter slices an MTProto byte stream into individual transport
-// packets so each becomes its own WS binary frame. It decrypts the
-// re-encrypted bytes (in lockstep with upstreamEncrypt) just enough to read
-// packet boundaries; the ciphertext itself is what gets framed.
+// packets so each becomes its own WS binary frame. The bridge provides the
+// plaintext it already decrypted to read packet boundaries; the ciphertext
+// itself is what gets framed.
 type messageSplitter struct {
 	decryptor cipher.Stream
 	proto     uint32
@@ -36,9 +36,26 @@ func (m *messageSplitter) split(chunk []byte) [][]byte {
 	if m.off {
 		return [][]byte{chunk}
 	}
-	m.cipherBuf = append(m.cipherBuf, chunk...)
 	plain := make([]byte, len(chunk))
 	m.decryptor.XORKeyStream(plain, chunk)
+	return m.splitPlain(chunk, plain)
+}
+
+// splitPlain uses matching plaintext/ciphertext chunks without decrypting the
+// upload a third time. It copies buffered bytes before the bridge reuses its
+// read buffer. Use either split or splitPlain for an entire stream: this method
+// does not advance the legacy split decryptor's keystream.
+func (m *messageSplitter) splitPlain(chunk, plain []byte) [][]byte {
+	if len(chunk) != len(plain) {
+		panic("tgws: mismatched splitter plaintext and ciphertext lengths")
+	}
+	if len(chunk) == 0 {
+		return nil
+	}
+	if m.off {
+		return [][]byte{chunk}
+	}
+	m.cipherBuf = append(m.cipherBuf, chunk...)
 	m.plainBuf = append(m.plainBuf, plain...)
 
 	var parts [][]byte
@@ -150,10 +167,10 @@ func bridgeWS(client io.Reader, clientWriter io.Writer, closeClient func(), ws *
 				upBytes += int64(n)
 				upPackets++
 				reenc := make([]byte, n)
-				ctx.clientDecrypt.XORKeyStream(reenc, buf[:n])
-				ctx.upstreamEncrypt.XORKeyStream(reenc, reenc)
+				ctx.clientDecrypt.XORKeyStream(buf[:n], buf[:n])
+				ctx.upstreamEncrypt.XORKeyStream(reenc, buf[:n])
 				if splitter != nil {
-					parts := splitter.split(reenc)
+					parts := splitter.splitPlain(reenc, buf[:n])
 					if len(parts) == 1 {
 						if e := ws.send(parts[0]); e != nil {
 							closed = result{source: "upstream write", err: e}

@@ -2,6 +2,7 @@ package tgws
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"io"
 	"log"
@@ -10,6 +11,8 @@ import (
 	"regexp"
 	"strings"
 	"time"
+
+	"nfqws2strategy/internal/tools/tlsroots"
 )
 
 const cfProxyDomainsURL = "https://raw.githubusercontent.com/Flowseal/tg-ws-proxy/main/.github/cfproxy-domains.txt"
@@ -105,6 +108,12 @@ func runCFDomainRefresh(ctx context.Context, bal *domainBalancer) {
 	// Match upstream's GitHub DNS fallback without disabling HTTPS verification.
 	dialer := &net.Dialer{Timeout: 5 * time.Second}
 	transport := http.DefaultTransport.(*http.Transport).Clone()
+	if transport.TLSClientConfig == nil {
+		transport.TLSClientConfig = &tls.Config{}
+	} else {
+		transport.TLSClientConfig = transport.TLSClientConfig.Clone()
+	}
+	tlsroots.Configure(transport.TLSClientConfig)
 	transport.Proxy = nil
 	transport.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
 		host, port, _ := net.SplitHostPort(addr)
@@ -116,6 +125,12 @@ func runCFDomainRefresh(ctx context.Context, bal *domainBalancer) {
 	defer transport.CloseIdleConnections()
 	client := &http.Client{Timeout: 10 * time.Second, Transport: transport}
 	normalTransport := http.DefaultTransport.(*http.Transport).Clone()
+	if normalTransport.TLSClientConfig == nil {
+		normalTransport.TLSClientConfig = &tls.Config{}
+	} else {
+		normalTransport.TLSClientConfig = normalTransport.TLSClientConfig.Clone()
+	}
+	tlsroots.Configure(normalTransport.TLSClientConfig)
 	normalTransport.Proxy = nil
 	defer normalTransport.CloseIdleConnections()
 	normalClient := &http.Client{Timeout: 10 * time.Second, Transport: normalTransport}

@@ -355,6 +355,15 @@ func (h *clientHandler) connectDirect(dcKey, targetIP string, domains []string, 
 		if err == nil {
 			return ws
 		}
+		if isWSHandshakeQueueError(err) {
+			// A busy local setup budget must not blacklist a healthy DC/IP or
+			// record it as an upstream WS failure. The next client can retry.
+			if !allRedirects {
+				// Preserve a real failure from an earlier SNI in this attempt.
+				h.cooldown.cooldown(dcKey)
+			}
+			return nil
+		}
 		h.stats.wsErrors.Add(1)
 		if h.ctx.Err() != nil {
 			return nil
