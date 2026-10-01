@@ -251,7 +251,7 @@ func (s *Service) startRunLocked(parent context.Context) error {
 	// listener service or redirect the router's existing DNS/HTTPS service.
 	run.listeners, err = StartListeners(ctx, opts)
 	if err == nil {
-		err = s.backend.Prepare(ctx, dnsroute.ListenOptions{Host: host, DNSPort: cfg.DNSPort})
+		err = s.backend.Prepare(ctx, dnsroute.ListenOptions{Host: host, DNSPort: cfg.DNSPort, DisableNFQWS: cfg.RouteMode == RouteModeVPNOnly})
 	}
 	if err != nil {
 		cancel()

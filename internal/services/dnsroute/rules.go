@@ -37,10 +37,12 @@ func routeSelector(slot int) string { return routeMark(slot) + "/" + routeMarkMa
 func firewallScript(queue int, listen ListenOptions, iface, subnet string) string {
 	var b strings.Builder
 	b.WriteString("#!/bin/sh\n" + hookSignature + "\nset -e\n")
-	b.WriteString(familyFirewall("iptables", queue))
-	b.WriteString("if command -v ip6tables >/dev/null 2>&1; then\n(\n")
-	b.WriteString(familyFirewall("ip6tables", queue))
-	b.WriteString(") || true\nfi\n")
+	if !listen.DisableNFQWS {
+		b.WriteString(familyFirewall("iptables", queue))
+		b.WriteString("if command -v ip6tables >/dev/null 2>&1; then\n(\n")
+		b.WriteString(familyFirewall("ip6tables", queue))
+		b.WriteString(") || true\nfi\n")
+	}
 	fam := "iptables"
 	if net.ParseIP(listen.Host).To4() == nil {
 		fam = "ip6tables"

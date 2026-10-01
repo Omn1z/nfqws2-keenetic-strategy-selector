@@ -207,7 +207,8 @@ func (r *Resolver) Resolve(ctx context.Context, raw []byte) ([]byte, Outcome, er
 	r.mu.Lock()
 	scheduler, observer, cancelObserver := r.scheduler, r.observer, r.cancelObserver
 	r.mu.Unlock()
-	ordered := scheduler.order(r.policyConfig(), r.backend.Routes(), domain)
+	policy := r.policyConfig()
+	ordered := scheduler.order(policy, r.backend.Routes(), domain)
 	type result struct {
 		index int
 		msg   *mdns.Msg
@@ -304,7 +305,11 @@ collect:
 		}
 	}
 	if len(failures) == 0 {
-		failures = append(failures, "нет доступных включённых методов в выбранном пуле DoH: проверьте выключенные методы, NFQWS и AWG-подключения")
+		if policy.RouteMode == RouteModeVPNOnly {
+			failures = append(failures, "режим «только VPN»: нет доступных включённых методов DoH через AWG; проверьте VPN-подключение и выключенные методы")
+		} else {
+			failures = append(failures, "нет доступных включённых методов в выбранном пуле DoH: проверьте выключенные методы, NFQWS и AWG-подключения")
+		}
 	}
 	if ctx.Err() != nil {
 		failures = append(failures, ctx.Err().Error())

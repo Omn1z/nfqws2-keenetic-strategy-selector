@@ -13,21 +13,17 @@ import (
 func (s *Server) dnsServerStatus(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, s.app.DNSServer().Status())
 }
-func (s *Server) dnsServerConfig(w http.ResponseWriter, r *http.Request) {
-	s.portsMu.Lock()
-	defer s.portsMu.Unlock()
-	var in struct {
-		dnsserver.Config
-		CacheTTLSeconds *int  `json:"cache_ttl_seconds"`
-		FastDNS         *bool `json:"fast_dns"`
-	}
-	if err := readJSON(r, &in); err != nil {
-		httpErr(w, 400, err)
-		return
-	}
+
+type dnsServerConfigRequest struct {
+	dnsserver.Config
+	CacheTTLSeconds *int    `json:"cache_ttl_seconds"`
+	FastDNS         *bool   `json:"fast_dns"`
+	RouteMode       *string `json:"route_mode"`
+}
+
+func (in dnsServerConfigRequest) merge(current dnsserver.Config) dnsserver.Config {
 	cfg := in.Config
 	// The port belongs to System settings. A stale DNS form must not reset it.
-	current := s.app.DNSServer().Config()
 	cfg.DNSPort = current.DNSPort
 	cfg.LoggingEnabled = current.LoggingEnabled
 	// Method switches belong to the scheduler. Saving a stale DNS form must
@@ -41,6 +37,11 @@ func (s *Server) dnsServerConfig(w http.ResponseWriter, r *http.Request) {
 	cfg.FastDNS = current.FastDNS
 	if in.FastDNS != nil {
 		cfg.FastDNS = *in.FastDNS
+	}
+	// Saving a tab opened before VPN-only existed must not reopen the WAN path.
+	cfg.RouteMode = current.RouteMode
+	if in.RouteMode != nil {
+		cfg.RouteMode = *in.RouteMode
 	}
 	// Older open tabs do not know about pools. Only an explicit empty array
 	// removes additional providers; unrelated edits must keep the saved pool.
@@ -58,6 +59,18 @@ func (s *Server) dnsServerConfig(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+	return cfg
+}
+
+func (s *Server) dnsServerConfig(w http.ResponseWriter, r *http.Request) {
+	s.portsMu.Lock()
+	defer s.portsMu.Unlock()
+	var in dnsServerConfigRequest
+	if err := readJSON(r, &in); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	cfg := in.merge(s.app.DNSServer().Config())
 	if err := s.app.DNSServer().SetConfig(cfg); err != nil {
 		httpErr(w, 400, err)
 		return

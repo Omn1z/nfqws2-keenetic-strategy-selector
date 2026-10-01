@@ -15,12 +15,16 @@ import { DomainGroups } from "./DomainGroups";
 import { collectRuleGroups, groupRules, type RuleGroupForm } from "./ruleGroups";
 import type { DnsServerConfig, DnsServerStatus, DnsServerTestResult } from "@/types/api";
 
-type Form = Omit<DnsServerConfig, "dns_port" | "logging_enabled" | "timeout_seconds" | "cache_size" | "cache_ttl_seconds" | "default_upstream" | "default_pool" | "rules"> & {
+type RouteMode = "auto" | "vpn_only";
+type Form = Omit<DnsServerConfig, "dns_port" | "logging_enabled" | "timeout_seconds" | "cache_size" | "cache_ttl_seconds" | "default_upstream" | "default_pool" | "rules" | "route_mode"> & {
   timeout_seconds: string; cache_size: string; cache_ttl_seconds: string;
-  default_pool: UpstreamForm[]; groups: RuleGroupForm[];
+  default_pool: UpstreamForm[]; groups: RuleGroupForm[]; route_mode: RouteMode;
 };
 const toForm = (c: DnsServerConfig): Form => ({
-  enabled: c.enabled, listen_host: c.listen_host, awg_fallback: c.awg_fallback, fast_dns: c.fast_dns ?? true,
+  enabled: c.enabled, listen_host: c.listen_host,
+  route_mode: c.route_mode === "vpn_only" ? "vpn_only" : "auto",
+  awg_fallback: c.route_mode === "vpn_only" && c.awg_fallback === "off" ? "auto" : c.awg_fallback,
+  fast_dns: c.fast_dns ?? true,
   timeout_seconds: String(c.timeout_seconds), cache_size: String(c.cache_size),
   cache_ttl_seconds: String(c.cache_ttl_seconds ?? 3600),
   default_pool: [c.default_upstream, ...(c.default_pool ?? [])].map(upstreamForm),
@@ -38,6 +42,7 @@ const collect = (f: Form): Omit<DnsServerConfig, "dns_port" | "logging_enabled">
   const { groups, ...config } = f;
   return {
     ...config, listen_host: f.listen_host.trim() || "auto",
+    awg_fallback: f.route_mode === "vpn_only" && f.awg_fallback === "off" ? "auto" : f.awg_fallback,
     timeout_seconds: integer(f.timeout_seconds, "Таймаут", 1, 10), cache_size: integer(f.cache_size, "Размер кэша", 0, 4096),
     cache_ttl_seconds: integer(f.cache_ttl_seconds, "Время хранения кэша", 1, 86400),
     default_upstream: collectUpstream(f.default_pool[0]), default_pool: f.default_pool.slice(1).map(collectUpstream),
@@ -114,6 +119,9 @@ export default function DnsServer() {
     finally { acting.current = false; setBusy(false); setClearing(false); }
   };
   const set = <K extends keyof Form>(key: K, value: Form[K]) => setForm((f) => f ? { ...f, [key]: value } : f);
+  const setRouteMode = (mode: RouteMode) => setForm((f) => f ? {
+    ...f, route_mode: mode, awg_fallback: mode === "vpn_only" && f.awg_fallback === "off" ? "auto" : f.awg_fallback,
+  } : f);
   const lookup = async () => {
     setTesting(true); setTest(null);
     try { setTest(await api<DnsServerTestResult>("POST", "/api/dnsserver/test", { domain: domain.trim(), type: queryType })); }
@@ -126,6 +134,9 @@ export default function DnsServer() {
   const dirty = JSON.stringify(form) !== JSON.stringify(toForm(live.config));
   const tunnels = (live.routes ?? []).filter((r) => r.id.startsWith("awg:"));
   const selectedTunnelExists = tunnels.some((r) => r.id.slice(4) === form.awg_fallback);
+  const selectedTunnelAvailable = form.awg_fallback === "auto"
+    ? tunnels.some((r) => r.available)
+    : tunnels.some((r) => r.id.slice(4) === form.awg_fallback && r.available);
   const routeName = (id?: string) => live.routes?.find((r) => r.id === id)?.name || (id === "nfqws" ? "NFQWS" : id === "cache" ? "Кэш" : id || "—");
 
   return (
@@ -148,10 +159,13 @@ export default function DnsServer() {
         {live.stats.last_error && <p className="mt-2 text-xs text-bad [overflow-wrap:anywhere]">Последняя ошибка: {live.stats.last_error}</p>}
       </Card>
 
-      <Card title="Подключение устройств" sub="адрес из сохранённых настроек" head={<Button mini onClick={() => navigate("system")}>Настроить порты</Button>}>
-        <Endpoint label="DNS · UDP и TCP" value={live.endpoints.dns} />
-        <p className="mt-3 text-xs text-muted">В настройках обычного DNS укажите адрес роутера и порт сервера. Пока сервис выключен, этот адрес не отвечает.</p>
-        <p className="mt-2 text-xs text-muted">Если устройство позволяет указать только IP, оно использует порт 53. В этом случае настройте DNS роутера на этот сервер или выберите свободный порт 53 в разделе «Система».</p>
+      <Card title="Подключение Keenetic и устройств" sub="адрес из сохранённых настроек" head={<Button mini onClick={() => navigate("system")}>Настроить порты</Button>}>
+        <Endpoint label="Обычный DNS · UDP и TCP, без TLS" value={live.endpoints.dns} />
+        <p className="mt-3 text-xs text-warn">Этот адрес принимает обычный DNS. Не добавляйте его в список DoT/DoH Keenetic: там ожидается TLS или HTTPS, а локальный порт обслуживает DNS по UDP/TCP.</p>
+        <p className="mt-2 text-xs text-muted">Чтобы встроенный DNS Keenetic на порту 53 пересылал запросы сюда, откройте штатную CLI KeeneticOS (не оболочку Entware root) и выполните:</p>
+        {live.endpoints.dns && <pre className="mt-2 overflow-x-auto rounded-lg border border-line bg-panel-soft p-3 font-mono text-xs">{`ip name-server ${live.endpoints.dns}\nsystem configuration save\nshow ip name-server`}</pre>}
+        <p className="mt-2 text-xs text-muted">Устройства, которым можно задать порт DNS, могут обращаться напрямую к адресу выше. Устройства с полем только для IP используют порт 53 — оставьте им IP роутера. Пока сервис выключен, порт выше не отвечает.</p>
+        <p className="mt-2 text-xs text-warn">Keenetic может одновременно использовать другие DNS: от провайдера, добавленные вручную, DoT/DoH и профили интернет-фильтрации. Для исключительного использования этого сервиса проверьте и отключите конкурирующие источники в настройках Keenetic вручную.</p>
       </Card>
 
       <fieldset disabled={busy || testing} className="min-w-0">
@@ -164,7 +178,7 @@ export default function DnsServer() {
         <DomainGroups value={form.groups} onChange={(groups) => set("groups", groups)} disabled={busy || testing} />
 
         <Card title="Ускорение и обход блокировок DNS">
-          <p className="mb-3 text-xs text-muted">Если ответа нет в кэше, DoH из подходящего пула запрашиваются через NFQWS и выбранные AWG-подключения. Планировщик ставит быстрые и надёжные сочетания «маршрут + DoH» первыми. Попытки запускаются параллельно; первый корректный ответ возвращается сразу, остальные отменяются.</p>
+          <p className="mb-3 text-xs text-muted">Если ответа нет в кэше, DoH из подходящего пула запрашиваются через маршруты выбранного режима. Планировщик ставит быстрые и надёжные сочетания «маршрут + DoH» первыми. Попытки запускаются параллельно; первый корректный ответ возвращается сразу, остальные отменяются.</p>
           <div className="mb-3 rounded-lg border border-line p-3">
             <Switch checked={form.fast_dns} onChange={(enabled) => set("fast_dns", enabled)} label="fast-dns" />
             <p className="mt-2 text-xs text-muted">Кэширует IP-адреса DoH-серверов и обновляет их в фоне каждый час. Указанные вручную IP имеют приоритет. Этот кэш не зависит от кэша DNS-ответов и его времени хранения.</p>
@@ -177,21 +191,27 @@ export default function DnsServer() {
               {live.fast_dns.last_error && <p className="mt-1 text-xs text-warn [overflow-wrap:anywhere]">Обновление IP: {live.fast_dns.last_error}</p>}
             </>}
           </div>
-          <div className="grid gap-3 md:grid-cols-[minmax(0,1fr)_180px]">
-            <Field label="AWG одновременно с NFQWS"><Select value={form.awg_fallback} onChange={(e) => set("awg_fallback", e.target.value)}>
+          <div className="grid gap-3 md:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_180px]">
+            <Field label="Маршруты исходящих DNS-запросов"><Select value={form.route_mode} onChange={(e) => setRouteMode(e.target.value as RouteMode)}>
+              <option value="auto">NFQWS и VPN</option>
+              <option value="vpn_only">Только VPN (AWG/WARP)</option>
+            </Select></Field>
+            <Field label="VPN-подключение для DNS"><Select value={form.awg_fallback} onChange={(e) => set("awg_fallback", e.target.value)}>
               <option value="auto">Авто — все доступные AWG, включая WARP</option>
-              <option value="off">Выключено — только NFQWS</option>
+              {form.route_mode !== "vpn_only" && <option value="off">Выключено — только NFQWS</option>}
               {!selectedTunnelExists && !["auto", "off"].includes(form.awg_fallback) && <option value={form.awg_fallback}>Сохранённое подключение недоступно</option>}
               {tunnels.map((r) => <option key={r.id} value={r.id.slice(4)}>{r.name}{r.available ? " — доступен" : " — недоступен"}</option>)}
             </Select></Field>
             <Field label="Таймаут маршрута, сек."><Input type="number" min={1} max={10} value={form.timeout_seconds} onChange={(e) => set("timeout_seconds", e.target.value)} /></Field>
           </div>
+          {form.route_mode === "vpn_only" && <p className="mt-2 text-xs text-warn">Режим «Только VPN» не отправляет новые запросы к DoH через NFQWS или напрямую. Если выбранный AWG/WARP недоступен, запросы без ответа в кэше завершатся ошибкой DNS до восстановления туннеля.</p>}
           <div className="mt-3 flex flex-wrap gap-2">{live.routes?.map((r) => {
             const dnsDisabled = r.id === "nfqws" && !live.config.enabled;
-            return <span key={r.id} title={dnsDisabled ? "Маршрут запускается при включении DNS-сервера" : r.error || r.interface}><Badge kind={dnsDisabled ? "neutral" : r.available ? "ok" : "warn"}>{r.name}: {dnsDisabled ? "DNS-сервер выключен" : r.available ? "доступен" : "недоступен"}</Badge></span>;
+            const excluded = r.id === "nfqws" && live.config.route_mode === "vpn_only";
+            return <span key={r.id} title={dnsDisabled ? "Маршрут запускается при включении DNS-сервера" : excluded ? "Исключён режимом «Только VPN»" : r.error || r.interface}><Badge kind={dnsDisabled || excluded ? "neutral" : r.available ? "ok" : "warn"}>{r.name}: {dnsDisabled ? "DNS-сервер выключен" : excluded ? "исключён режимом" : r.available ? "доступен" : "недоступен"}</Badge></span>;
           })}</div>
-          {form.awg_fallback !== "off" && !tunnels.some((r) => r.available) && <p className="mt-2 text-xs text-warn">Сейчас нет доступных AWG-подключений. Они смогут участвовать в параллельных запросах после подключения VPN.</p>}
-          <p className="mt-2 text-xs text-muted">Таймаут ограничивает каждый маршрут отдельно: быстрый ответ не ждёт медленных маршрутов. NFQWS обрабатывает DoH на порту 443; для другого HTTPS-порта используются выбранные AWG-подключения.</p>
+          {form.awg_fallback !== "off" && !selectedTunnelAvailable && <p className="mt-2 text-xs text-warn">Выбранное VPN-подключение сейчас недоступно. {form.route_mode === "vpn_only" ? "Новые DNS-запросы без кэша будут завершаться ошибкой." : "VPN сможет участвовать в запросах после подключения."}</p>}
+          <p className="mt-2 text-xs text-muted">Таймаут ограничивает каждый маршрут отдельно: быстрый ответ не ждёт медленных маршрутов. NFQWS доступен только в режиме «NFQWS и VPN» и обрабатывает DoH на порту 443; для другого HTTPS-порта используются выбранные AWG-подключения.</p>
         </Card>
 
         <Card title="Параметры сервера">

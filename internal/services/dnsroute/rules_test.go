@@ -82,6 +82,20 @@ func TestFirewallIsScopedAndLANOnly(t *testing.T) {
 	}
 }
 
+func TestVPNOnlyFirewallDoesNotRequireNFQUEUE(t *testing.T) {
+	script := firewallScript(300, ListenOptions{Host: "192.168.3.1", DNSPort: 5355, DisableNFQWS: true}, "br0", "192.168.3.0/24")
+	for _, unwanted := range []string{"NFQUEUE", "CONNMARK", "--connbytes", "-t mangle", postChain, preChain} {
+		if strings.Contains(script, unwanted) {
+			t.Fatalf("VPN-only DNS requires NFQWS firewall: %s", unwanted)
+		}
+	}
+	for _, required := range []string{"-i lo -j ACCEPT", "-i br0 -s 192.168.3.0/24 -j ACCEPT", "-j DROP", "-p udp --dport 5355", "-p tcp --dport 5355"} {
+		if !strings.Contains(script, required) {
+			t.Fatalf("VPN-only DNS lost LAN access protection: %s", required)
+		}
+	}
+}
+
 func TestInterfaceValidationRejectsShellSyntax(t *testing.T) {
 	for _, name := range []string{"eth3;true", "br0\ntrue", "$(id)", "a b", "eth3/../lo", "", strings.Repeat("a", 16)} {
 		if validInterface(name) {

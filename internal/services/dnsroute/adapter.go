@@ -17,8 +17,9 @@ import (
 )
 
 type ListenOptions struct {
-	Host    string
-	DNSPort int
+	Host         string
+	DNSPort      int
+	DisableNFQWS bool // VPN-only DNS must not require or use an NFQUEUE path.
 }
 
 type Route struct {

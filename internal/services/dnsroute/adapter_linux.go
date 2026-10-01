@@ -24,11 +24,42 @@ var command = executeCommand
 func executeCommand(ctx context.Context, name string, args ...string) (string, error) {
 	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	out, err := exec.CommandContext(ctx, name, args...).CombinedOutput()
+	out, err := runCommandContext(ctx, "", name, args...)
 	if err != nil {
 		return strings.TrimSpace(string(out)), fmt.Errorf("%s %s: %w: %s", name, strings.Join(args, " "), err, strings.TrimSpace(string(out)))
 	}
-	return strings.TrimSpace(string(out)), nil
+	return out, nil
+}
+
+// Firewall shells can leave an iptables child holding the output pipe after
+// their deadline. Bound both the process group and the time spent reading it.
+func runCommandContext(ctx context.Context, stdin, name string, args ...string) (string, error) {
+	cmd := exec.CommandContext(ctx, name, args...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.WaitDelay = time.Second
+	cmd.Cancel = func() error {
+		if cmd.Process == nil {
+			return os.ErrProcessDone
+		}
+		if err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL); err != nil {
+			if errors.Is(err, syscall.ESRCH) {
+				return os.ErrProcessDone
+			}
+			return err
+		}
+		return nil
+	}
+	if stdin != "" {
+		cmd.Stdin = strings.NewReader(stdin)
+	}
+	out, err := cmd.CombinedOutput()
+	if errors.Is(err, exec.ErrWaitDelay) && cmd.Process != nil {
+		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+	}
+	if ctx.Err() != nil {
+		err = ctx.Err()
+	}
+	return strings.TrimSpace(string(out)), err
 }
 
 func (a *Adapter) prepareOS(ctx context.Context, l ListenOptions) error {
@@ -40,7 +71,7 @@ func (a *Adapter) prepareOS(ctx context.Context, l ListenOptions) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if a.cfg.MainQueue < 0 || a.cfg.MainQueue > 65535 {
+	if !l.DisableNFQWS && (a.cfg.MainQueue < 0 || a.cfg.MainQueue > 65535) {
 		return fmt.Errorf("invalid main NFQUEUE number")
 	}
 	if l.DNSPort < 1 || l.DNSPort > 65535 {
@@ -133,7 +164,7 @@ func (a *Adapter) maintain(ctx context.Context, done chan struct{}) {
 			if a.started {
 				// ndm calls the hook after firewall reload. This check also repairs
 				// manual flushes, while each new dial verifies its own queue path.
-				if !a.firewallReady(ctx, "iptables") {
+				if !a.inputFirewallReady(ctx) || !a.listen.DisableNFQWS && !a.firewallReady(ctx, "iptables") {
 					_, err := command(ctx, "sh", hookPath)
 					a.hookReady = err == nil
 				}
@@ -159,6 +190,8 @@ func (a *Adapter) refreshLocked() {
 	nfq.Error = ""
 	if !a.started {
 		nfq.Error = "сервис выключен"
+	} else if a.listen.DisableNFQWS {
+		nfq.Error = "DNS настроен только через VPN"
 	} else if !a.hookReady {
 		nfq.Error = "правила NFQWS DNS недоступны"
 	} else if !queueBound(a.cfg.MainQueue) {
@@ -245,6 +278,28 @@ func (a *Adapter) firewallReady(ctx context.Context, family string) bool {
 	return true
 }
 
+func (a *Adapter) inputFirewallReady(ctx context.Context) bool {
+	family := "iptables"
+	if net.ParseIP(a.listen.Host).To4() == nil {
+		family = "ip6tables"
+	}
+	for _, port := range listenerPorts(a.listen) {
+		if _, err := command(ctx, family, "-w", "-t", "filter", "-C", "INPUT", "-d", a.listen.Host, "-p", port.protocol, "--dport", strconv.Itoa(port.port), "-j", inputChain); err != nil {
+			return false
+		}
+	}
+	for _, rule := range [][]string{
+		{"-i", "lo", "-j", "ACCEPT"},
+		{"-i", a.lanIface, "-s", a.lanSubnet, "-j", "ACCEPT"},
+		{"-j", "DROP"},
+	} {
+		if _, err := command(ctx, family, append([]string{"-w", "-t", "filter", "-C", inputChain}, rule...)...); err != nil {
+			return false
+		}
+	}
+	return true
+}
+
 func (a *Adapter) dialOS(ctx context.Context, id, network, address string) (net.Conn, error) {
 	ipText, port, _ := net.SplitHostPort(address)
 	ip := net.ParseIP(ipText)
@@ -261,6 +316,10 @@ func (a *Adapter) dialOS(ctx context.Context, id, network, address string) (net.
 	if !a.started {
 		a.mu.Unlock()
 		return nil, fmt.Errorf("DNS routing is disabled")
+	}
+	if id == "nfqws" && a.listen.DisableNFQWS {
+		a.mu.Unlock()
+		return nil, fmt.Errorf("DNS is configured for VPN only; NFQWS route is disabled")
 	}
 	a.refreshLocked()
 	r := a.routes[id]
@@ -503,10 +562,8 @@ func (a *Adapter) cleanupLocked(ctx context.Context) error {
 	ctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	defer cancel()
 	var errs []error
-	cmd := exec.CommandContext(ctx, "sh")
-	cmd.Stdin = strings.NewReader(cleanupFirewallScript())
-	if out, err := cmd.CombinedOutput(); err != nil {
-		errs = append(errs, fmt.Errorf("DNS firewall cleanup: %w: %s", err, strings.TrimSpace(string(out))))
+	if out, err := runCommandContext(ctx, cleanupFirewallScript(), "sh"); err != nil {
+		errs = append(errs, fmt.Errorf("DNS firewall cleanup: %w: %s", err, out))
 	}
 	for _, family := range []string{"-4", "-6"} {
 		rules, err := command(ctx, "ip", family, "rule", "show")

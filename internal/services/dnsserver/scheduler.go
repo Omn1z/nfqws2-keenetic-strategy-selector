@@ -190,7 +190,7 @@ func eligibleRoutes(cfg Config, routes []dnsroute.Route) []dnsroute.Route {
 	result := make([]dnsroute.Route, 0, len(routes))
 	seen := make(map[string]bool, len(routes))
 	for _, route := range routes {
-		allowed := route.ID == "nfqws" || strings.HasPrefix(route.ID, "awg:") && cfg.AWGFallback != "off" && (cfg.AWGFallback == "auto" || route.ID == "awg:"+cfg.AWGFallback)
+		allowed := route.ID == "nfqws" && cfg.RouteMode != RouteModeVPNOnly || strings.HasPrefix(route.ID, "awg:") && cfg.AWGFallback != "off" && (cfg.AWGFallback == "auto" || route.ID == "awg:"+cfg.AWGFallback)
 		if allowed && !seen[route.ID] {
 			seen[route.ID] = true
 			result = append(result, route)

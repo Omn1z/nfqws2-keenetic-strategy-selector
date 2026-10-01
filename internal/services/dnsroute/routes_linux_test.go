@@ -5,9 +5,76 @@ package dnsroute
 import (
 	"context"
 	"errors"
+	"os/exec"
 	"strings"
 	"testing"
+	"time"
 )
+
+func TestVPNOnlyAdapterRefusesNFQWSDial(t *testing.T) {
+	a := New(nil, nil)
+	a.started = true
+	a.listen.DisableNFQWS = true
+	_, err := a.DialContext(context.Background(), "nfqws", "tcp", "1.1.1.1:443")
+	if err == nil || !strings.Contains(err.Error(), "VPN only") {
+		t.Fatalf("NFQWS dial not blocked by adapter: %v", err)
+	}
+	for _, route := range a.Routes() {
+		if route.ID == "nfqws" && (route.Available || route.Error == "") {
+			t.Fatalf("NFQWS route advertised in VPN-only mode: %+v", route)
+		}
+	}
+}
+
+func TestDNSCommandDeadlineKillsChildren(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel()
+	started := time.Now()
+	_, err := executeCommand(ctx, "sh", "-c", "sleep 5 & wait")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("command error = %v, want deadline exceeded", err)
+	}
+	if elapsed := time.Since(started); elapsed > 2*time.Second {
+		t.Fatalf("DNS command waited for child after deadline: %s", elapsed)
+	}
+}
+
+func TestDNSCommandOrphanCannotHoldOutputPipe(t *testing.T) {
+	started := time.Now()
+	_, err := executeCommand(context.Background(), "sh", "-c", "sleep 5 &")
+	if !errors.Is(err, exec.ErrWaitDelay) {
+		t.Fatalf("command error = %v, want output-pipe wait limit", err)
+	}
+	if elapsed := time.Since(started); elapsed > 2*time.Second {
+		t.Fatalf("orphan held DNS command output for %s", elapsed)
+	}
+}
+
+func TestInputFirewallRepairDoesNotDependOnNFQUEUE(t *testing.T) {
+	prior := command
+	defer func() { command = prior }()
+	missingDrop := false
+	command = func(_ context.Context, name string, args ...string) (string, error) {
+		joined := strings.Join(args, " ")
+		if name != "iptables" || strings.Contains(joined, "mangle") || strings.Contains(joined, "NFQUEUE") {
+			t.Fatalf("LAN listener repair inspected NFQWS: %s %s", name, joined)
+		}
+		if missingDrop && strings.HasSuffix(joined, "-j DROP") {
+			return "", errors.New("rule absent")
+		}
+		return "", nil
+	}
+	a := New(nil, nil)
+	a.listen = ListenOptions{Host: "192.168.3.1", DNSPort: 5355, DisableNFQWS: true}
+	a.lanIface, a.lanSubnet = "br0", "192.168.3.0/24"
+	if !a.inputFirewallReady(context.Background()) {
+		t.Fatal("LAN listener rejected because NFQWS was not checked")
+	}
+	missingDrop = true
+	if a.inputFirewallReady(context.Background()) {
+		t.Fatal("missing non-LAN drop rule did not trigger repair")
+	}
+}
 
 func TestWANSelectionDoesNotFollowAWGDefault(t *testing.T) {
 	out := "default dev awg1\ndefault via 192.168.0.1 dev eth3 metric 1000\n"

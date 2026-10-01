@@ -345,6 +345,7 @@ export interface DnsServerConfig {
   fast_dns: boolean;
   disabled_methods?: DnsServerDisabledMethod[];
   awg_fallback: string;
+  route_mode?: "auto" | "vpn_only" | "";
   timeout_seconds: number;
   cache_size: number;
   cache_ttl_seconds: number;

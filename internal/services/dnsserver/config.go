@@ -15,6 +15,11 @@ type Upstream struct {
 	BootstrapIPs []string `json:"bootstrap_ips"`
 }
 
+const (
+	RouteModeAuto    = "auto"
+	RouteModeVPNOnly = "vpn_only"
+)
+
 type Rule struct {
 	ID                string     `json:"id"`
 	Enabled           bool       `json:"enabled"`
@@ -33,6 +38,7 @@ type Config struct {
 	LoggingEnabled  bool             `json:"logging_enabled"`
 	FastDNS         bool             `json:"fast_dns"`
 	AWGFallback     string           `json:"awg_fallback"`
+	RouteMode       string           `json:"route_mode"`
 	TimeoutSeconds  int              `json:"timeout_seconds"`
 	CacheSize       int              `json:"cache_size"`
 	CacheTTLSeconds int              `json:"cache_ttl_seconds"`
@@ -44,7 +50,7 @@ func Default() Config {
 	u := Upstream{Address: "https://xbox-dns.ru/dns-query", BootstrapIPs: []string{}}
 	c := Config{ListenHost: "auto", DNSPort: 5355,
 		DefaultUpstream: Upstream{Address: "https://1.1.1.1/dns-query", BootstrapIPs: []string{}},
-		AWGFallback:     "auto", TimeoutSeconds: 3, CacheSize: 512, CacheTTLSeconds: 3600, LoggingEnabled: true, FastDNS: true, DefaultPool: []Upstream{}, DisabledMethods: []DisabledMethod{}}
+		AWGFallback:     "auto", RouteMode: RouteModeAuto, TimeoutSeconds: 3, CacheSize: 512, CacheTTLSeconds: 3600, LoggingEnabled: true, FastDNS: true, DefaultPool: []Upstream{}, DisabledMethods: []DisabledMethod{}}
 	for i, domain := range []string{"claude.com", "grok.com", "claude.ai"} {
 		c.Rules = append(c.Rules, Rule{ID: fmt.Sprintf("rule-%d", i+1), Enabled: true, Domain: domain, IncludeSubdomains: true, Upstream: u})
 	}
@@ -161,6 +167,16 @@ func (c *Config) NormalizeValidate() error {
 	}
 	if len(c.AWGFallback) > 100 {
 		return fmt.Errorf("неверное подключение AWG")
+	}
+	c.RouteMode = strings.TrimSpace(c.RouteMode)
+	if c.RouteMode == "" {
+		c.RouteMode = RouteModeAuto // configurations saved before this option existed
+	}
+	if c.RouteMode != RouteModeAuto && c.RouteMode != RouteModeVPNOnly {
+		return fmt.Errorf("режим DNS-маршрутизации должен быть auto или vpn_only")
+	}
+	if c.RouteMode == RouteModeVPNOnly && c.AWGFallback == "off" {
+		return fmt.Errorf("режим «только VPN» требует включённого AWG-подключения")
 	}
 	if err := normalizePool(&c.DefaultUpstream, &c.DefaultPool); err != nil {
 		return err
