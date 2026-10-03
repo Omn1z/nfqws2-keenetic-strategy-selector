@@ -44,8 +44,8 @@ func TestAWGRunShellFeedsStdin(t *testing.T) {
 func TestFirewallRestoreRetriesRespectOuterCommandDeadline(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
 	defer cancel()
-	script := "iptables-restore() { if [ \"$1\" = --help ]; then echo usage; return 0; fi; cat >/dev/null; echo 'Another app is currently holding the xtables lock.' >&2; return 4; }\n"
-	script += awgFirewallRestoreShell("awg_restore_test", "iptables-restore", "TESTRESTORE", "*mangle\n:AWG2_MULTI -\nCOMMIT\n")
+	script := "mock_restore() { if [ \"$1\" = --help ]; then echo usage; return 0; fi; cat >/dev/null; echo 'Another app is currently holding the xtables lock.' >&2; return 4; }\n"
+	script += awgFirewallRestoreShell("awg_restore_test", "mock_restore", "TESTRESTORE", "*mangle\n:AWG2_MULTI -\nCOMMIT\n")
 	script += "awg_restore_test\n"
 	started := time.Now()
 	_, err := awgRunShell(ctx, script, "")

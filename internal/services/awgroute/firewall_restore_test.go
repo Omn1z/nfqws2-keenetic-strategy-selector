@@ -76,10 +76,10 @@ printf 'commit\n' >> "$AWG_TEST_COMMIT"
 			quote := func(path string) string { return "'" + strings.ReplaceAll(filepath.ToSlash(path), "'", "'\\''") + "'" }
 			// Always replace restore with this temp executable, even on a router.
 			// Other hook actions are represented by a lifecycle log, not executed.
-			script := "set -e\niptables-restore() { sh " + quote(mock) + " \"$@\"; }\n"
+			script := "set -e\nmock_restore() { sh " + quote(mock) + " \"$@\"; }\n"
 			script += "sleep() { printf 'pause\\n' >> \"$AWG_TEST_PAUSES\"; }\n"
 			script += "printf 'cleanup\\n' >> \"$AWG_TEST_LIFECYCLE\"\n"
-			script += awgFirewallRestoreShell("awg_restore_test", "iptables-restore", "TESTRESTORE", document)
+			script += awgFirewallRestoreShell("awg_restore_test", "mock_restore", "TESTRESTORE", document)
 			script += "awg_restore_test\nprintf 'jumps-and-nat\\n' >> \"$AWG_TEST_LIFECYCLE\"\n"
 			cmd := exec.Command(firewallRestoreTestShell(t))
 			cmd.Stdin = strings.NewReader(script)

@@ -18,7 +18,14 @@ func isolatedBypassScript(t *testing.T, lockDir string) string {
 	if strings.Count(generatedBypassScript, original) != 1 {
 		t.Fatal("production lock location changed: update the isolated test mapping")
 	}
-	return strings.Replace(generatedBypassScript, original, `lock=`+shell.Quote(filepath.ToSlash(lockDir))+`"/nfqws-bypass-$CMD.lock"`, 1)
+	const restore = `RESTORE="${CMD}-restore"`
+	if strings.Count(generatedBypassScript, restore) != 1 {
+		t.Fatal("production restore selector changed: update the isolated test mapping")
+	}
+	isolated := strings.Replace(generatedBypassScript, original, `lock=`+shell.Quote(filepath.ToSlash(lockDir))+`"/nfqws-bypass-$CMD.lock"`, 1)
+	// dash rejects hyphens in function names. Map only the executable selector
+	// to POSIX mock names so the unmodified transaction still runs under /bin/sh.
+	return strings.Replace(isolated, restore, `RESTORE="${CMD}_restore"`, 1)
 }
 
 func bypassTestShell(t *testing.T) string {
@@ -91,7 +98,7 @@ iptables() {
   esac
 }
 ip6tables() { iptables "$@"; }
-iptables-restore() {
+iptables_restore() {
   printf 'restore %s\n' "$*" >> "$TESTROOT/calls"
   cat > "$TESTROOT/pending"
   if [ "$MODE" = term-commit ]; then kill -TERM "$$"; return 1; fi
@@ -99,7 +106,7 @@ iptables-restore() {
   cp "$TESTROOT/pending" "$TESTROOT/chain"
   if [ "$MODE" = term-after-commit ]; then kill -TERM "$$"; fi
 }
-ip6tables-restore() { iptables-restore "$@"; }
+ip6tables_restore() { iptables_restore "$@"; }
 sleep() { printf 'sleep\n' >> "$TESTROOT/calls"; }
 if [ "$MODE" = busy ]; then
   mkdir "$TMPDIR/nfqws-bypass-$1.lock"
