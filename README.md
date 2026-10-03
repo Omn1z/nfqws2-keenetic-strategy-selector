@@ -1,4 +1,4 @@
-# NFQWS2 Strategy Selector для Keenetic
+# NFQWS2 Strategy Selector для Keenetic/Netcraze и OpenWrt
 
 Веб‑инструмент для **автоматического подбора рабочих стратегий обхода DPI** для
 [`nfqws2-keenetic`](https://github.com/nfqws/nfqws2-keenetic) (движок
@@ -78,26 +78,123 @@
 
 ## Установка
 
+Выберите инструкцию для своей системы. Команды выполняются по SSH от `root`.
+Перед скачиванием `install.sh` нужно подготовить HTTPS-загрузчик и сертификаты:
+сам установщик ещё не может исправить загрузчик, которым его пытаются скачать.
+
+### Keenetic/Netcraze и другие системы с Entware
+
+На роутере должна быть установлена [среда Entware](https://github.com/Entware/Entware/wiki).
+На Keenetic/Netcraze также включите компонент **«Модули ядра подсистемы Netfilter»**
+в настройках компонентов прошивки. Откройте именно оболочку Entware, а не штатную
+CLI KeeneticOS: обычно это SSH на порт `222`, пользователь `root` и ваш пароль Entware.
+Подготовка роутера также описана в [инструкции NFQWS2](https://github.com/nfqws/nfqws2-keenetic).
+
 ```sh
-wget -qO- https://github.com/Omn1z/nfqws2-keenetic-strategy-selector/releases/latest/download/install.sh | sh
+export PATH="/opt/bin:/opt/sbin:$PATH"
+opkg update &&
+opkg install ca-certificates wget-ssl &&
+mkdir -p /opt/tmp &&
+/opt/bin/wget -4 -T 30 -t 3 -O /opt/tmp/n2s-install.sh \
+  'https://github.com/Omn1z/nfqws2-keenetic-strategy-selector/releases/latest/download/install.sh' &&
+sh /opt/tmp/n2s-install.sh
 ```
 
-После установки откройте `http://<IP‑роутера>:8090`.
+Здесь явно используется `/opt/bin/wget` из Entware: системный `wget` прошивки
+может не поддерживать HTTPS. У актуального `wget-ssl` приоритет выше, чем у
+`wget-nossl`, поэтому обязательное удаление `wget-nossl` не требуется.
+На старых ARM64-установках Entware возможен сбой `curl`; ниже приведён способ
+обновления с локальным бинарником.
+
+### OpenWrt до 24.10 включительно — opkg
+
+Подключитесь к оболочке OpenWrt по SSH. Подготовьте сертификаты и `curl`, затем
+скачайте и запустите единый установщик:
+
+```sh
+opkg update &&
+opkg install ca-bundle ca-certificates curl &&
+curl -4 -fL --connect-timeout 15 --max-time 180 \
+  -o /tmp/n2s-install.sh \
+  'https://github.com/Omn1z/nfqws2-keenetic-strategy-selector/releases/latest/download/install.sh' &&
+sh /tmp/n2s-install.sh
+```
+
+### OpenWrt 25+ и Snapshot с apk
+
+В стабильной ветке OpenWrt 25.12 и новых Snapshot используется `apk`:
+
+```sh
+apk --update-cache add ca-bundle ca-certificates curl &&
+curl -4 -fL --connect-timeout 15 --max-time 180 \
+  -o /tmp/n2s-install.sh \
+  'https://github.com/Omn1z/nfqws2-keenetic-strategy-selector/releases/latest/download/install.sh' &&
+sh /tmp/n2s-install.sh
+```
+
+В нестандартной прошивке ориентируйтесь на фактически установленный пакетный
+менеджер: `command -v apk` или `command -v opkg`.
+
+Для OpenWrt выбран `curl`, чтобы не зависеть от того, какой вариант `wget`
+использует прошивка. `wget-ssl` тоже поддерживает HTTPS, но последовательность
+`apk add wget-ssl`, затем `apk del wget-nossl` может остановиться уже на первой
+команде из-за конфликта вариантов. Для установки через `curl` удалять
+`wget-nossl` или `uclient-fetch` не нужно.
+
+### После установки
+
+Откройте `http://<IP‑роутера>:8090`. Для проверки версии выполните
+`/opt/usr/bin/n2s version` на Entware или `/usr/bin/n2s version` на OpenWrt.
 
 Ссылки `/releases/latest/download/` всегда ведут к последнему стабильному релизу.
 Команды установки, обновления и удаления не требуют подстановки номера версии.
+В примерах загрузка выполняется по IPv4 (`-4`); в сети только с IPv6 уберите этот
+параметр. Скрипт запускается из файла только после успешного скачивания (`&&`),
+проверка TLS остаётся включённой.
 
 Единый установщик определяет `apk` (OpenWrt 25.12+) или `opkg`, доустанавливает
-HTTPS-клиент, модули Netfilter/IPSet/TUN и подписанный пакет NFQWS2, затем ставит
-панель и регистрирует сервис через `procd` (на OpenWrt). Повторный запуск
-безопасен: пользовательские конфиги и списки сохраняются. Чтобы подготовить
-только зависимости и NFQWS2 без панели, задайте `N2S_DEPS_ONLY=1`.
+недостающие зависимости, добавляет репозиторий NFQWS2 (на OpenWrt — с ключом
+проверки подписи) и устанавливает движок и панель. На OpenWrt он также устанавливает
+модули Netfilter/IPSet/TUN и регистрирует сервис через `procd`; процесс работает
+в foreground и перезапускается
+при падении. Отдельно добавлять репозиторий NFQWS2 по инструкции upstream не нужно.
+Повторный запуск сохраняет пользовательские конфиги и списки. Чтобы подготовить
+только зависимости и NFQWS2 без панели, запустите скачанный скрипт с
+`N2S_DEPS_ONLY=1` перед `sh`.
 
-На Keenetic/Entware, где системный `wget` не умеет HTTPS, используйте
-`/opt/bin/wget`. Сервис и данные выбираются автоматически:
+Сервис и данные выбираются автоматически:
 
 - Keenetic/Entware: `/opt/etc/init.d/S52nfqws2-strategy` и `/opt/etc/nfqws2-strategy/`;
 - OpenWrt: `/etc/init.d/nfqws2-strategy` и `/etc/nfqws2-strategy/`.
+
+### Если не удаётся скачать установщик
+
+- Ошибка `Failed to send request: Operation not permitted` от `uclient-fetch`
+  возникает до запуска установщика и сама по себе не доказывает недостаток прав.
+  Проверьте доступ роутера к сети, DNS и загрузку по IPv4.
+- `Server hostname does not match SSL certificate` означает, что загрузчик не
+  подтвердил соответствие сертификата имени сервера. Установка корневых
+  сертификатов сама по себе не исправляет несовпадение имени. Попробуйте `curl`
+  из инструкции OpenWrt; не добавляйте `-k` или `--no-check-certificate` при
+  скачивании исполняемого установщика.
+- Если уже `apk --update-cache add` или `opkg update` не может скачать индексы,
+  сначала устраните доступ к штатным репозиториям. Не продолжайте установку
+  с неполным набором зависимостей и не заменяйте адреса репозиториев случайными зеркалами.
+
+Для диагностики OpenWrt сохраните вывод ошибки и следующих команд. Последние
+две команды выполняются, если `curl` уже установлен:
+
+```sh
+cat /etc/openwrt_release
+date
+nslookup github.com
+nslookup release-assets.githubusercontent.com
+ip -4 route
+curl -V
+curl -4 -vI --connect-timeout 15 --max-time 30 https://raw.githubusercontent.com/
+```
+
+### Старый Keenetic ARM64: Segmentation fault при обновлении
 
 Если обновление старой версии на ARM64 обрывается после строки `downloading ...arm64`
 сообщениями `Segmentation fault` и `download failed`, сохраните файлы релиза
@@ -121,9 +218,6 @@ N2S_BIN_SRC="$(pwd)/nfqws2-strategy-linux-arm64" sh ./install.sh
 передайте по SCP в `/opt/tmp/n2s-upgrade/`. На роутере перейдите в этот каталог
 и выполните команды начиная с создания файла `CHECKSUMS`. Переустановка старой
 версии и удаление конфигурации не требуются.
-
-На OpenWrt процесс остаётся в foreground под `procd`, поэтому падение панели
-автоматически приводит к повторному запуску.
 
 ## Использование
 
@@ -629,17 +723,33 @@ keepalive-проба. Без ответа за 90 секунд пересозд�
 
 ## Обновление
 
-```sh
-wget -qO- https://github.com/Omn1z/nfqws2-keenetic-strategy-selector/releases/latest/download/update.sh | sh
-```
+Повторите блок [установки](#установка) для своей платформы: единый `install.sh`
+обновляет существующую панель и сохраняет конфиги, списки и выбранный порт.
+Подготовку HTTPS-загрузчика можно повторять; скачивается последний стабильный релиз.
+Для старого Keenetic ARM64 со сбоем `curl` используйте способ с локальным бинарником
+из раздела установки. После обновления перезагрузите страницу веб-панели.
 
 ## Удаление
 
+Скачайте скрипт подходящим загрузчиком. На OpenWrt после подготовки `curl`:
+
 ```sh
-wget -qO- https://github.com/Omn1z/nfqws2-keenetic-strategy-selector/releases/latest/download/uninstall.sh | sh
-# или с удалением данных:
-wget -qO- https://github.com/Omn1z/nfqws2-keenetic-strategy-selector/releases/latest/download/uninstall.sh | sh -s -- --purge
+curl -4 -fL --connect-timeout 15 --max-time 180 \
+  -o /tmp/n2s-uninstall.sh \
+  'https://github.com/Omn1z/nfqws2-keenetic-strategy-selector/releases/latest/download/uninstall.sh' &&
+sh /tmp/n2s-uninstall.sh
 ```
+
+На Keenetic/Netcraze и других системах с Entware:
+
+```sh
+/opt/bin/wget -4 -T 30 -t 3 -O /tmp/n2s-uninstall.sh \
+  'https://github.com/Omn1z/nfqws2-keenetic-strategy-selector/releases/latest/download/uninstall.sh' &&
+sh /tmp/n2s-uninstall.sh
+```
+
+По умолчанию данные сохраняются. Для удаления вместе с данными замените последнюю
+команду выбранного блока на `sh /tmp/n2s-uninstall.sh --purge`.
 
 ## Сборка из исходников
 
