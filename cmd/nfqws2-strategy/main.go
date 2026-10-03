@@ -14,10 +14,12 @@ import (
 
 	"nfqws2strategy/internal/app"
 	"nfqws2strategy/internal/server"
+	"nfqws2strategy/internal/services/openwrtdns"
 	"nfqws2strategy/internal/services/strategy/core/catalog"
 	"nfqws2strategy/internal/services/strategy/core/engine"
 	"nfqws2strategy/internal/tools/config"
 	"nfqws2strategy/internal/tools/logbuf"
+	routerpath "nfqws2strategy/internal/tools/path"
 	"nfqws2strategy/internal/tools/probe"
 )
 
@@ -68,10 +70,27 @@ func main() {
 		cmdCheckUpdate()
 	case "update":
 		cmdUpdate()
+	case "openwrt-dns-restore":
+		if err := restoreOpenWrtDNS(); err != nil {
+			fmt.Fprintln(os.Stderr, "restore OpenWrt DNS failed:", err)
+			os.Exit(1)
+		}
 	default:
 		usage()
 		os.Exit(2)
 	}
+}
+
+// Restore without creating the application: uninstall also needs this when
+// the DNS listener is stopped or its saved application configuration is broken.
+func restoreOpenWrtDNS() error {
+	if !routerpath.IsOpenWrt() {
+		return nil
+	}
+	cfg := loadConfig()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	return openwrtdns.New(cfg.DataDir).Restore(ctx, "")
 }
 
 func cmdCheckUpdate() {
@@ -109,6 +128,7 @@ func usage() {
 	fmt.Fprintln(os.Stderr, "  nfqws2-strategy config                                          print resolved config")
 	fmt.Fprintln(os.Stderr, "  nfqws2-strategy checkupdate                                     check GitHub for a newer release")
 	fmt.Fprintln(os.Stderr, "  nfqws2-strategy update                                          download the latest release and restart")
+	fmt.Fprintln(os.Stderr, "  nfqws2-strategy openwrt-dns-restore                             restore DNS settings managed on OpenWrt (also used by uninstall)")
 }
 
 func cmdServe(args []string) {

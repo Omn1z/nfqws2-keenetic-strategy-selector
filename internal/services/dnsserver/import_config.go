@@ -22,11 +22,36 @@ func ConfigDigest(cfg Config) string {
 
 // ValidateImportedConfig does not persist settings, bind sockets or start DNS.
 func (s *Service) ValidateImportedConfig(cfg Config) (Config, string, error) {
+	return s.validateImportedConfig(cfg, false)
+}
+
+// PrepareImportedConfig adapts a valid, but unavailable, source-router LAN
+// address to this router before previewing an import. The normal validator and
+// commit remain strict: they must validate the exact listener being applied.
+func (s *Service) PrepareImportedConfig(cfg Config) (Config, string, error) {
+	return s.validateImportedConfig(cfg, true)
+}
+
+func (s *Service) validateImportedConfig(cfg Config, adaptListener bool) (Config, string, error) {
 	cfg = cloneConfig(cfg)
 	if err := cfg.NormalizeValidate(); err != nil {
 		return Config{}, "", err
 	}
 	host, err := s.resolveHost(cfg.ListenHost)
+	if err != nil && adaptListener && cfg.ListenHost != "auto" {
+		// Prefer the destination's configured listener. It may also have become
+		// stale after a LAN change, in which case discover a current LAN address.
+		for _, candidate := range []string{s.Config().ListenHost, "auto"} {
+			if candidate == cfg.ListenHost {
+				continue
+			}
+			host, err = s.resolveHost(candidate)
+			if err == nil {
+				cfg.ListenHost = candidate
+				break
+			}
+		}
+	}
 	if err != nil {
 		return Config{}, "", err
 	}

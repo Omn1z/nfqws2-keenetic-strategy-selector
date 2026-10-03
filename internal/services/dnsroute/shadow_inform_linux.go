@@ -20,24 +20,39 @@ const shadowInformMaxReads = 512
 // exactly one INFORM, never modifies a lease/address, and never occupies UDP68.
 // The caller establishes WAN/server provenance and filters returned DNS loops.
 func shadowDHCPInform(ctx context.Context, iface string, clientIP, serverIP net.IP) ([]string, error) {
+	_, servers, err := shadowDHCPInformOnWAN(ctx, iface, clientIP, serverIP, false)
+	return servers, err
+}
+
+// RFC2131 section 4.4.3 permits a broadcast INFORM when the client already has
+// an address but does not know the DHCP server. It requests only DNS parameters
+// and learns a peer from the matching unicast ACK, never from the WAN gateway.
+func shadowDHCPInformDiscover(ctx context.Context, iface string, clientIP net.IP) (net.IP, []string, error) {
+	return shadowDHCPInformOnWAN(ctx, iface, clientIP, nil, true)
+}
+
+func shadowDHCPInformOnWAN(ctx context.Context, iface string, clientIP, serverIP net.IP, discover bool) (net.IP, []string, error) {
 	ctx, cancel := context.WithTimeout(ctx, shadowInformTimeout)
 	defer cancel()
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	if !validShadowWAN(iface) || clientIP.To4() == nil || serverIP.To4() == nil || !clientIP.IsGlobalUnicast() || !serverIP.IsGlobalUnicast() || clientIP.IsLoopback() || serverIP.IsLoopback() || clientIP.Equal(serverIP) {
-		return nil, fmt.Errorf("DHCPINFORM requires a WAN interface and distinct unicast IPv4 endpoints")
+	if !validShadowWAN(iface) || clientIP.To4() == nil || !clientIP.IsGlobalUnicast() || clientIP.IsLoopback() {
+		return nil, nil, fmt.Errorf("DHCPINFORM requires a WAN interface and unicast IPv4 client")
+	}
+	if !discover && (serverIP.To4() == nil || !serverIP.IsGlobalUnicast() || serverIP.IsLoopback() || clientIP.Equal(serverIP)) {
+		return nil, nil, fmt.Errorf("DHCPINFORM requires a distinct unicast IPv4 server")
 	}
 	nic, err := net.InterfaceByName(iface)
 	if err != nil {
-		return nil, fmt.Errorf("DHCPINFORM interface: %w", err)
+		return nil, nil, fmt.Errorf("DHCPINFORM interface: %w", err)
 	}
 	if nic.Flags&net.FlagUp == 0 || len(nic.HardwareAddr) != 6 || nic.HardwareAddr[0]&1 != 0 {
-		return nil, fmt.Errorf("DHCPINFORM requires an active Ethernet WAN")
+		return nil, nil, fmt.Errorf("DHCPINFORM requires an active Ethernet WAN")
 	}
 	addresses, err := nic.Addrs()
 	if err != nil {
-		return nil, fmt.Errorf("DHCPINFORM interface addresses: %w", err)
+		return nil, nil, fmt.Errorf("DHCPINFORM interface addresses: %w", err)
 	}
 	found := false
 	for _, address := range addresses {
@@ -48,38 +63,53 @@ func shadowDHCPInform(ctx context.Context, iface string, clientIP, serverIP net.
 		}
 	}
 	if !found {
-		return nil, fmt.Errorf("DHCPINFORM WAN no longer owns the expected IPv4 address")
+		return nil, nil, fmt.Errorf("DHCPINFORM WAN no longer owns the expected IPv4 address")
 	}
 	var id shadowInformIdentity
 	copy(id.client[:], clientIP.To4())
 	copy(id.server[:], serverIP.To4())
 	copy(id.mac[:], nic.HardwareAddr)
 	if id.mac == [6]byte{} {
-		return nil, fmt.Errorf("DHCPINFORM requires a nonzero Ethernet MAC")
+		return nil, nil, fmt.Errorf("DHCPINFORM requires a nonzero Ethernet MAC")
 	}
 	if _, err := rand.Read(id.xid[:]); err != nil {
-		return nil, fmt.Errorf("DHCPINFORM transaction ID: %w", err)
+		return nil, nil, fmt.Errorf("DHCPINFORM transaction ID: %w", err)
 	}
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_RAW|syscall.SOCK_CLOEXEC, syscall.IPPROTO_UDP)
 	if err != nil {
-		return nil, fmt.Errorf("DHCPINFORM raw socket: %w", err)
+		return nil, nil, fmt.Errorf("DHCPINFORM raw socket: %w", err)
 	}
 	defer syscall.Close(fd)
+	if discover {
+		if err := attachShadowInformFilter(fd); err != nil {
+			return nil, nil, fmt.Errorf("DHCPINFORM attach reply filter: %w", err)
+		}
+	}
 	if err := syscall.SetsockoptString(fd, syscall.SOL_SOCKET, syscall.SO_BINDTODEVICE, iface); err != nil {
-		return nil, fmt.Errorf("DHCPINFORM bind WAN: %w", err)
+		return nil, nil, fmt.Errorf("DHCPINFORM bind WAN: %w", err)
 	}
 	if err := syscall.Bind(fd, &syscall.SockaddrInet4{Addr: id.client}); err != nil {
-		return nil, fmt.Errorf("DHCPINFORM bind source: %w", err)
+		return nil, nil, fmt.Errorf("DHCPINFORM bind source: %w", err)
 	}
-	// Connecting a raw socket sends no handshake. It limits incoming traffic
-	// to the expected peer, without taking any packets from native ndhcpc.
-	if err := syscall.Connect(fd, &syscall.SockaddrInet4{Addr: id.server}); err != nil {
-		return nil, fmt.Errorf("DHCPINFORM select server: %w", err)
+	destination := id.server
+	if discover {
+		if err := syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_BROADCAST, 1); err != nil {
+			return nil, nil, fmt.Errorf("DHCPINFORM enable broadcast: %w", err)
+		}
+		destination = [4]byte{255, 255, 255, 255}
+		// Leave discovery unconnected: the server must reply from its unicast
+		// address, not the broadcast destination. The parser checks its identity.
+	} else {
+		// Connecting a raw socket sends no handshake. It limits incoming traffic
+		// to the expected peer, without taking any packets from native ndhcpc.
+		if err := syscall.Connect(fd, &syscall.SockaddrInet4{Addr: id.server}); err != nil {
+			return nil, nil, fmt.Errorf("DHCPINFORM select server: %w", err)
+		}
 	}
-	return exchangeShadowInform(ctx, shadowInformRawSocket{fd: fd, server: id.server}, id)
+	return exchangeShadowInformFrom(ctx, shadowInformRawSocket{fd: fd, server: destination}, id, discover)
 }
 
 // A per-call interface keeps cancellation/deadline tests independent of real
@@ -112,53 +142,62 @@ func (s shadowInformRawSocket) receive(packet []byte, wait time.Duration) (int, 
 }
 
 func exchangeShadowInform(ctx context.Context, socket shadowInformSocket, id shadowInformIdentity) ([]string, error) {
+	_, servers, err := exchangeShadowInformFrom(ctx, socket, id, false)
+	return servers, err
+}
+
+func exchangeShadowInformFrom(ctx context.Context, socket shadowInformSocket, id shadowInformIdentity, discover bool) (net.IP, []string, error) {
 	if err := ctx.Err(); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	deadline, ok := ctx.Deadline()
 	if !ok {
-		return nil, fmt.Errorf("DHCPINFORM requires a deadline")
+		return nil, nil, fmt.Errorf("DHCPINFORM requires a deadline")
 	}
 	remaining := time.Until(deadline)
 	if remaining <= 0 {
-		return nil, context.DeadlineExceeded
+		return nil, nil, context.DeadlineExceeded
 	}
 	// One attempt only; a short send timeout also bounds cancellation latency.
 	if err := socket.send(makeShadowInformPacket(id), min(remaining, shadowInformReadSlice)); err != nil {
 		if ctx.Err() != nil {
-			return nil, ctx.Err()
+			return nil, nil, ctx.Err()
 		}
-		return nil, fmt.Errorf("send DHCPINFORM: %w", err)
+		return nil, nil, fmt.Errorf("send DHCPINFORM: %w", err)
 	}
 	buffer := make([]byte, 4096)
 	for attempt := 0; attempt < shadowInformMaxReads; attempt++ {
 		if err := ctx.Err(); err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		remaining := time.Until(deadline)
 		if remaining <= 0 {
-			return nil, context.DeadlineExceeded
+			return nil, nil, context.DeadlineExceeded
 		}
 		n, err := socket.receive(buffer, min(remaining, shadowInformReadSlice))
 		if ctx.Err() != nil {
-			return nil, ctx.Err()
+			return nil, nil, ctx.Err()
 		}
 		if !time.Now().Before(deadline) {
-			return nil, context.DeadlineExceeded
+			return nil, nil, context.DeadlineExceeded
 		}
 		if err != nil {
 			if errors.Is(err, syscall.EINTR) || errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.EWOULDBLOCK) {
 				continue
 			}
-			return nil, fmt.Errorf("receive DHCPINFORM: %w", err)
+			return nil, nil, fmt.Errorf("receive DHCPINFORM: %w", err)
 		}
 		if n < 0 || n > len(buffer) {
-			return nil, fmt.Errorf("invalid DHCPINFORM socket length")
+			return nil, nil, fmt.Errorf("invalid DHCPINFORM socket length")
 		}
-		if servers, err := parseShadowInformReply(buffer[:n], id); err == nil {
-			return servers, nil
+		if discover {
+			if peer, servers, err := parseShadowInformDiscoverReply(buffer[:n], id); err == nil {
+				return peer, servers, nil
+			}
+		} else if servers, err := parseShadowInformReply(buffer[:n], id); err == nil {
+			return append(net.IP(nil), id.server[:]...), servers, nil
 		}
 	}
 	// A packet flood must not spin for an unbounded number of parse attempts.
-	return nil, fmt.Errorf("DHCPINFORM receive limit reached without a matching ACK")
+	return nil, nil, fmt.Errorf("DHCPINFORM receive limit reached without a matching ACK")
 }

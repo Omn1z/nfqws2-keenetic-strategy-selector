@@ -3,6 +3,7 @@ package dnsserver
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"reflect"
 	"strconv"
@@ -53,6 +54,88 @@ func TestDNSImportPreviewValidationIsReadOnly(t *testing.T) {
 		t.Fatal("rejected preview changed current config")
 	}
 }
+
+func TestDNSImportPreparesForeignLANListenerWithoutChangingSavedSettings(t *testing.T) {
+	for _, currentListener := range []string{"auto", "192.168.1.1", "192.168.2.1"} {
+		t.Run(currentListener, func(t *testing.T) {
+			s := importTestService(t)
+			current := s.Config()
+			current.ListenHost = currentListener
+			if err := s.SetConfig(current); err != nil {
+				t.Fatal(err)
+			}
+			s.resolveHost = func(host string) (string, error) {
+				if host == "auto" || host == "192.168.1.1" {
+					return "192.168.1.1", nil
+				}
+				return "", fmt.Errorf("address %s is not owned by this router", host)
+			}
+			before := ConfigDigest(s.Config())
+			candidate := s.Config()
+			candidate.ListenHost = "192.168.3.1"
+			candidate.RouteMode, candidate.AWGFallback = RouteModeVPNOnly, "auto"
+			if _, _, err := s.ValidateImportedConfig(candidate); err == nil {
+				t.Fatal("strict validation silently changed an unavailable listener")
+			}
+			prepared, host, err := s.PrepareImportedConfig(candidate)
+			wantListener := currentListener
+			if currentListener == "192.168.2.1" {
+				wantListener = "auto"
+			}
+			if err != nil || host != "192.168.1.1" || prepared.ListenHost != wantListener || prepared.RouteMode != RouteModeVPNOnly || prepared.AWGFallback != "auto" {
+				t.Fatalf("listener preparation=%+v host=%q err=%v", prepared, host, err)
+			}
+			if candidate.ListenHost != "192.168.3.1" || ConfigDigest(s.Config()) != before || s.Status().Running {
+				t.Fatal("preview mutated source, saved config or runtime")
+			}
+			var persisted Config
+			if err := s.store.Load(configFile, &persisted); err != nil || ConfigDigest(persisted) != before {
+				t.Fatalf("preview changed disk config: %v", err)
+			}
+		})
+	}
+}
+
+func TestDNSImportListenerPreparationPreservesValidHostAndRejectsUnsafeConfig(t *testing.T) {
+	s := importTestService(t)
+	var resolved []string
+	s.resolveHost = func(host string) (string, error) {
+		resolved = append(resolved, host)
+		if host == "auto" {
+			return "192.168.1.1", nil
+		}
+		if host == "192.168.1.2" {
+			return host, nil
+		}
+		return "", errors.New("listener unavailable")
+	}
+	cfg := s.Config()
+	cfg.ListenHost = "192.168.1.2"
+	prepared, host, err := s.PrepareImportedConfig(cfg)
+	if err != nil || prepared.ListenHost != cfg.ListenHost || host != cfg.ListenHost || !reflect.DeepEqual(resolved, []string{cfg.ListenHost}) {
+		t.Fatalf("valid owned listener replaced: %+v host=%q resolved=%v err=%v", prepared, host, resolved, err)
+	}
+	for _, invalid := range []string{"0.0.0.0", "::", "8.8.8.8", "not-an-address"} {
+		resolved = nil
+		cfg.ListenHost = invalid
+		if _, _, err := s.PrepareImportedConfig(cfg); err == nil || len(resolved) != 0 {
+			t.Fatalf("malformed listener %q was adapted instead of rejected: %v %v", invalid, resolved, err)
+		}
+	}
+	// Validation must use the effective destination listener, never the foreign
+	// address, or an imported DoH endpoint could become a DNS forwarding loop.
+	cfg.ListenHost = "192.168.3.1"
+	cfg.DefaultUpstream.Address = "https://192.168.1.1:" + strconv.Itoa(cfg.DNSPort) + "/dns-query"
+	if _, _, err := s.PrepareImportedConfig(cfg); err == nil {
+		t.Fatal("self upstream accepted after listener adaptation")
+	}
+	cfg.DefaultUpstream = s.Config().DefaultUpstream
+	s.resolveHost = func(string) (string, error) { return "", errors.New("no local LAN address") }
+	if _, _, err := s.PrepareImportedConfig(cfg); err == nil {
+		t.Fatal("unavailable target listener accepted")
+	}
+}
+
 func TestDNSImportConflictPreservesLaterEdits(t *testing.T) {
 	s := importTestService(t)
 	candidate := s.Config()

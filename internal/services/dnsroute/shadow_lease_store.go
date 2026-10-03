@@ -198,8 +198,12 @@ func decodeShadowState(data []byte, clock shadowBootClock) (map[string]shadowRem
 		if !validKeeneticInterface(item.Interface) || client.To4() == nil || server.To4() == nil || !client.IsGlobalUnicast() || !server.IsGlobalUnicast() || client.Equal(server) || item.WANKey == "" || len(item.WANKey) > 2048 || strings.ContainsAny(item.WANKey, "\r\n\x00") {
 			return nil, nil, fmt.Errorf("invalid saved DHCP discovery target")
 		}
-		if _, err := time.Parse("Jan _2 15:04:05", item.Stamp); err != nil {
-			return nil, nil, fmt.Errorf("invalid DHCP target timestamp")
+		// A live DHCPINFORM discovery has no historical ACK timestamp and
+		// conveys no address lease. Its peer can still be revalidated/requeried.
+		if item.Stamp != "" {
+			if _, err := time.Parse("Jan _2 15:04:05", item.Stamp); err != nil {
+				return nil, nil, fmt.Errorf("invalid DHCP target timestamp")
+			}
 		}
 		if _, duplicate := targets[item.Interface]; duplicate {
 			return nil, nil, fmt.Errorf("duplicate DHCP discovery target")

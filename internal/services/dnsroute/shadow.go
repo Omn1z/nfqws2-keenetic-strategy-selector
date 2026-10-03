@@ -297,6 +297,11 @@ type shadowInformState struct {
 	answers    map[string]shadowInformAnswer
 	retryAfter map[string]time.Time
 	probe      func(context.Context, string, net.IP, net.IP) ([]string, error)
+	// Initial discovery has no known DHCP peer yet. Keep its bounded retry
+	// separately so a failed broadcast cannot poison a learned unicast target.
+	broadcastKey   string
+	broadcastRetry time.Time
+	probeDiscover  func(context.Context, string, net.IP) (net.IP, []string, error)
 }
 
 func (target shadowDHCPTarget) valid(key string, ips []net.IP) bool {

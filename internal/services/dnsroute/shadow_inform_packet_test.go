@@ -3,6 +3,7 @@ package dnsroute
 import (
 	"bytes"
 	"encoding/binary"
+	"net"
 	"reflect"
 	"testing"
 )
@@ -59,11 +60,17 @@ func TestShadowInformACKStrictIdentity(t *testing.T) {
 			if _, err := parseShadowInformReply(p, id); err == nil {
 				t.Fatal("accepted changed reply identity")
 			}
+			if _, _, err := parseShadowInformDiscoverReply(p, id); err == nil {
+				t.Fatal("discovery accepted changed reply identity")
+			}
 		})
 	}
 	for n := 0; n < len(packet); n++ {
 		if _, err := parseShadowInformReply(packet[:n], id); err == nil {
 			t.Fatalf("accepted truncated packet %d", n)
+		}
+		if _, _, err := parseShadowInformDiscoverReply(packet[:n], id); err == nil {
+			t.Fatalf("discovery accepted truncated packet %d", n)
 		}
 	}
 	zeroCI := append([]byte(nil), packet...)
@@ -90,6 +97,9 @@ func TestShadowInformACKLengthsAndFragments(t *testing.T) {
 			alter(packet)
 			if _, err := parseShadowInformReply(packet, shadowInformTestIdentity()); err == nil {
 				t.Fatal("accepted malformed datagram")
+			}
+			if _, _, err := parseShadowInformDiscoverReply(packet, shadowInformTestIdentity()); err == nil {
+				t.Fatal("discovery accepted malformed datagram")
 			}
 		})
 	}
@@ -129,6 +139,51 @@ func TestShadowInformACKRejectsMalformedOptions(t *testing.T) {
 			copy(p[268:], options)
 			if _, err := parseShadowInformReply(p, shadowInformTestIdentity()); err == nil {
 				t.Fatal("accepted malformed options")
+			}
+			if _, _, err := parseShadowInformDiscoverReply(p, shadowInformTestIdentity()); err == nil {
+				t.Fatal("discovery accepted malformed options")
+			}
+		})
+	}
+}
+
+func TestShadowInformDiscoveryLearnsOnlyFullyValidatedPeer(t *testing.T) {
+	id := shadowInformTestIdentity()
+	packet := shadowInformACKFixture()
+	// The server is learned from a matching ACK, independently of any gateway
+	// or previous peer. The known-server parser must remain just as strict.
+	peer := net.IPv4(192, 0, 2, 41).To4()
+	copy(packet[12:16], peer)
+	copy(packet[273:277], peer)
+	if _, err := parseShadowInformReply(packet, id); err == nil {
+		t.Fatal("known-server exchange accepted an unrelated peer")
+	}
+	id.server = [4]byte{}
+	got, servers, err := parseShadowInformDiscoverReply(packet, id)
+	if err != nil || !got.Equal(peer) || !reflect.DeepEqual(servers, []string{"77.88.8.7", "1.1.1.1"}) {
+		t.Fatalf("valid discovered peer: %v %v %v", got, servers, err)
+	}
+	packet[12] ^= 1
+	if !got.Equal(peer) {
+		t.Fatal("learned peer retained receive-buffer memory")
+	}
+	// Both modes request only INFORM and DNS, with the existing ciaddr and a
+	// zero BOOTP broadcast flag: RFC2131 servers answer this INFORM unicast.
+	if !bytes.Equal(makeShadowInformPacket(id), makeShadowInformPacket(shadowInformTestIdentity())) {
+		t.Fatal("peer discovery changed DHCP request or introduced lease options")
+	}
+}
+
+func TestShadowInformDiscoveryRejectsNonUnicastOrSelfPeer(t *testing.T) {
+	for _, source := range []string{"0.0.0.0", "127.0.0.1", "169.254.1.1", "224.0.0.1", "255.255.255.255", "192.168.0.10"} {
+		t.Run(source, func(t *testing.T) {
+			packet := shadowInformACKFixture()
+			ip := net.ParseIP(source).To4()
+			copy(packet[12:16], ip)
+			copy(packet[273:277], ip)
+			peer, servers, err := parseShadowInformDiscoverReply(packet, shadowInformTestIdentity())
+			if err == nil || peer != nil || servers != nil {
+				t.Fatalf("unsafe discovered peer: %v %v %v", peer, servers, err)
 			}
 		})
 	}

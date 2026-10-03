@@ -14,6 +14,7 @@ import { DnsStatistics } from "./DnsStatistics";
 import { DnsLastRequest, DnsTestAnswer } from "./DnsAnswerPresentation";
 import { DnsSettingsExportButton, DnsSettingsExportNote } from "./DnsSettingsExport";
 import { DnsSettingsImport } from "./DnsSettingsImport";
+import { OpenWrtDns } from "./OpenWrtDns";
 import { Blocking, blockingForm, collectBlocking, type BlockingForm } from "./Blocking";
 import { DomainGroups } from "./DomainGroups";
 import { collectRuleGroups, groupRules, type RuleGroupForm } from "./ruleGroups";
@@ -79,6 +80,9 @@ export default function DnsServer() {
   const [live, setLive] = useState<DnsServerStatus | null>(null);
   const [form, setForm] = useState<Form | null>(null);
   const [busy, setBusy] = useState(false);
+  const [openWrtBusy, setOpenWrtBusy] = useState(false);
+  const [openWrtSupported, setOpenWrtSupported] = useState<boolean | null>(null);
+  const [openWrtRefresh, setOpenWrtRefresh] = useState(0);
   const [clearing, setClearing] = useState(false);
   const [filterUpdating, setFilterUpdating] = useState(false);
   const [loadError, setLoadError] = useState("");
@@ -112,7 +116,7 @@ export default function DnsServer() {
     acting.current = true; mutation.current++; setBusy(true);
     try { apply(await api<DnsServerStatus>("POST", `/api/dnsserver/${path}`, body)); setTest(null); toast(message, "ok"); return true; }
     catch (e) { toast((e as Error).message, "err"); return false; }
-    finally { acting.current = false; setBusy(false); }
+    finally { acting.current = false; setBusy(false); setOpenWrtRefresh((value) => value + 1); }
   };
   const save = async () => {
     if (!form) return;
@@ -150,6 +154,7 @@ export default function DnsServer() {
     ...f, route_mode: mode, awg_fallback: mode === "vpn_only" && f.awg_fallback === "off" ? "auto" : f.awg_fallback,
   } : f);
   const lookup = async () => {
+    if (acting.current) return;
     setTesting(true); setTest(null);
     try { setTest(await api<DnsServerTestResult>("POST", "/api/dnsserver/test", { domain: domain.trim(), type: queryType })); }
     catch (e) { toast((e as Error).message, "err"); }
@@ -187,16 +192,27 @@ export default function DnsServer() {
         {live.stats.last_error && <p className="mt-2 text-xs text-bad [overflow-wrap:anywhere]">Последняя ошибка: {live.stats.last_error}</p>}
       </Card>
 
-      <Card title="Подключение Keenetic и устройств" sub="адрес из сохранённых настроек" head={<Button mini onClick={() => navigate("system")}>Настроить порты</Button>}>
+      <Card title="Подключение роутера и устройств" sub="адрес из сохранённых настроек" head={<Button mini disabled={busy} onClick={() => navigate("system")}>Настроить порты</Button>}>
         <Endpoint label="Обычный DNS · UDP и TCP, без TLS" value={live.endpoints.dns} />
-        <p className="mt-3 text-xs text-warn">Этот адрес принимает обычный DNS. Не добавляйте его в список DoT/DoH Keenetic: там ожидается TLS или HTTPS, а локальный порт обслуживает DNS по UDP/TCP.</p>
-        <p className="mt-2 text-xs text-muted">Чтобы встроенный DNS Keenetic на порту 53 пересылал запросы сюда, откройте штатную CLI KeeneticOS (не оболочку Entware root) и выполните:</p>
+        <p className="mt-3 text-xs text-warn">Этот адрес принимает обычный DNS. Не добавляйте его в список DoT/DoH: там ожидается TLS или HTTPS, а локальный порт обслуживает DNS по UDP/TCP.</p>
+        {openWrtSupported === false && <><p className="mt-2 text-xs text-muted">Чтобы встроенный DNS Keenetic на порту 53 пересылал запросы сюда, откройте штатную CLI KeeneticOS (не оболочку Entware root) и выполните:</p>
         {live.endpoints.dns && <pre className="mt-2 overflow-x-auto rounded-lg border border-line bg-panel-soft p-3 font-mono text-xs">{`ip name-server ${live.endpoints.dns}\nsystem configuration save\nshow ip name-server`}</pre>}
+        <p className="mt-2 text-xs text-warn">Keenetic может одновременно использовать другие DNS: от провайдера, добавленные вручную, DoT/DoH и профили интернет-фильтрации. Для исключительного использования этого сервиса проверьте и отключите конкурирующие источники в настройках Keenetic вручную.</p></>}
         <p className="mt-2 text-xs text-muted">Устройства, которым можно задать порт DNS, могут обращаться напрямую к адресу выше. Устройства с полем только для IP используют порт 53 — оставьте им IP роутера. Пока сервис выключен, порт выше не отвечает.</p>
-        <p className="mt-2 text-xs text-warn">Keenetic может одновременно использовать другие DNS: от провайдера, добавленные вручную, DoT/DoH и профили интернет-фильтрации. Для исключительного использования этого сервиса проверьте и отключите конкурирующие источники в настройках Keenetic вручную.</p>
       </Card>
 
-      <fieldset disabled={busy || testing} className="min-w-0">
+      <OpenWrtDns dirty={dirty} running={live.running} busy={busy || testing || filterUpdating || importing} endpoint={live.endpoints.dns}
+        configurationKey={JSON.stringify([live.config, live.listen_host, live.running, live.endpoints.dns, openWrtRefresh])}
+        onSupportedChange={setOpenWrtSupported} onBusyChange={(pending) => {
+          if (pending) {
+            if (acting.current) return false;
+            acting.current = true; mutation.current++;
+          } else acting.current = false;
+          setOpenWrtBusy(pending); setBusy(pending);
+          return true;
+        }} />
+
+      <fieldset disabled={busy || testing} inert={openWrtBusy} className="min-w-0">
         <ShadowDns value={form.shadow_dns} status={live.shadow_dns} onChange={(value) => set("shadow_dns", value)} />
 
         <Card title="Пул DoH по умолчанию" sub="для доменов вне Shadow DNS и специальных групп">
@@ -267,7 +283,7 @@ export default function DnsServer() {
         </Card>
       </fieldset>
 
-      <DnsDiagnostics loggingEnabled={live.config.logging_enabled} running={live.running} routes={live.routes} onLoggingChange={(enabled) => { mutation.current++; setLive((v) => v ? { ...v, config: { ...v.config, logging_enabled: enabled } } : v); }} />
+      <div inert={openWrtBusy}><DnsDiagnostics loggingEnabled={live.config.logging_enabled} running={live.running} routes={live.routes} onLoggingChange={(enabled) => { mutation.current++; setLive((v) => v ? { ...v, config: { ...v.config, logging_enabled: enabled } } : v); }} /></div>
 
       {importing && <DnsSettingsImport dirty={dirty} saving={busy} onClose={() => setImporting(false)} onImport={async (request) => (await action("import", request, "Настройки DNS импортированы")) ?? false} />}
 

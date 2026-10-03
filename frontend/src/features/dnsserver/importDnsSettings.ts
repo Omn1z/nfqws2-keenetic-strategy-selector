@@ -17,16 +17,29 @@ export function parseDnsSettingsDocument(text: string): void {
 }
 
 export function initialDnsImportMapping(plan: DnsSettingsImportPlan): string {
-  return plan.vpn.state === "matched" ? plan.vpn.matched_id ?? "" : "";
+  if (plan.vpn.state === "off" && plan.config.route_mode !== "vpn_only") return "off";
+  if (plan.vpn.state === "matched") {
+    const candidate = plan.vpn.candidates.find((v) => v.ref === plan.vpn.matched_id && v.fingerprint);
+    if (candidate) return candidate.ref;
+  }
+  // Foreign IDs, old exports without fingerprints and ambiguous identities
+  // remain portable even when no local VPN has been configured yet.
+  return "auto";
 }
 
 export function buildDnsImportRequest(document: string, plan: DnsSettingsImportPlan, mapping: string): DnsSettingsImportRequest {
   parseDnsSettingsDocument(document);
   if (!plan.base_hash) throw new Error("Сначала обновите предварительный просмотр.");
   const request: DnsSettingsImportRequest = { document, base_hash: plan.base_hash };
-  if (["auto", "off"].includes(plan.vpn.state)) return request;
+  if (mapping === "auto" || mapping === "off") {
+    if (mapping === "off" && plan.config.route_mode === "vpn_only") {
+      throw new Error("В режиме «Только VPN» выберите «Автоматически» или VPN-подключение.");
+    }
+    request.mapping = mapping;
+    return request;
+  }
   const candidate = plan.vpn.candidates.find((v) => v.ref === mapping);
-  if (!candidate || !candidate.fingerprint) throw new Error("Выберите VPN-подключение для импортируемых настроек.");
+  if (!candidate || !candidate.fingerprint) throw new Error("Выберите «Автоматически» или доступное VPN-подключение.");
   request.mapping = candidate.ref;
   request.mapping_fingerprint = candidate.fingerprint;
   return request;

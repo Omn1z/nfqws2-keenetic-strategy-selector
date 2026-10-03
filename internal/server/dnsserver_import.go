@@ -31,6 +31,7 @@ type dnsImportRequest struct {
 type dnsImportVPNPlan struct {
 	SourceID   string                       `json:"source_id"`
 	State      string                       `json:"state"`
+	Resolution string                       `json:"resolution,omitempty"`
 	MatchedID  string                       `json:"matched_id,omitempty"`
 	Candidates []awgroute.AWG2ConnectionRef `json:"candidates"`
 }
@@ -242,9 +243,16 @@ func prepareDNSImport(doc dnsServerSettingsExport, in dnsImportRequest, live []a
 			plan.VPN.MatchedID = targetID
 			plan.Config.AWGFallback = targetID
 		} else {
-			plan.VPN.State = "missing"
+			// A router-local ID cannot identify a connection on another router.
+			// Keep the source identity for display, but make the imported config
+			// usable with the destination's available VPNs even when none of the
+			// original connections exists. RouteMode remains unchanged, so
+			// VPN-only imports still cannot fall back to the direct WAN route.
+			plan.Config.AWGFallback = "auto"
+			plan.VPN.State = "auto"
+			plan.VPN.Resolution = "missing"
 			if bySource[sourceID].Fingerprint == "" {
-				plan.VPN.State = "selection_required"
+				plan.VPN.Resolution = "selection_required"
 			} else {
 				n := 0
 				for _, target := range plan.VPN.Candidates {
@@ -253,12 +261,13 @@ func prepareDNSImport(doc dnsServerSettingsExport, in dnsImportRequest, live []a
 					}
 				}
 				if n > 1 {
-					plan.VPN.State = "ambiguous"
+					plan.VPN.Resolution = "ambiguous"
 				}
 			}
 		}
 	}
 	if in.Mapping != nil {
+		plan.VPN.Resolution = ""
 		selected := *in.Mapping
 		if selected == "auto" || selected == "off" {
 			plan.Config.AWGFallback = selected
@@ -282,8 +291,11 @@ func prepareDNSImport(doc dnsServerSettingsExport, in dnsImportRequest, live []a
 			plan.VPN.State = "matched"
 		}
 	}
-	if plan.VPN.State != "auto" && plan.VPN.State != "off" && plan.VPN.State != "matched" {
-		plan.Warnings = append(plan.Warnings, "Выберите VPN: локальный ID из файла не подтверждает идентичность подключения на этом роутере.")
+	if plan.VPN.Resolution != "" {
+		plan.Warnings = append(plan.Warnings, "Подключение VPN из файла не удалось однозначно сопоставить с подключениями этого роутера. Выбран автоматический выбор локального VPN; при необходимости укажите замену.")
+	}
+	if plan.Config.RouteMode == dnsserver.RouteModeVPNOnly && plan.Config.AWGFallback == "auto" && len(plan.VPN.Candidates) == 0 {
+		plan.Warnings = append(plan.Warnings, "На этом роутере пока нет настроенных VPN-подключений. Режим «только VPN» сохранён: DNS будет ожидать доступный VPN и не перейдёт на прямой маршрут.")
 	}
 	methods := make([]dnsserver.DisabledMethod, 0, len(doc.Config.DisabledMethods))
 	dropped := 0
@@ -346,9 +358,12 @@ func (s *Server) previewDNSImportWithConnections(doc dnsServerSettingsExport, in
 	if err := validateSystemPorts(systemPorts{PanelPort: s.app.PanelPort(), DNSPort: plan.Config.DNSPort}); err != nil {
 		return plan, err
 	}
-	cfg, host, err := s.app.DNSServer().ValidateImportedConfig(plan.Config)
+	cfg, host, err := s.app.DNSServer().PrepareImportedConfig(plan.Config)
 	if err != nil {
 		return plan, err
+	}
+	if cfg.ListenHost != plan.Config.ListenHost {
+		plan.Warnings = append(plan.Warnings, fmt.Sprintf("Адрес DNS из файла (%s) отсутствует на этом роутере. Будет использован локальный адрес %s.", plan.Config.ListenHost, host))
 	}
 	plan.Config = cfg
 	plan.BaseHash = dnsserver.ConfigDigest(s.app.DNSServer().Config())

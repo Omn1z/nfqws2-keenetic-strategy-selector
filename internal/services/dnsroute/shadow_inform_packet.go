@@ -160,3 +160,23 @@ func parseShadowInformReply(packet []byte, id shadowInformIdentity) ([]string, e
 	}
 	return servers, nil
 }
+
+// A broadcast INFORM has no known peer. Learn one only from a parameter-only
+// ACK addressed to this client, with the same random transaction and MAC and
+// an option 54 matching the packet source. All other checks remain identical
+// to the known-peer parser; the source alone is never evidence of a DNS server.
+func parseShadowInformDiscoverReply(packet []byte, id shadowInformIdentity) (net.IP, []string, error) {
+	if len(packet) < 20 {
+		return nil, nil, fmt.Errorf("short DHCPINFORM discovery reply")
+	}
+	server := net.IP(packet[12:16])
+	if !server.IsGlobalUnicast() || server.IsLoopback() || server.Equal(net.IP(id.client[:])) {
+		return nil, nil, fmt.Errorf("DHCPINFORM discovery requires a distinct unicast server")
+	}
+	copy(id.server[:], server)
+	servers, err := parseShadowInformReply(packet, id)
+	if err != nil {
+		return nil, nil, err
+	}
+	return append(net.IP(nil), server...), servers, nil
+}

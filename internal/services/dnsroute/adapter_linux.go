@@ -16,6 +16,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"nfqws2strategy/internal/tools/keenetic"
 )
 
 // Kept injectable for Linux tests; no test needs privileges or router mutations.
@@ -35,6 +37,9 @@ func executeCommand(ctx context.Context, name string, args ...string) (string, e
 // their deadline. Bound both the process group and the time spent reading it.
 func runCommandContext(ctx context.Context, stdin, name string, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, name, args...)
+	if filepath.Base(name) == "ndmc" {
+		cmd.Env = keenetic.NativeEnv(os.Environ())
+	}
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.WaitDelay = time.Second
 	cmd.Cancel = func() error {

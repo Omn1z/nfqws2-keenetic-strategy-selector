@@ -34,8 +34,11 @@ func (a *Adapter) shadowServersOS(ctx context.Context) ([]string, error) {
 	if err := shadowDiscoveryContextErr(callerCtx); err != nil {
 		return nil, err
 	} // a canceled caller must not poison discovery
-	if err := shadowDiscoveryContextErr(ctx); err != nil && len(servers) == 0 {
-		return nil, err
+	if contextErr := shadowDiscoveryContextErr(ctx); contextErr != nil && len(servers) == 0 {
+		// The caller is still alive, so this was our discovery budget rather
+		// than caller cancellation. Cache it below like other discovery errors;
+		// otherwise a slow native CLI would repeat for every DNS question.
+		err = contextErr
 	}
 	a.saveShadowLeases()
 	a.shadow.servers, a.shadow.discoveryErr = servers, err
@@ -65,6 +68,9 @@ func discoverShadowServersWithLeases(ctx context.Context, wan []string, remember
 }
 
 func discoverShadowServersWithState(ctx context.Context, wan []string, remembered map[string]shadowRememberedLease, inform *shadowInformState) ([]string, error) {
+	if err := shadowDiscoveryContextErr(ctx); err != nil {
+		return nil, err
+	}
 	ifs, err := net.Interfaces()
 	if err != nil {
 		return nil, err
@@ -95,21 +101,31 @@ func discoverShadowServersWithState(ctx context.Context, wan []string, remembere
 		}
 	}
 	var candidates []string
-	var informErr error
+	var informErr, nativeErr error
 	if ndmc, err := exec.LookPath("ndmc"); err == nil {
+		readNative := func(operation string) (string, error) {
+			out, err := command(ctx, ndmc, "-c", operation)
+			if err := shadowNativeCommandError(ctx, operation, out, err); err != nil {
+				if nativeErr == nil {
+					nativeErr = err
+				}
+				return "", err
+			}
+			return out, nil
+		}
 		verified := map[string]bool{}
 		checked := map[string]bool{}
 		statuses := map[string]string{}
 		verify := func(iface string) bool {
 			if !checked[iface] {
 				checked[iface] = true
-				status, err := command(ctx, ndmc, "-c", "show interface "+iface)
+				status, err := readNative("show interface " + iface)
 				statuses[iface] = status
 				verified[iface] = err == nil && keeneticInterfaceOwnsWAN(status, wanIPs)
 			}
 			return verified[iface]
 		}
-		out, e := command(ctx, ndmc, "-c", "show ip name-server")
+		out, e := readNative("show ip name-server")
 		if e == nil {
 			entries := parseKeeneticShadowServers(out)
 			if len(entries) > 32 {
@@ -130,8 +146,9 @@ func discoverShadowServersWithState(ctx context.Context, wan []string, remembere
 			// Current authoritative DNS supersedes any older ignored lease.
 			clear(remembered)
 		} else {
-			key := ""
+			key, defaultRoutes := "", ""
 			if routes, err := command(ctx, "ip", "-4", "route", "show", "table", "main", "default"); err == nil {
+				defaultRoutes = routes
 				key = shadowWANKey(routes, wan, wanIPs)
 			}
 			now := time.Now()
@@ -149,7 +166,7 @@ func discoverShadowServersWithState(ctx context.Context, wan []string, remembere
 					}
 				}
 			}
-			if log, err := command(ctx, ndmc, "-c", "show log"); err == nil {
+			if log, err := readNative("show log"); err == nil {
 				routerNow := time.Time{}
 				if clock, err := command(ctx, "date", "+%Y-%m-%dT%H:%M:%S%z"); err == nil {
 					routerNow, _ = time.Parse("2006-01-02T15:04:05-0700", strings.TrimSpace(clock))
@@ -201,12 +218,23 @@ func discoverShadowServersWithState(ctx context.Context, wan []string, remembere
 				}
 			}
 			if inform != nil {
-				fresh, err := discoverShadowInform(ctx, inform, key, wanIPs, local, wanDevices, func(iface string, clientIP net.IP) bool {
+				verifyTarget := func(iface string, clientIP net.IP) bool {
 					return verify(iface) && keeneticInterfaceOwnsWAN(statuses[iface], []net.IP{clientIP})
-				})
+				}
+				fresh, err := discoverShadowInform(ctx, inform, key, wanIPs, local, wanDevices, verifyTarget)
 				informErr = err
 				if len(fresh) > 0 {
 					candidates = fresh // current option 6 supersedes older leased DNS
+				}
+				if len(filterShadowServers(candidates, local)) == 0 && nativeErr == nil && key != "" && !hasShadowInformTarget(inform, key, wanIPs, wanDevices, verifyTarget) {
+					if interfaces, err := readNative("show interface"); err == nil {
+						eligible := parseShadowBroadcastWANs(interfaces, defaultRoutes, wan, wanDevices)
+						fresh, err := discoverShadowBroadcast(ctx, inform, key, eligible, local)
+						informErr = err
+						if len(fresh) > 0 {
+							candidates = fresh
+						}
+					}
 				}
 			}
 		}
@@ -218,6 +246,12 @@ func discoverShadowServersWithState(ctx context.Context, wan []string, remembere
 	}
 	servers := filterShadowServers(candidates, local)
 	if len(servers) == 0 {
+		if err := shadowDiscoveryContextErr(ctx); err != nil {
+			return nil, err
+		}
+		if nativeErr != nil {
+			return nil, nativeErr
+		}
 		if informErr != nil {
 			return nil, fmt.Errorf("DHCPINFORM: %w", informErr)
 		}

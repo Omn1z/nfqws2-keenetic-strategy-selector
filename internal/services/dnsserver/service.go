@@ -12,6 +12,7 @@ import (
 
 	mdns "github.com/miekg/dns"
 	"nfqws2strategy/internal/services/dnsroute"
+	"nfqws2strategy/internal/services/openwrtdns"
 	"nfqws2strategy/internal/tools/logbuf"
 	"nfqws2strategy/internal/tools/store"
 )
@@ -78,12 +79,14 @@ type Service struct {
 	filtering     *FilterManager
 	active        *serviceRun
 	controlCancel context.CancelFunc
+	openwrt       openWrtDNSManager
 }
 
 func New(st *store.Store, backend Backend, resolveHost func(string) (string, error)) *Service {
 	cfg := Default()
 	loaded := Config{LoggingEnabled: true, CacheTTLSeconds: cfg.CacheTTLSeconds, FastDNS: cfg.FastDNS, SchedulerEnabled: true}
 	s := &Service{store: st, backend: backend, resolveHost: resolveHost, cfg: cfg, logs: NewLogBuffer(), scheduler: NewScheduler()}
+	s.openwrt = openwrtdns.New(st.Path(""))
 	if err := st.Load(configFile, &loaded); err == nil {
 		legacy := loaded.DNSPort == 0
 		if legacy {
@@ -153,7 +156,7 @@ func (s *Service) SetConfig(cfg Config) error {
 	return s.setConfigLocked(cfg)
 }
 
-func (s *Service) setConfigLocked(cfg Config) error {
+func (s *Service) setConfigLocked(cfg Config) (result error) {
 	cfg = cloneConfig(cfg)
 	if err := cfg.NormalizeValidate(); err != nil {
 		return err
@@ -175,6 +178,15 @@ func (s *Service) setConfigLocked(cfg Config) error {
 		// counters or transports. Failed/stopped runs still take the retry path.
 		return nil
 	}
+	restored, err := s.reconcileOpenWrtDNSLocked(cfg, host)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if restored && result != nil {
+			result = fmt.Errorf("%w; %s", result, openWrtRestoreNotice)
+		}
+	}()
 	if err := s.filtering.ConfigurePersist(cfg.Filtering, func() error { return s.store.Save(configFile, cfg) }); err != nil {
 		return err
 	}
@@ -187,6 +199,14 @@ func (s *Service) setConfigLocked(cfg Config) error {
 	s.logs.SetEnabled(cfg.LoggingEnabled)
 	if cfg.Enabled {
 		s.startControlLocked()
+		if restored {
+			s.mu.RLock()
+			failed, detail := s.active == nil, s.lastError
+			s.mu.RUnlock()
+			if failed {
+				s.setError(fmt.Errorf("%s; %s", detail, openWrtRestoreNotice))
+			}
+		}
 	}
 	return nil
 }
@@ -202,7 +222,16 @@ func (s *Service) SetEnabled(enabled bool) error {
 func (s *Service) StartEnabled() {
 	s.opMu.Lock()
 	defer s.opMu.Unlock()
-	if s.Config().Enabled && s.controlCancel == nil {
+	cfg := s.Config()
+	if !cfg.Enabled {
+		// A removed or manually disabled config must not leave the native
+		// forwarder pointing at a listener that will never start.
+		if _, err := s.reconcileOpenWrtDNSLocked(cfg, ""); err != nil {
+			s.setError(err)
+		}
+		return
+	}
+	if s.controlCancel == nil {
 		s.startControlLocked()
 	}
 }
@@ -255,7 +284,7 @@ func (s *Service) supervise(ctx context.Context) {
 	}
 }
 
-func (s *Service) startRunLocked(parent context.Context) error {
+func (s *Service) startRunLocked(parent context.Context) (result error) {
 	cfg := s.Config()
 	host, err := s.resolveHost(cfg.ListenHost)
 	if err != nil {
@@ -264,6 +293,15 @@ func (s *Service) startRunLocked(parent context.Context) error {
 	if err := validateNoSelfUpstream(cfg, host); err != nil {
 		return err
 	}
+	restored, err := s.reconcileOpenWrtDNSLocked(cfg, host)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if restored && result != nil {
+			result = fmt.Errorf("%w; %s", result, openWrtRestoreNotice)
+		}
+	}()
 	ctx, cancel := context.WithCancel(parent)
 	run := &serviceRun{cancel: cancel, failure: make(chan error, 1)}
 	cfg.ListenHost = host // concrete bind address also protects upstream dialing from loops

@@ -203,3 +203,21 @@ func TestShadowInformTargetPersistenceIsIndependentOfDNSLease(t *testing.T) {
 		}
 	}
 }
+
+func TestShadowDiscoveredPeerPersistsWithoutInventingLease(t *testing.T) {
+	_, clock, leases := shadowStoredFixture(t)
+	targets := map[string]shadowDHCPTarget{"ISP": {wanKey: leases["ISP"].wanKey, clientIP: leases["ISP"].clientIP, serverIP: net.ParseIP("192.168.0.1")}}
+	wire, err := encodeShadowState(nil, targets, clock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotLeases, gotTargets, err := decodeShadowState(wire, clock)
+	if err != nil || len(gotLeases) != 0 || len(gotTargets) != 1 || gotTargets["ISP"].stamp != "" || !gotTargets["ISP"].serverIP.Equal(targets["ISP"].serverIP) {
+		t.Fatal("live discovered DHCP peer required historical lease evidence", gotLeases, gotTargets, err)
+	}
+	otherBoot := clock
+	otherBoot.bootID = "11234567-89ab-cdef-0123-456789abcdef"
+	if _, _, err := decodeShadowState(wire, otherBoot); err == nil {
+		t.Fatal("peer discovery survived an unverified new boot")
+	}
+}

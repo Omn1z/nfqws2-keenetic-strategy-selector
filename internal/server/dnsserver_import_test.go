@@ -169,22 +169,90 @@ func TestDNSImportPortableVPNMatchesIdentityAndNeverSameID(t *testing.T) {
 		t.Fatalf("identity remap=%+v %v", plan, err)
 	}
 	plan, err = prepareDNSImport(doc, dnsImportRequest{}, []awgroute.AWG2ConnectionRef{changed})
-	if err != nil || plan.VPN.State != "missing" || len(plan.Config.DisabledMethods) != 0 || len(plan.Warnings) == 0 {
+	if err != nil || plan.VPN.State != "auto" || plan.VPN.Resolution != "missing" || plan.Config.AWGFallback != "auto" || len(plan.Config.DisabledMethods) != 0 || len(plan.Warnings) == 0 {
 		t.Fatalf("same ID reused wrong identity: %+v %v", plan, err)
 	}
 	doc.Connections = nil
 	plan, err = prepareDNSImport(doc, dnsImportRequest{}, []awgroute.AWG2ConnectionRef{source})
-	if err != nil || plan.VPN.State != "selection_required" || plan.VPN.MatchedID != "" {
+	if err != nil || plan.VPN.State != "auto" || plan.VPN.Resolution != "selection_required" || plan.Config.AWGFallback != "auto" || plan.VPN.MatchedID != "" {
 		t.Fatalf("legacy ID auto assigned: %+v %v", plan, err)
 	}
 	doc.Connections = []awgroute.AWG2ConnectionRef{source}
 	duplicate := same
 	duplicate.Ref = "another"
 	plan, err = prepareDNSImport(doc, dnsImportRequest{}, []awgroute.AWG2ConnectionRef{same, duplicate})
-	if err != nil || plan.VPN.State != "ambiguous" || plan.VPN.MatchedID != "" {
+	if err != nil || plan.VPN.State != "auto" || plan.VPN.Resolution != "ambiguous" || plan.Config.AWGFallback != "auto" || plan.VPN.MatchedID != "" {
 		t.Fatalf("ambiguous identity auto assigned: %+v %v", plan, err)
 	}
 }
+func TestDNSImportMissingVPNDefaultsToLocalAutomaticWithoutChangingRoutePolicy(t *testing.T) {
+	for _, routeMode := range []string{dnsserver.RouteModeAuto, dnsserver.RouteModeVPNOnly} {
+		for _, withMetadata := range []bool{false, true} {
+			for _, withLocalVPN := range []bool{false, true} {
+				t.Run(fmt.Sprintf("%s/metadata=%v/local=%v", routeMode, withMetadata, withLocalVPN), func(t *testing.T) {
+					doc := dnsImportTestDocument(t)
+					doc.Config.RouteMode = routeMode
+					doc.Config.AWGFallback = "foreign"
+					doc.Config.SchedulerEnabled = false
+					if withMetadata {
+						doc.Connections = []awgroute.AWG2ConnectionRef{dnsImportPublicRef("foreign", "198.51.100.1:51820")}
+					}
+					var live []awgroute.AWG2ConnectionRef
+					if withLocalVPN {
+						live = []awgroute.AWG2ConnectionRef{dnsImportPublicRef("local", "203.0.113.1:51820")}
+					}
+					// Read a real serialized export, including legacy exports without
+					// connection metadata, before preparing the destination preview.
+					decoded, err := decodeDNSImportDocument(dnsImportWire(t, doc))
+					if err != nil {
+						t.Fatal(err)
+					}
+					plan, err := prepareDNSImport(decoded, dnsImportRequest{}, live)
+					if err != nil || plan.VPN.State != "auto" || plan.Config.AWGFallback != "auto" || plan.Config.RouteMode != routeMode || plan.Config.SchedulerEnabled || plan.VPN.SourceID != "foreign" {
+						t.Fatalf("portable import=%+v %v", plan, err)
+					}
+					if len(plan.VPN.Candidates) != len(live) || len(plan.Warnings) == 0 || plan.VPN.MatchedID != "" {
+						t.Fatalf("missing replacement choices or explanation: %+v", plan)
+					}
+					// Explicitly accepting the preview's default must apply without
+					// any stale source-connection requirement or fingerprint.
+					accepted, err := prepareDNSImport(decoded, dnsImportRequest{Mapping: ptrString("auto")}, live)
+					if err != nil || accepted.Config.AWGFallback != "auto" || accepted.VPN.Resolution != "" || accepted.Config.RouteMode != routeMode {
+						t.Fatalf("accept automatic=%+v %v", accepted, err)
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestDNSImportExplicitVPNMappingCanOverrideAutomaticOffAndMatchedSource(t *testing.T) {
+	source := dnsImportPublicRef("source", "198.51.100.1:51820")
+	target := dnsImportPublicRef("target", "203.0.113.1:51820")
+	for _, sourceID := range []string{"auto", "off", "source", "missing"} {
+		for _, selected := range []string{"auto", "off", "target"} {
+			t.Run(sourceID+"/"+selected, func(t *testing.T) {
+				doc := dnsImportTestDocument(t)
+				doc.Config.AWGFallback = sourceID
+				doc.Connections = []awgroute.AWG2ConnectionRef{source}
+				request := dnsImportRequest{Mapping: ptrString(selected)}
+				if selected == "target" {
+					request.MappingFingerprint = target.Fingerprint
+				}
+				plan, err := prepareDNSImport(doc, request, []awgroute.AWG2ConnectionRef{source, target})
+				if err != nil || plan.Config.AWGFallback != selected || plan.VPN.Resolution != "" || len(plan.Warnings) != 0 {
+					t.Fatalf("explicit replacement=%+v %v", plan, err)
+				}
+			})
+		}
+	}
+	doc := dnsImportTestDocument(t)
+	doc.Config.RouteMode = dnsserver.RouteModeVPNOnly
+	if _, err := prepareDNSImport(doc, dnsImportRequest{Mapping: ptrString("off")}, nil); err == nil {
+		t.Fatal("VPN-only import accepted disabled VPN")
+	}
+}
+
 func TestDNSImportManualVPNRequiresCurrentFingerprintAndPreservesNFQWS(t *testing.T) {
 	doc := dnsImportTestDocument(t)
 	doc.Config.AWGFallback = "foreign"
@@ -197,7 +265,7 @@ func TestDNSImportManualVPNRequiresCurrentFingerprintAndPreservesNFQWS(t *testin
 		}
 	}
 	plan, err := prepareDNSImport(doc, dnsImportRequest{Mapping: ptrString("local"), MappingFingerprint: target.Fingerprint}, []awgroute.AWG2ConnectionRef{target})
-	if err != nil || plan.Config.AWGFallback != "local" || plan.VPN.MatchedID != "local" || len(plan.Config.DisabledMethods) != 2 || plan.Config.DisabledMethods[0].Route != "nfqws" || plan.Config.DisabledMethods[1].Route != "awg:local" {
+	if err != nil || plan.Config.AWGFallback != "local" || plan.VPN.MatchedID != "local" || plan.VPN.Resolution != "" || len(plan.Config.DisabledMethods) != 2 || plan.Config.DisabledMethods[0].Route != "nfqws" || plan.Config.DisabledMethods[1].Route != "awg:local" {
 		t.Fatalf("manual mapping=%+v %v", plan, err)
 	}
 	if string(dnsImportWire(t, doc)) != string(before) {

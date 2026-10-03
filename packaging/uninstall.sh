@@ -27,6 +27,28 @@ else
   ENGINE_CONF=/opt/etc/nfqws2
 fi
 
+# An old binary has no restore command and cannot own this new snapshot. Only
+# invoke the command when a backup exists, before removing any recovery files.
+restore_openwrt_dns() {
+  [ "$PLATFORM" = openwrt ] || return 0
+  dns_backup="$DATA/openwrt-dns-binding.json"
+  [ -e "$dns_backup" ] || [ -L "$dns_backup" ] || return 0
+  if [ ! -x "$BIN" ]; then
+    say "ERROR: cannot restore managed OpenWrt DNS: executable $BIN is missing" >&2
+    say "uninstall stopped; keep $dns_backup and restore DNS before removing the service" >&2
+    return 1
+  fi
+  if ! N2S_DATA="$DATA" "$BIN" openwrt-dns-restore; then
+    say "ERROR: OpenWrt DNS restoration failed; uninstall stopped to preserve the service and backup" >&2
+    say "resolve the reported UCI conflict/error, keep $dns_backup, then retry uninstall" >&2
+    return 1
+  fi
+  if [ -e "$dns_backup" ] || [ -L "$dns_backup" ]; then
+    say "ERROR: OpenWrt DNS backup remains at $dns_backup; uninstall stopped" >&2
+    return 1
+  fi
+}
+
 # Remove only the tagged post-start block, including older versions that
 # targeted nfqws-bypass.sh. Restoring a saved init file could undo engine
 # upgrades or unrelated user edits, so leave every other line intact.
@@ -85,7 +107,11 @@ remove_bypass_files() {
   fi
 }
 
+# Restore while the local DNS listener is still available. Repeat after stop
+# in case a concurrent web request applied a new binding just before shutdown.
+restore_openwrt_dns || exit 1
 [ -x "$INIT" ] && "$INIT" stop 2>/dev/null || true
+restore_openwrt_dns || exit 1
 if [ "$PLATFORM" = openwrt ]; then
   "$INIT" disable 2>/dev/null || true
 fi

@@ -4,6 +4,7 @@ package dnsroute
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -14,6 +15,121 @@ import (
 
 	"github.com/miekg/dns"
 )
+
+func shadowDiscoveryTestWAN(t *testing.T) (string, net.IP) {
+	t.Helper()
+	ifs, err := net.Interfaces()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, iface := range ifs {
+		if !validShadowWAN(iface.Name) || iface.Flags&net.FlagUp == 0 {
+			continue
+		}
+		addrs, _ := iface.Addrs()
+		for _, addr := range addrs {
+			ip, _, _ := net.ParseCIDR(addr.String())
+			if ip.To4() != nil && ip.IsGlobalUnicast() {
+				return iface.Name, ip
+			}
+		}
+	}
+	t.Skip("no IPv4 WAN-like interface for read-only lookup")
+	return "", nil
+}
+
+func TestShadowDiscoveryNativeControlFailuresAndIgnoredDNS(t *testing.T) {
+	device, ip := shadowDiscoveryTestWAN(t)
+	bin := t.TempDir()
+	if err := os.WriteFile(filepath.Join(bin, "ndmc"), []byte("#!/bin/sh\nexit 0\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	previous := command
+	t.Cleanup(func() { command = previous })
+	const failure = "[C] Oct 4 00:39:03 ndm: ndmc: system failed [0xcffd0062].\nndmc: initialization failure."
+	current := "server:\n address: 192.0.2.53\n service: DHCP client\n interface: ISP\n"
+	ignored := "I [Oct 3 01:00:00] ndhcpc: ISP: received ACK for " + ip.String() + " from 192.0.2.1 lease 86400 sec.\nI [Oct 3 01:00:00] ndm: Dhcp::Client: obtained IP address " + ip.String() + "/24.\nW [Oct 3 01:00:00] ndm: Dns::InterfaceSpecific: name server 192.0.2.53 is ignored."
+	for _, tc := range []struct {
+		name, failedOperation, current, log, wantStage string
+		exitErr                                        error
+		remember, wantDNS                              bool
+	}{
+		{name: "initialization failure with nonzero exit", failedOperation: "all", exitErr: errors.New("exit status 1"), wantStage: "show ip name-server"},
+		{name: "initialization failure with zero exit", failedOperation: "all", wantStage: "show ip name-server"},
+		{name: "current DNS cannot verify WAN owner", failedOperation: "show interface ISP", current: current, wantStage: "show interface ISP"},
+		{name: "empty current DNS cannot read lease log", failedOperation: "show log", wantStage: "show log"},
+		{name: "normal ignored DNS", log: ignored, wantDNS: true},
+		{name: "failed DNS command still allows verified log", failedOperation: "show ip name-server", log: ignored, wantDNS: true},
+		{name: "historical ndmc failure is not current failure", log: "I [Oct 3 00:39:03] ndm: ndmc: initialization failure.\n" + ignored, wantDNS: true},
+		{name: "failed log still allows valid remembered lease", failedOperation: "show log", remember: true, wantDNS: true},
+		{name: "failed WAN verification rejects remembered lease", failedOperation: "show interface ISP", remember: true, wantStage: "show interface ISP"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			route := "default via 192.0.2.1 dev " + device
+			command = func(_ context.Context, name string, args ...string) (string, error) {
+				if filepath.Base(name) == "ndmc" && (tc.failedOperation == "all" || args[1] == tc.failedOperation) {
+					return failure, tc.exitErr
+				}
+				switch filepath.Base(name) + " " + strings.Join(args, " ") {
+				case "ndmc -c show ip name-server":
+					return tc.current, nil
+				case "ndmc -c show log":
+					return tc.log, nil
+				case "ndmc -c show interface ISP":
+					return "connected: yes\naddress: " + ip.String(), nil
+				case "ip -4 route show table main default":
+					return route, nil
+				case "date +%Y-%m-%dT%H:%M:%S%z":
+					return "2026-10-03T12:00:00+0300", nil
+				}
+				t.Fatalf("unexpected command: %s %v", name, args)
+				return "", errors.New("unexpected command")
+			}
+			remembered := map[string]shadowRememberedLease{}
+			expires := time.Now().Add(time.Hour)
+			if tc.remember {
+				remembered["ISP"] = shadowRememberedLease{wanKey: shadowWANKey(route, []string{device}, []net.IP{ip}), clientIP: ip, servers: []string{"192.0.2.53:53"}, expires: expires}
+			}
+			got, err := discoverShadowServersWithLeases(context.Background(), []string{device}, remembered)
+			if tc.wantDNS {
+				if err != nil || len(got) != 1 || got[0] != "192.0.2.53:53" {
+					t.Fatalf("verified DNS lost: servers=%v err=%v", got, err)
+				}
+			} else if len(got) != 0 || err == nil || !strings.Contains(err.Error(), tc.wantStage) || !strings.Contains(err.Error(), "initialization failure") || strings.Contains(err.Error(), "ожидается информация DHCP/PPP") {
+				t.Fatalf("native failure misreported: servers=%v err=%v", got, err)
+			}
+			if tc.remember && !remembered["ISP"].expires.Equal(expires) {
+				t.Fatal("native command failure extended or removed valid remembered evidence")
+			}
+		})
+	}
+}
+
+func TestShadowDiscoveryNativeCancellationDoesNotPoisonCache(t *testing.T) {
+	device, _ := shadowDiscoveryTestWAN(t)
+	bin := t.TempDir()
+	if err := os.WriteFile(filepath.Join(bin, "ndmc"), []byte("#!/bin/sh\nexit 0\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	previous := command
+	t.Cleanup(func() { command = previous })
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	command = func(context.Context, string, ...string) (string, error) {
+		cancel()
+		return "ndmc: initialization failure.", errors.New("signal: killed")
+	}
+	a := New(nil, nil)
+	a.cfg.WANIfaces, a.cfg.DataDir = []string{device}, t.TempDir()
+	if got, err := a.shadowServersOS(ctx); !errors.Is(err, context.Canceled) || len(got) != 0 {
+		t.Fatalf("caller cancellation replaced by native failure: %v %v", got, err)
+	}
+	if !a.shadow.discoveryUntil.IsZero() || a.shadow.discoveryErr != nil {
+		t.Fatal("cancellation installed a negative discovery cache")
+	}
+}
 
 func TestKeeneticShadowInterfaceMustOwnActiveWANAddress(t *testing.T) {
 	wan := []net.IP{net.ParseIP("192.168.0.10")}

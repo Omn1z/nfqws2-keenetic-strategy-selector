@@ -17,6 +17,7 @@ say() { printf '%s\n' "$*"; }
 sed -n '/^ensure_bypass_init_hook() {/,/^}/p' "$script_dir/install.sh" > "$test_dir/functions.sh"
 sed -n '/^remove_bypass_init_hook() {/,/^}/p' "$script_dir/uninstall.sh" >> "$test_dir/functions.sh"
 sed -n '/^remove_bypass_files() {/,/^}/p' "$script_dir/uninstall.sh" >> "$test_dir/functions.sh"
+sed -n '/^restore_openwrt_dns() {/,/^}/p' "$script_dir/uninstall.sh" >> "$test_dir/functions.sh"
 . "$test_dir/functions.sh"
 
 cat > "$test_dir/bin/uci" <<'EOF'
@@ -134,3 +135,110 @@ EOF
 done
 ! grep -Fq 'vendor called' "$N2S_TEST_LOG"
 printf 'bypass hook smoke: passed (OpenWrt, Keenetic, migration, uninstall)\n'
+
+# Run the real uninstall entrypoint against only private paths. A failed DNS
+# restore must prevent even --purge from removing the listener or its backup.
+cat > "$test_dir/uninstall-runner.sh" <<'EOF'
+#!/bin/sh
+set -eu
+say() { printf '%s\n' "$*"; }
+. "$N2S_TEST_FUNCTIONS"
+EOF
+sed -n '/^restore_openwrt_dns || exit 1$/,$p' "$script_dir/uninstall.sh" >> "$test_dir/uninstall-runner.sh"
+N2S_TEST_FUNCTIONS="$test_dir/functions.sh"
+export N2S_TEST_FUNCTIONS
+
+uninstall_fixture() {
+  fixture="$test_dir/uninstall $1"
+  PLATFORM=openwrt
+  DATA="$fixture/etc/nfqws2-strategy"
+  BIN="$fixture/usr/bin/n2s"
+  OLD_BIN="$fixture/usr/bin/nfqws2-strategy"
+  INIT="$fixture/etc/init.d/nfqws2-strategy"
+  PIDFILE="$fixture/var/run/nfqws2-strategy.pid"
+  LOGFILE="$fixture/var/log/nfqws2-strategy.log"
+  ENGINE_INIT="$fixture/etc/init.d/nfqws2-keenetic"
+  ENGINE_CONF="$fixture/etc/nfqws2"
+  mkdir -p "$DATA" "${BIN%/*}" "${INIT%/*}" "${PIDFILE%/*}" "${LOGFILE%/*}" "$ENGINE_CONF"
+  printf 'backup\n' > "$DATA/openwrt-dns-binding.json"
+  printf 'data\n' > "$DATA/keep-me"
+  touch "$OLD_BIN" "$PIDFILE" "$LOGFILE"
+  N2S_TEST_LOG="$fixture/calls"
+  : > "$N2S_TEST_LOG"
+  N2S_TEST_RESTORE=ok
+  N2S_TEST_REBIND=0
+  export PLATFORM DATA BIN OLD_BIN INIT PIDFILE LOGFILE ENGINE_INIT ENGINE_CONF N2S_TEST_LOG N2S_TEST_RESTORE N2S_TEST_REBIND
+  cat > "$BIN" <<'EOF'
+#!/bin/sh
+[ "$#" = 1 ] && [ "$1" = openwrt-dns-restore ] && [ "$N2S_DATA" = "$DATA" ] || exit 90
+printf 'restore\n' >> "$N2S_TEST_LOG"
+case "$N2S_TEST_RESTORE" in
+  fail) exit 1 ;;
+  stale) exit 0 ;;
+  fail-after-stop) if grep -qx stop "$N2S_TEST_LOG"; then exit 1; fi ;;
+esac
+rm -f "$N2S_DATA/openwrt-dns-binding.json"
+EOF
+  cat > "$INIT" <<'EOF'
+#!/bin/sh
+printf '%s\n' "$1" >> "$N2S_TEST_LOG"
+if [ "$1" = stop ] && [ "$N2S_TEST_REBIND" = 1 ]; then
+  printf 'new backup\n' > "$DATA/openwrt-dns-binding.json"
+fi
+EOF
+  chmod +x "$BIN" "$INIT"
+}
+
+assert_uninstall_preserved() {
+  [ -f "$DATA/openwrt-dns-binding.json" ]
+  [ -f "$DATA/keep-me" ]
+  [ -f "$INIT" ]
+  [ -f "$OLD_BIN" ]
+  [ -f "$PIDFILE" ]
+  [ -f "$LOGFILE" ]
+  ! grep -qx disable "$N2S_TEST_LOG"
+}
+
+for failure in fail stale missing; do
+  uninstall_fixture "$failure"
+  N2S_TEST_RESTORE="$failure"
+  [ "$failure" != missing ] || rm -f "$BIN"
+  if sh "$test_dir/uninstall-runner.sh" --purge; then
+    echo "uninstall accepted failed DNS restore: $failure" >&2; exit 1
+  fi
+  assert_uninstall_preserved
+  ! grep -qx stop "$N2S_TEST_LOG"
+  [ "$failure" = missing ] || [ -x "$BIN" ]
+done
+
+uninstall_fixture success
+sh "$test_dir/uninstall-runner.sh" --purge
+[ "$(sed -n '1,3p' "$N2S_TEST_LOG")" = "$(printf 'restore\nstop\ndisable')" ]
+[ ! -e "$DATA" ] && [ ! -e "$BIN" ] && [ ! -e "$INIT" ]
+
+uninstall_fixture rebind
+N2S_TEST_REBIND=1
+sh "$test_dir/uninstall-runner.sh" --purge
+[ "$(sed -n '1,4p' "$N2S_TEST_LOG")" = "$(printf 'restore\nstop\nrestore\ndisable')" ]
+[ ! -e "$DATA" ]
+
+uninstall_fixture rebind-failure
+N2S_TEST_REBIND=1
+N2S_TEST_RESTORE=fail-after-stop
+if sh "$test_dir/uninstall-runner.sh" --purge; then
+  echo 'uninstall removed an unrestored binding created during shutdown' >&2; exit 1
+fi
+assert_uninstall_preserved
+[ -x "$BIN" ]
+[ "$(cat "$N2S_TEST_LOG")" = "$(printf 'restore\nstop\nrestore')" ]
+
+for scenario in old-openwrt entware; do
+  uninstall_fixture "$scenario"
+  if [ "$scenario" = entware ]; then PLATFORM=entware; else rm -f "$DATA/openwrt-dns-binding.json"; fi
+  N2S_TEST_RESTORE=fail
+  sh "$test_dir/uninstall-runner.sh"
+  ! grep -qx restore "$N2S_TEST_LOG"
+  [ -f "$DATA/keep-me" ]
+  [ ! -e "$BIN" ] && [ ! -e "$INIT" ]
+done
+printf 'uninstall DNS restore smoke: passed (restore order, conflicts, missing binary, concurrent apply, old binary, Entware)\n'

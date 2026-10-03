@@ -27,10 +27,10 @@ export function DnsSettingsImport({ dirty, saving, onClose, onImport }: Props) {
     mounted.current = true;
     return () => { mounted.current = false; controller.current?.abort(); };
   }, []);
-  const preview = async (text: string) => {
+  const preview = async (text: string, selection?: DnsSettingsImportRequest) => {
     const aborter = new AbortController();
     controller.current = aborter;
-    const result = await api<DnsSettingsImportPlan>("POST", "/api/dnsserver/import/preview", { document: text }, { signal: aborter.signal, readOnly: true });
+    const result = await api<DnsSettingsImportPlan>("POST", "/api/dnsserver/import/preview", selection ?? { document: text }, { signal: aborter.signal, readOnly: true });
     if (!mounted.current || aborter.signal.aborted) return;
     setPlan(result);
     setMapping(initialDnsImportMapping(result));
@@ -55,6 +55,16 @@ export function DnsSettingsImport({ dirty, saving, onClose, onImport }: Props) {
     catch (e) { if (mounted.current) setError((e as Error).message); }
     finally { working.current = false; if (mounted.current) setBusy(false); }
   };
+  const selectMapping = async (value: string) => {
+    if (!plan || working.current || saving) return;
+    let request: DnsSettingsImportRequest;
+    try { request = buildDnsImportRequest(document, plan, value); }
+    catch (e) { setError((e as Error).message); return; }
+    working.current = true; setBusy(true); setError(""); setMapping(value);
+    try { await preview(document, request); }
+    catch (e) { if (mounted.current) { setError((e as Error).message); setPlan(null); } }
+    finally { working.current = false; if (mounted.current) setBusy(false); }
+  };
   const apply = async () => {
     if (!plan || working.current || saving) return;
     let request: DnsSettingsImportRequest;
@@ -66,17 +76,16 @@ export function DnsSettingsImport({ dirty, saving, onClose, onImport }: Props) {
       else setError("Импорт не подтверждён. Обновите предварительный просмотр: настройки могли измениться или сохраниться после потери ответа.");
     } finally { working.current = false; if (mounted.current) setBusy(false); }
   };
-  const needsVPN = plan && !["auto", "off"].includes(plan.vpn.state);
   return <Modal title="Импорт настроек DNS Server" size="lg" onClose={() => { if (!saving && !working.current) onClose(); }} actions={<>
     <Button disabled={busy || saving} onClick={onClose}>Отмена</Button>
     {document && <Button disabled={busy || saving} onClick={refresh}>Обновить просмотр</Button>}
-    <Button variant="primary" disabled={!plan || busy || saving || !!needsVPN && !mapping} onClick={apply}>{saving ? "Импорт…" : "Применить импорт"}</Button>
+    <Button variant="primary" disabled={!plan || busy || saving || !mapping} onClick={apply}>{saving ? "Импорт…" : "Применить импорт"}</Button>
   </>}>
     <p className="mb-3 text-xs text-muted">Выберите JSON экспорта DNS Server. Сначала будет показана конфигурация; она заменит все сохранённые настройки DNS только после «Применить импорт».</p>
     {dirty && <p className="mb-3 text-xs text-warn">На странице есть несохранённые изменения. Применение импорта заменит и этот черновик.</p>}
     <Field label="Файл настроек DNS"><input type="file" accept="application/json,.json" disabled={busy || saving} onChange={(e) => { void choose(e.target.files?.[0]); e.target.value = ""; }} className="block w-full rounded-lg border border-line bg-input p-2 text-xs" /></Field>
     {filename && <p className="mt-2 text-xs text-muted">{filename}</p>}
-    {busy && !saving && <p role="status" className="mt-3 text-xs text-muted">Проверка файла и подключения…</p>}
+    {busy && !saving && <p role="status" className="mt-3 text-xs text-muted">Проверка настроек и подключения…</p>}
     {error && <p role="alert" className="mt-3 text-xs text-bad">{error}</p>}
     {plan && <>
       <div className="mt-4 grid gap-2 rounded-lg border border-line p-3 text-xs sm:grid-cols-2">
@@ -86,16 +95,19 @@ export function DnsSettingsImport({ dirty, saving, onClose, onImport }: Props) {
         <p>Блокировка: {plan.config.filtering?.enabled ? "включена" : "выключена"}</p><p>Планировщик: {plan.config.scheduler_enabled === false ? "выключен" : "включён"}</p>
         <p>Shadow DNS: {plan.config.shadow_dns?.enabled ? "включён" : "выключен"} · {plan.config.shadow_dns?.domains.length ?? 0} правил</p><p>DNS провайдера определяется автоматически на этом роутере.</p>
       </div>
-      {needsVPN && <div className="mt-3">
-        <Field label="VPN-подключение для DNS"><Select value={mapping} disabled={busy || saving} onChange={(e) => setMapping(e.target.value)}>
-          <option value="">Выберите подключение</option>
+      <div className="mt-3">
+        <Field label="VPN-подключение для DNS"><Select value={mapping} disabled={busy || saving} onChange={(e) => { void selectMapping(e.target.value); }}>
+          <option value="auto">Автоматически — подключения этого роутера</option>
+          {plan.config.route_mode !== "vpn_only" && <option value="off">Без VPN — только NFQWS</option>}
           {plan.vpn.candidates.map((v) => <option key={v.ref} value={v.ref}>{[v.label || v.ref, v.endpoint, v.client_iface].filter(Boolean).join(" · ")}</option>)}
         </Select></Field>
-        <p className="mt-2 text-xs text-muted">{plan.vpn.state === "matched" ? "Подключение найдено по отпечатку публичных параметров. Можно выбрать замену." : `Подключение из файла (${plan.vpn.source_id}) требует выбора: одного совпадения ID недостаточно.`}</p>
-      </div>}
+        <p className="mt-2 text-xs text-muted">{mapping === "auto" ? "Автоматический режим использует включённые VPN-подключения этого роутера. Можно выбрать конкретное подключение из списка." : mapping === "off" ? "VPN для DNS отключён. Можно выбрать подключение этого роутера или автоматику." : "Выбрано подключение этого роутера. Можно выбрать другое или автоматику."}</p>
+        {mapping === "auto" && plan.vpn.candidates.length === 0 && <p className="mt-2 text-xs text-warn">{plan.config.route_mode === "vpn_only" ? "VPN-подключений пока нет. Настройки можно импортировать; запросы через VPN заработают после добавления и включения подключения." : "VPN-подключений пока нет. Настройки можно импортировать; новые подключения будут подхвачены автоматически."}</p>}
+        {plan.config.route_mode === "vpn_only" && <p className="mt-2 text-xs text-muted">Режим «Только VPN» сохраняется и при автоматическом выборе подключения.</p>}
+      </div>
       {plan.warnings.map((warning, index) => <p key={index} className="mt-2 text-xs text-warn">{warning}</p>)}
       <p className="mt-3 text-xs text-warn">Импорт включает адрес, порт и состояние DNS-сервиса. При изменении рабочих настроек сервис перезапустится. Проверьте адрес и VPN перед применением.</p>
-      <details className="mt-3 rounded-lg border border-line p-3 text-xs"><summary className="cursor-pointer font-semibold">Все настройки из файла</summary><pre className="mt-2 max-h-72 overflow-auto whitespace-pre-wrap [overflow-wrap:anywhere]">{JSON.stringify(plan.config, null, 2)}</pre></details>
+      <details className="mt-3 rounded-lg border border-line p-3 text-xs"><summary className="cursor-pointer font-semibold">Настройки после импорта</summary><pre className="mt-2 max-h-72 overflow-auto whitespace-pre-wrap [overflow-wrap:anywhere]">{JSON.stringify(plan.config, null, 2)}</pre></details>
     </>}
   </Modal>;
 }

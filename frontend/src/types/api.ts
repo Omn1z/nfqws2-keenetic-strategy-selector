@@ -411,6 +411,7 @@ export interface DnsSettingsImportPlan {
   vpn: {
     source_id: string;
     state: "auto" | "off" | "matched" | "selection_required" | "missing" | "ambiguous";
+    resolution?: "selection_required" | "missing" | "ambiguous";
     matched_id?: string;
     candidates: DnsSettingsConnection[];
   };
@@ -1007,4 +1008,17 @@ export interface Nfqws2Version {
   available: boolean;
   url: string;
   error?: string;
+}
+
+export interface OpenWrtDnsState {
+  supported: boolean;
+  reason?: string;
+  interfaces: { id: string; label: string }[];
+  instances: { id: string; label: string }[];
+  managed: boolean;
+  pending?: boolean;
+  binding?: { interface: string; instance: string; endpoint: { host: string; port: number } };
+  conflict?: string;
+  warnings: string[];
+  revision: string;
 }
