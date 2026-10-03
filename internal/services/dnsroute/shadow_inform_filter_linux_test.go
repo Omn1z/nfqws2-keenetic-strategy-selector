@@ -36,6 +36,14 @@ func TestShadowInformKernelFilterKeepsOnlyDHCPReplyPorts(t *testing.T) {
 		accept bool
 	}{
 		{name: "DHCP ACK", accept: true},
+		{name: "multihomed DHCP ACK", accept: true, alter: func(p []byte) []byte {
+			copy(p[12:16], []byte{192, 168, 0, 2})
+			return p
+		}},
+		{name: "relayed DHCP ACK", accept: true, alter: func(p []byte) []byte {
+			copy(p[52:56], []byte{192, 168, 0, 3})
+			return p
+		}},
 		{name: "IPv4 options", accept: true, alter: func(p []byte) []byte {
 			p = append(append(append([]byte(nil), p[:20]...), 1, 1, 1, 1), p[20:]...)
 			p[0] = 0x46

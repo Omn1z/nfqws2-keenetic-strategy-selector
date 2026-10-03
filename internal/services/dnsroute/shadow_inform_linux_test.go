@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"net"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -144,13 +145,61 @@ func TestShadowInformDiscoveryOneSendLearnsMatchingServer(t *testing.T) {
 		case 2:
 			ack[32] ^= 1 // another DHCP transaction on the unconnected socket
 		case 3:
-			ack[273] ^= 1 // self-declared server differs from packet source
+			ack[273] = 224 // multicast server identifier cannot identify a peer
 		}
 		return copy(packet, ack), nil
 	}
 	peer, servers, err := exchangeShadowInformFrom(ctx, socket, id, true)
 	if err != nil || !peer.Equal(net.ParseIP("192.168.0.1")) || len(servers) != 2 || socket.sends != 1 || socket.reads != 4 {
 		t.Fatalf("peer=%v servers=%v err=%v sends=%d reads=%d", peer, servers, err, socket.sends, socket.reads)
+	}
+}
+
+func TestShadowInformTimeoutDistinguishesRejectedRepliesFromNoReply(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		packet   func() []byte
+		rejected bool
+	}{
+		{name: "no reply"},
+		{name: "unrelated transaction", packet: func() []byte {
+			p := shadowInformACKFixture()
+			p[32] ^= 1
+			return p
+		}},
+		{name: "matching ACK without DNS", rejected: true, packet: func() []byte {
+			p := shadowInformACKFixture()
+			p[277] = 255
+			return p
+		}},
+		{name: "matching wrong known server", rejected: true, packet: func() []byte {
+			p := shadowInformACKFixture()
+			p[273] ^= 1
+			return p
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+			defer cancel()
+			socket := &shadowInformFakeSocket{}
+			socket.onReceive = func(buf []byte, wait time.Duration) (int, error) {
+				if socket.reads == 1 && tc.packet != nil {
+					return copy(buf, tc.packet()), nil
+				}
+				time.Sleep(wait + time.Millisecond)
+				return 0, syscall.EAGAIN
+			}
+			_, err := exchangeShadowInform(ctx, socket, shadowInformTestIdentity())
+			if !errors.Is(err, context.DeadlineExceeded) || socket.sends != 1 {
+				t.Fatalf("timeout identity lost: %v sends=%d", err, socket.sends)
+			}
+			if strings.Contains(err.Error(), "получен, но отклонён") != tc.rejected {
+				t.Fatalf("incorrect reply diagnosis: %v", err)
+			}
+			if !tc.rejected && !strings.Contains(err.Error(), "не получен") {
+				t.Fatalf("missing no-reply diagnosis: %v", err)
+			}
+		})
 	}
 }
 

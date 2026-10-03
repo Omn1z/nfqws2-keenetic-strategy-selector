@@ -77,9 +77,10 @@ func shadowInformChecksumValid(data []byte) bool {
 	return uint16(sum) == 0xffff
 }
 
-// parseShadowInformReply accepts only an unicast IPv4 ACK for this transaction.
-// The returned literal DNS addresses still require caller-side loop filtering.
-func parseShadowInformReply(packet []byte, id shadowInformIdentity) ([]string, error) {
+// shadowInformReplyDatagram checks transaction identity independently of the
+// server's parameter contents. Only matching replies may explain a failed
+// exchange; unrelated WAN packets must never become diagnostic evidence.
+func shadowInformReplyDatagram(packet []byte, id shadowInformIdentity) ([]byte, error) {
 	if len(packet) < 20 || packet[0]>>4 != 4 || packet[9] != 17 {
 		return nil, fmt.Errorf("not IPv4 UDP")
 	}
@@ -88,8 +89,8 @@ func parseShadowInformReply(packet []byte, id shadowInformIdentity) ([]string, e
 	if iHL < 20 || total > len(packet) || total < iHL+8+240 || binary.BigEndian.Uint16(packet[6:8])&0x3fff != 0 {
 		return nil, fmt.Errorf("invalid IPv4 length or fragment")
 	}
-	if !bytes.Equal(packet[12:16], id.server[:]) || !bytes.Equal(packet[16:20], id.client[:]) {
-		return nil, fmt.Errorf("wrong IPv4 endpoints")
+	if !bytes.Equal(packet[16:20], id.client[:]) {
+		return nil, fmt.Errorf("wrong IPv4 destination")
 	}
 	udp := packet[iHL:total]
 	length := int(binary.BigEndian.Uint16(udp[4:6]))
@@ -97,6 +98,40 @@ func parseShadowInformReply(packet []byte, id shadowInformIdentity) ([]string, e
 		return nil, fmt.Errorf("wrong UDP endpoints or length")
 	}
 	udp = udp[:length]
+	dhcp := udp[8:]
+	if dhcp[0] != 2 || dhcp[1] != 1 || dhcp[2] != 6 || !bytes.Equal(dhcp[4:8], id.xid[:]) || !bytes.Equal(dhcp[28:34], id.mac[:]) {
+		return nil, fmt.Errorf("wrong BOOTP reply identity")
+	}
+	return udp, nil
+}
+
+func shadowInformReplyMatches(packet []byte, id shadowInformIdentity) bool {
+	_, err := shadowInformReplyDatagram(packet, id)
+	return err == nil
+}
+
+func shadowInformPeerIP(ip net.IP, id shadowInformIdentity) bool {
+	return len(ip) == net.IPv4len && ip.IsGlobalUnicast() && !ip.IsLoopback() && !ip.Equal(net.IP(id.client[:]))
+}
+
+// parseShadowInformReply accepts only a unicast IPv4 ACK for this transaction
+// and the known server identifier. Source addresses can differ from option 54
+// with multihomed DHCP servers and relays (RFC2131 section 4.1).
+// The returned literal DNS addresses still require caller-side loop filtering.
+func parseShadowInformReply(packet []byte, id shadowInformIdentity) ([]string, error) {
+	_, servers, err := parseShadowInformACK(packet, id, false)
+	return servers, err
+}
+
+func parseShadowInformACK(packet []byte, id shadowInformIdentity, discover bool) (net.IP, []string, error) {
+	udp, err := shadowInformReplyDatagram(packet, id)
+	if err != nil {
+		return nil, nil, err
+	}
+	if !shadowInformPeerIP(net.IP(packet[12:16]), id) {
+		return nil, nil, fmt.Errorf("invalid DHCP reply source")
+	}
+	length := len(udp)
 	if binary.BigEndian.Uint16(udp[6:8]) != 0 {
 		pseudo := make([]byte, 12+length)
 		copy(pseudo[0:8], packet[12:20])
@@ -104,79 +139,67 @@ func parseShadowInformReply(packet []byte, id shadowInformIdentity) ([]string, e
 		binary.BigEndian.PutUint16(pseudo[10:12], uint16(length))
 		copy(pseudo[12:], udp)
 		if !shadowInformChecksumValid(pseudo) {
-			return nil, fmt.Errorf("invalid UDP checksum")
+			return nil, nil, fmt.Errorf("invalid UDP checksum")
 		}
 	}
 	dhcp := udp[8:]
-	if dhcp[0] != 2 || dhcp[1] != 1 || dhcp[2] != 6 || !bytes.Equal(dhcp[4:8], id.xid[:]) || !bytes.Equal(dhcp[28:34], id.mac[:]) {
-		return nil, fmt.Errorf("wrong BOOTP reply identity")
-	}
 	if !bytes.Equal(dhcp[236:240], shadowDHCPMagic) {
-		return nil, fmt.Errorf("wrong DHCP cookie")
+		return nil, nil, fmt.Errorf("wrong DHCP cookie")
 	}
 	zero := []byte{0, 0, 0, 0}
 	// RFC2131 Table3 permits zero ciaddr in ACK. Reject another nonzero
 	// address; destination, xid, hardware address, and server remain mandatory.
 	if !bytes.Equal(dhcp[12:16], zero) && !bytes.Equal(dhcp[12:16], id.client[:]) {
-		return nil, fmt.Errorf("wrong ACK ciaddr")
+		return nil, nil, fmt.Errorf("wrong ACK ciaddr")
 	}
 	// This transport accepts only parameter-only INFORM replies. A yiaddr
 	// assignment belongs to lease negotiation, which we never participate in.
 	if !bytes.Equal(dhcp[16:20], zero) {
-		return nil, fmt.Errorf("unexpected address assignment in INFORM ACK")
+		return nil, nil, fmt.Errorf("unexpected address assignment in INFORM ACK")
 	}
-	if !bytes.Equal(dhcp[24:28], zero) {
-		return nil, fmt.Errorf("unexpected DHCP relay")
+	// Relays can retain their giaddr in a direct unicast ACK to ciaddr. It is
+	// neither an address assignment nor the server identifier for later INFORMs.
+	if !bytes.Equal(dhcp[24:28], zero) && !shadowInformPeerIP(net.IP(dhcp[24:28]), id) {
+		return nil, nil, fmt.Errorf("invalid DHCP relay address")
 	}
 	options := make(map[byte][]byte)
 	if err := parseShadowInformOptions(dhcp[240:], options); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if overloaded, ok := options[52]; ok {
 		if len(overloaded) != 1 || overloaded[0] < 1 || overloaded[0] > 3 {
-			return nil, fmt.Errorf("invalid option overload")
+			return nil, nil, fmt.Errorf("invalid option overload")
 		}
 		if overloaded[0]&1 != 0 {
 			if err := parseShadowInformOptions(dhcp[108:236], options); err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 		}
 		if overloaded[0]&2 != 0 {
 			if err := parseShadowInformOptions(dhcp[44:108], options); err != nil {
-				return nil, err
+				return nil, nil, err
 			}
 		}
 	}
-	if !bytes.Equal(options[53], []byte{5}) || !bytes.Equal(options[54], id.server[:]) {
-		return nil, fmt.Errorf("wrong DHCP type or server identifier")
+	server := net.IP(options[54])
+	if !bytes.Equal(options[53], []byte{5}) || !shadowInformPeerIP(server, id) || !discover && !bytes.Equal(server, id.server[:]) {
+		return nil, nil, fmt.Errorf("wrong DHCP type or server identifier")
 	}
 	dns := options[6]
 	if len(dns) == 0 || len(dns)%4 != 0 {
-		return nil, fmt.Errorf("DHCPACK has no valid DNS option")
+		return nil, nil, fmt.Errorf("DHCPACK has no valid DNS option")
 	}
 	servers := make([]string, 0, len(dns)/4)
 	for i := 0; i < len(dns); i += 4 {
 		servers = append(servers, net.IP(dns[i:i+4]).String())
 	}
-	return servers, nil
+	return append(net.IP(nil), server...), servers, nil
 }
 
 // A broadcast INFORM has no known peer. Learn one only from a parameter-only
 // ACK addressed to this client, with the same random transaction and MAC and
-// an option 54 matching the packet source. All other checks remain identical
-// to the known-peer parser; the source alone is never evidence of a DNS server.
+// a valid option 54. RFC2131 requires this identifier for subsequent unicast
+// requests; an IP source or relay address alone is not the server identifier.
 func parseShadowInformDiscoverReply(packet []byte, id shadowInformIdentity) (net.IP, []string, error) {
-	if len(packet) < 20 {
-		return nil, nil, fmt.Errorf("short DHCPINFORM discovery reply")
-	}
-	server := net.IP(packet[12:16])
-	if !server.IsGlobalUnicast() || server.IsLoopback() || server.Equal(net.IP(id.client[:])) {
-		return nil, nil, fmt.Errorf("DHCPINFORM discovery requires a distinct unicast server")
-	}
-	copy(id.server[:], server)
-	servers, err := parseShadowInformReply(packet, id)
-	if err != nil {
-		return nil, nil, err
-	}
-	return append(net.IP(nil), server...), servers, nil
+	return parseShadowInformACK(packet, id, true)
 }

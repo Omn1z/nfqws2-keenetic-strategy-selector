@@ -26,7 +26,8 @@ func shadowDHCPInform(ctx context.Context, iface string, clientIP, serverIP net.
 
 // RFC2131 section 4.4.3 permits a broadcast INFORM when the client already has
 // an address but does not know the DHCP server. It requests only DNS parameters
-// and learns a peer from the matching unicast ACK, never from the WAN gateway.
+// and learns a peer identifier from the matching unicast ACK, never from the
+// WAN gateway or merely the packet's IP source.
 func shadowDHCPInformDiscover(ctx context.Context, iface string, clientIP net.IP) (net.IP, []string, error) {
 	return shadowDHCPInformOnWAN(ctx, iface, clientIP, nil, true)
 }
@@ -83,10 +84,8 @@ func shadowDHCPInformOnWAN(ctx context.Context, iface string, clientIP, serverIP
 		return nil, nil, fmt.Errorf("DHCPINFORM raw socket: %w", err)
 	}
 	defer syscall.Close(fd)
-	if discover {
-		if err := attachShadowInformFilter(fd); err != nil {
-			return nil, nil, fmt.Errorf("DHCPINFORM attach reply filter: %w", err)
-		}
+	if err := attachShadowInformFilter(fd); err != nil {
+		return nil, nil, fmt.Errorf("DHCPINFORM attach reply filter: %w", err)
 	}
 	if err := syscall.SetsockoptString(fd, syscall.SOL_SOCKET, syscall.SO_BINDTODEVICE, iface); err != nil {
 		return nil, nil, fmt.Errorf("DHCPINFORM bind WAN: %w", err)
@@ -100,15 +99,11 @@ func shadowDHCPInformOnWAN(ctx context.Context, iface string, clientIP, serverIP
 			return nil, nil, fmt.Errorf("DHCPINFORM enable broadcast: %w", err)
 		}
 		destination = [4]byte{255, 255, 255, 255}
-		// Leave discovery unconnected: the server must reply from its unicast
-		// address, not the broadcast destination. The parser checks its identity.
-	} else {
-		// Connecting a raw socket sends no handshake. It limits incoming traffic
-		// to the expected peer, without taking any packets from native ndhcpc.
-		if err := syscall.Connect(fd, &syscall.SockaddrInet4{Addr: id.server}); err != nil {
-			return nil, nil, fmt.Errorf("DHCPINFORM select server: %w", err)
-		}
 	}
+	// Leave both modes unconnected: RFC2131 permits a multihomed server to
+	// use an IP source different from option54, even for a unicast INFORM.
+	// Device/source binding and BPF limit received copies; the parser checks
+	// transaction, hardware address, destination and the server identifier.
 	return exchangeShadowInformFrom(ctx, shadowInformRawSocket{fd: fd, server: destination}, id, discover)
 }
 
@@ -146,6 +141,16 @@ func exchangeShadowInform(ctx context.Context, socket shadowInformSocket, id sha
 	return servers, err
 }
 
+func shadowInformReceiveError(err, rejected error) error {
+	if !errors.Is(err, context.DeadlineExceeded) {
+		return err
+	}
+	if rejected != nil {
+		return fmt.Errorf("ответ DHCPINFORM получен, но отклонён (%v): %w", rejected, err)
+	}
+	return fmt.Errorf("ответ DHCPINFORM на текущий запрос не получен: %w", err)
+}
+
 func exchangeShadowInformFrom(ctx context.Context, socket shadowInformSocket, id shadowInformIdentity, discover bool) (net.IP, []string, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, nil, err
@@ -166,20 +171,21 @@ func exchangeShadowInformFrom(ctx context.Context, socket shadowInformSocket, id
 		return nil, nil, fmt.Errorf("send DHCPINFORM: %w", err)
 	}
 	buffer := make([]byte, 4096)
+	var rejected error
 	for attempt := 0; attempt < shadowInformMaxReads; attempt++ {
 		if err := ctx.Err(); err != nil {
-			return nil, nil, err
+			return nil, nil, shadowInformReceiveError(err, rejected)
 		}
 		remaining := time.Until(deadline)
 		if remaining <= 0 {
-			return nil, nil, context.DeadlineExceeded
+			return nil, nil, shadowInformReceiveError(context.DeadlineExceeded, rejected)
 		}
 		n, err := socket.receive(buffer, min(remaining, shadowInformReadSlice))
 		if ctx.Err() != nil {
-			return nil, nil, ctx.Err()
+			return nil, nil, shadowInformReceiveError(ctx.Err(), rejected)
 		}
 		if !time.Now().Before(deadline) {
-			return nil, nil, context.DeadlineExceeded
+			return nil, nil, shadowInformReceiveError(context.DeadlineExceeded, rejected)
 		}
 		if err != nil {
 			if errors.Is(err, syscall.EINTR) || errors.Is(err, syscall.EAGAIN) || errors.Is(err, syscall.EWOULDBLOCK) {
@@ -190,12 +196,22 @@ func exchangeShadowInformFrom(ctx context.Context, socket shadowInformSocket, id
 		if n < 0 || n > len(buffer) {
 			return nil, nil, fmt.Errorf("invalid DHCPINFORM socket length")
 		}
+		var parseErr error
 		if discover {
 			if peer, servers, err := parseShadowInformDiscoverReply(buffer[:n], id); err == nil {
 				return peer, servers, nil
+			} else {
+				parseErr = err
 			}
 		} else if servers, err := parseShadowInformReply(buffer[:n], id); err == nil {
 			return append(net.IP(nil), id.server[:]...), servers, nil
+		} else {
+			parseErr = err
+		}
+		// Unrelated DHCP traffic must not change this request's diagnosis.
+		// Parser errors are fixed descriptions, never packet contents.
+		if shadowInformReplyMatches(buffer[:n], id) {
+			rejected = parseErr
 		}
 	}
 	// A packet flood must not spin for an unbounded number of parse attempts.
