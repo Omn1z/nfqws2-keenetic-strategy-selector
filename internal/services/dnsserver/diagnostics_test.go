@@ -3,9 +3,11 @@ package dnsserver
 import (
 	"context"
 	"encoding/json"
+	"net"
 	"os"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 
 	mdns "github.com/miekg/dns"
@@ -17,6 +19,36 @@ func activeDNSRun(s *Service) *serviceRun {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return s.active
+}
+
+// These preservation tests need both a successful and a failed scheduler entry.
+// A fast winner normally cancels losing attempts, which are correctly not
+// counted as failures. Hold the successful dial until the failing alternate has
+// been recorded, rather than relying on the order in which workers run.
+func configureFailingDNSAlternate(s *Service, backend *resolverTestBackend) {
+	resolver := activeDNSRun(s).resolver
+	closeResolverFixtureIdle(resolver)
+	failureRecorded := make(chan struct{})
+	var once sync.Once
+	resolver.SetAttemptObserver(func(event AttemptEvent) {
+		s.recordAttempt(event)
+		if event.Domain == "example.com" && event.Route == "awg:first" && !event.Success && !event.Canceled {
+			once.Do(func() { close(failureRecorded) })
+		}
+	})
+	backend.setFailures("awg:first")
+	backend.mu.Lock()
+	backend.routes = []dnsroute.Route{{ID: "nfqws", Name: "NFQWS", Available: true}, {ID: "awg:first", Name: "AWG", Available: true}}
+	upstream := backend.address
+	backend.dialHook = func(ctx context.Context, _, network, _ string) (net.Conn, error) {
+		select {
+		case <-failureRecorded:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		return (&net.Dialer{}).DialContext(ctx, network, upstream)
+	}
+	backend.mu.Unlock()
 }
 
 func TestDNSDiagnosticsTogglePersistsWithoutRestart(t *testing.T) {
@@ -188,19 +220,12 @@ func TestDNSDiagnosticsFailedSaveKeepsLoggingAndDNS(t *testing.T) {
 
 func TestDNSDiagnosticsSchedulerAndLogSurviveConfigSave(t *testing.T) {
 	s, backend, client := newDNSServiceFixture(t, 8)
-	backend.mu.Lock()
-	backend.routes = []dnsroute.Route{{ID: "nfqws", Name: "NFQWS", Available: true}, {ID: "awg:first", Name: "AWG", Available: true}}
-	backend.mu.Unlock()
-	backend.setFailures("awg:first")
+	configureFailingDNSAlternate(s, backend)
 	if msg := queryDNSService(t, client, s.Status().Endpoints.DNS, 330); msg.Rcode != mdns.RcodeSuccess {
 		t.Fatalf("initial DNS request failed: %s", mdns.RcodeToString[msg.Rcode])
 	}
-	waitFastDNS(t, func() bool {
-		history, err := s.SchedulerSnapshot("example.com")
-		return err == nil && len(history.Candidates) == 2 && history.Candidates[0].Successes == 1 && history.Candidates[1].Failures == 1
-	})
 	before, err := s.SchedulerSnapshot("EXAMPLE.COM.")
-	if err != nil || before.Domain != "example.com" || len(before.Candidates) != 2 || before.Candidates[0].Successes != 1 || before.Candidates[0].Attempts != 1 {
+	if err != nil || before.Domain != "example.com" || len(before.Candidates) != 2 || before.Candidates[0].Route != "nfqws" || before.Candidates[0].Successes != 1 || before.Candidates[0].Attempts != 1 || before.Candidates[1].Route != "awg:first" || before.Candidates[1].Failures != 1 || before.Candidates[1].Attempts != 1 {
 		t.Fatalf("actual query did not teach the scheduler: %v %+v", err, before)
 	}
 	scheduler, logs, run := s.scheduler, s.logs, activeDNSRun(s)
