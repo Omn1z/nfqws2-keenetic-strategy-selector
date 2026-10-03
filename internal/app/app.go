@@ -14,6 +14,7 @@ import (
 	"sync"
 	"time"
 
+	"nfqws2strategy/internal/services/arpblock"
 	"nfqws2strategy/internal/services/arpspoof"
 	"nfqws2strategy/internal/services/awgroute"
 	"nfqws2strategy/internal/services/blobs"
@@ -67,6 +68,7 @@ type App struct {
 	blobs     *blobs.Service    // fake-payload blob store + ClientHello capture (Blobs tab)
 	portfwd   *portforward.Service
 	arpspoof  *arpspoof.Service
+	arpblock  *arpblock.Service
 	dnsServer *dnsserver.Service
 
 	dnsMu      sync.Mutex
@@ -100,6 +102,7 @@ func New(cfg *config.Config) (*App, error) {
 	a.proxy = proxy.New(st)
 	a.portfwd = portforward.New(cfg, st)
 	a.arpspoof = arpspoof.New(cfg, st)
+	a.arpblock = arpblock.New()
 	a.awgroute = awgroute.New(cfg, st) // creates the manager; may autostart the tunnel + re-apply committed routing
 	// Apply trace policy as soon as the AWG service exists: "always" turns
 	// recording on right away, "off" pins it off; "auto" leaves it to the

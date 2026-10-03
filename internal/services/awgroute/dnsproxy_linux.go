@@ -127,10 +127,8 @@ func (svc *Service) awgEnsureDNSProxy(cfg *awg.ServerConfig) bool {
 		for _, ip := range ips {
 			d, r := decision, reason
 			rl := rule
-			if decision == "tunnel" {
-				if _, ok := sharedCDNProvider(ip); ok {
-					d, r, rl = "cdn-skip", "общий CDN — IP не добавлен в set", 0
-				}
+			if skipSharedCDNDomainIP(string(dec.Route), dec.SourceBound, ip) {
+				d, r, rl = "cdn-skip", "общий CDN — глобальное исключение direct не добавлено", 0
 			}
 			traceAppend(TraceEntry{Src: srcIP, Kind: "dns", Name: qname, Qtype: qtype, Dst: ip, Decision: d, Rule: rl, Reason: r})
 		}

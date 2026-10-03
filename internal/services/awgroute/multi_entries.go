@@ -84,7 +84,7 @@ func (svc *Service) awgMultiRuleEntriesWithLookup(z awg.Zone, lookup func(string
 			continue
 		}
 		for _, ip := range answers[i] {
-			if _, ok := sharedCDNProvider(ip); ok {
+			if skipSharedCDNDomainIP(z.RouteValue(), false, ip) {
 				svc.awgNoteSharedCDNSkip("multi-resolve", ip)
 				continue
 			}

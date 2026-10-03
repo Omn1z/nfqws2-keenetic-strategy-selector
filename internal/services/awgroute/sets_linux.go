@@ -271,7 +271,7 @@ func (svc *Service) awgPrepareSetPlan(cfg *awg.ServerConfig, force bool) awgSetP
 		}
 		for _, r := range parallelResolveWithLookup(plain, 32, lookup) {
 			for _, ip := range r {
-				if _, ok := sharedCDNProvider(ip); ok {
+				if skipSharedCDNDomainIP(z.RouteValue(), false, ip) {
 					svc.awgNoteSharedCDNSkip("resolve", ip)
 					continue
 				}
@@ -385,7 +385,7 @@ func (svc *Service) awgPrepareSourceSetsWithLookup(cfg *awg.ServerConfig, lookup
 		}
 		for _, r := range parallelResolveWithLookup(plain, 32, lookup) {
 			for _, ip := range r {
-				if _, ok := sharedCDNProvider(ip); ok {
+				if skipSharedCDNDomainIP(z.RouteValue(), false, ip) {
 					continue
 				}
 				target, suffix := set4, "/32"

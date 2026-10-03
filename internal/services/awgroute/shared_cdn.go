@@ -6,9 +6,11 @@ import (
 )
 
 // Domain-based split routing eventually becomes IP routing. Shared CDN edge
-// addresses are unsafe to learn from one matched hostname because the same IP can
-// serve unrelated hostnames; adding such an IP to an ipset would route/bypass all
-// those neighbours too. Keep explicit user-entered IP/CIDR rules untouched.
+// addresses can serve unrelated hostnames. A direct exception must not silently
+// bypass VPN for all those neighbours. An explicit tunnel rule, however, must
+// route the requested destination even when it shares a CDN edge. This remains
+// IP routing: other names on that exact address may follow the same rule.
+// Keep explicit user-entered IP/CIDR rules untouched.
 //
 // Cloudflare publishes the current ranges at:
 // https://www.cloudflare.com/ips-v4 and https://www.cloudflare.com/ips-v6
@@ -73,15 +75,21 @@ func sharedCDNProvider(ip string) (string, bool) {
 	return "", false
 }
 
-// awgNoteSharedCDNSkip records that we skipped putting a shared-CDN IP into the
-// destination ipsets. The behaviour is INTENTIONAL — putting a Cloudflare /
-// Akamai edge IP into awg2_exc would also bypass every unrelated site on the
-// same IP, which is wrong. In Russia specifically that's even the correct
-// outcome (Cloudflare ranges are network-blocked, so traffic to them rides VPN
-// anyway). The early code surfaced this as a per-IP `warn` line in the panel
-// log; it spammed dozens of lines per apply and convinced users something was
-// broken. So we now keep ONLY the dedup map (in case future code wants to
-// reason over it) and stay silent in the log.
+// skipSharedCDNDomainIP applies only to domain-derived destinations. A tunnel
+// selection must not turn into an unmarked/direct flow because its answer is a
+// CDN address. Preserve the shared-address guard for LAN-wide direct exceptions;
+// source-bound rules already limit their effect to explicitly selected devices.
+// The common tunnel path avoids a prefix lookup entirely.
+func skipSharedCDNDomainIP(route string, sourceBound bool, ip string) bool {
+	if route != "direct" || sourceBound {
+		return false
+	}
+	_, shared := sharedCDNProvider(ip)
+	return shared
+}
+
+// awgNoteSharedCDNSkip deduplicates guarded direct exceptions without creating a
+// log entry for every CDN answer. The routing trace reports the skipped address.
 func (svc *Service) awgNoteSharedCDNSkip(source, ip string) {
 	svc.route.sharedCDNSkips.LoadOrStore(source+"|"+ip, struct{}{})
 }

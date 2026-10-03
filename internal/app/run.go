@@ -206,6 +206,10 @@ func (a *App) StartRun(req RunRequest) (*Run, error) {
 	if len(strategies) == 0 {
 		return nil, fmt.Errorf("no strategies selected")
 	}
+	strategies = httpsRunStrategies(strategies)
+	if len(strategies) == 0 {
+		return nil, fmt.Errorf("нет стратегий для HTTPS (IPv4, TCP/443, TLS): текущая проверка не тестирует HTTP/QUIC")
+	}
 
 	// Cross with the selected DNS servers: each strategy is tested through every
 	// DNS choice (empty selection = one system-resolver pass).
@@ -498,6 +502,10 @@ func (a *App) testStrategy(ctx context.Context, sb *engine.Sandbox, pr *probe.Pr
 		dnsID, dnsName = job.dns.ID, job.dns.Name
 	}
 	res := StrategyResult{StrategyID: s.ID, Name: s.Name, ArgLine: s.ArgLine, L7: s.L7, DNS: dnsName, DNSID: dnsID, TargetsTotal: len(targets)}
+	if err := validateHTTPSStrategy(s.ArgLine); err != nil {
+		res.Error = err.Error()
+		return res
+	}
 	// Resolve targets through this job's DNS (nil = system resolver). The worker
 	// runs one job at a time, so mutating the shared prober here is safe.
 	if job.dns != nil {

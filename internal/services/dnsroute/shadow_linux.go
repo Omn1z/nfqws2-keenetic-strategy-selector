@@ -7,12 +7,14 @@ import (
 	"fmt"
 	"net"
 	"os/exec"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
 )
 
 func (a *Adapter) shadowServersOS(ctx context.Context) ([]string, error) {
+	callerCtx := ctx
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -27,10 +29,14 @@ func (a *Adapter) shadowServersOS(ctx context.Context) ([]string, error) {
 	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
 	a.loadShadowLeases()
-	servers, err := discoverShadowServersWithLeases(ctx, a.cfg.WANIfaces, a.shadow.leases)
-	if ctx.Err() != nil {
-		return nil, ctx.Err()
+	discoveryStarted := time.Now()
+	servers, err := discoverShadowServersWithState(ctx, a.cfg.WANIfaces, a.shadow.leases, &a.shadow.inform)
+	if err := shadowDiscoveryContextErr(callerCtx); err != nil {
+		return nil, err
 	} // a canceled caller must not poison discovery
+	if err := shadowDiscoveryContextErr(ctx); err != nil && len(servers) == 0 {
+		return nil, err
+	}
 	a.saveShadowLeases()
 	a.shadow.servers, a.shadow.discoveryErr = servers, err
 	a.shadow.discoveryUntil = time.Now().Add(time.Minute)
@@ -39,8 +45,13 @@ func (a *Adapter) shadowServersOS(ctx context.Context) ([]string, error) {
 			a.shadow.discoveryUntil = lease.expires
 		}
 	}
+	for _, answer := range a.shadow.inform.answers {
+		if discoveryStarted.Before(answer.expires) && answer.expires.Before(a.shadow.discoveryUntil) {
+			a.shadow.discoveryUntil = answer.expires
+		}
+	}
 	if err != nil {
-		a.shadow.discoveryUntil = time.Now().Add(15 * time.Second)
+		a.shadow.discoveryUntil = time.Now().Add(30 * time.Second)
 	}
 	return append([]string(nil), servers...), err
 }
@@ -50,11 +61,16 @@ func discoverShadowServers(ctx context.Context, wan []string) ([]string, error) 
 }
 
 func discoverShadowServersWithLeases(ctx context.Context, wan []string, remembered map[string]shadowRememberedLease) ([]string, error) {
+	return discoverShadowServersWithState(ctx, wan, remembered, nil)
+}
+
+func discoverShadowServersWithState(ctx context.Context, wan []string, remembered map[string]shadowRememberedLease, inform *shadowInformState) ([]string, error) {
 	ifs, err := net.Interfaces()
 	if err != nil {
 		return nil, err
 	}
 	var local, wanIPs []net.IP
+	wanDevices := map[string]string{}
 	for _, iface := range ifs {
 		isWAN := false
 		for _, name := range wan {
@@ -73,11 +89,13 @@ func discoverShadowServersWithLeases(ctx context.Context, wan []string, remember
 				local = append(local, ip)
 				if isWAN {
 					wanIPs = append(wanIPs, ip)
+					wanDevices[ip.String()] = iface.Name
 				}
 			}
 		}
 	}
 	var candidates []string
+	var informErr error
 	if ndmc, err := exec.LookPath("ndmc"); err == nil {
 		verified := map[string]bool{}
 		checked := map[string]bool{}
@@ -122,20 +140,41 @@ func discoverShadowServersWithLeases(ctx context.Context, wan []string, remember
 					delete(remembered, iface)
 				}
 			}
+			if inform != nil && key != "" {
+				for iface, target := range inform.targets {
+					if !target.valid(key, wanIPs) {
+						delete(inform.targets, iface)
+						delete(inform.answers, iface)
+						delete(inform.retryAfter, iface)
+					}
+				}
+			}
 			if log, err := command(ctx, ndmc, "-c", "show log"); err == nil {
 				routerNow := time.Time{}
 				if clock, err := command(ctx, "date", "+%Y-%m-%dT%H:%M:%S%z"); err == nil {
 					routerNow, _ = time.Parse("2006-01-02T15:04:05-0700", strings.TrimSpace(clock))
 				}
 				for _, lease := range parseKeeneticShadowLeases(log) {
-					// A newer observed ACK always supersedes the cached lease,
-					// including a renewal without DNS or with a different address.
-					if previous, ok := remembered[lease.iface]; ok && (previous.stamp != lease.stamp || previous.leaseSeconds != lease.leaseSeconds || !previous.clientIP.Equal(lease.clientIP)) {
-						delete(remembered, lease.iface)
+					if previous, ok := remembered[lease.iface]; ok {
+						observed := shadowLeaseObservedAt(lease.stamp, routerNow)
+						retained := shadowLeaseObservedAt(previous.stamp, routerNow)
+						if !observed.IsZero() && !retained.IsZero() && observed.Before(retained) {
+							continue // an older ring-log ACK cannot replace newer evidence
+						}
+						if !previous.clientIP.Equal(lease.clientIP) {
+							delete(remembered, lease.iface)
+						}
 					}
+					// Keenetic renewals can log only an ACK, without repeating the
+					// obtained-address/ignored-DNS lines. Missing log detail is not
+					// a DNS withdrawal. Keep verified same-WAN evidence until its
+					// original expiry; only a complete new DNS observation renews it.
 					ownsIP := false
 					for _, ip := range wanIPs {
 						ownsIP = ownsIP || ip.Equal(lease.clientIP)
+					}
+					if inform != nil && key != "" && ownsIP && lease.serverIP != nil && len(filterShadowServers([]string{lease.serverIP.String()}, local)) == 1 && verify(lease.iface) && keeneticInterfaceOwnsWAN(statuses[lease.iface], []net.IP{lease.clientIP}) {
+						inform.remember(lease.iface, shadowDHCPTarget{wanKey: key, clientIP: append(net.IP(nil), lease.clientIP...), serverIP: append(net.IP(nil), lease.serverIP...), stamp: lease.stamp}, routerNow)
 					}
 					remaining := time.Duration(0)
 					if !routerNow.IsZero() {
@@ -161,6 +200,15 @@ func discoverShadowServersWithLeases(ctx context.Context, wan []string, remember
 					}
 				}
 			}
+			if inform != nil {
+				fresh, err := discoverShadowInform(ctx, inform, key, wanIPs, local, wanDevices, func(iface string, clientIP net.IP) bool {
+					return verify(iface) && keeneticInterfaceOwnsWAN(statuses[iface], []net.IP{clientIP})
+				})
+				informErr = err
+				if len(fresh) > 0 {
+					candidates = fresh // current option 6 supersedes older leased DNS
+				}
+			}
 		}
 	} else if ubus, err := exec.LookPath("ubus"); err == nil {
 		out, e := command(ctx, ubus, "call", "network.interface", "dump")
@@ -170,9 +218,88 @@ func discoverShadowServersWithLeases(ctx context.Context, wan []string, remember
 	}
 	servers := filterShadowServers(candidates, local)
 	if len(servers) == 0 {
+		if informErr != nil {
+			return nil, fmt.Errorf("DHCPINFORM: %w", informErr)
+		}
 		return nil, fmt.Errorf("DNS провайдера ещё не получен от активного WAN; ожидается информация DHCP/PPP")
 	}
 	return servers, nil
+}
+
+// Inform responses have no lease grant. Cache the verified options for five
+// minutes independently of the original DHCP lease, with a bounded retry rate.
+// Called only while discoveryMu is held; no per-query worker or periodic fork.
+func discoverShadowInform(ctx context.Context, state *shadowInformState, key string, wanIPs, local []net.IP, devices map[string]string, verify func(string, net.IP) bool) ([]string, error) {
+	const ttl, retry = 5 * time.Minute, 30 * time.Second
+	now := time.Now()
+	keys := make([]string, 0, len(state.targets))
+	for iface := range state.targets {
+		keys = append(keys, iface)
+	}
+	sort.Strings(keys)
+	var lastErr error
+	for _, iface := range keys {
+		target := state.targets[iface]
+		device := devices[target.clientIP.String()]
+		if !target.valid(key, wanIPs) || !validShadowWAN(device) || !verify(iface, target.clientIP) {
+			continue
+		}
+		answer := state.answers[iface]
+		// Refresh one discovery interval before expiry so a transient failure
+		// can continue using still-valid information while the retry is cooled.
+		if !answer.refresh && now.Before(answer.expires.Add(-time.Minute)) {
+			return filterShadowServers(answer.servers, local), nil
+		}
+		if now.Before(state.retryAfter[iface]) {
+			if now.Before(answer.expires) {
+				return filterShadowServers(answer.servers, local), nil
+			}
+			lastErr = fmt.Errorf("ожидается повторное получение DNS от DHCP-сервера")
+			continue
+		}
+		probe := state.probe
+		if probe == nil {
+			probe = shadowDHCPInform
+		}
+		servers, err := probe(ctx, device, target.clientIP, target.serverIP)
+		now = time.Now()
+		if err := shadowDiscoveryContextErr(ctx); err != nil {
+			if now.Before(answer.expires) {
+				return filterShadowServers(answer.servers, local), nil
+			}
+			return nil, err // cancellation never installs a negative cache
+		}
+		servers = filterShadowServers(servers, local)
+		if err == nil && len(servers) == 0 {
+			err = fmt.Errorf("DHCP-сервер не сообщил допустимые DNS")
+		}
+		if state.retryAfter == nil {
+			state.retryAfter = map[string]time.Time{}
+		}
+		state.retryAfter[iface] = time.Now().Add(retry)
+		if err == nil {
+			if state.answers == nil {
+				state.answers = map[string]shadowInformAnswer{}
+			}
+			state.answers[iface] = shadowInformAnswer{servers: append([]string(nil), servers...), expires: time.Now().Add(ttl)}
+			return servers, nil
+		}
+		lastErr = err
+		if now.Before(answer.expires) {
+			return filterShadowServers(answer.servers, local), nil
+		}
+	}
+	return nil, lastErr
+}
+
+func shadowDiscoveryContextErr(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if deadline, ok := ctx.Deadline(); ok && !time.Now().Before(deadline) {
+		return context.DeadlineExceeded
+	}
+	return nil
 }
 
 func keeneticInterfaceOwnsWAN(output string, wanIPs []net.IP) bool {

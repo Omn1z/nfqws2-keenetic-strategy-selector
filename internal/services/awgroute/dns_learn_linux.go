@@ -28,6 +28,10 @@ func (svc *Service) awgSetLegacyDNSLearner(p *awg.DNSProxy) {
 }
 
 func (svc *Service) awgLearnLegacyDNSAnswer(ctx context.Context, name, srcIP string, ips []string, generation uint64) error {
+	return svc.awgLearnLegacyDNSAnswerWith(ctx, name, srcIP, ips, generation, svc.awgIPSetLearnSync)
+}
+
+func (svc *Service) awgLearnLegacyDNSAnswerWith(ctx context.Context, name, srcIP string, ips []string, generation uint64, learn func(context.Context, []ipsetAddReq) error) error {
 	release, err := svc.routingDNSGate.acquire(ctx, generation, true)
 	if err != nil {
 		return err
@@ -51,9 +55,9 @@ func (svc *Service) awgLearnLegacyDNSAnswer(ctx context.Context, name, srcIP str
 				}
 			}
 		}
-		// Shared-CDN addresses remain excluded from LAN-wide domain sets;
-		// source-bound sets above preserve the user's explicit device scope.
-		if _, ok := sharedCDNProvider(ip); ok {
+		// Only a global direct exception needs the shared-address guard.
+		// Explicit tunnel destinations must be installed before replying.
+		if skipSharedCDNDomainIP(string(dec.Route), false, ip) {
 			svc.awgNoteSharedCDNSkip("dnsproxy", ip)
 			continue
 		}
@@ -64,7 +68,7 @@ func (svc *Service) awgLearnLegacyDNSAnswer(ctx context.Context, name, srcIP str
 			requests = append(requests, ipsetAddReq{set: awgSetInc + v6Suffix, ip: ip})
 		}
 	}
-	if err := svc.awgIPSetLearnSync(ctx, requests); err != nil {
+	if err := learn(ctx, requests); err != nil {
 		return err
 	}
 	return svc.routingDNSGate.verify(generation)

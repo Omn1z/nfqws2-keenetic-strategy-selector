@@ -29,6 +29,7 @@ type shadowState struct {
 	leases       map[string]shadowRememberedLease
 	leasesLoaded bool
 	leaseDigest  string
+	inform       shadowInformState
 	// Route fields below are protected by Adapter.opMu. Preparing their
 	// kernel tables must never hold the ordinary DNS/cache/status mutex.
 	route   *routeState
@@ -270,9 +271,73 @@ func parseOpenWrtShadowWAN(output string, configured, defaults []string) ([]stri
 type keeneticShadowLease struct {
 	iface        string
 	clientIP     net.IP
+	serverIP     net.IP
 	servers      []string
 	stamp        string
 	leaseSeconds uint64
+}
+
+// DHCP server identity is separate from DNS lease lifetime. The peer observed
+// in an ACK may be asked for current options with DHCPINFORM after that lease
+// expires, but is never itself assumed to be a DNS resolver.
+type shadowDHCPTarget struct {
+	wanKey             string
+	clientIP, serverIP net.IP
+	stamp              string
+}
+
+type shadowInformAnswer struct {
+	servers []string
+	expires time.Time
+	refresh bool
+}
+
+type shadowInformState struct {
+	targets    map[string]shadowDHCPTarget
+	answers    map[string]shadowInformAnswer
+	retryAfter map[string]time.Time
+	probe      func(context.Context, string, net.IP, net.IP) ([]string, error)
+}
+
+func (target shadowDHCPTarget) valid(key string, ips []net.IP) bool {
+	if key == "" || target.wanKey != key {
+		return false
+	}
+	for _, ip := range ips {
+		if ip.Equal(target.clientIP) {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *shadowInformState) remember(iface string, target shadowDHCPTarget, routerNow time.Time) {
+	if previous, ok := s.targets[iface]; ok {
+		observed := shadowLeaseObservedAt(target.stamp, routerNow)
+		retained := shadowLeaseObservedAt(previous.stamp, routerNow)
+		if !observed.IsZero() && !retained.IsZero() && observed.Before(retained) {
+			return
+		}
+		if previous.wanKey == target.wanKey && previous.clientIP.Equal(target.clientIP) && previous.serverIP.Equal(target.serverIP) && previous.stamp == target.stamp {
+			return
+		}
+		if previous.wanKey == target.wanKey && previous.clientIP.Equal(target.clientIP) && previous.serverIP.Equal(target.serverIP) {
+			if answer, exists := s.answers[iface]; exists {
+				answer.refresh = true
+				s.answers[iface] = answer
+			}
+		} else {
+			delete(s.answers, iface)
+			delete(s.retryAfter, iface)
+		}
+	}
+	if s.targets == nil {
+		s.targets = map[string]shadowDHCPTarget{}
+	}
+	if _, exists := s.targets[iface]; !exists && len(s.targets) >= 8 {
+		return
+	}
+	s.targets[iface] = target
 }
 
 type shadowRememberedLease struct {
@@ -290,12 +355,9 @@ func shadowLeaseRemaining(lease keeneticShadowLease, routerNow time.Time) time.D
 	if lease.leaseSeconds == 0 || lease.leaseSeconds >= 0xffffffff {
 		return 0
 	}
-	started, err := time.ParseInLocation("Jan _2 15:04:05 2006", lease.stamp+" "+strconv.Itoa(routerNow.Year()), routerNow.Location())
-	if err != nil {
+	started := shadowLeaseObservedAt(lease.stamp, routerNow)
+	if started.IsZero() {
 		return 0
-	}
-	if started.After(routerNow) {
-		started = started.AddDate(-1, 0, 0)
 	}
 	remaining := started.Add(time.Duration(lease.leaseSeconds) * time.Second).Sub(routerNow)
 	if remaining <= 0 {
@@ -307,6 +369,20 @@ func shadowLeaseRemaining(lease keeneticShadowLease, routerNow time.Time) time.D
 		remaining = 7 * 24 * time.Hour
 	}
 	return remaining
+}
+
+func shadowLeaseObservedAt(stamp string, routerNow time.Time) time.Time {
+	if routerNow.IsZero() {
+		return time.Time{}
+	}
+	started, err := time.ParseInLocation("Jan _2 15:04:05 2006", stamp+" "+strconv.Itoa(routerNow.Year()), routerNow.Location())
+	if err != nil {
+		return time.Time{}
+	}
+	if started.After(routerNow) {
+		started = started.AddDate(-1, 0, 0)
+	}
+	return started
 }
 
 func shadowWANKey(routes string, wan []string, ips []net.IP) string {
@@ -409,7 +485,11 @@ func parseKeeneticShadowLeases(output string) []keeneticShadowLease {
 			if fields[7] != "lease" {
 				seconds = 0
 			}
-			leases[index] = keeneticShadowLease{iface: iface, clientIP: ip, stamp: timestamp, leaseSeconds: seconds}
+			server := net.ParseIP(fields[6])
+			if server.To4() == nil || !server.IsGlobalUnicast() {
+				server = nil
+			}
+			leases[index] = keeneticShadowLease{iface: iface, clientIP: ip, serverIP: server, stamp: timestamp, leaseSeconds: seconds}
 			current, stamp, obtained, remaining = index, timestamp, false, 16
 			continue
 		}

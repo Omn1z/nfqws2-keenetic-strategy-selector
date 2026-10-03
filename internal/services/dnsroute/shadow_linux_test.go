@@ -288,10 +288,30 @@ func TestShadowLeaseCacheSurvivesLogRotationAndRejectsChangedWAN(t *testing.T) {
 	gateway = "192.0.2.1"
 	cache["ISP"] = saved
 	log = "I [Oct  3 12:00:00] ndhcpc: ISP: received ACK for " + ip + " from 192.0.2.1 lease 86400 sec."
-	if got, err := discover(); err == nil || len(got) != 0 || len(cache) != 0 {
-		t.Fatal("new incomplete lease reused previous DNS", got, err, cache)
+	if got, err := discover(); err != nil || len(got) != 1 || got[0] != "192.0.2.53:53" || !sameShadowLease(cache["ISP"], saved) || !cache["ISP"].expires.Equal(saved.expires) {
+		t.Fatal("ACK-only renewal lost valid DNS or extended its original expiry", got, err, cache)
 	}
-	log = ""
+	// An old complete ACK may remain in the ring; it must neither replace
+	// current DNS nor clear it merely because its timestamp differs.
+	log = strings.ReplaceAll(strings.ReplaceAll(fixture, "01:00:00", "00:30:00"), "192.0.2.53", "192.0.2.54")
+	if got, err := discover(); err != nil || len(got) != 1 || got[0] != "192.0.2.53:53" || !cache["ISP"].expires.Equal(saved.expires) {
+		t.Fatal("older ACK replaced current DNS", got, err, cache)
+	}
+	log = strings.ReplaceAll(log, ip, "192.0.2.200")
+	if got, err := discover(); err != nil || len(got) != 1 || !sameShadowLease(cache["ISP"], saved) || !cache["ISP"].expires.Equal(saved.expires) {
+		t.Fatal("older different-address ACK invalidated current lease", got, err, cache)
+	}
+	// Complete, current DNS evidence does replace the previous lease.
+	log = strings.ReplaceAll(strings.ReplaceAll(fixture, "01:00:00", "12:00:00"), "192.0.2.53", "192.0.2.54")
+	if got, err := discover(); err != nil || len(got) != 1 || got[0] != "192.0.2.54:53" || cache["ISP"].stamp != "Oct  3 12:00:00" {
+		t.Fatal("complete new DHCP DNS did not replace previous evidence", got, err, cache)
+	}
+	cache["ISP"] = saved
+	log = "I [Oct  3 12:00:00] ndhcpc: ISP: received ACK for 192.0.2.200 from 192.0.2.1 lease 86400 sec."
+	if got, err := discover(); err == nil || len(got) != 0 || len(cache) != 0 {
+		t.Fatal("changed-address ACK reused previous DNS", got, err, cache)
+	}
+	log = "I [Oct  3 12:00:00] ndhcpc: ISP: received ACK for " + ip + " from 192.0.2.1 lease 86400 sec."
 	saved.expires = time.Now().Add(-time.Second)
 	cache["ISP"] = saved
 	if got, err := discover(); err == nil || len(got) != 0 || len(cache) != 0 {

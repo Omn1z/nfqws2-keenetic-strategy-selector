@@ -269,6 +269,8 @@ func (s *Server) routes() {
 	m.HandleFunc("POST /api/arp-spoofing/config", s.saveARPSpoofingConfig)
 	m.HandleFunc("POST /api/arp-spoofing/enabled", s.setARPSpoofingEnabled)
 	m.HandleFunc("POST /api/arp-spoofing/generate", s.generateARPSpoofingMAC)
+	m.HandleFunc("GET /api/arp-block", s.getARPBlock)
+	m.HandleFunc("POST /api/arp-block/isolation", s.setARPBlockIsolation)
 	m.HandleFunc("GET /api/dnsserver", s.dnsServerStatus)
 	m.HandleFunc("GET /api/dnsserver/export", s.dnsServerExport)
 	m.HandleFunc("POST /api/dnsserver/import/preview", s.dnsServerImportPreview)

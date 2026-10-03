@@ -158,12 +158,48 @@ func TestShadowLeaseStoreRestartAndUnchangedLeaseAvoidsWrites(t *testing.T) {
 	b.cfg.DataDir = a.cfg.DataDir
 	b.loadShadowLeases()
 	restored, ok := b.shadow.leases["ISP"]
-	if !ok || !sameShadowLease(restored, lease) || restored.expires.After(lease.expires) {
+	// The serialized expiry has no monotonic component. A reload attaches a
+	// new monotonic anchor to the same wall instant; comparing those anchors
+	// during NTP clock slewing can falsely report a nanosecond extension.
+	if !ok || !sameShadowLease(restored, lease) || restored.expires.Round(0).After(lease.expires.Round(0)) {
 		t.Fatalf("restart did not preserve bounded lease: %+v", b.shadow.leases)
 	}
 	b.saveShadowLeases()
 	after, err = os.ReadFile(filename)
 	if err != nil || string(before) != string(after) {
 		t.Fatal("reading lease after restart caused flash write", err)
+	}
+}
+
+func TestShadowInformTargetPersistenceIsIndependentOfDNSLease(t *testing.T) {
+	_, clock, leases := shadowStoredFixture(t)
+	targets := map[string]shadowDHCPTarget{"ISP": {wanKey: leases["ISP"].wanKey, clientIP: leases["ISP"].clientIP, serverIP: net.ParseIP("192.168.0.1"), stamp: "Oct  3 11:00:00"}}
+	wire, err := encodeShadowState(leases, targets, clock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	later := clock
+	later.now, later.uptime = clock.now.Add(2*time.Hour), clock.uptime+2*time.Hour
+	got, retained, err := decodeShadowState(wire, later)
+	if err != nil || len(got) != 0 || len(retained) != 1 || !retained["ISP"].serverIP.Equal(net.ParseIP("192.168.0.1")) {
+		t.Fatal("DNS lease expiry removed the independently verified DHCP target", got, retained, err)
+	}
+	for _, mutate := range []func(*shadowLeaseDocument){
+		func(d *shadowLeaseDocument) { d.BootID = "11234567-89ab-cdef-0123-456789abcdef" },
+		func(d *shadowLeaseDocument) { d.DHCPTargets[0].ServerIP = "127.0.0.1" },
+		func(d *shadowLeaseDocument) { d.DHCPTargets[0].ServerIP = d.DHCPTargets[0].ClientIP },
+		func(d *shadowLeaseDocument) { d.DHCPTargets[0].Interface = "ISP;reboot" },
+		func(d *shadowLeaseDocument) { d.DHCPTargets[0].Stamp = "invalid" },
+		func(d *shadowLeaseDocument) { d.DHCPTargets = append(d.DHCPTargets, d.DHCPTargets[0]) },
+	} {
+		var doc shadowLeaseDocument
+		if err := json.Unmarshal(wire, &doc); err != nil {
+			t.Fatal(err)
+		}
+		mutate(&doc)
+		bad, _ := json.Marshal(doc)
+		if _, _, err := decodeShadowState(bad, later); err == nil {
+			t.Fatal("invalid/unbound DHCP target accepted")
+		}
 	}
 }

@@ -24,7 +24,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -381,7 +380,7 @@ func (a *App) runAutoPick(reason string) {
 		logbuf.Append("automation", "error", "auto-pick: "+err.Error())
 		return
 	}
-	if err := a.ApplyStrategyToConfig(winner.ArgLine, true); err != nil {
+	if err := a.applyAutoPickStrategy(*winner, true); err != nil {
 		a.recordPickError(fmt.Errorf("apply: %w", err))
 		logbuf.Append("automation", "error", "auto-pick apply: "+err.Error())
 		return
@@ -415,26 +414,47 @@ func (a *App) waitRunForWinner(ctx context.Context, runID string) (*StrategyResu
 			a.cancelActiveRunIfMatches(runID)
 			return nil, errors.New("auto-pick timeout")
 		case <-tk.C:
-			a.mu.Lock()
-			run, ok := a.runs[runID]
-			a.mu.Unlock()
+			run, ok := a.GetRun(runID)
 			if !ok {
 				return nil, errors.New("run vanished")
 			}
 			if run.Status == "running" {
 				continue
 			}
-			// Pick the best result with Success=true.
-			results := append([]StrategyResult(nil), run.Results...)
-			sort.Slice(results, func(i, j int) bool { return results[i].Coefficient > results[j].Coefficient })
-			for _, r := range results {
-				if r.Success {
-					return &r, nil
-				}
+			if run.Status != "done" {
+				return nil, fmt.Errorf("auto-pick run %s: %s", run.Status, run.Error)
 			}
-			return nil, errors.New("no working strategy found")
+			return autoPickWinner(run.Results)
 		}
 	}
+}
+
+// Recheck old/persisted results as well: versions before this guard could label
+// HTTP-only profiles successful after a request that never used that profile.
+func autoPickWinner(results []StrategyResult) (*StrategyResult, error) {
+	var best *StrategyResult
+	for _, result := range results {
+		if !result.Success || result.TargetsTotal <= 0 || result.TargetsOK != result.TargetsTotal || validateHTTPSStrategy(result.ArgLine) != nil {
+			continue
+		}
+		if best == nil || result.Coefficient > best.Coefficient {
+			copy := result
+			best = &copy
+		}
+	}
+	if best == nil {
+		return nil, errors.New("no working HTTPS (TCP/443, TLS) strategy found")
+	}
+	return best, nil
+}
+
+// Guard automatic writes independently of result selection. Manual config/apply
+// actions remain able to install HTTP strategies when the user requests them.
+func (a *App) applyAutoPickStrategy(result StrategyResult, restart bool) error {
+	if _, err := autoPickWinner([]StrategyResult{result}); err != nil {
+		return err
+	}
+	return a.ApplyStrategyToConfig(result.ArgLine, restart)
 }
 
 func (a *App) cancelActiveRunIfMatches(runID string) {

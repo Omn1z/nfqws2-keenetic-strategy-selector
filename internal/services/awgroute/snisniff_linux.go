@@ -132,22 +132,18 @@ func (svc *Service) awgEnsureSNISniff(cfg *awg.ServerConfig) bool {
 		}
 		switch dec.Route {
 		case RouteDirect:
-			// We deliberately do NOT consult sharedCDNProvider here — the whole
-			// point of SNI is to carve out the SHARED CDN IP for this specific
-			// hostname, knowing the same IP also serves unrelated names. That's
-			// safe because awg2_exc only causes a RETURN (no marking); other
-			// sites on the same CDN IP that don't match a direct rule never
-			// get into awg2_exc here.
+			// This is still a destination-IP set, not a per-flow SNI rule. Keep
+			// the DNS guard: a shared edge must not bypass unrelated VPN traffic.
+			if skipSharedCDNDomainIP(string(dec.Route), false, dstIP) {
+				svc.awgNoteSharedCDNSkip("sni", dstIP)
+				traceAppend(TraceEntry{Kind: "sni", Name: sni, Dst: dstIP, Decision: "cdn-skip", Reason: "общий CDN — глобальное исключение direct не добавлено"})
+				return
+			}
 			ipsetAddAsync(awgSetExc+suffix, dstIP)
 			svc.route.sniSeen.Store(dstIP, now)
 			traceAppend(TraceEntry{Kind: "sni", Name: sni, Dst: dstIP, Decision: "direct", Rule: matchedIdx + 1,
 				Reason: fmt.Sprintf("правило #%d (direct, SNI carve-out)", matchedIdx+1)})
 		case RouteTunnel:
-			if _, ok := sharedCDNProvider(dstIP); ok {
-				svc.awgNoteSharedCDNSkip("sni", dstIP)
-				traceAppend(TraceEntry{Kind: "sni", Name: sni, Dst: dstIP, Decision: "cdn-skip", Reason: "общий CDN — IP не маршрутизирован"})
-				return
-			}
 			ipsetAddAsyncTTL(awgSetSNI+suffix, dstIP, awgSNITTL)
 			svc.route.sniSeen.Store(dstIP, now)
 			traceAppend(TraceEntry{Kind: "sni", Name: sni, Dst: dstIP, Decision: "tunnel", Rule: matchedIdx + 1,

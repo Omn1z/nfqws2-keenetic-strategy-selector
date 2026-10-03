@@ -111,6 +111,10 @@ func awgMultiRuleForName(rules []awgMultiRule, name, srcIP string) *awgMultiRule
 }
 
 func (svc *Service) awgMultiLearnDNSAnswer(ctx context.Context, rules []awgMultiRule, name, srcIP string, ips []string, generation uint64) error {
+	return svc.awgMultiLearnDNSAnswerWith(ctx, rules, name, srcIP, ips, generation, svc.awgIPSetLearnSync)
+}
+
+func (svc *Service) awgMultiLearnDNSAnswerWith(ctx context.Context, rules []awgMultiRule, name, srcIP string, ips []string, generation uint64, learn func(context.Context, []ipsetAddReq) error) error {
 	release, err := svc.routingDNSGate.acquire(ctx, generation, true)
 	if err != nil {
 		return err
@@ -121,11 +125,7 @@ func (svc *Service) awgMultiLearnDNSAnswer(ctx context.Context, rules []awgMulti
 		return svc.routingDNSGate.verify(generation)
 	}
 	v4 := awgDNSIPv4Answers(ips)
-	// A source-bound rule already scopes an address to the explicitly selected
-	// devices. Keep the shared-CDN protection only for LAN-wide domain rules.
-	if len(r.Sources) == 0 {
-		v4 = svc.awgFilterMultiDNSLearnIPs(v4)
-	}
+	v4 = svc.awgFilterMultiDNSLearnIPs(r, v4)
 	if len(v4) == 0 {
 		return svc.routingDNSGate.verify(generation)
 	}
@@ -134,16 +134,16 @@ func (svc *Service) awgMultiLearnDNSAnswer(ctx context.Context, rules []awgMulti
 	for _, ip := range v4 {
 		requests = append(requests, ipsetAddReq{set: r.SetName, ip: ip})
 	}
-	if err := svc.awgIPSetLearnSync(ctx, requests); err != nil {
+	if err := learn(ctx, requests); err != nil {
 		return err
 	}
 	return svc.routingDNSGate.verify(generation)
 }
 
-func (svc *Service) awgFilterMultiDNSLearnIPs(ips []string) []string {
+func (svc *Service) awgFilterMultiDNSLearnIPs(rule *awgMultiRule, ips []string) []string {
 	out := ips[:0]
 	for _, ip := range ips {
-		if _, ok := sharedCDNProvider(ip); ok {
+		if skipSharedCDNDomainIP(rule.Zone.RouteValue(), len(rule.Sources) > 0, ip) {
 			svc.awgNoteSharedCDNSkip("multi-dns", ip)
 			continue
 		}
@@ -198,10 +198,8 @@ func (svc *Service) awgTraceMultiDNSQuery(rules []awgMultiRule, srcIP, qname, qt
 	}
 	for _, ip := range ips {
 		d, why, matched := decision, reason, rule
-		if r != nil && r.HasDst && !r.CatchAll && len(r.Sources) == 0 && decision == "tunnel" {
-			if _, shared := sharedCDNProvider(ip); shared {
-				d, why, matched = "cdn-skip", "multi-routing: shared CDN address excluded from global DNS learning", 0
-			}
+		if r != nil && r.HasDst && !r.CatchAll && skipSharedCDNDomainIP(decision, len(r.Sources) > 0, ip) {
+			d, why, matched = "cdn-skip", "multi-routing: shared CDN address excluded from global direct exception", 0
 		}
 		traceAppend(TraceEntry{Src: srcIP, Kind: "dns", Name: qname, Qtype: qtype, Dst: ip, Decision: d, Rule: matched, Reason: why})
 	}
