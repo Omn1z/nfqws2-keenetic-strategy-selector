@@ -106,21 +106,22 @@ export default function ARPSpoofing() {
 
   if (!view) return <Card><span className="text-xs text-muted">Загрузка...</span></Card>;
 
-  const toolsOK = view.tools.ip;
   const canSave = !saving && (!form.enabled || form.mac.trim() !== "" || form.prefix.trim() !== "");
 
   return (
     <Card
       title="ARP Spoofing"
-      sub={view.config.mac || "MAC роутера в ARP"}
+      sub={view.config.mac || "MAC LAN-моста"}
       head={
         <div className="flex flex-wrap items-center justify-end gap-2">
           <Badge kind={view.active ? "ok" : view.config.enabled ? "bad" : "neutral"}>{view.active ? "активен" : view.config.enabled ? "ошибка" : "выключен"}</Badge>
           <Badge kind="neutral">AUTO {autoIfaces.join(", ")}</Badge>
-          <Badge kind={toolsOK ? "ok" : "warn"}>{toolsOK ? "ip link ok" : "нужен ip"}</Badge>
         </div>
       }
     >
+      <p className="mb-4 text-sm text-muted-foreground">
+        Меняет MAC-адрес LAN-моста роутера. После смены может понадобиться переподключить Wi-Fi на устройствах, чтобы обновились ARP-записи и кеш IPv6 DNS.
+      </p>
       <div className="grid gap-3 lg:grid-cols-[minmax(180px,.8fr)_minmax(150px,.6fr)_minmax(220px,1fr)_auto] lg:items-end">
         <Field label="Вендор">
           <Select value={form.vendor_id} onChange={(e) => setVendor(e.target.value)}>
@@ -137,7 +138,7 @@ export default function ARPSpoofing() {
             {!prefixes.includes(form.prefix) && form.prefix && <option value={form.prefix}>{form.prefix}</option>}
           </Select>
         </Field>
-        <Field label="ARP MAC">
+        <Field label="MAC LAN-моста">
           <Input value={form.mac} placeholder="64:6E:EA:12:34:56" onChange={(e) => markDirty({ ...form, mac: e.target.value })} />
         </Field>
         <Button onClick={generate} disabled={saving}>Сгенерировать</Button>

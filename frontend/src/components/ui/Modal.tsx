@@ -32,14 +32,15 @@ export function Modal({ title, onClose, children, actions, size = "md" }: ModalP
       }}
     >
       <Dialog.Portal>
-        <Dialog.Backdrop className="fixed inset-0 z-[70] bg-[rgba(20,30,45,.55)] backdrop-blur-sm transition-opacity data-[ending-style]:opacity-0 data-[starting-style]:opacity-0" />
+        <Dialog.Backdrop data-slot="dialog-overlay" className="fixed inset-0 z-[70] bg-black/30 backdrop-blur-sm transition-opacity data-[ending-style]:opacity-0 data-[starting-style]:opacity-0" />
         <Dialog.Popup
+          data-slot="dialog-content"
           className={cn(
-            "fixed left-1/2 top-1/2 z-[71] flex max-h-[calc(100dvh-1rem)] max-w-none -translate-x-1/2 -translate-y-1/2 flex-col overflow-hidden rounded-xl border border-border bg-card text-card-foreground shadow-2xl outline-none transition-all data-[ending-style]:scale-95 data-[ending-style]:opacity-0 data-[starting-style]:scale-95 data-[starting-style]:opacity-0",
+            "fixed left-1/2 top-1/2 z-[71] flex max-h-[calc(100dvh-1rem)] max-w-none -translate-x-1/2 -translate-y-1/2 flex-col overflow-hidden rounded-lg bg-popover text-popover-foreground shadow-xl ring-1 ring-foreground/5 outline-none transition-all dark:ring-foreground/10 data-[ending-style]:scale-95 data-[ending-style]:opacity-0 data-[starting-style]:scale-95 data-[starting-style]:opacity-0",
             widths[size],
           )}
         >
-          <Dialog.Title className="shrink-0 px-4 pt-4 text-[15px] font-semibold sm:px-5 sm:pt-5">{title}</Dialog.Title>
+          <Dialog.Title data-slot="dialog-title" className="shrink-0 px-4 pt-4 font-heading text-base font-medium sm:px-5 sm:pt-5">{title}</Dialog.Title>
           <div className="min-h-0 min-w-0 flex-1 overflow-y-auto overflow-x-hidden px-4 pb-4 pt-2 text-[13px] leading-relaxed text-ink-soft [overflow-wrap:anywhere] sm:px-5">
             <div className="min-w-0 max-w-full [&_*]:min-w-0 [&_img]:max-w-full [&_pre]:max-w-full [&_table]:max-w-full">
               {children}

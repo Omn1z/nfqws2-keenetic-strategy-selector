@@ -80,7 +80,7 @@ func TestCacheClearDoesNotRepopulateFromInflightQuery(t *testing.T) {
 	unblock := func() { releaseOnce.Do(func() { close(release) }) }
 	defer unblock()
 	var calls atomic.Int32
-	r, _, _ := newResolverFixture(t, func(q *mdns.Msg) *mdns.Msg {
+	r, backend, _ := newResolverFixture(t, func(q *mdns.Msg) *mdns.Msg {
 		if calls.Add(1) == 1 {
 			close(started)
 			select {
@@ -91,7 +91,10 @@ func TestCacheClearDoesNotRepopulateFromInflightQuery(t *testing.T) {
 		}
 		return resolverAnswer(q, 60)
 	})
-	r.cfg.AWGFallback = "off"
+	// Competing routes collect scheduler evidence, while only NFQWS reaches
+	// the upstream response whose cache generation is under test.
+	backend.routes = backend.routes[:2]
+	backend.setFailures("awg:first")
 	r.cfg.CacheSize = 8
 	query := resolverWire(t, "clear-inflight.example", 42, mdns.TypeA)
 	var oldQuestion mdns.Msg
@@ -141,7 +144,7 @@ func TestCacheClearDoesNotRepopulateFromInflightQuery(t *testing.T) {
 	if _, out, err := r.Resolve(context.Background(), query); err != nil || !out.Cached || calls.Load() != 2 {
 		t.Fatalf("new cache generation could not cache: %+v, %v, calls %d", out, err, calls.Load())
 	}
-	if got := r.SchedulerSnapshot("clear-inflight.example").Candidates[0]; got.Successes != 2 {
+	if got := r.SchedulerSnapshot("clear-inflight.example").Candidates[0]; got.Route != "nfqws" || got.Successes != 2 {
 		t.Fatalf("clear lost scheduler observations: %+v", got)
 	}
 }

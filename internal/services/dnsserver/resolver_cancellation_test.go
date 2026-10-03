@@ -122,7 +122,7 @@ func TestResolverCancellationSummaryDoesNotDelayWinner(t *testing.T) {
 	}
 }
 
-func TestResolverConcurrentSameDomainCancellationSummariesRemainSeparate(t *testing.T) {
+func TestResolverConcurrentDifferentDNSFlagsCancellationSummariesRemainSeparate(t *testing.T) {
 	started := make(chan struct{}, 6)
 	b := &resolverTestBackend{routes: schedulerTestRoutes(), dialHook: func(ctx context.Context, _, _, _ string) (net.Conn, error) {
 		started <- struct{}{}
@@ -143,7 +143,16 @@ func TestResolverConcurrentSameDomainCancellationSummariesRemainSeparate(t *test
 		requests.Add(1)
 		go func(id uint16) {
 			defer requests.Done()
-			_, _, err := r.Resolve(ctx, resolverWire(t, "same.example", id, mdns.TypeA))
+			query := new(mdns.Msg)
+			query.SetQuestion("same.example.", mdns.TypeA)
+			query.Id = id
+			query.CheckingDisabled = id == 1 // Semantically different queries must not join.
+			wire, err := query.Pack()
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			_, _, err = r.Resolve(ctx, wire)
 			if err == nil {
 				t.Error("canceled request unexpectedly succeeded")
 			}
@@ -210,7 +219,7 @@ func TestResolverCancellationSummaryExcludesUndispatchedCandidates(t *testing.T)
 }
 
 func TestResolverAttemptTimeoutRemainsDiagnosticError(t *testing.T) {
-	b := &resolverTestBackend{routes: schedulerTestRoutes()[:1], dialHook: func(ctx context.Context, _, _, _ string) (net.Conn, error) {
+	b := &resolverTestBackend{routes: schedulerTestRoutes()[:2], dialHook: func(ctx context.Context, _, _, _ string) (net.Conn, error) {
 		<-ctx.Done()
 		return nil, ctx.Err()
 	}}
@@ -229,10 +238,15 @@ func TestResolverAttemptTimeoutRemainsDiagnosticError(t *testing.T) {
 		t.Fatal("timed out route unexpectedly resolved DNS")
 	}
 	snapshot := s.Logs(0)
-	if len(snapshot.Entries) != 1 || snapshot.Entries[0].Event != "attempt_error" || !strings.Contains(snapshot.Entries[0].Message, "deadline exceeded") {
+	if len(snapshot.Entries) != 2 {
 		t.Fatalf("real timeout was suppressed or counted as cancellation: %+v", snapshot.Entries)
 	}
-	if candidates := r.SchedulerSnapshot("timeout.example").Candidates; len(candidates) != 1 || candidates[0].Failures != 1 {
+	for _, entry := range snapshot.Entries {
+		if entry.Event != "attempt_error" || !strings.Contains(entry.Message, "deadline exceeded") {
+			t.Fatalf("real timeout was suppressed or counted as cancellation: %+v", entry)
+		}
+	}
+	if candidates := r.SchedulerSnapshot("timeout.example").Candidates; len(candidates) != 2 || candidates[0].Failures != 1 || candidates[1].Failures != 1 {
 		t.Fatalf("timeout no longer penalizes scheduler: %+v", candidates)
 	}
 }

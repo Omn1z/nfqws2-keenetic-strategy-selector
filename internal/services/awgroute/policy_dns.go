@@ -51,7 +51,12 @@ func (svc *Service) policyDNSLookup(resolve bool, live func(string) []string) fu
 		if resolve {
 			ips := live(name)
 			svc.rememberPolicyDNS(key, ips)
-			return ips
+			if len(ips) > 0 || !svc.routingDNSGate.failed() {
+				return ips
+			}
+			// The system resolver may forward to our own DNS observer. A failed
+			// kernel apply must still reject client answers, but a retry can use
+			// the unexpired upstream hint captured before that rejection.
 		}
 		svc.policyDNSMu.Lock()
 		defer svc.policyDNSMu.Unlock()
@@ -63,6 +68,56 @@ func (svc *Service) policyDNSLookup(resolve bool, live func(string) []string) fu
 		}
 		return nil
 	}
+}
+
+func (svc *Service) policyHostIPWithLookup(host string, live func(string) string) string {
+	ip := live(host)
+	if ip != "" {
+		svc.rememberPolicyDNS(host, []string{ip})
+		svc.rememberPolicyEndpointIP(host, ip)
+		return ip
+	}
+	if svc.routingDNSGate.failed() {
+		return svc.cachedPolicyHostIP(host)
+	}
+	return ""
+}
+
+func (svc *Service) rememberPolicyEndpointIP(host, rawIP string) {
+	ip := net.ParseIP(rawIP)
+	if ip == nil || ip.To4() == nil {
+		return
+	}
+	key := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(host), "."))
+	if key == "" {
+		return
+	}
+	svc.policyDNSMu.Lock()
+	defer svc.policyDNSMu.Unlock()
+	if svc.policyEndpointIPs == nil {
+		svc.policyEndpointIPs = map[string]string{}
+	}
+	if _, exists := svc.policyEndpointIPs[key]; !exists && len(svc.policyEndpointIPs) >= policyDNSCacheLimit {
+		for old := range svc.policyEndpointIPs {
+			delete(svc.policyEndpointIPs, old)
+			break
+		}
+	}
+	svc.policyEndpointIPs[key] = ip.To4().String()
+}
+
+func (svc *Service) cachedPolicyEndpointIP(host string) string {
+	if ip := net.ParseIP(strings.TrimSpace(host)); ip != nil && ip.To4() != nil {
+		return ip.To4().String()
+	}
+	key := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(host), "."))
+	svc.policyDNSMu.Lock()
+	ip := svc.policyEndpointIPs[key]
+	svc.policyDNSMu.Unlock()
+	if ip != "" {
+		return ip
+	}
+	return svc.cachedPolicyHostIP(host)
 }
 
 func (svc *Service) cachedPolicyHostIP(host string) string {

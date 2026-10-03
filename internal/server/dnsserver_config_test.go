@@ -41,7 +41,10 @@ func decodeDNSConfigRequest(t *testing.T, payload map[string]any) dnsServerConfi
 func TestDNSConfigOldPOSTPreservesIndependentSettings(t *testing.T) {
 	current := dnsserver.Default()
 	current.RouteMode = dnsserver.RouteModeVPNOnly
+	current.SchedulerEnabled = false
 	current.Filtering.Enabled = true
+	current.ShadowDNS.Enabled = true
+	current.ShadowDNS.Servers = []string{"192.0.2.53:53"}
 	current.Filtering.Allowlist = []string{"allowed.example"}
 	current.CacheTTLSeconds = 1234
 	current.DefaultPool = []dnsserver.Upstream{{Address: "https://9.9.9.9/dns-query"}}
@@ -50,7 +53,9 @@ func TestDNSConfigOldPOSTPreservesIndependentSettings(t *testing.T) {
 	payload := dnsConfigPayload(t, current)
 	delete(payload, "route_mode")
 	delete(payload, "filtering")
+	delete(payload, "shadow_dns")
 	delete(payload, "fast_dns")
+	delete(payload, "scheduler_enabled")
 	delete(payload, "cache_ttl_seconds")
 	delete(payload, "default_pool")
 	delete(payload["rules"].([]any)[0].(map[string]any), "pool")
@@ -63,6 +68,9 @@ func TestDNSConfigOldPOSTPreservesIndependentSettings(t *testing.T) {
 		t.Fatal("old request unexpectedly supplied route mode")
 	}
 	merged := in.merge(current)
+	if merged.SchedulerEnabled {
+		t.Fatal("old tab re-enabled the saved disabled scheduler")
+	}
 	if merged.RouteMode != dnsserver.RouteModeVPNOnly || merged.DNSPort != current.DNSPort || merged.LoggingEnabled != current.LoggingEnabled || merged.FastDNS != current.FastDNS || merged.CacheTTLSeconds != current.CacheTTLSeconds {
 		t.Fatalf("old request reset current settings: %+v", merged)
 	}
@@ -72,8 +80,23 @@ func TestDNSConfigOldPOSTPreservesIndependentSettings(t *testing.T) {
 	if !reflect.DeepEqual(merged.Filtering, current.Filtering) {
 		t.Fatalf("old request reset filtering: %+v", merged.Filtering)
 	}
+	if !reflect.DeepEqual(merged.ShadowDNS, current.ShadowDNS) {
+		t.Fatalf("old request reset Shadow DNS: %+v", merged.ShadowDNS)
+	}
 	if err := merged.NormalizeValidate(); err != nil {
 		t.Fatalf("merged old request should remain valid: %v", err)
+	}
+}
+
+func TestDNSConfigExplicitSchedulerSwitch(t *testing.T) {
+	current := dnsserver.Default()
+	for _, enabled := range []bool{false, true} {
+		payload := dnsConfigPayload(t, current)
+		payload["scheduler_enabled"] = enabled
+		merged := decodeDNSConfigRequest(t, payload).merge(current)
+		if merged.SchedulerEnabled != enabled {
+			t.Fatalf("explicit scheduler switch = %v, want %v", merged.SchedulerEnabled, enabled)
+		}
 	}
 }
 

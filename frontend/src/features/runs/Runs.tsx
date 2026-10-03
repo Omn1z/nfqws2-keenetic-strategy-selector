@@ -136,7 +136,7 @@ export default function Runs() {
             </div>
             {running && run && (
               <div className="mt-2">
-                <div className="h-2 overflow-hidden rounded-full bg-line"><div className="h-full rounded-full bg-gradient-to-r from-accent to-[#5cb3ff] transition-[width]" style={{ width: `${pct}%` }} /></div>
+                <div className="h-2 overflow-hidden rounded-full bg-line"><div className="h-full rounded-full bg-accent transition-[width]" style={{ width: `${pct}%` }} /></div>
                 <span className="text-xs text-muted">{run.done}/{run.total} стратегий · {run.threads} потоков · найдено {found} · с ошибкой {errored} · {run.status}</span>
               </div>
             )}

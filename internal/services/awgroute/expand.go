@@ -211,7 +211,7 @@ func isIPish(s string) bool {
 func sourceBoundZones(zones []awg.Zone) []awg.Zone {
 	var out []awg.Zone
 	for _, z := range zones {
-		if z.Enabled && len(z.SourceIPs) > 0 {
+		if z.Enabled && !z.WaitingForConnection && len(z.SourceIPs) > 0 {
 			out = append(out, z)
 		}
 	}

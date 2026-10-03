@@ -82,9 +82,14 @@ func TestVPNOnlyFiltersQueriesFastDNSAndProbes(t *testing.T) {
 	if got := fastDNSTargets(cfg, routes); !reflect.DeepEqual(got, []FastDNSTarget{{Route: "awg:warp", Host: "resolver.example"}}) {
 		t.Fatalf("VPN-only bootstrap targets: %+v", got)
 	}
-	if got := schedulerProbeCandidates(cfg, routes); len(got) != 1 || got[0].route.ID != "awg:warp" {
-		t.Fatalf("VPN-only probes: %+v", got)
+	if got := schedulerProbeCandidates(cfg, routes); len(got) != 0 {
+		t.Fatalf("sole VPN-only method scheduled pointless probes: %+v", got)
 	}
+	cfg.DefaultPool = []Upstream{{Address: "https://second-resolver.example/dns-query"}}
+	if got := schedulerProbeCandidates(cfg, routes); len(got) != 2 || got[0].route.ID != "awg:warp" || got[1].route.ID != "awg:warp" {
+		t.Fatalf("competitive VPN-only probes included a WAN path: %+v", got)
+	}
+	cfg.DefaultPool = nil
 	cfg.AWGFallback = "down"
 	if got := NewScheduler().order(cfg, routes, "example.com"); len(got) != 0 {
 		t.Fatalf("unavailable selected VPN created query attempts: %+v", got)

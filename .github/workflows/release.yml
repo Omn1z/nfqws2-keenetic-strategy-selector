@@ -53,7 +53,7 @@ jobs:
       - name: Include upstream license
         run: |
           cp internal/services/tgws/LICENSE.upstream dist/TGWS-LICENSE.txt
-          cp THIRD_PARTY_NOTICES.md dist/THIRD-PARTY-NOTICES.txt
+          cat THIRD_PARTY_NOTICES.md THIRD_PARTY_LICENSES/Frontend-LICENSES.txt > dist/THIRD-PARTY-NOTICES.txt
           cp THIRD_PARTY_LICENSES/AdGuard-urlfilter-GPL-3.0.txt dist/ADGUARD-URLFILTER-LICENSE.txt
       - name: Upload panel artifacts
         uses: actions/upload-artifact@v4

@@ -11,26 +11,34 @@ import { Switch } from "@/components/ui/Switch";
 import { UpstreamPool, collectUpstream, upstreamForm, type UpstreamForm } from "./UpstreamPool";
 import { DnsDiagnostics } from "./DnsDiagnostics";
 import { DnsStatistics } from "./DnsStatistics";
+import { DnsLastRequest, DnsTestAnswer } from "./DnsAnswerPresentation";
+import { DnsSettingsExportButton, DnsSettingsExportNote } from "./DnsSettingsExport";
+import { DnsSettingsImport } from "./DnsSettingsImport";
 import { Blocking, blockingForm, collectBlocking, type BlockingForm } from "./Blocking";
 import { DomainGroups } from "./DomainGroups";
 import { collectRuleGroups, groupRules, type RuleGroupForm } from "./ruleGroups";
+import { ShadowDns } from "./ShadowDns";
+import { collectShadow, dnsRouteLabel, shadowForm, type ShadowForm } from "./shadowDnsForm";
 import type { DnsServerConfig, DnsServerStatus, DnsServerTestResult } from "@/types/api";
 
 type RouteMode = "auto" | "vpn_only";
-type Form = Omit<DnsServerConfig, "dns_port" | "logging_enabled" | "timeout_seconds" | "cache_size" | "cache_ttl_seconds" | "default_upstream" | "default_pool" | "rules" | "route_mode" | "filtering"> & {
+type Form = Omit<DnsServerConfig, "dns_port" | "logging_enabled" | "timeout_seconds" | "cache_size" | "cache_ttl_seconds" | "default_upstream" | "default_pool" | "rules" | "route_mode" | "filtering" | "shadow_dns"> & {
   timeout_seconds: string; cache_size: string; cache_ttl_seconds: string;
   default_pool: UpstreamForm[]; groups: RuleGroupForm[]; route_mode: RouteMode; filtering: BlockingForm;
+  shadow_dns: ShadowForm;
 };
 const toForm = (c: DnsServerConfig): Form => ({
   enabled: c.enabled, listen_host: c.listen_host,
   route_mode: c.route_mode === "vpn_only" ? "vpn_only" : "auto",
   awg_fallback: c.route_mode === "vpn_only" && c.awg_fallback === "off" ? "auto" : c.awg_fallback,
   fast_dns: c.fast_dns ?? true,
+  scheduler_enabled: c.scheduler_enabled ?? true,
   timeout_seconds: String(c.timeout_seconds), cache_size: String(c.cache_size),
   cache_ttl_seconds: String(c.cache_ttl_seconds ?? 3600),
   default_pool: [c.default_upstream, ...(c.default_pool ?? [])].map(upstreamForm),
   groups: groupRules(c.rules ?? []),
   filtering: blockingForm(c.filtering),
+  shadow_dns: shadowForm(c.shadow_dns),
 });
 const integer = (value: string, name: string, min: number, max: number) => {
   if (!/^\d+$/.test(value) || Number(value) < min || Number(value) > max) throw new Error(`${name}: укажите целое число от ${min} до ${max}`);
@@ -41,7 +49,7 @@ const timeLabel = (value: string) => {
   return Number.isNaN(date.getTime()) ? value : date.toLocaleTimeString("ru-RU", { hour12: false });
 };
 const collect = (f: Form): Omit<DnsServerConfig, "dns_port" | "logging_enabled"> => {
-  const { groups, filtering, ...config } = f;
+  const { groups, filtering, shadow_dns, ...config } = f;
   return {
     ...config, listen_host: f.listen_host.trim() || "auto",
     awg_fallback: f.route_mode === "vpn_only" && f.awg_fallback === "off" ? "auto" : f.awg_fallback,
@@ -50,6 +58,7 @@ const collect = (f: Form): Omit<DnsServerConfig, "dns_port" | "logging_enabled">
     default_upstream: collectUpstream(f.default_pool[0]), default_pool: f.default_pool.slice(1).map(collectUpstream),
     rules: collectRuleGroups(groups),
     filtering: collectBlocking(filtering),
+    shadow_dns: collectShadow(shadow_dns),
   };
 };
 
@@ -76,6 +85,7 @@ export default function DnsServer() {
   const [domain, setDomain] = useState("claude.ai");
   const [queryType, setQueryType] = useState<"A" | "AAAA" | "CNAME" | "HTTPS" | "SVCB">("A");
   const [testing, setTesting] = useState(false);
+  const [importing, setImporting] = useState(false);
   const [test, setTest] = useState<DnsServerTestResult | null>(null);
   const loaded = useRef(false);
   const polling = useRef(false);
@@ -154,17 +164,18 @@ export default function DnsServer() {
   const selectedTunnelAvailable = form.awg_fallback === "auto"
     ? tunnels.some((r) => r.available)
     : tunnels.some((r) => r.id.slice(4) === form.awg_fallback && r.available);
-  const routeName = (id?: string) => live.routes?.find((r) => r.id === id)?.name || (id === "nfqws" ? "NFQWS" : id === "cache" ? "Кэш" : id === "blocked" ? "Локальная блокировка" : id || "—");
+  const routeName = (id?: string) => dnsRouteLabel(id, live.routes);
 
   return (
     <>
-      <Card title="DNS Server" sub="локальный DNS с группами доменов" head={<Badge kind={live.running ? "ok" : live.config.enabled ? "bad" : "neutral"}>{live.running ? "работает" : live.config.enabled ? "ошибка запуска" : "выключен"}</Badge>}>
+      <Card title="DNS Server" sub="локальный DNS с группами доменов" head={<div className="flex flex-wrap items-center gap-2"><Button mini disabled={busy || testing || filterUpdating} onClick={() => setImporting(true)}>Импорт настроек</Button><DnsSettingsExportButton disabled={busy || testing || filterUpdating} /><Badge kind={live.running ? "ok" : live.config.enabled ? "bad" : "neutral"}>{live.running ? "работает" : live.config.enabled ? "ошибка запуска" : "выключен"}</Badge></div>}>
         <p className="mb-3 text-xs text-muted">Устройства отправляют обычные DNS-запросы на роутер по UDP или TCP. Выберите специальный DoH или пул серверов и назначьте ему группу доменов. Сервис по умолчанию выключен.</p>
         <div className="flex flex-wrap items-center gap-4">
           <Switch checked={live.config.enabled} disabled={busy || dirty || testing} onChange={(on) => action(on ? "start" : "stop", {}, on ? "DNS-сервер включён" : "DNS-сервер выключен")} label="DNS-сервер включён" />
           {dirty && <><Button mini variant="primary" disabled={busy || testing} onClick={save}>Сохранить изменения</Button><Button mini disabled={busy || testing} onClick={() => setForm(toForm(live.config))}>Отменить</Button></>}
           {!dirty && live.running && <span className="text-xs text-muted">Адрес в локальной сети: {live.listen_host}</span>}
         </div>
+        <DnsSettingsExportNote dirty={dirty} />
         {live.last_error && <p role="alert" className="mt-3 text-xs text-bad [overflow-wrap:anywhere]">{live.last_error}</p>}
         {loadError && <p role="alert" className="mt-3 text-xs text-warn">Не удалось обновить состояние: {loadError}</p>}
       </Card>
@@ -172,7 +183,7 @@ export default function DnsServer() {
       <Card title="Статистика" sub="с запуска DNS-сервера" head={<Button mini disabled={busy || testing || !live.cache.entries} onClick={clearCache}>{clearing ? "Очистка…" : "Очистить кэш"}</Button>}>
         <DnsStatistics stats={live.stats} cache={live.cache} />
         <p className="mt-3 text-xs text-muted">Очистка кэша сохраняет статистику и настройки. Новые запросы снова заполняют кэш.</p>
-        {live.stats.last_domain && <p className="mt-2 text-xs text-muted [overflow-wrap:anywhere]">Последний запрос: {live.stats.last_domain} · {routeName(live.stats.last_route)} · {live.stats.last_upstream || "—"}</p>}
+        <DnsLastRequest stats={live.stats} routeName={routeName} />
         {live.stats.last_error && <p className="mt-2 text-xs text-bad [overflow-wrap:anywhere]">Последняя ошибка: {live.stats.last_error}</p>}
       </Card>
 
@@ -186,7 +197,9 @@ export default function DnsServer() {
       </Card>
 
       <fieldset disabled={busy || testing} className="min-w-0">
-        <Card title="Пул DoH по умолчанию" sub="для доменов вне специальных групп">
+        <ShadowDns value={form.shadow_dns} status={live.shadow_dns} onChange={(value) => set("shadow_dns", value)} />
+
+        <Card title="Пул DoH по умолчанию" sub="для доменов вне Shadow DNS и специальных групп">
           <p className="mb-3 text-xs text-muted">Серверы пула участвуют в параллельных запросах через доступные маршруты. Первый корректный ответ возвращается устройству.</p>
           <UpstreamPool value={form.default_pool} onChange={(v) => set("default_pool", v)} />
           <p className="mt-2 text-xs text-muted">IP для подключения помогает, когда провайдер блокирует разрешение имени самого DNS-сервера. Имя и проверка сертификата берутся из HTTPS-адреса.</p>
@@ -197,7 +210,11 @@ export default function DnsServer() {
         <Blocking value={form.filtering} onChange={(filtering) => set("filtering", filtering)} status={live.filtering} savedEnabled={live.config.filtering?.enabled ?? false} running={live.running} disabled={busy || testing} updateBusy={filterUpdating} unsaved={dirty} onUpdate={updateFiltering} />
 
         <Card title="Ускорение и обход блокировок DNS">
-          <p className="mb-3 text-xs text-muted">Если ответа нет в кэше, DoH из подходящего пула запрашиваются через маршруты выбранного режима. Планировщик ставит быстрые и надёжные сочетания «маршрут + DoH» первыми. Попытки запускаются параллельно; первый корректный ответ возвращается сразу, остальные отменяются.</p>
+          <p className="mb-3 text-xs text-muted">Если ответа нет в кэше, DoH из подходящего пула запрашиваются через маршруты выбранного режима. Попытки запускаются параллельно; первый корректный ответ возвращается сразу, остальные отменяются.</p>
+          <div className="mb-3 rounded-lg border border-line p-3">
+            <Switch checked={form.scheduler_enabled ?? true} onChange={(enabled) => set("scheduler_enabled", enabled)} label="Планировщик DNS" />
+            <p className="mt-2 text-xs text-muted">Ставит быстрые и надёжные сочетания «маршрут + DoH» первыми и измеряет альтернативы в фоне. При единственном доступном сочетании фоновые замеры не нужны и автоматически пропускаются. После выключения запросы идут в порядке настройки пула, без обучения и фоновых замеров; кэш и fast-dns продолжают работать. Выбор применяется кнопкой «Сохранить настройки».</p>
+          </div>
           <div className="mb-3 rounded-lg border border-line p-3">
             <Switch checked={form.fast_dns} onChange={(enabled) => set("fast_dns", enabled)} label="fast-dns" />
             <p className="mt-2 text-xs text-muted">Кэширует IP-адреса DoH-серверов и обновляет их в фоне каждый час. Указанные вручную IP имеют приоритет. Этот кэш не зависит от кэша DNS-ответов и его времени хранения.</p>
@@ -223,13 +240,13 @@ export default function DnsServer() {
             </Select></Field>
             <Field label="Таймаут маршрута, сек."><Input type="number" min={1} max={10} value={form.timeout_seconds} onChange={(e) => set("timeout_seconds", e.target.value)} /></Field>
           </div>
-          {form.route_mode === "vpn_only" && <p className="mt-2 text-xs text-warn">Режим «Только VPN» не отправляет новые запросы к DoH через NFQWS или напрямую. Если выбранный AWG/WARP недоступен, запросы без ответа в кэше завершатся ошибкой DNS до восстановления туннеля.</p>}
+          {form.route_mode === "vpn_only" && <p className="mt-2 text-xs text-warn">Режим «Только VPN» не отправляет новые запросы к DoH через NFQWS или напрямую. Если выбранный AWG/WARP недоступен, запросы без ответа в кэше завершатся ошибкой DNS до восстановления туннеля. Включённый Shadow DNS — отдельное исключение: его домены идут к DNS провайдера.</p>}
           <div className="mt-3 flex flex-wrap gap-2">{live.routes?.map((r) => {
             const dnsDisabled = r.id === "nfqws" && !live.config.enabled;
             const excluded = r.id === "nfqws" && live.config.route_mode === "vpn_only";
             return <span key={r.id} title={dnsDisabled ? "Маршрут запускается при включении DNS-сервера" : excluded ? "Исключён режимом «Только VPN»" : r.error || r.interface}><Badge kind={dnsDisabled || excluded ? "neutral" : r.available ? "ok" : "warn"}>{r.name}: {dnsDisabled ? "DNS-сервер выключен" : excluded ? "исключён режимом" : r.available ? "доступен" : "недоступен"}</Badge></span>;
           })}</div>
-          {form.awg_fallback !== "off" && !selectedTunnelAvailable && <p className="mt-2 text-xs text-warn">Выбранное VPN-подключение сейчас недоступно. {form.route_mode === "vpn_only" ? "Новые DNS-запросы без кэша будут завершаться ошибкой." : "VPN сможет участвовать в запросах после подключения."}</p>}
+          {form.awg_fallback !== "off" && !selectedTunnelAvailable && <p className="mt-2 text-xs text-warn">Выбранное VPN-подключение сейчас недоступно. {form.route_mode === "vpn_only" ? "Новые DoH-запросы без кэша будут завершаться ошибкой." : "VPN сможет участвовать в запросах после подключения."}</p>}
           <p className="mt-2 text-xs text-muted">Таймаут ограничивает каждый маршрут отдельно: быстрый ответ не ждёт медленных маршрутов. NFQWS доступен только в режиме «NFQWS и VPN» и обрабатывает DoH на порту 443; для другого HTTPS-порта используются выбранные AWG-подключения.</p>
         </Card>
 
@@ -241,6 +258,7 @@ export default function DnsServer() {
           </div>
           <p className="mt-2 text-xs text-muted">Размер кэша 0 отключает кэш. Порт DNS-сервера меняется в разделе «Система».</p>
           <p className="mt-2 text-xs text-muted">Время хранения — верхний предел от 1 до 86400 секунд. Если TTL ответа DNS-провайдера истекает раньше, запись удаляется раньше.</p>
+          <p className="mt-1 text-xs text-muted">A, AAAA и HTTPS хранятся как отдельные записи. Параметры DNS-запроса также могут различать записи кэша, даже для одного домена.</p>
           <div className="mt-4 flex flex-wrap items-center gap-3">
             <Button variant="primary" disabled={busy || testing || !dirty} onClick={save}>{busy && !clearing ? "Сохранение…" : "Сохранить настройки"}</Button>
             {dirty && <Button disabled={busy || testing} onClick={() => setForm(toForm(live.config))}>Отменить изменения</Button>}
@@ -251,6 +269,8 @@ export default function DnsServer() {
 
       <DnsDiagnostics loggingEnabled={live.config.logging_enabled} running={live.running} routes={live.routes} onLoggingChange={(enabled) => { mutation.current++; setLive((v) => v ? { ...v, config: { ...v.config, logging_enabled: enabled } } : v); }} />
 
+      {importing && <DnsSettingsImport dirty={dirty} saving={busy} onClose={() => setImporting(false)} onImport={async (request) => (await action("import", request, "Настройки DNS импортированы")) ?? false} />}
+
       <Card title="Проверка DNS" sub="использует сохранённые настройки">
         <div className="flex flex-wrap items-end gap-3">
           <Field label="Домен" className="min-w-[180px] flex-1"><Input value={domain} disabled={testing} onChange={(e) => setDomain(e.target.value)} placeholder="claude.ai" autoCapitalize="none" spellCheck={false} /></Field>
@@ -259,13 +279,7 @@ export default function DnsServer() {
         </div>
         {!live.running && <p className="mt-2 text-xs text-muted">Для проверки включите DNS-сервер.</p>}
         {dirty && <p className="mt-2 text-xs text-muted">Для проверки сначала сохраните изменения.</p>}
-        {test && <div role="status" className="mt-3 rounded-lg border border-line p-3 text-xs">
-          <div className="flex flex-wrap items-center gap-2"><Badge kind={test.blocked ? "warn" : test.ok ? "ok" : "bad"}>{test.blocked ? "Заблокировано локально" : test.ok ? "Ответ получен" : "Ошибка"}</Badge><span>{test.domain} · {test.type} · {Math.round(test.duration_ms)} мс</span></div>
-          {test.blocked ? <p className="mt-2 [overflow-wrap:anywhere]">Ответ NXDOMAIN сформирован локально.{test.block_domain && test.block_domain !== test.domain ? ` В ответе DNS заблокирован адрес: ${test.block_domain}.` : ""}{test.block_category ? ` Категория: ${test.block_category === "ads" ? "реклама" : test.block_category === "mixed" ? "реклама и трекеры" : "трекеры"}` : ""}{test.block_source ? ` · Источник: ${test.block_source}` : ""}{test.block_rule ? ` · Правило: ${test.block_rule}` : ""}</p>
-            : <p className="mt-2 [overflow-wrap:anywhere]">Маршрут: {routeName(test.route)} · DNS: {test.upstream || "—"}</p>}
-          {test.answers?.length > 0 && <pre className="mt-2 whitespace-pre-wrap font-mono text-xs [overflow-wrap:anywhere]">{test.answers.join("\n")}</pre>}
-          {test.error && !test.blocked && <p className="mt-2 text-bad [overflow-wrap:anywhere]">{test.error}</p>}
-        </div>}
+        {test && <DnsTestAnswer result={test} routeName={routeName} />}
       </Card>
 
     </>

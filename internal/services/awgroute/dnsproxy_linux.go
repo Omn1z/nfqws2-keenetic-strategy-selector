@@ -4,6 +4,7 @@ package awgroute
 
 import (
 	"fmt"
+	"strconv"
 
 	"nfqws2strategy/internal/services/awg"
 	"nfqws2strategy/internal/tools/logbuf"
@@ -24,7 +25,7 @@ func (svc *Service) awgZoneMatchers(cfg *awg.ServerConfig) *awg.MatcherSet {
 		if !z.Enabled {
 			continue
 		}
-		exp, _ := svc.expandEntries(z.Domains)
+		exp, _ := svc.expandZoneEntries(z)
 		entries = append(entries, exp...)
 	}
 	ms, _ := awg.CompileMatcherSet(awgDropCatchAll(entries))
@@ -40,22 +41,8 @@ func (svc *Service) awgZoneMatchers(cfg *awg.ServerConfig) *awg.MatcherSet {
 // the LAN :53 REDIRECT only while the proxy is actually up (never blackhole DNS).
 func (svc *Service) awgEnsureDNSProxy(cfg *awg.ServerConfig) bool {
 	ms := svc.awgZoneMatchers(cfg)
-	// Run the proxy only when the routing selects a SUBSET (include/exclude) and that
-	// subset needs DNS interception — either the user turned it on, or a real mask is
-	// present (a "*.com"/"*ip*" mask can ONLY be matched via interception). Skip it for
-	// "full" (everything is marked at the firewall — no per-name decision needed), and
-	// for "off"/"" (nothing to route).
+	want := awgDNSProxyWanted(cfg, ms)
 	eff := awgEffectiveMode(cfg.Routing)
-	// Source-bound zones don't affect eff (they're per-device, see mode.go), but
-	// they still need DNS interception to track CDN-served destinations live.
-	hasSrc := false
-	for _, z := range cfg.Routing.Zones {
-		if z.Enabled && len(z.SourceIPs) > 0 && len(z.Domains) > 0 {
-			hasSrc = true
-			break
-		}
-	}
-	want := (eff == "include" || eff == "exclude" || hasSrc) && ms.Len() > 0 && awgUsesDNSProxy(cfg)
 	svc.route.mu.Lock()
 	p := svc.route.dnsProxy
 	svc.route.mu.Unlock()
@@ -66,62 +53,21 @@ func (svc *Service) awgEnsureDNSProxy(cfg *awg.ServerConfig) bool {
 		return false
 	}
 	// Publish a fresh routeTable snapshot — single source of truth for every
-	// hot-path decision. republishRouteTable short-circuits when the inputs
-	// match the last build (the SNI ensure that fires right after this one
-	// hits the cached snapshot for free instead of re-running expandEntries
-	// + matcher compilation).
+	// hot-path decision. republishRouteTable reuses unchanged inputs.
 	tbl := svc.republishRouteTable(cfg, awgTunnelV6Reaches())
 	ordered := tbl.ordered
 	svc.route.orderedMatchers.Store(&ordered)
+	identity := tbl.hash + ":" + strconv.FormatInt(tbl.revision, 10) + ":" + strconv.FormatUint(svc.routingDNSGate.version(), 10)
 	if p != nil {
-		p.SetMatchers(ms) // refresh on zone change
+		if p.PolicyChanged(identity) {
+			svc.awgSetLegacyDNSLearner(p)
+			p.SetMatchers(ms)
+		}
 		return true
 	}
-	np := awg.NewDNSProxy(awgDNSAddr, svc.awgEffectiveDNSUpstream(), func(name string, ips []string) {
-		// Per-NAME decisions computed ONCE per query. Per-IP work below
-		// shrinks to just family-pick + ipsetAddAsync. Before this hoist,
-		// the same routeFor walk + sourceZoneMatchers walk ran per IP, so
-		// a CDN answer with 8 IPs cost 8× the matcher work for an
-		// identical result.
-		dec := svc.routeFor(name, "")
-		tbl := svc.route.routeTable.Load()
-		// Pre-compute which source-bound zones matched this name. Source-
-		// bound zones are evaluated per-device but the MATCHER itself is
-		// per-NAME — hoisting the walk is correct.
-		var matchedSrc []sourceZoneDecision
-		if tbl != nil {
-			for _, sb := range tbl.source {
-				if sb.Matchers != nil && sb.Matchers.Len() > 0 && sb.Matchers.MatchAny(name) {
-					matchedSrc = append(matchedSrc, sb)
-				}
-			}
-		}
-		for _, ip := range ips {
-			v6Suffix := ""
-			if isIPv6(ip) {
-				v6Suffix = "_6"
-			}
-			// Source-bound zones first, BEFORE the shared-CDN skip: the user
-			// explicitly opted that device into this zone, so a Cloudflare/
-			// Akamai destination is what they asked for. Skipping it for "shared
-			// CDN" reasoning is correct for LAN-wide global sets (a stray vk.com
-			// → 104.16.0.0/13 routed everything-else-on-that-/13 through the
-			// tunnel) but wrong for a per-device carve-out.
-			for _, sb := range matchedSrc {
-				ipsetAddAsync(sb.SetName+v6Suffix, ip)
-			}
-			if _, ok := sharedCDNProvider(ip); ok {
-				svc.awgNoteSharedCDNSkip("dnsproxy", ip)
-				continue
-			}
-			switch dec.Route {
-			case RouteDirect:
-				ipsetAddAsync(awgSetExc+v6Suffix, ip)
-			case RouteTunnel:
-				ipsetAddAsync(awgSetInc+v6Suffix, ip)
-			}
-		}
-	})
+	np := awg.NewDNSProxy(awgDNSAddr, awgDNSUpstream, nil)
+	np.PolicyChanged(identity)
+	svc.awgSetLegacyDNSLearner(np)
 	// Trace hooks for the per-flow debug log. Both are no-ops when trace is off
 	// (the ring's atomic enabled-check kicks the hot path out in ~5ns).
 	//
@@ -137,7 +83,7 @@ func (svc *Service) awgEnsureDNSProxy(cfg *awg.ServerConfig) bool {
 		// when ring recording is off ("trace_mode=off"). traceAppend itself
 		// always increments counters and only skips the ring write.
 		//
-		// Pi-hole sinkhole short-circuit: when the upstream returned a
+		// DNS sinkhole short-circuit: when the upstream returned a
 		// no-destination answer (NXDOMAIN / NOERROR-empty / 0.0.0.0|::), the
 		// FMW routing decision is moot — the client got an "address not
 		// found". Label the row "blocked" so the user sees the real outcome
@@ -148,11 +94,11 @@ func (svc *Service) awgEnsureDNSProxy(cfg *awg.ServerConfig) bool {
 		// трафика…" for a query that already completed.
 		if sinkholed {
 			if len(ips) == 0 {
-				traceAppend(TraceEntry{Src: srcIP, Kind: "dns", Name: qname, Qtype: qtype, Decision: "blocked", Reason: "pi-hole: домен в блок-листе"})
+				traceAppend(TraceEntry{Src: srcIP, Kind: "dns", Name: qname, Qtype: qtype, Decision: "blocked", Reason: "DNS upstream: пустой или отрицательный ответ"})
 				return
 			}
 			for _, ip := range ips {
-				traceAppend(TraceEntry{Src: srcIP, Kind: "dns", Name: qname, Qtype: qtype, Dst: ip, Decision: "blocked", Reason: "pi-hole: домен в блок-листе (null-route)"})
+				traceAppend(TraceEntry{Src: srcIP, Kind: "dns", Name: qname, Qtype: qtype, Dst: ip, Decision: "blocked", Reason: "DNS upstream: null-route"})
 			}
 			return
 		}
@@ -216,6 +162,24 @@ func (svc *Service) awgEnsureDNSProxy(cfg *awg.ServerConfig) bool {
 	return true
 }
 
+// Share the exact listener requirement with apply/recovery checks. A full
+// tunnel with domain entries still needs no per-name learner unless source
+// rules select a subset, so its deliberately absent proxy is not a failure.
+func awgDNSProxyWanted(cfg *awg.ServerConfig, ms *awg.MatcherSet) bool {
+	if cfg == nil || ms == nil || ms.Len() == 0 || !awgUsesDNSProxy(cfg) {
+		return false
+	}
+	eff := awgEffectiveMode(cfg.Routing)
+	hasSrc := false
+	for _, z := range cfg.Routing.Zones {
+		if z.Enabled && !z.WaitingForConnection && len(z.SourceIPs) > 0 && len(z.Domains) > 0 {
+			hasSrc = true
+			break
+		}
+	}
+	return eff == "include" || eff == "exclude" || hasSrc
+}
+
 // awgStopDNSProxy stops the proxy and removes its LAN :53 REDIRECT rules so DNS
 // falls straight back to the router's resolver.
 func (svc *Service) awgStopDNSProxy() {
@@ -226,11 +190,10 @@ func (svc *Service) awgStopDNSProxy() {
 	if p != nil {
 		p.Stop()
 	}
-	// Strip both possible REDIRECT targets — :5354 (legacy, proxy-first) and
-	// :5353 (current, pi-hole-first) — so a chain-mode flip doesn't leave a
-	// stale rule pointing at a dead port.
+	// Also remove the old Pi-hole target on upgrades, so a retired DNS chain
+	// cannot leave LAN clients pointing at an unused port.
 	_, _ = awgRun("for br in $(ls /sys/class/net/ 2>/dev/null | grep '^br'); do " +
-		"for port in " + awgDNSPort + " " + awgPiholeDNSPort + "; do " +
+		"for port in " + awgDNSPort + " " + awgLegacyPiholeDNSPort + "; do " +
 		"iptables -t nat -D PREROUTING -i $br -p udp --dport 53 -j REDIRECT --to-ports $port 2>/dev/null; " +
 		"iptables -t nat -D PREROUTING -i $br -p tcp --dport 53 -j REDIRECT --to-ports $port 2>/dev/null; " +
 		"ip6tables -t nat -D PREROUTING -i $br -p udp --dport 53 -j REDIRECT --to-ports $port 2>/dev/null; " +

@@ -23,7 +23,7 @@ export function Dropzone({ multiple, accept, onFiles, children }: DropzoneProps)
       onDragLeave={(e) => { if (!e.currentTarget.contains(e.relatedTarget as Node)) setDrag(false); }}
       onDrop={(e) => { e.preventDefault(); setDrag(false); onFiles(e.dataTransfer.files); }}
       className={cn(
-        "cursor-pointer rounded-xl border-2 border-dashed p-5 text-center text-ink-soft outline-none transition",
+        "cursor-pointer rounded-lg border border-dashed p-5 text-center text-ink-soft outline-none transition-colors focus-visible:border-ring focus-visible:ring-[3px] focus-visible:ring-ring/25",
         drag ? "border-accent bg-accent-w" : "border-line bg-line-soft hover:border-accent hover:bg-accent-w",
       )}
     >

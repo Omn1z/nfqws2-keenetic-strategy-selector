@@ -73,7 +73,7 @@ func awgDropCatchAll(entries []string) []string {
 // and don't participate in the global walk.
 func firstCatchAllZoneIndex(r awg.RoutingConfig) int {
 	for i, z := range r.Zones {
-		if !z.Enabled || len(z.SourceIPs) > 0 {
+		if !z.Enabled || z.WaitingForConnection || len(z.SourceIPs) > 0 {
 			continue
 		}
 		if z.IsCatchAll() {
@@ -94,14 +94,34 @@ func firstCatchAllZoneIndex(r awg.RoutingConfig) int {
 func effectiveZones(r awg.RoutingConfig) []awg.Zone {
 	idx := firstCatchAllZoneIndex(r)
 	if idx < 0 {
-		return r.Zones
+		waiting := false
+		for _, z := range r.Zones {
+			if z.WaitingForConnection {
+				waiting = true
+				break
+			}
+		}
+		if !waiting {
+			return r.Zones
+		}
+		out := make([]awg.Zone, 0, len(r.Zones))
+		for _, z := range r.Zones {
+			if !z.WaitingForConnection {
+				out = append(out, z)
+			}
+		}
+		return out
 	}
 	// Keep all zones up to and including the catch-all, then APPEND every
 	// source-bound zone from the tail (they remain alive — see comment above).
 	out := make([]awg.Zone, 0, len(r.Zones))
-	out = append(out, r.Zones[:idx+1]...)
+	for _, z := range r.Zones[:idx+1] {
+		if !z.WaitingForConnection {
+			out = append(out, z)
+		}
+	}
 	for _, z := range r.Zones[idx+1:] {
-		if len(z.SourceIPs) > 0 {
+		if !z.WaitingForConnection && len(z.SourceIPs) > 0 {
 			out = append(out, z)
 		}
 	}
@@ -130,12 +150,16 @@ func awgZonesHaveMask(cfg *awg.ServerConfig) bool {
 // awgUsesDNSProxy reports whether split-routing needs the domain-mask DNS
 // proxy: either the user explicitly chose DNS interception, OR a zone
 // contains a real mask that can only work via interception, OR a source-bound
-// zone has any domain entry (per-device CDN tracking).
+// zone has any domain entry (per-device CDN tracking), OR a rule explicitly
+// includes every subdomain, which cannot be enumerated by resolving its apex.
 func awgUsesDNSProxy(cfg *awg.ServerConfig) bool {
 	if cfg.Routing.DomainSource == "dnsproxy" || awgZonesHaveMask(cfg) {
 		return true
 	}
 	for _, z := range effectiveZones(cfg.Routing) {
+		if z.Enabled && z.IncludeSubdomains != nil && *z.IncludeSubdomains && len(z.Domains) > 0 {
+			return true // discover subdomains before delivering their DNS answers
+		}
 		if !z.Enabled || len(z.SourceIPs) == 0 {
 			continue
 		}
@@ -185,7 +209,7 @@ func awgEffectiveMode(r awg.RoutingConfig) string {
 		earlierOpposite := false
 		for i := 0; i < idx; i++ {
 			z := r.Zones[i]
-			if !z.Enabled || len(z.SourceIPs) > 0 {
+			if !z.Enabled || z.WaitingForConnection || len(z.SourceIPs) > 0 {
 				continue
 			}
 			if len(z.Domains) == 0 && len(z.IPs) == 0 {
@@ -215,7 +239,7 @@ func awgEffectiveMode(r awg.RoutingConfig) string {
 	// No catch-all: classic direction mix.
 	hasInc, hasExc := false, false
 	for _, z := range r.Zones {
-		if !z.Enabled || (len(z.Domains) == 0 && len(z.IPs) == 0) {
+		if !z.Enabled || z.WaitingForConnection || (len(z.Domains) == 0 && len(z.IPs) == 0) {
 			continue
 		}
 		if len(z.SourceIPs) > 0 {

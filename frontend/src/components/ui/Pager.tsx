@@ -1,3 +1,5 @@
+import { Select } from "./form";
+
 export function pageSlice<T>(arr: T[], page: number, pageSize: string): T[] {
   const total = arr.length;
   const size = pageSize === "all" ? Math.max(total, 1) : parseInt(pageSize, 10);
@@ -26,16 +28,16 @@ export function Pager({ total, page, setPage, pageSize, setPageSize }: PagerProp
     <div className="mt-3.5 flex flex-wrap items-center justify-center gap-3">
       <label className="flex items-center gap-1.5 text-xs text-ink-soft">
         Показывать
-        <select
+        <Select
           value={pageSize}
           onChange={(e) => { setPageSize(e.target.value); setPage(1); }}
-          className="rounded-md border border-line bg-input px-2 py-1 text-xs text-ink"
+          className="w-auto text-xs"
         >
           <option value="20">20</option>
           <option value="50">50</option>
           <option value="100">100</option>
           <option value="all">Все</option>
-        </select>
+        </Select>
       </label>
       <button className={btn} disabled={p <= 1} onClick={() => setPage(p - 1)}>‹ Назад</button>
       <span className="min-w-[170px] text-center text-xs text-muted">стр. {p} из {pages} · {total} записей</span>

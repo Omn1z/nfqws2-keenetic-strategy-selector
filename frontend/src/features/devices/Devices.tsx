@@ -142,7 +142,7 @@ export default function Devices() {
           </div>
           {tracing && (
             <div className="mb-2 h-2 overflow-hidden rounded-full bg-line">
-              <div className="h-full rounded-full bg-gradient-to-r from-accent to-[#5cb3ff] transition-[width]" style={{ width: `${Math.min(100, trace.elapsed_ms / (trace.seconds * 10))}%` }} />
+              <div className="h-full rounded-full bg-accent transition-[width]" style={{ width: `${Math.min(100, trace.elapsed_ms / (trace.seconds * 10))}%` }} />
             </div>
           )}
           <div className="max-h-[280px] overflow-auto rounded-lg border border-line bg-input p-3 font-mono text-xs leading-relaxed">
@@ -183,7 +183,7 @@ export default function Devices() {
           </div>
           {pcapping && (
             <div className="mb-2 h-2 overflow-hidden rounded-full bg-line">
-              <div className="h-full rounded-full bg-gradient-to-r from-accent to-[#5cb3ff] transition-[width]" style={{ width: `${Math.min(100, pcap.elapsed_ms / (pcap.seconds * 10))}%` }} />
+              <div className="h-full rounded-full bg-accent transition-[width]" style={{ width: `${Math.min(100, pcap.elapsed_ms / (pcap.seconds * 10))}%` }} />
             </div>
           )}
           <p className="mt-1 text-xs text-muted">

@@ -222,11 +222,6 @@ type awgRouteState struct {
 	stopRefresh chan struct{}
 	active      bool
 	dnsProxy    *awg.DNSProxy
-	// dnsChainEnabledFlag (atomic.Bool) tracks whether pi-hole sits in front of
-	// our proxy. Read on every firewall-hook re-render (watchdog tick) and on
-	// every DNS-proxy ensure call, so a lock here would contend with apply
-	// paths. Mirror of the bool the pi-hole toggle sets.
-	dnsChainEnabledFlag atomic.Bool
 	// lastHookHash + hookSkipsSinceFull let the watchdog skip the expensive
 	// hook-rerun/route/killswitch/accel/sniff block when the config hasn't
 	// changed. We still force a full re-assertion every 4th tick so a Keenetic

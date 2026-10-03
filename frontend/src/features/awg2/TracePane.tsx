@@ -1,10 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { api } from "@/lib/api";
+import { usePoll } from "@/lib/hooks";
 import { cn } from "@/lib/cn";
 import { Card } from "@/components/ui/Card";
 import { Badge } from "@/components/ui/Badge";
 import { Button } from "@/components/ui/Button";
-import { Input } from "@/components/ui/form";
+import { Input, Select } from "@/components/ui/form";
 import { toast } from "@/components/ui/Toast";
 import { confirmDialog } from "@/components/ui/Confirm";
 
@@ -102,7 +103,21 @@ async function quickRule(name: string, route: "tunnel" | "direct") {
   });
 }
 
-export default function TracePane() {
+export default function TracePane({ externalBusy, runMutation, reload }: {
+  externalBusy: boolean;
+  runMutation: (work: () => Promise<void>) => Promise<void>;
+  reload: () => Promise<void>;
+}) {
+  const blockedRef = useRef(externalBusy);
+  blockedRef.current = externalBusy;
+  const writing = useRef(false);
+  const fetching = useRef(false);
+  const readRevision = useRef(0);
+  const mounted = useRef(true);
+  useEffect(() => {
+    mounted.current = true;
+    return () => { mounted.current = false; readRevision.current++; };
+  }, []);
   const [status, setStatus] = useState<TraceStatus | null>(null);
   const [entries, setEntries] = useState<TraceEntry[]>([]);
   const [filterSrc, setFilterSrc] = useState("");
@@ -133,9 +148,10 @@ export default function TracePane() {
   // / "MyWin (fe80::abc…)" instead of bare IPs. Refreshed alongside the trace
   // poll so a new device that just came online gets named within a tick.
   const [ipToHost, setIpToHost] = useState<Record<string, string>>({});
-  const refreshDeviceMap = async () => {
+  const refreshDeviceMap = async (signal: AbortSignal) => {
     try {
-      const r = await api<{ devices: { ip: string; ipv6?: string[]; hostname?: string }[] }>("GET", "/api/devices");
+      const r = await api<{ devices: { ip: string; ipv6?: string[]; hostname?: string }[] }>("GET", "/api/devices", undefined, { signal });
+      if (signal.aborted) return;
       const map: Record<string, string> = {};
       for (const d of r.devices ?? []) {
         if (!d.hostname) continue;
@@ -145,15 +161,15 @@ export default function TracePane() {
       setIpToHost(map);
     } catch { /* keep last */ }
   };
-  useEffect(() => {
-    void refreshDeviceMap();
-    const t = window.setInterval(() => void refreshDeviceMap(), 15_000);
-    return () => window.clearInterval(t);
-  }, []);
+  usePoll(refreshDeviceMap, 15_000, !externalBusy);
 
-  const fetchOnce = async () => {
+  const fetchOnce = async (signal?: AbortSignal) => {
+    if (fetching.current || !mounted.current) return;
+    fetching.current = true;
+    const revision = readRevision.current;
     try {
-      const r = await api<TraceListResp>("GET", `/api/awg2/trace?since=${sinceRef.current}`);
+      const r = await api<TraceListResp>("GET", `/api/awg2/trace?since=${sinceRef.current}`, undefined, { signal });
+      if (signal?.aborted || !mounted.current || revision !== readRevision.current) return;
       setStatus(r.status);
       if (r.entries.length > 0) {
         sinceRef.current = r.entries[r.entries.length - 1].ts;
@@ -164,34 +180,40 @@ export default function TracePane() {
       }
     } catch {
       /* keep last */
+    } finally {
+      fetching.current = false;
     }
   };
 
   const applyTraceMode = async (nextMode: TraceMode) => {
-    if (modeBusy) return;
+    if (modeBusy || writing.current || blockedRef.current) return;
+    writing.current = true;
     setModeBusy(true);
     try {
-      const sys = await api<{ trace_mode: TraceMode }>("POST", "/api/system/settings", { trace_mode: nextMode });
-      const effectiveMode = sys.trace_mode || nextMode;
-      setMode(effectiveMode);
-
-      if (effectiveMode === "auto") {
-        const nextStatus = await api<TraceStatus>("POST", "/api/awg2/trace/enabled", { enabled: true });
-        weEnabledRef.current = true;
-        setStatus(nextStatus);
-        toast("Трассировка включена до закрытия вкладки", "ok");
-        void fetchOnce();
-        return;
-      }
-
-      weEnabledRef.current = false;
-      const nextStatus = await api<TraceStatus>("GET", "/api/awg2/trace/status");
-      setStatus(nextStatus);
-      toast(effectiveMode === "always" ? "Трассировка пишет постоянно" : "Трассировка выключена", "ok");
+      await runMutation(async () => {
+        readRevision.current++;
+        const sys = await api<{ trace_mode: TraceMode }>("POST", "/api/system/settings", { trace_mode: nextMode }, { timeoutMs: 30_000 });
+        const effectiveMode = sys.trace_mode || nextMode;
+        setMode(effectiveMode);
+        if (effectiveMode === "auto") {
+          const nextStatus = await api<TraceStatus>("POST", "/api/awg2/trace/enabled", { enabled: true }, { timeoutMs: 30_000 });
+          weEnabledRef.current = true;
+          setStatus(nextStatus);
+          toast("Трассировка включена до закрытия вкладки", "ok");
+          await fetchOnce();
+        } else {
+          weEnabledRef.current = false;
+          const nextStatus = await api<TraceStatus>("GET", "/api/awg2/trace/status");
+          setStatus(nextStatus);
+          toast(effectiveMode === "always" ? "Трассировка пишет постоянно" : "Трассировка выключена", "ok");
+        }
+        await reload();
+      });
     } catch (e) {
       toast((e as Error).message, "err");
     } finally {
       setModeBusy(false);
+      writing.current = false;
     }
   };
 
@@ -200,47 +222,72 @@ export default function TracePane() {
   // "always" are pass-through: we don't touch the recording flag.
   useEffect(() => {
     let cancelled = false;
-    (async () => {
-      try {
-        const sys = await api<{ trace_mode: TraceMode }>("GET", "/api/system/settings");
+    const controller = new AbortController();
+    void runMutation(async () => {
+      if (cancelled) return;
+      const sys = await api<{ trace_mode: TraceMode }>("GET", "/api/system/settings", undefined, { signal: controller.signal });
+      if (cancelled) return;
+      setMode(sys.trace_mode);
+      const s = await api<TraceStatus>("GET", "/api/awg2/trace/status", undefined, { signal: controller.signal });
+      if (cancelled) return;
+      setStatus(s);
+      if (sys.trace_mode === "auto" && !s.enabled) {
+        const next = await api<TraceStatus>("POST", "/api/awg2/trace/enabled", { enabled: true }, { timeoutMs: 30_000 });
+        // The write can finish after unmount. Its queued cleanup still owns
+        // this flag and must turn auto recording off before the next mount.
+        weEnabledRef.current = true;
         if (cancelled) return;
-        setMode(sys.trace_mode);
-        const s = await api<TraceStatus>("GET", "/api/awg2/trace/status");
-        if (cancelled) return;
-        setStatus(s);
-        if (sys.trace_mode === "auto" && !s.enabled) {
-          const next = await api<TraceStatus>("POST", "/api/awg2/trace/enabled", { enabled: true });
-          if (cancelled) return;
-          setStatus(next);
-          weEnabledRef.current = true;
-        }
-        await fetchOnce();
-      } catch { /* keep last */ }
-    })();
+        setStatus(next);
+      }
+      await fetchOnce(controller.signal);
+    }).catch(() => {});
     return () => {
       cancelled = true;
-      if (weEnabledRef.current) {
-        void api<TraceStatus>("POST", "/api/awg2/trace/enabled", { enabled: false }).catch(() => {});
-      }
+      controller.abort();
+      void runMutation(async () => {
+        if (!weEnabledRef.current) return;
+        weEnabledRef.current = false;
+        await api<TraceStatus>("POST", "/api/awg2/trace/enabled", { enabled: false }, { timeoutMs: 30_000 });
+      }).catch(() => {});
     };
     /* eslint-disable-next-line react-hooks/exhaustive-deps */
-  }, []);
-  useEffect(() => {
-    if (!live) return;
-    const id = window.setInterval(() => { void fetchOnce(); }, 2000);
-    return () => window.clearInterval(id);
-  }, [live]);
+  }, [runMutation]);
+  usePoll(fetchOnce, 2000, live && !externalBusy);
+
+  const onQuickRule = async (name: string, route: "tunnel" | "direct") => {
+    if (writing.current || blockedRef.current) return;
+    writing.current = true;
+    try {
+      await runMutation(async () => {
+        await quickRule(name, route);
+        await reload();
+      });
+      toast(`Правило добавлено: ${name} → ${route === "tunnel" ? "VPN" : "мимо VPN"}`, "ok");
+    } catch (error) {
+      toast((error as Error).message, "err");
+    } finally {
+      writing.current = false;
+    }
+  };
 
   const onClear = async () => {
     if (!(await confirmDialog({ title: "Очистить весь буфер трассировки?" }))) return;
+    if (writing.current || blockedRef.current) return;
+    writing.current = true;
     try {
-      const s = await api<TraceStatus>("POST", "/api/awg2/trace/clear", {});
-      setStatus(s);
-      setEntries([]);
-      sinceRef.current = 0;
-      setPage(1);
+      await runMutation(async () => {
+        const s = await api<TraceStatus>("POST", "/api/awg2/trace/clear", {}, { timeoutMs: 30_000 });
+        readRevision.current++;
+        if (!mounted.current) return;
+        setStatus(s);
+        setEntries([]);
+        sinceRef.current = 0;
+        setPage(1);
+      });
     } catch (e) {
       toast((e as Error).message, "err");
+    } finally {
+      writing.current = false;
     }
   };
 
@@ -342,7 +389,7 @@ export default function TracePane() {
               onClick={() => void applyTraceMode(opt.value)}
               className={cn(
                 "border-r border-line px-2 text-[12px] last:border-r-0 disabled:cursor-wait disabled:opacity-60",
-                mode === opt.value ? "bg-accent text-white" : "bg-panel text-ink-soft hover:bg-line-soft hover:text-ink",
+                mode === opt.value ? "bg-accent text-primary-foreground" : "bg-panel text-ink-soft hover:bg-line-soft hover:text-ink",
               )}
             >
               {opt.label}
@@ -381,18 +428,18 @@ export default function TracePane() {
           </div>
         </details>
         <span className="ml-2 text-[12px] text-muted">Решение:</span>
-        <select value={filterDecision} onChange={(e) => { setFilterDecision(e.target.value as typeof filterDecision); setPage(1); }} className="h-7 rounded border border-line bg-panel px-2 text-[12px]">
+        <Select value={filterDecision} onChange={(e) => { setFilterDecision(e.target.value as typeof filterDecision); setPage(1); }} className="h-7 min-h-7 w-auto text-[12px]">
           <option value="all">все</option>
           <option value="tunnel">tunnel</option>
           <option value="direct">direct</option>
           <option value="blocked">blocked</option>
           <option value="cdn-skip">cdn-skip</option>
-        </select>
+        </Select>
         <span className="ml-auto text-[12px] text-muted">
           Show
-          <select value={pageSize} onChange={(e) => { setPageSize(parseInt(e.target.value, 10)); setPage(1); }} className="mx-1 h-7 rounded border border-line bg-panel px-1 text-[12px]">
+          <Select value={pageSize} onChange={(e) => { setPageSize(parseInt(e.target.value, 10)); setPage(1); }} className="mx-1 h-7 min-h-7 w-auto text-[12px]">
             {PAGE_SIZES.map((s) => <option key={s} value={s}>{s}</option>)}
-          </select>
+          </Select>
           entries
         </span>
       </div>
@@ -453,7 +500,7 @@ export default function TracePane() {
                   <td className="hidden whitespace-nowrap px-2 py-1 font-mono lg:table-cell">{traceDst(e)}</td>
                   <td className="whitespace-nowrap px-2 py-1">
                     {/* Tooltip on the badge surfaces the FULL reason (правило #N
-                        / pi-hole sinkhole / CDN skip / default-route etc.). The
+                        / DNS sinkhole / CDN skip / default-route etc.). The
                         rule index is part of the reason text so dropping the
                         separate "Правило" column is lossless. */}
                     <span title={e.reason || ds.l}><Badge kind={ds.k}>{ds.l}</Badge></span>
@@ -466,25 +513,21 @@ export default function TracePane() {
                     {e.kind !== "flow" && e.decision !== "tunnel" && (
                       <button type="button" title={`Всегда через VPN: ${e.name}`}
                         className="rounded border border-line bg-panel px-1.5 py-0.5 text-[11px] hover:bg-line-soft"
-                        onClick={async () => {
-                          try { await quickRule(e.name, "tunnel"); toast(`Правило добавлено: ${e.name} → через VPN`, "ok"); }
-                          catch (err) { toast((err as Error).message, "err"); }
-                        }}>↑ VPN</button>
+                        disabled={externalBusy}
+                        onClick={() => { void onQuickRule(e.name, "tunnel"); }}>↑ VPN</button>
                     )}
                     {e.kind !== "flow" && e.decision !== "direct" && (
                       <button type="button" title={`Всегда мимо VPN: ${e.name}`}
                         className="ml-1 rounded border border-line bg-panel px-1.5 py-0.5 text-[11px] hover:bg-line-soft"
-                        onClick={async () => {
-                          try { await quickRule(e.name, "direct"); toast(`Правило добавлено: ${e.name} → мимо VPN`, "ok"); }
-                          catch (err) { toast((err as Error).message, "err"); }
-                        }}>→ direct</button>
+                        disabled={externalBusy}
+                        onClick={() => { void onQuickRule(e.name, "direct"); }}>→ direct</button>
                     )}
                   </td>
                 </tr>
               );
             })}
           </tbody>
-          {/* Pi-hole-style filter inputs in the footer row */}
+          {/* Per-column filter inputs in the footer row */}
           <tfoot className="bg-panel-soft">
             <tr>
               <td className="px-2 py-1 text-[11px] uppercase text-muted">Время</td>
@@ -524,7 +567,7 @@ export default function TracePane() {
       <p className="mt-3 text-[11px] text-muted">
         DNS-строки видны только когда трафик идёт через наш :5354 (LAN → router DNS).
         Для DoH/DoT-клиентов работает SNI-сниффер (включается в зонах).
-        Src=127.0.0.1 означает, что pi-hole в цепочке скрыл реальный client IP — это поправлю отдельно.
+        Src=127.0.0.1 означает запрос от локального DNS-прокси; исходное устройство может быть неизвестно.
       </p>
     </Card>
   );

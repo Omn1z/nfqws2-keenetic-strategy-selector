@@ -1,19 +1,38 @@
 @import "tailwindcss";
 
+/* Inter 5.3.0, SIL OFL 1.1. Embedded by Vite: no external font requests. */
+@font-face {
+  font-family: "Inter Variable"; font-style: normal; font-display: swap; font-weight: 100 900;
+  src: url("./assets/fonts/inter-latin-wght-normal.woff2") format("woff2");
+  unicode-range: U+0000-00FF,U+0131,U+0152-0153,U+02BB-02BC,U+02C6,U+02DA,U+02DC,U+0304,U+0308,U+0329,U+2000-206F,U+20AC,U+2122,U+2191,U+2193,U+2212,U+2215,U+FEFF,U+FFFD;
+}
+@font-face {
+  font-family: "Inter Variable"; font-style: normal; font-display: swap; font-weight: 100 900;
+  src: url("./assets/fonts/inter-cyrillic-wght-normal.woff2") format("woff2");
+  unicode-range: U+0301,U+0400-045F,U+0490-0491,U+04B0-04B1,U+2116;
+}
+
 /* Manual dark mode driven by <html data-theme>, set pre-paint in index.html and
    toggled by useTheme(). */
 @custom-variant dark (&:where([data-theme="dark"], [data-theme="dark"] *));
 
-/* Semantic design tokens (Keenetic palette). Light by default; the values flip
-   under [data-theme="dark"], so every Tailwind `*-<token>` utility adapts. */
+/* shadcn preset b27GcrTs: Rhea / Neutral / Inter / small radius.
+   Keep the project's semantic aliases so all existing screens share the palette. */
 :root {
-  --c-bg: #eef2f7; --c-panel: #ffffff; --c-ink: #25313f; --c-ink-soft: #4a5868; --c-muted: #8a97a8;
-  --c-line: #e4e9f0; --c-line-soft: #eef2f7; --c-accent: #1f8ceb; --c-accent-d: #1670c4; --c-accent-w: #eaf4fe;
-  --c-ok: #25b06b; --c-ok-bg: #e6f7ee; --c-bad: #e0544b; --c-bad-bg: #fdebea; --c-warn: #f0a020; --c-warn-bg: #fdf2dd;
-  --c-input: #ffffff; --c-track: #cfd8e3;
+  --c-bg: oklch(1 0 0); --c-panel: oklch(1 0 0); --c-ink: oklch(0.145 0 0); --c-ink-soft: #525252; --c-muted: #737373;
+  --c-line: oklch(0.922 0 0); --c-line-soft: oklch(0.97 0 0); --c-accent: oklch(0.205 0 0); --c-accent-d: #262626; --c-accent-w: oklch(0.97 0 0);
+  --c-ok: #15803d; --c-ok-bg: #f0fdf4; --c-bad: #b91c1c; --c-bad-bg: #fef2f2; --c-warn: #92400e; --c-warn-bg: #fffbeb;
+  --c-input: #ffffff; --c-track: #d4d4d4;
+  --rhea-input: oklch(0.922 0 0);
+  /* VS Code token palette, as used by nfqws-keenetic-web; surfaces stay Neutral. */
+  --syntax-comment: #008000; --syntax-keyword: #0000ff; --syntax-string: #a31515; --syntax-number: #098658;
+  --syntax-function: #795e26; --syntax-variable: #0070c1; --syntax-type: #267f99; --syntax-control: #af00db;
+  --syntax-operator: #383a42; --syntax-punctuation: #383a42; --syntax-invalid: #b91c1c;
+  --editor-bg: #fafafa; --editor-gutter: #f5f5f5; --editor-active-line: #f0f0f0;
+  --editor-selection: #e5e5e5; --editor-search-match: #e8e8e8; --editor-selection-match: #eeeeee;
   color-scheme: light;
 
-  /* shadcn / Base-UI token bridge → Keenetic palette. Values reference --c-* so
+  /* shadcn / Base-UI token bridge. Values reference --c-* so
      they auto-flip under [data-theme="dark"] with no duplicate dark block.
      NOTE: `accent`, `muted`, `input` already exist as project color utilities,
      so shadcn's hover-`accent`/`muted` backgrounds and input border are expressed
@@ -25,7 +44,7 @@
   --popover: var(--c-panel);
   --popover-foreground: var(--c-ink);
   --primary: var(--c-accent);
-  --primary-foreground: #ffffff;
+  --primary-foreground: oklch(0.985 0 0);
   --secondary: var(--c-line-soft);
   --secondary-foreground: var(--c-ink);
   --muted-foreground: var(--c-muted);
@@ -33,14 +52,23 @@
   --destructive: var(--c-bad);
   --destructive-foreground: #ffffff;
   --border: var(--c-line);
-  --ring: var(--c-accent);
-  --radius: 0.625rem;
+  --ring: oklch(0.708 0 0);
+  --radius: 0.45rem;
 }
 [data-theme="dark"] {
-  --c-bg: #0f151d; --c-panel: #1a232f; --c-ink: #e7edf5; --c-ink-soft: #aeb9c7; --c-muted: #7c899a;
-  --c-line: #2a3645; --c-line-soft: #222d3a; --c-accent: #3a9bf0; --c-accent-d: #2f80d8; --c-accent-w: #14304a;
-  --c-ok: #34c07a; --c-ok-bg: #142c22; --c-bad: #ef6a60; --c-bad-bg: #3a201e; --c-warn: #f0a836; --c-warn-bg: #2e2410;
-  --c-input: #131b25; --c-track: #3a4756;
+  --c-bg: oklch(0.145 0 0); --c-panel: oklch(0.205 0 0); --c-ink: oklch(0.985 0 0); --c-ink-soft: #d4d4d4; --c-muted: #a3a3a3;
+  --c-line: oklch(1 0 0 / 10%); --c-line-soft: oklch(0.269 0 0); --c-accent: oklch(0.922 0 0); --c-accent-d: #e5e5e5; --c-accent-w: oklch(0.269 0 0);
+  --c-ok: #86cba0; --c-ok-bg: #16291e; --c-bad: #f0a09b; --c-bad-bg: #321d1d; --c-warn: #e7c38b; --c-warn-bg: oklch(0.269 0 0);
+  --c-input: #202020; --c-track: #404040;
+  --rhea-input: oklch(1 0 0 / 15%);
+  --primary-foreground: oklch(0.205 0 0);
+  --destructive-foreground: #321d1d;
+  --ring: oklch(0.556 0 0);
+  --syntax-comment: #6a9955; --syntax-keyword: #569cd6; --syntax-string: #ce9178; --syntax-number: #b5cea8;
+  --syntax-function: #dcdcaa; --syntax-variable: #9cdcfe; --syntax-type: #4ec9b0; --syntax-control: #c586c0;
+  --syntax-operator: #d4d4d4; --syntax-punctuation: #d4d4d4; --syntax-invalid: #f0a09b;
+  --editor-bg: var(--c-bg); --editor-gutter: var(--c-panel); --editor-active-line: #202020;
+  --editor-selection: #303030; --editor-search-match: #303030; --editor-selection-match: #242424;
   color-scheme: dark;
 }
 
@@ -62,8 +90,11 @@
   --color-warn: var(--c-warn);
   --color-warn-bg: var(--c-warn-bg);
   --color-input: var(--c-input);
+  --color-rhea-input: var(--rhea-input);
   --color-track: var(--c-track);
-  --font-mono: ui-monospace, Consolas, monospace;
+  --font-sans: "Inter Variable", Inter, -apple-system, "Segoe UI", sans-serif;
+  --font-heading: "Inter Variable", Inter, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: ui-monospace, "SFMono-Regular", Consolas, "Liberation Mono", monospace;
 
   /* shadcn token utilities: bg-primary, text-foreground, bg-card, border-border,
      ring-ring, rounded-lg/md/sm, … `accent`/`muted`/`input` deliberately omitted
@@ -87,12 +118,20 @@
   --radius-lg: var(--radius);
   --radius-md: calc(var(--radius) - 2px);
   --radius-sm: calc(var(--radius) - 4px);
+  --radius-xl: calc(var(--radius) + 4px);
 }
 
 html, body, #root { height: 100%; }
 body {
   margin: 0; background: var(--c-bg); color: var(--c-ink); overflow: hidden;
-  font-family: -apple-system, "Segoe UI", Roboto, system-ui, sans-serif; -webkit-font-smoothing: antialiased;
+  font-family: var(--font-sans); -webkit-font-smoothing: antialiased;
+}
+
+::selection { background: var(--editor-selection); color: var(--c-ink); }
+input[type="checkbox"], input[type="radio"] { accent-color: var(--c-accent); }
+* { scrollbar-color: var(--c-track) transparent; scrollbar-width: thin; }
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { scroll-behavior: auto !important; transition-duration: 0.01ms !important; animation-duration: 0.01ms !important; }
 }
 
 /* Clamp long nfqws2 arg strings to 3 lines (full text in the title tooltip). */

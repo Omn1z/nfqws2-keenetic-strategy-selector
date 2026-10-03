@@ -145,7 +145,7 @@ func TestSchedulerMaintenanceSpecialPoolReplyDoesNotBecomeClientAnswer(t *testin
 	backend.routes = backend.routes[:1]
 	special := r.cfg.DefaultPool[0]
 	r.cfg.DefaultPool = nil
-	r.cfg.Rules = []Rule{{ID: "special", Enabled: true, Domain: "claude.ai", Upstream: special}}
+	r.cfg.Rules = []Rule{{ID: "special", Enabled: true, Domain: "claude.ai", Upstream: special, Pool: []Upstream{r.cfg.DefaultUpstream}}}
 	r.cfg.CacheSize = 8
 	r.scheduler.record(AttemptEvent{Route: backend.routes[0].ID, Upstream: r.cfg.DefaultUpstream.Address, Success: true, DurationMS: 20})
 	var observed atomic.Int32
@@ -165,8 +165,14 @@ func TestSchedulerMaintenanceSpecialPoolReplyDoesNotBecomeClientAnswer(t *testin
 	if r.CacheStatus().Entries != 0 || observed.Load() != 0 {
 		t.Fatal("special probe produced a client answer or backend route observation")
 	}
-	if candidate := r.SchedulerSnapshot("claude.ai").Candidates[0]; candidate.ProbeSuccesses != 1 {
-		t.Fatalf("special probe was not measured: %+v", candidate)
+	found := false
+	for _, candidate := range r.SchedulerSnapshot("claude.ai").Candidates {
+		if candidate.Upstream == special.Address {
+			found = candidate.ProbeSuccesses == 1
+		}
+	}
+	if !found {
+		t.Fatal("special probe was not measured in its competitive pool")
 	}
 }
 
@@ -201,7 +207,7 @@ func TestSchedulerMaintenanceShutdownCancelsProbeNeutrally(t *testing.T) {
 		<-req.Context().Done()
 		close(canceled)
 	}))
-	backend.routes = backend.routes[:1]
+	backend.routes = backend.routes[:2]
 	r.cfg.DefaultPool, r.cfg.TimeoutSeconds = nil, 5
 	var notifications atomic.Int32
 	r.SetAttemptObserver(func(AttemptEvent) { notifications.Add(1) })
@@ -223,7 +229,7 @@ func TestSchedulerMaintenanceShutdownCancelsProbeNeutrally(t *testing.T) {
 
 func TestSchedulerMaintenanceFailedProbeRecordsDiagnostic(t *testing.T) {
 	r, backend := newPoolResolverFixture(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusServiceUnavailable) }))
-	backend.routes = backend.routes[:1]
+	backend.routes = backend.routes[:2]
 	r.cfg.DefaultPool = nil
 	events := make(chan AttemptEvent, 1)
 	r.SetAttemptObserver(func(event AttemptEvent) { events <- event })
@@ -236,8 +242,14 @@ func TestSchedulerMaintenanceFailedProbeRecordsDiagnostic(t *testing.T) {
 	default:
 		t.Fatal("failed probe emitted no diagnostic")
 	}
-	if candidate := r.SchedulerSnapshot("").Candidates[0]; candidate.ProbeFailures != 1 || candidate.Failures != 1 || candidate.Probing {
-		t.Fatalf("failed probe did not update scheduler: %+v", candidate)
+	found := false
+	for _, candidate := range r.SchedulerSnapshot("").Candidates {
+		if candidate.Route == backend.routes[0].ID {
+			found = candidate.ProbeFailures == 1 && candidate.Failures == 1 && !candidate.Probing
+		}
+	}
+	if !found {
+		t.Fatal("failed probe did not update its own scheduler pair")
 	}
 }
 

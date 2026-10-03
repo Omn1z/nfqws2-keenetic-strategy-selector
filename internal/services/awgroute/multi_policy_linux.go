@@ -3,6 +3,7 @@
 package awgroute
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"os"
@@ -50,8 +51,18 @@ type awgMultiRule struct {
 	RuleIndex     int
 }
 
-func (svc *Service) awgApplyMultiPolicyOS() error {
-	rules, tunnels := svc.awgBuildMultiPolicy()
+func (svc *Service) awgApplyMultiPolicyOS() (applyErr error) {
+	return svc.awgApplyMultiPolicyWithResolveOS(true)
+}
+
+func (svc *Service) awgApplyMultiPolicyCachedOS() error {
+	return svc.awgApplyMultiPolicyWithResolveOS(false)
+}
+
+func (svc *Service) awgApplyMultiPolicyWithResolveOS(resolve bool) (applyErr error) {
+	rules, tunnels := svc.awgBuildMultiPolicyWithResolve(resolve)
+	finishDNS := svc.routingDNSGate.begin(true)
+	defer func() { finishDNS(applyErr) }()
 	svc.awgClearLegacyPolicyOS()
 	svc.awgClearMultiPolicyOS()
 	if len(rules) == 0 || len(tunnels) == 0 {
@@ -68,11 +79,14 @@ func (svc *Service) awgApplyMultiPolicyOS() error {
 		return err
 	}
 	dnsOn := svc.awgEnsureMultiDNSProxy(rules)
-	if err := awgWriteMultiHook(tunnels, rules, dnsOn, svc.dnsChainEnabled()); err != nil {
+	if awgMultiDynamicRuleCount(rules) > 0 && !dnsOn {
+		return fmt.Errorf("multi-routing: DNS route learner failed to start")
+	}
+	if err := awgWriteMultiHook(tunnels, rules, dnsOn); err != nil {
 		return err
 	}
 	awgSetAccel(false)
-	svc.awgStartMultiPolicyRefresh()
+	svc.awgStartMultiPolicyRefresh(rules, tunnels)
 	logbuf.Append("awg2", "info", "multi-routing: policy rules applied: "+strconv.Itoa(len(rules)))
 	return nil
 }
@@ -86,6 +100,12 @@ func (svc *Service) awgBuildMultiPolicyCached() ([]awgMultiRule, []awgMultiTunne
 }
 
 func (svc *Service) awgBuildMultiPolicyWithResolve(resolve bool) ([]awgMultiRule, []awgMultiTunnel) {
+	lookup := svc.policyDNSLookup(false, nil)
+	if resolve {
+		var cancel context.CancelFunc
+		lookup, cancel = svc.policyDNSWarmupLookup(resolveDomainAllContext)
+		defer cancel()
+	}
 	servers := map[string]*managedServer{}
 	for _, srv := range svc.serverSnapshot() {
 		servers[srv.ID] = srv
@@ -123,13 +143,19 @@ func (svc *Service) awgBuildMultiPolicyWithResolve(resolve bool) ([]awgMultiRule
 		// alone repairs absent interfaces; preserving the slot while down keeps
 		// other tunnels' marks/tables stable and the configured killswitch intact.
 		endpointIP := svc.cachedPolicyHostIP(hostOf(cfg.Endpoint))
+		if !resolve {
+			endpointIP = svc.cachedPolicyEndpointIP(hostOf(cfg.Endpoint))
+		}
 		if resolve && endpointIP == "" {
-			endpointIP = resolveHostIP(hostOf(cfg.Endpoint))
+			endpointIP = svc.resolvePolicyHostIP(hostOf(cfg.Endpoint))
 			svc.rememberPolicyDNS(hostOf(cfg.Endpoint), []string{endpointIP})
 		}
 		if endpointIP == "" && resolve {
 			logbuf.Append("awg2", "warn", "multi-routing: endpoint is not resolved for "+iface)
 			return nil
+		}
+		if resolve && endpointIP != "" {
+			svc.rememberPolicyEndpointIP(hostOf(cfg.Endpoint), endpointIP)
 		}
 		if len(tunnelOrder) >= awgMultiMax {
 			logbuf.Append("awg2", "warn", "multi-routing: too many tunnels, skipping "+iface)
@@ -165,7 +191,7 @@ func (svc *Service) awgBuildMultiPolicyWithResolve(resolve bool) ([]awgMultiRule
 
 	out := []awgMultiRule{}
 	for i, z := range svc.awgRoutingRules() {
-		if !z.Enabled {
+		if !z.Enabled || z.WaitingForConnection {
 			continue
 		}
 		primaryID := strings.TrimSpace(z.TunnelID)
@@ -210,7 +236,7 @@ func (svc *Service) awgBuildMultiPolicyWithResolve(resolve bool) ([]awgMultiRule
 			Sources:   awgCleanMultiSources(z.SourceIPs),
 			RuleIndex: i,
 		}
-		r.Entries, r.CatchAll, r.StaticOK = svc.awgMultiRuleEntriesWithLookup(z, svc.policyDNSLookup(resolve, resolveDomainAll))
+		r.Entries, r.CatchAll, r.StaticOK = svc.awgMultiRuleEntriesWithLookup(z, lookup)
 		r.DomainEntries = svc.awgMultiRuleDomainEntries(z)
 		if len(r.DomainEntries) > 0 {
 			ms, _ := awg.CompileMatcherSet(r.DomainEntries)
@@ -242,12 +268,14 @@ func (svc *Service) awgBuildMultiPolicyWithResolve(resolve bool) ([]awgMultiRule
 }
 
 func (svc *Service) awgMultiRuleDomainEntries(z awg.Zone) []string {
-	expDomains, _ := svc.expandEntries(z.Domains)
+	expDomains, _ := svc.expandZoneEntries(z)
 	return awgDropCatchAll(expDomains)
 }
 
 func (svc *Service) awgMultiRuleEntries(z awg.Zone) ([]string, bool, bool) {
-	return svc.awgMultiRuleEntriesWithLookup(z, svc.policyDNSLookup(true, resolveDomainAll))
+	lookup, cancel := svc.policyDNSWarmupLookup(resolveDomainAllContext)
+	defer cancel()
+	return svc.awgMultiRuleEntriesWithLookup(z, lookup)
 }
 
 func awgCleanMultiSources(in []string) []string {
@@ -306,6 +334,10 @@ func awgWriteMultiSets(rules []awgMultiRule) error {
 
 func (svc *Service) awgInstallMultiRoutes(tunnels []awgMultiTunnel) error {
 	gw, wandev := awgDefaultRoute()
+	routeRules, err := awgRun("ip rule show")
+	if err != nil {
+		return awgCmdErr("ip rule show", routeRules, err)
+	}
 	var firstErr error
 	for _, t := range tunnels {
 		awgTuneClientKernelBuffers()
@@ -322,19 +354,68 @@ func (svc *Service) awgInstallMultiRoutes(tunnels []awgMultiTunnel) error {
 				firstErr = fmt.Errorf("ip tunnel route %s: %w", t.Iface, err)
 			}
 		}
-		_, _ = awgRun("ip rule add pref " + strconv.Itoa(awgMultiPref(t)) + " fwmark " + t.Mark + "/" + awgMultiMarkMask + " table " + strconv.Itoa(t.Table) + " 2>/dev/null")
+		if !awgMultiHasRouteRule(routeRules, t) {
+			if err := awgRunCheck("ip rule add pref " + strconv.Itoa(awgMultiPref(t)) + " fwmark " + t.Mark + "/" + awgMultiMarkMask + " table " + strconv.Itoa(t.Table)); err != nil && firstErr == nil {
+				firstErr = fmt.Errorf("ip tunnel rule %s: %w", t.Iface, err)
+			}
+		}
 		if t.Killswitch {
-			_, _ = awgRun("ip route replace blackhole default table " + strconv.Itoa(t.Table) + " metric 1000")
+			if err := awgRunCheck("ip route replace blackhole default table " + strconv.Itoa(t.Table) + " metric 1000"); err != nil && firstErr == nil {
+				firstErr = fmt.Errorf("ip tunnel killswitch %s: %w", t.Iface, err)
+			}
 		}
 	}
 	return firstErr
 }
 
-func awgWriteMultiHook(tunnels []awgMultiTunnel, rules []awgMultiRule, dnsRedirect, chainEnabled bool) error {
+// Existing rules are expected during a watchdog re-assertion. Recognize only
+// our complete pref/mark/mask/table selector, rather than treating every failed
+// add as harmless (which previously hid missing policy rules).
+func awgMultiHasRouteRule(output string, tunnel awgMultiTunnel) bool {
+	wantMark, markErr := strconv.ParseUint(tunnel.Mark, 0, 32)
+	wantMask, maskErr := strconv.ParseUint(awgMultiMarkMask, 0, 32)
+	if markErr != nil || maskErr != nil {
+		return false
+	}
+	for _, line := range strings.Split(output, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 1 {
+			continue
+		}
+		pref, err := strconv.Atoi(strings.TrimSuffix(fields[0], ":"))
+		if err != nil || pref != awgMultiPref(tunnel) {
+			continue
+		}
+		var mark, mask uint64
+		var table int
+		for i := 1; i+1 < len(fields); i++ {
+			switch fields[i] {
+			case "fwmark":
+				parts := strings.SplitN(fields[i+1], "/", 2)
+				mark, err = strconv.ParseUint(parts[0], 0, 32)
+				if err != nil {
+					continue
+				}
+				mask = 0xffffffff
+				if len(parts) == 2 {
+					mask, _ = strconv.ParseUint(parts[1], 0, 32)
+				}
+			case "lookup", "table":
+				table, _ = strconv.Atoi(fields[i+1])
+			}
+		}
+		if mark == wantMark && mask == wantMask && table == tunnel.Table {
+			return true
+		}
+	}
+	return false
+}
+
+func awgWriteMultiHook(tunnels []awgMultiTunnel, rules []awgMultiRule, dnsRedirect bool) error {
 	if err := os.MkdirAll(filepath.Dir(awgMultiHookPath), 0o755); err != nil {
 		return err
 	}
-	hook := awgMultiFirewallHook(tunnels, rules, dnsRedirect, chainEnabled)
+	hook := awgMultiFirewallHook(tunnels, rules, dnsRedirect)
 	if err := os.WriteFile(awgMultiHookPath, []byte(hook), 0o755); err != nil {
 		return err
 	}
@@ -349,23 +430,8 @@ func awgWriteMultiHook(tunnels []awgMultiTunnel, rules []awgMultiRule, dnsRedire
 	return nil
 }
 
-func awgMultiFirewallHook(tunnels []awgMultiTunnel, rules []awgMultiRule, dnsRedirect, chainEnabled bool) string {
-	var s, doc strings.Builder
-	dnsPortHex := "14EA"
-	if p, err := strconv.Atoi(awgDNSPort); err == nil {
-		dnsPortHex = fmt.Sprintf("%04X", p)
-	}
-	s.WriteString("#!/bin/sh\n")
-	s.WriteString("set -e\n")
-	s.WriteString("# AWG2 multi-tunnel policy routing hook - managed by nfqws2-strategy.\n")
-	s.WriteString("while iptables -w -t mangle -D PREROUTING -j " + awgMultiChain + " 2>/dev/null; do :; done\n")
-	s.WriteString("while iptables -w -t mangle -D OUTPUT -j " + awgMultiChain + " 2>/dev/null; do :; done\n")
-	s.WriteString("iptables -w -t mangle -N " + awgMultiChain + " 2>/dev/null || true\n")
-	s.WriteString("iptables -w -t mangle -F " + awgMultiChain + " 2>/dev/null || true\n")
-	s.WriteString(awgMultiSharedCleanupShell())
-	s.WriteString("IPTABLES_RESTORE='iptables-restore --noflush'\n")
-	s.WriteString("if iptables-restore --help 2>&1 | grep -q -- ' -w'; then IPTABLES_RESTORE='iptables-restore -w --noflush'; fi\n")
-
+func awgMultiPolicyDocument(tunnels []awgMultiTunnel, rules []awgMultiRule) string {
+	var doc strings.Builder
 	doc.WriteString("*mangle\n")
 	doc.WriteString(":" + awgMultiChain + " -\n")
 	for _, ex := range awgExcludes {
@@ -377,8 +443,7 @@ func awgMultiFirewallHook(tunnels []awgMultiTunnel, rules []awgMultiRule, dnsRed
 		}
 	}
 	for _, r := range rules {
-		matches := awgMultiRuleMatches(r)
-		for _, match := range matches {
+		for _, match := range awgMultiRuleMatches(r) {
 			if r.Zone.RouteValue() == "direct" {
 				doc.WriteString("-A " + awgMultiChain + match + " -j RETURN\n")
 				continue
@@ -391,11 +456,30 @@ func awgMultiFirewallHook(tunnels []awgMultiTunnel, rules []awgMultiRule, dnsRed
 		}
 	}
 	doc.WriteString("COMMIT\n")
-	s.WriteString("$IPTABLES_RESTORE <<'AWGMV4'\n")
-	s.WriteString(doc.String())
-	s.WriteString("AWGMV4\n")
-	s.WriteString("iptables -w -t mangle -I PREROUTING 1 -j " + awgMultiChain + "\n")
-	s.WriteString("iptables -w -t mangle -I OUTPUT 1 -j " + awgMultiChain + "\n")
+	return doc.String()
+}
+
+func awgMultiFirewallHook(tunnels []awgMultiTunnel, rules []awgMultiRule, dnsRedirect bool) string {
+	var s strings.Builder
+	dnsPortHex := "14EA"
+	if p, err := strconv.Atoi(awgDNSPort); err == nil {
+		dnsPortHex = fmt.Sprintf("%04X", p)
+	}
+	s.WriteString("#!/bin/sh\n")
+	s.WriteString("set -e\n")
+	s.WriteString("# AWG2 multi-tunnel policy routing hook - managed by nfqws2-strategy.\n")
+	// --noflush rebuilds a declared user chain at COMMIT. Keep the live chain
+	// and its jumps intact while preparing the replacement; separate -F/-D
+	// calls otherwise let existing packets escape the policy during refresh.
+
+	s.WriteString(awgFirewallRestoreShell("awg_restore_multi", "iptables-restore", "AWGMV4", awgMultiPolicyDocument(tunnels, rules)))
+	s.WriteString("awg_restore_multi\n")
+	for _, chain := range []string{"PREROUTING", "OUTPUT"} {
+		// An existing jump below another marking chain must regain priority.
+		// Insert the desired first jump without detaching the live one.
+		s.WriteString("if ! iptables -w -t mangle -S " + chain + " | awk '$1 == \"-A\" { ok = ($3 == \"-j\" && $4 == \"" + awgMultiChain + "\"); exit } END { exit !ok }'; then\n")
+		s.WriteString("  iptables -w -t mangle -I " + chain + " 1 -j " + awgMultiChain + "\nfi\n")
+	}
 	fw4Ifaces := make([]string, 0, len(tunnels))
 	for _, t := range tunnels {
 		mss := t.MTU - 40
@@ -404,24 +488,26 @@ func awgMultiFirewallHook(tunnels []awgMultiTunnel, rules []awgMultiRule, dnsRed
 		}
 		ms := strconv.Itoa(mss)
 		fw4Ifaces = append(fw4Ifaces, t.Iface)
-		s.WriteString("iptables -w -t nat -A POSTROUTING -o " + t.Iface + " -j MASQUERADE 2>/dev/null || true\n")
-		s.WriteString("iptables -w -A FORWARD -i " + t.Iface + " -j ACCEPT 2>/dev/null || true\n")
-		s.WriteString("iptables -w -A FORWARD -o " + t.Iface + " -j ACCEPT 2>/dev/null || true\n")
-		s.WriteString("iptables -w -t mangle -A FORWARD -o " + t.Iface + " -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss " + ms + " 2>/dev/null || true\n")
-		s.WriteString("iptables -w -t mangle -A FORWARD -i " + t.Iface + " -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss " + ms + " 2>/dev/null || true\n")
+		for _, rule := range []struct{ table, chain, match string }{
+			{"nat", "POSTROUTING", "-o " + t.Iface + " -j MASQUERADE"},
+			{"filter", "FORWARD", "-i " + t.Iface + " -j ACCEPT"},
+			{"filter", "FORWARD", "-o " + t.Iface + " -j ACCEPT"},
+			{"mangle", "FORWARD", "-o " + t.Iface + " -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss " + ms},
+			{"mangle", "FORWARD", "-i " + t.Iface + " -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss " + ms},
+		} {
+			base := "iptables -w -t " + rule.table
+			s.WriteString(base + " -C " + rule.chain + " " + rule.match + " 2>/dev/null || " + base + " -A " + rule.chain + " " + rule.match + "\n")
+		}
 	}
 	s.WriteString(awgFW4ForwardRulesShell(fw4Ifaces))
 	if dnsRedirect {
 		redirectPort := awgDNSPort
-		if chainEnabled {
-			redirectPort = awgPiholeDNSPort
-		}
 		s.WriteString("if grep -qi ':" + dnsPortHex + " ' /proc/net/udp /proc/net/udp6 2>/dev/null; then\n")
 		s.WriteString("  for br in $(ls /sys/class/net/ 2>/dev/null | grep '^br'); do\n")
 		for _, proto := range []string{"udp", "tcp"} {
 			r := "-i $br -p " + proto + " --dport 53 -j REDIRECT --to-ports " + redirectPort
-			s.WriteString("    iptables -t nat -C PREROUTING " + r + " 2>/dev/null || iptables -t nat -A PREROUTING " + r + "\n")
-			s.WriteString("    ip6tables -t nat -C PREROUTING " + r + " 2>/dev/null || ip6tables -t nat -A PREROUTING " + r + "\n")
+			s.WriteString("    iptables -w -t nat -C PREROUTING " + r + " 2>/dev/null || iptables -w -t nat -A PREROUTING " + r + "\n")
+			s.WriteString("    ip6tables -w -t nat -C PREROUTING " + r + " 2>/dev/null || ip6tables -w -t nat -A PREROUTING " + r + "\n")
 		}
 		s.WriteString("  done\nfi\n")
 	}
@@ -493,7 +579,8 @@ func (svc *Service) awgClearMultiPolicyOS() {
 	_, _ = awgRun("iptables -w -t mangle -X " + awgMultiChain + " 2>/dev/null")
 	_, _ = awgRun(awgMultiSharedCleanupShell())
 	awgClearMultiRouteRules(awgRun)
-	_, _ = awgRun("for s in $(ipset list -n 2>/dev/null | awk '/^" + awgMultiSetPrefix + "_[0-9][0-9][0-9]$/ {print $1}'); do ipset destroy \"$s\" 2>/dev/null; done")
+	// Include unreferenced staging sets left by an interrupted periodic swap.
+	_, _ = awgRun("for s in $(ipset list -n 2>/dev/null | awk '/^" + awgMultiSetPrefix + "_[0-9][0-9][0-9](_r)?$/ {print $1}'); do ipset destroy \"$s\" 2>/dev/null; done")
 }
 
 // Clear every reserved slot, including stale rules from removed tunnels. Run
@@ -518,8 +605,13 @@ func awgClearMultiRouteRules(run func(string) (string, error)) {
 	}
 }
 
-func (svc *Service) awgStartMultiPolicyRefresh() {
+func (svc *Service) awgStartMultiPolicyRefresh(rules []awgMultiRule, tunnels []awgMultiTunnel) {
 	svc.awgStopMultiPolicyRefresh()
+	// Capture the installed policy once. Re-expanding large domain lists on
+	// every unchanged minute tick can itself create CPU/lock spikes. A real
+	// config/fallback apply stops this loop and installs its new snapshot.
+	rules = awgCloneMultiRules(rules)
+	tunnels = append([]awgMultiTunnel(nil), tunnels...)
 	svc.route.mu.Lock()
 	stop := make(chan struct{})
 	svc.route.multiStopRefresh = stop
@@ -541,32 +633,62 @@ func (svc *Service) awgStartMultiPolicyRefresh() {
 					continue
 				}
 				ticks++
-				if _, err := os.Stat(awgMultiHookPath); err != nil || ticks%15 == 0 {
-					rules, tunnels := svc.awgBuildMultiPolicyCached()
-					if len(rules) == 0 || len(tunnels) == 0 {
-						unlock()
-						continue
+				_, hookErr := os.Stat(awgMultiHookPath)
+				if len(rules) == 0 || len(tunnels) == 0 {
+					unlock()
+					continue
+				}
+				wasReady := svc.RoutingDNSReadiness().Ready
+				svc.route.mu.Lock()
+				proxy := svc.route.dnsProxy
+				svc.route.mu.Unlock()
+				dnsOn := proxy != nil && proxy.Running()
+				healthy := wasReady && hookErr == nil && (awgMultiDynamicRuleCount(rules) == 0 || dnsOn) && svc.awgMultiPolicyIntact(rules, tunnels, dnsOn)
+				refreshRules := rules
+				if !healthy || ticks%15 == 0 {
+					// Prepare cached entries before blocking DNS readers. Never
+					// resolve unused domains or alter the applied rule bindings.
+					refreshRules = awgCloneMultiRules(rules)
+					lookup := svc.policyDNSLookup(false, nil)
+					for i := range refreshRules {
+						refreshRules[i].Entries, _, _ = svc.awgMultiRuleEntriesWithLookup(refreshRules[i].Zone, lookup)
 					}
-					if err := awgWriteMultiSets(rules); err != nil {
-						logbuf.Append("awg2", "warn", "multi-routing refresh: "+err.Error())
+				}
+				err := svc.awgMaintainMultiPolicy(hookErr != nil, ticks, func() bool { return healthy }, func() error {
+					// Same policy: stage and atomically swap sets while retaining
+					// all learned addresses, their options, and the running proxy.
+					return awgRefreshMultiSets(refreshRules)
+				}, func() error {
+					// Missing/reset kernel state and a previous failed install
+					// still require a complete, synchronous recovery.
+					if wasReady {
+						if err := awgEnsureMultiSets(refreshRules); err != nil {
+							return err
+						}
+						if err := awgRefreshMultiSets(refreshRules); err != nil {
+							return err
+						}
+					} else if err := awgWriteMultiSets(refreshRules); err != nil {
+						return err
 					}
 					if err := svc.awgInstallMultiRoutes(tunnels); err != nil {
-						logbuf.Append("awg2", "warn", "multi-routing refresh: "+err.Error())
+						return err
 					}
-					dnsOn := svc.awgEnsureMultiDNSProxy(rules)
-					if err := awgWriteMultiHook(tunnels, rules, dnsOn, svc.dnsChainEnabled()); err != nil {
-						logbuf.Append("awg2", "warn", "multi-routing refresh: "+err.Error())
+					if !wasReady || !dnsOn {
+						dnsOn = svc.awgEnsureMultiDNSProxy(rules)
 					}
-				} else {
-					tunnels := svc.awgBuildMultiTunnelsOnly()
-					if len(tunnels) > 0 {
-						if err := svc.awgInstallMultiRoutes(tunnels); err != nil {
-							logbuf.Append("awg2", "warn", "multi-routing refresh: "+err.Error())
-						}
+					if awgMultiDynamicRuleCount(rules) > 0 && !dnsOn {
+						return fmt.Errorf("multi-routing: DNS route learner failed to start")
 					}
-					_, _ = awgRun("sh " + awgMultiHookPath)
+					if err := awgWriteMultiHook(tunnels, rules, dnsOn); err != nil {
+						return err
+					}
+					awgSetAccel(false)
+					return nil
+				})
+				if err != nil {
+					logbuf.Append("awg2", "warn", "multi-routing refresh: "+err.Error())
 				}
-				awgSetAccel(false)
 				unlock()
 			}
 		}
@@ -607,7 +729,7 @@ func (svc *Service) awgBuildMultiTunnelsOnly() []awgMultiTunnel {
 		if !validAWGClientIfaceName(iface) || strings.TrimSpace(cfg.Endpoint) == "" {
 			continue
 		}
-		endpointIP := svc.cachedPolicyHostIP(hostOf(cfg.Endpoint))
+		endpointIP := svc.cachedPolicyEndpointIP(hostOf(cfg.Endpoint))
 		if len(tunnelOrder) >= awgMultiMax {
 			continue
 		}

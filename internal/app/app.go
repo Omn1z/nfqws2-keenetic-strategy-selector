@@ -4,7 +4,6 @@
 package app
 
 import (
-	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -22,7 +21,6 @@ import (
 	"nfqws2strategy/internal/services/dnsserver"
 	"nfqws2strategy/internal/services/monitor"
 	"nfqws2strategy/internal/services/nfqws2"
-	"nfqws2strategy/internal/services/pihole"
 	"nfqws2strategy/internal/services/portforward"
 	"nfqws2strategy/internal/services/proxy"
 	"nfqws2strategy/internal/services/strategy/core/catalog"
@@ -68,7 +66,6 @@ type App struct {
 	awgroute  *awgroute.Service // AWG2 server + router client/split-routing (AWG2 tab)
 	blobs     *blobs.Service    // fake-payload blob store + ClientHello capture (Blobs tab)
 	portfwd   *portforward.Service
-	pihole    *pihole.Service // Pi-hole v6 container (ad-block, DNS sinkhole)
 	arpspoof  *arpspoof.Service
 	dnsServer *dnsserver.Service
 
@@ -122,7 +119,7 @@ func New(cfg *config.Config) (*App, error) {
 	// iptables chains / orphaned test nfqws2 children). Without this a killed run
 	// leaves an exclude-connmark rule that makes the MAIN nfqws2 skip connections.
 	engine.CleanupSandboxes(cfg, maxThreads)
-	// Clear leaked AWG routing before DNS/Pi-hole initialization. Start recovery
+	// Clear leaked AWG routing before DNS initialization. Start recovery
 	// only after initialization, so it cannot block startup on the lifecycle lock.
 	a.awgroute.RepairRouting()
 	if err := a.portfwd.Apply(); err != nil {
@@ -130,7 +127,6 @@ func New(cfg *config.Config) (*App, error) {
 	}
 	a.startGeoAutoLoop()
 	a.initAutomation()
-	a.initPihole()
 	if err := a.arpspoof.Apply(); err != nil {
 		logbuf.Append("arp-spoofing", "warn", err.Error())
 	}
@@ -143,76 +139,6 @@ func New(cfg *config.Config) (*App, error) {
 	})
 	a.dnsServer.StartEnabled()
 	return a, nil
-}
-
-// initPihole loads the persisted Pi-hole config or seeds defaults. The container
-// itself is not touched on boot — install/start is an explicit user action. The
-// chain-toggle hook is wired here so awgroute's DNS proxy upstream swaps live
-// when the user flips DNSChainEnabled in the UI.
-func (a *App) initPihole() {
-	var cfg pihole.Config
-	if err := a.store.Load("pihole.json", &cfg); err != nil || cfg.DataRoot == "" {
-		cfg = pihole.Default()
-		_ = a.store.Save("pihole.json", &cfg)
-	}
-	a.pihole = pihole.New(cfg)
-	// fw3 wipes our LAN-input rule on every reboot — re-apply at boot so the
-	// admin UI (port {ui_port}) stays reachable from the LAN without user action.
-	a.pihole.EnsureFirewall()
-	// Push add-subnet=32,128 into pi-hole's dnsmasq so the AWG2 trace log can
-	// show real LAN client IPs instead of pi-hole's 127.0.0.1 (it's the only
-	// peer our :5354 sees otherwise). Silent best-effort.
-	_ = a.pihole.EnsureAddSubnet()
-	// The bundled xiaomi-docker leaves a stale containerd shim directory on
-	// reboot, so a plain "--restart unless-stopped" doesn't actually bring the
-	// container back. Recover by remove+run if the container is in a bad state.
-	a.pihole.EnsureRunning()
-	// Inverted chain: pi-hole sits at the iptables REDIRECT target (its FTL
-	// port), and forwards to the AWG2 proxy as its only upstream. That keeps
-	// real client IPs in pi-hole's per-client log while still letting the proxy
-	// classify every (non-blocked) query for SNI/zone routing.
-	a.pihole.SetChainChangeHook(func(enabled bool, _ string) {
-		ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
-		defer cancel()
-		if enabled {
-			_ = a.pihole.SetUpstreams(ctx, []string{awgroute.DNSProxyUpstreamAddr()})
-		} else {
-			_ = a.pihole.SetUpstreams(ctx, nil) // restore FTL defaults
-		}
-		// Flip the iptables REDIRECT target so toggling actually removes pi-hole
-		// from the data plane (not just from its upstream role) when disabled.
-		a.awgroute.SetDNSChainEnabled(enabled)
-	})
-	// Apply the persisted state at boot so a chain-enabled config survives reboot.
-	a.awgroute.SetDNSChainEnabled(cfg.DNSChainEnabled)
-	if cfg.DNSChainEnabled {
-		// Run async with backoff — EnsureRunning() above can take 1-3 min on a
-		// cold start (image pull/extract), and FTL's :8053 isn't listening
-		// until well after that. A single synchronous SetUpstreams here would
-		// just hit "connection refused", swallow the error, and leave the
-		// persisted chain state silently NOT applied until the user toggles
-		// the UI by hand. Retry every 5s for ~5 min instead.
-		go func() {
-			for delay, total := 5*time.Second, time.Duration(0); total < 5*time.Minute; total += delay {
-				time.Sleep(delay)
-				ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
-				err := a.pihole.SetUpstreams(ctx, []string{awgroute.DNSProxyUpstreamAddr()})
-				cancel()
-				if err == nil {
-					return
-				}
-			}
-		}()
-	}
-}
-
-// Pihole exposes the service for the API layer.
-func (a *App) Pihole() *pihole.Service { return a.pihole }
-
-// SavePiholeConfig persists pi-hole settings + applies them.
-func (a *App) SavePiholeConfig(cfg pihole.Config) error {
-	a.pihole.SetConfig(cfg)
-	return a.store.Save("pihole.json", &cfg)
 }
 
 // Shutdown cancels any active run/block check, tears down every test sandbox

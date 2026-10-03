@@ -46,7 +46,9 @@ func TestSetRoutingRulesDoesNotRequireVPSHostForImportedLikeProfile(t *testing.T
 		awg: m,
 	}
 
-	err = svc.AWG2SetRoutingRules(awg.RoutingConfig{
+	_, unlock := svc.lockClientOps(false)
+	defer unlock()
+	err = svc.awgSaveRoutingRules(awg.RoutingConfig{
 		Mode:         "zones",
 		DomainSource: "dnsproxy",
 		Killswitch:   true,

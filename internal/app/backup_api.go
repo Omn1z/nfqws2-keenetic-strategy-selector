@@ -49,7 +49,7 @@ func (a *App) BackupRestore(r io.Reader) (int, error) {
 // In scope (selector state, restore makes the install whole):
 //   - Selector's own DataDir — awg.json (servers+peers+private keys + PSK +
 //     obfuscation Jc/Jmin/Jmax/S1/S2/H1..H4 + SSH creds + routing rules),
-//     pihole.json, automation.json, lists/, runs/, geo/, custom strategies,
+//     dnsserver.json, automation.json, lists/, runs/, geo/, custom strategies,
 //     settings, ipsets (awg2_inc/exc/recent) — every file the selector reads
 //     on boot.
 //   - /opt/etc/amnezia/amneziawg/awg0.conf — reference copy of the AWG tunnel
@@ -63,8 +63,7 @@ func (a *App) BackupRestore(r io.Reader) (int, error) {
 //
 // Out of scope (deliberately not backed up):
 //   - /data/xmir-init.sh — user's personal boot script; not selector state.
-//   - pi-hole's USB-mount data dir — managed by FTL itself; restoring would
-//     clobber Pi-hole's own UI state.
+//   - External containers and their data volumes.
 //
 // Missing paths are skipped silently inside the backup package, so listing
 // every plausible location here is safe across different deployments.

@@ -1,10 +1,13 @@
 import type { DnsServerLogEntry } from "@/types/api";
+import { dnsRequestSourceLabel } from "./dnsRequestSource";
 
 const cancellationEvents = new Set(["cancel", "canceled", "cancelled", "attempt_cancelled"]);
 const cacheEvents = new Set(["cache", "cache_hit"]);
 
 export const isLogProblem = (entry: DnsServerLogEntry) => entry.event !== "blocked" && (entry.level === "error" || entry.level === "warn" || ["error", "failure", "attempt_error"].includes(entry.event));
 export const isCancellation = (entry: DnsServerLogEntry) => cancellationEvents.has(entry.event);
+export const isCacheEvent = (entry: DnsServerLogEntry) => cacheEvents.has(entry.event);
+export const isSharedEvent = (entry: DnsServerLogEntry) => entry.event === "shared";
 export const logCount = (entry: DnsServerLogEntry) => Number.isSafeInteger(entry.count) && (entry.count ?? 0) > 0 ? entry.count! : 1;
 
 export function compactLogMessage(entry: DnsServerLogEntry): string {
@@ -23,7 +26,7 @@ export function shortProvider(address: string): string {
 
 export function matchesLogFilter(entry: DnsServerLogEntry, query: string, routeName: (id: string) => string = (id) => id): boolean {
   const meta = logEventPresentation(entry);
-  return [entry.domain, entry.qtype, entry.route, entry.route ? routeName(entry.route) : "", entry.upstream, entry.message, entry.event, entry.block_category, entry.block_rule, entry.block_source, entry.block_domain, meta.label, meta.symbol]
+  return [entry.domain, entry.qtype, entry.client_ip, entry.source, dnsRequestSourceLabel(entry.source), entry.transport, entry.route, entry.route ? routeName(entry.route) : "", entry.upstream, entry.message, entry.event, entry.block_category, entry.block_rule, entry.block_source, entry.block_domain, meta.label, meta.symbol]
     .filter(Boolean).join(" ").toLowerCase().includes(query.trim().toLowerCase());
 }
 
@@ -33,6 +36,7 @@ export function logEventPresentation(entry: DnsServerLogEntry): EventPresentatio
   if (isLogProblem(entry)) return { symbol: "!", label: entry.event === "attempt_error" ? "Ошибка маршрута" : "Ошибка", tone: entry.level === "warn" ? "warn" : "bad" };
   if (isCancellation(entry)) return { symbol: "⊘", label: "Отмена без штрафа", tone: "muted" };
   if (cacheEvents.has(entry.event)) return { symbol: "⚡", label: "Из кэша", tone: "accent" };
+  if (isSharedEvent(entry)) return { symbol: "⇄", label: "Общий ответ", tone: "accent" };
   if (["answer", "success", "attempt_success"].includes(entry.event)) return { symbol: "✓", label: entry.event === "attempt_success" ? "Ответ маршрута" : "Ответ", tone: "ok" };
   if (entry.event === "cache_clear") return { symbol: "↺", label: "Кэш очищен", tone: "accent" };
   const labels: Record<string, string> = { query: "Запрос", attempt: "Попытка", attempt_start: "Запуск попытки", start: "Запуск", stop: "Остановка", logging: "Журнал", config: "Настройки", service: "Сервис" };

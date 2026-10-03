@@ -29,6 +29,16 @@ type Service struct {
 	activeID string
 	order    []string
 	servers  map[string]*managedServer
+	// routing is the shared router policy. Connection selection never replaces
+	// these settings with the selected profile's defaults.
+	routing *awgRoutingSettings
+	// Detached rules survive deleting their connection. Their original public
+	// connection references remain available for explicit reassignment/export.
+	pendingRules   []awg.Zone
+	connectionRefs map[string]AWG2ConnectionRef
+	// routingDNSGate prevents replies from crossing a partially replaced policy.
+	// Its lifecycle is owned by the OS routing apply and the DNS observer.
+	routingDNSGate routingDNSGate
 
 	// awg is the currently selected server manager. Low-level client/routing code
 	// still operates on one local awg0 tunnel, so it always reads this active one.
@@ -63,6 +73,12 @@ type Service struct {
 	expandCache map[string]expandCacheEntry
 	policyDNSMu sync.Mutex
 	policyDNS   map[string]policyDNSAnswer
+	// The running engine keeps its resolved endpoint until a client reapply.
+	// Retain that WAN-escape hint beyond the short-lived DNS answer cache.
+	policyEndpointIPs map[string]string
+	// Bounded optional bulk-warmup coordination. It is separate from DNS
+	// answer TTLs and never suppresses a client's real DNS request.
+	policyDNSWarmups map[string]*policyDNSWarmup
 }
 
 type expandCacheEntry struct {
@@ -84,25 +100,41 @@ func (svc *Service) expandEntriesMemo(in []string) ([]string, []string) {
 	key := strings.Join(in, "\x1f")
 	rev := svc.zonesRevision.Load()
 	svc.expandMu.RLock()
-	if e, ok := svc.expandCache[key]; ok && e.rev == rev {
+	if e, ok := svc.expandCache[key]; ok && e.rev == rev && svc.zonesRevision.Load() == rev {
 		d, i := e.domains, e.ips
 		svc.expandMu.RUnlock()
 		return d, i
 	}
 	svc.expandMu.RUnlock()
-	d, i := svc.expandEntriesUncached(in)
-	svc.expandMu.Lock()
-	if svc.expandCache == nil {
-		svc.expandCache = map[string]expandCacheEntry{}
+	return svc.expandEntriesFresh(key, in, svc.expandEntriesUncached)
+}
+
+// expandEntriesFresh retries an expansion once if a list/policy changed while
+// it was being read. The injected reader is used only on cache misses, so the
+// normal cached path does not create a method value or allocate a retry helper.
+func (svc *Service) expandEntriesFresh(key string, in []string, expand func([]string) ([]string, []string)) ([]string, []string) {
+	var domains, ips []string
+	for attempt := 0; attempt < 2; attempt++ {
+		rev := svc.zonesRevision.Load()
+		domains, ips = expand(in)
+		svc.expandMu.Lock()
+		if svc.zonesRevision.Load() == rev {
+			if svc.expandCache == nil {
+				svc.expandCache = map[string]expandCacheEntry{}
+			}
+			svc.expandCache[key] = expandCacheEntry{rev: rev, domains: domains, ips: ips}
+			svc.expandMu.Unlock()
+			return domains, ips
+		}
+		// Keep any newer result published by a concurrent reader. Clearing the
+		// map here could erase that result, and changing rev would incorrectly
+		// label this older expansion as belonging to the latest generation.
+		svc.expandMu.Unlock()
 	}
-	// If the revision moved while we computed, drop the now-stale older entries.
-	if cur := svc.zonesRevision.Load(); cur != rev {
-		svc.expandCache = map[string]expandCacheEntry{}
-		rev = cur
-	}
-	svc.expandCache[key] = expandCacheEntry{rev: rev, domains: d, ips: i}
-	svc.expandMu.Unlock()
-	return d, i
+	// Continuous edits must not turn a request into an unlimited retry loop.
+	// Return the last snapshot without caching it under a generation it did not
+	// read; a subsequent request will perform a fresh expansion.
+	return domains, ips
 }
 
 type managedServer struct {
@@ -172,8 +204,8 @@ func (svc *Service) RepairRouting() {
 	unlock()
 }
 
-// StartClientSupervisor starts retries after the app has initialized Pi-hole
-// and all other services which may mutate routing during startup.
+// StartClientSupervisor starts retries after the app has initialized the other
+// services which may mutate routing during startup.
 func (svc *Service) StartClientSupervisor() { svc.startClientSupervisor() }
 
 // TeardownRouting removes the live split-routing without clearing the committed

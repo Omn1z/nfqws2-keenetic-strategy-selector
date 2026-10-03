@@ -109,6 +109,10 @@ func awgRunShell(ctx context.Context, command, stdin string) (string, error) {
 // workers it finishes in seconds (the router's resolver handles parallel queries
 // fine — nslookup is just fork+exec + a UDP round trip).
 func parallelResolve(domains []string, workers int) [][]string {
+	return parallelResolveWithLookup(domains, workers, resolveDomainAll)
+}
+
+func parallelResolveWithLookup(domains []string, workers int, lookup func(string) []string) [][]string {
 	if len(domains) == 0 {
 		return nil
 	}
@@ -123,7 +127,7 @@ func parallelResolve(domains []string, workers int) [][]string {
 		go func() {
 			defer wg.Done()
 			for i := range jobs {
-				out[i] = resolveDomainAll(domains[i])
+				out[i] = lookup(domains[i])
 			}
 		}()
 	}
@@ -303,6 +307,10 @@ func hostOf(endpoint string) string {
 }
 
 func resolveHostIP(host string) string {
+	return resolveHostIPContext(context.Background(), host)
+}
+
+func resolveHostIPContext(ctx context.Context, host string) string {
 	host = strings.TrimSpace(host)
 	if host == "" {
 		return ""
@@ -313,19 +321,30 @@ func resolveHostIP(host string) string {
 		}
 		return ""
 	}
-	for _, ip := range resolveDomain(host) {
+	for _, ip := range resolveDomainContext(ctx, host) {
 		return ip
 	}
 	return ""
 }
 
+func (svc *Service) resolvePolicyHostIP(host string) string {
+	ctx := svc.clientOpContext()
+	return svc.policyHostIPWithLookup(host, func(name string) string { return resolveHostIPContext(ctx, name) })
+}
+
 // resolveDomain returns the IPv4 addresses for a domain (system resolver).
 func resolveDomain(d string) []string {
+	return resolveDomainContext(context.Background(), d)
+}
+
+func resolveDomainContext(parent context.Context, d string) []string {
 	d = strings.TrimSpace(d)
 	if d == "" {
 		return nil
 	}
-	ips, err := net.LookupIP(d)
+	ctx, cancel := context.WithTimeout(parent, policyDNSLookupTimeout)
+	defer cancel()
+	ips, err := net.DefaultResolver.LookupIP(ctx, "ip4", d)
 	if err != nil {
 		return nil
 	}
@@ -363,33 +382,32 @@ func isValidHostname(d string) bool {
 //
 // Uses the system resolver via the busybox `nslookup` command (invoked directly
 // via exec.Command — not through `sh -c` — to keep zone domain entries out of
-// any shell-parse path) plus net.LookupIP as a second source. CGO_ENABLED=0
+// any shell-parse path), with a bounded Go fallback for missing families. CGO_ENABLED=0
 // binaries fall back to a pure-Go resolver that doesn't talk reliably to the
 // router's ndnproxy on 127.0.0.1:53 (it returned empty for plain `.ru`
 // hostnames in practice), so nslookup is what carries the truth.
 func resolveDomainAll(d string) []string {
+	return resolveDomainAllContext(context.Background(), d)
+}
+
+func (svc *Service) resolvePolicyDomainAll(d string) []string {
+	return resolveDomainAllContext(svc.clientOpContext(), d)
+}
+
+func resolveDomainAllContext(parent context.Context, d string) []string {
 	d = strings.TrimSpace(d)
 	if !isValidHostname(d) {
 		return nil
 	}
-	var ips []string
-	seen := map[string]struct{}{}
-	ctx, cancel := contextTimeout(15 * time.Second)
+	ctx, cancel := context.WithTimeout(parent, policyDNSLookupTimeout)
 	defer cancel()
-	if out, err := exec.CommandContext(ctx, "nslookup", d).CombinedOutput(); err == nil && len(out) > 0 {
-		ips = appendNslookupIPs(ips, seen, string(out))
-	}
-	if goIPs, err := net.LookupIP(d); err == nil {
-		for _, ip := range goIPs {
-			s := ip.String()
-			if _, ok := seen[s]; ok {
-				continue
-			}
-			seen[s] = struct{}{}
-			ips = append(ips, s)
+	return policyResolveDomainAll(ctx, d, func(ctx context.Context, name string) []string {
+		out, err := exec.CommandContext(ctx, "nslookup", name).CombinedOutput()
+		if err != nil || len(out) == 0 {
+			return nil
 		}
-	}
-	return ips
+		return appendNslookupIPs(nil, make(map[string]struct{}), string(out))
+	}, net.DefaultResolver.LookupIP)
 }
 
 func appendNslookupIPs(ips []string, seen map[string]struct{}, out string) []string {

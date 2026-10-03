@@ -18,12 +18,14 @@ import (
 //     "test##.com" → test + 2 chars + ".com").
 //   - plain "domain.com"   → the domain itself AND every subdomain
 //     (domain.com and *.domain.com).
+//   - "full:domain.com"    → only the named host, without subdomains.
 //
 // Matching is case-insensitive and ignores a trailing dot on the queried name.
 type DomainMatcher struct {
-	Raw  string         // original entry, for display
-	re   *regexp.Regexp // compiled (for [re] and glob)
-	base string         // lowercased domain (for the plain form)
+	Raw   string         // original entry, for display
+	re    *regexp.Regexp // compiled (for [re] and glob)
+	base  string         // lowercased domain (for the plain form)
+	exact bool           // full: entries match only the named host
 }
 
 const reMatcherPrefix = "[re]"
@@ -36,6 +38,12 @@ func NewDomainMatcher(pattern string) (DomainMatcher, error) {
 		return m, fmt.Errorf("пустой шаблон домена")
 	}
 	switch {
+	case strings.HasPrefix(p, "full:"):
+		m.base = normalizedName(strings.TrimPrefix(p, "full:"))
+		m.exact = true
+		if m.base == "" {
+			return m, fmt.Errorf("пустое точное имя домена")
+		}
 	case strings.HasPrefix(p, reMatcherPrefix):
 		expr := strings.TrimSpace(strings.TrimPrefix(p, reMatcherPrefix))
 		if expr == "" {
@@ -99,6 +107,9 @@ func (m DomainMatcher) matchLower(n string) bool {
 	}
 	if n == m.base {
 		return true
+	}
+	if m.exact {
+		return false
 	}
 	// Suffix check without the `"." + m.base` concat: the previous form was
 	// allocating one string per matcher per query.
@@ -195,12 +206,13 @@ func (t *SuffixTrie) match(name string) bool {
 // MatcherSet pairs a SuffixTrie (for plain patterns) with a residual slice of
 // regex/glob matchers that can't easily live in a trie. CompileMatcherSet
 // builds it from raw zone entries and drops patterns that are already covered
-// by a broader entry — so configurations like ["regexp:\\.ru$", "domain:vk.ru"]
+// by a broader entry — so configurations like ["[re]\\.ru$", "vk.ru"]
 // collapse to just the regex.
 type MatcherSet struct {
 	Trie       *SuffixTrie
-	Regexes    []DomainMatcher // [re]+glob entries only
-	plainCount int             // number of plain entries kept post-dedup
+	Regexes    []DomainMatcher     // [re]+glob entries only
+	plainCount int                 // number of plain entries kept post-dedup
+	exact      map[string]struct{} // full: hosts, without a regex per list entry
 }
 
 // MatchAny is the hot-path matcher: one normalized lowercased pass, one
@@ -214,6 +226,9 @@ func (s *MatcherSet) MatchAny(name string) bool {
 		return false
 	}
 	if s.Trie.match(n) {
+		return true
+	}
+	if _, ok := s.exact[n]; ok {
 		return true
 	}
 	for i := range s.Regexes {
@@ -231,7 +246,7 @@ func (s *MatcherSet) Len() int {
 	if s == nil {
 		return 0
 	}
-	return s.plainCount + len(s.Regexes)
+	return s.plainCount + len(s.Regexes) + len(s.exact)
 }
 
 // CompileMatcherSet compiles raw zone entries (the strings users type in the
@@ -241,8 +256,9 @@ func (s *MatcherSet) Len() int {
 //   - Exact duplicates of plain or regex entries collapse to one.
 //   - A plain entry covered by a broader plain entry (e.g. "abr.ru" when "ru"
 //     is also present) is dropped.
-//   - A plain entry covered by any regex (e.g. "vk.ru" when "regexp:\\.ru$" is
-//     also present) is dropped.
+//   - A plain entry covered by a literal suffix regex (e.g. "vk.ru" when
+//     "[re]\\.ru$" is also present) is dropped. Matching only its apex does
+//     not prove that the regex covers every subdomain.
 //
 // Regex-vs-regex coverage isn't decidable in general so regexes are kept as-is.
 func CompileMatcherSet(entries []string) (MatcherSet, []string) {
@@ -251,6 +267,7 @@ func CompileMatcherSet(entries []string) (MatcherSet, []string) {
 	// Split into plain and regex pools. We carry the regex pool as-is.
 	var plains []DomainMatcher
 	var regexes []DomainMatcher
+	var exact map[string]struct{}
 	seenPlain := make(map[string]struct{}, len(ms))
 	seenRegex := make(map[string]struct{}, len(ms))
 	for _, m := range ms {
@@ -264,6 +281,13 @@ func CompileMatcherSet(entries []string) (MatcherSet, []string) {
 			continue
 		}
 		if m.base == "" {
+			continue
+		}
+		if m.exact {
+			if exact == nil {
+				exact = make(map[string]struct{})
+			}
+			exact[m.base] = struct{}{}
 			continue
 		}
 		if _, dup := seenPlain[m.base]; dup {
@@ -281,17 +305,26 @@ func CompileMatcherSet(entries []string) (MatcherSet, []string) {
 	})
 
 	trie := newSuffixTrie()
+	// Determine provable suffix coverage once per regex, not once per domain in
+	// a large list. General regexes retain their explicit matching semantics.
+	var literalSuffixes []string
+	for _, r := range regexes {
+		literal, _ := r.re.LiteralPrefix()
+		if literal != "" && r.re.String() == regexp.QuoteMeta(literal)+"$" {
+			literalSuffixes = append(literalSuffixes, literal)
+		}
+	}
 	kept := 0
 	for _, p := range plains {
 		// Already covered by a broader plain that we kept? Skip.
 		if trie.match(p.base) {
 			continue
 		}
-		// Covered by any regex? Skip. This is the "regexp:\.ru$ already there,
-		// drop every domain:foo.ru" case.
+		// Only a literal suffix regex proves that ALL descendants are covered.
+		// Matching the apex alone (e.g. ^example\.com$) does not cover children.
 		coveredByRegex := false
-		for _, r := range regexes {
-			if r.re.MatchString(p.base) {
+		for _, literal := range literalSuffixes {
+			if strings.HasSuffix(p.base, literal) {
 				coveredByRegex = true
 				break
 			}
@@ -302,5 +335,17 @@ func CompileMatcherSet(entries []string) (MatcherSet, []string) {
 		trie.addBase(p.base)
 		kept++
 	}
-	return MatcherSet{Trie: trie, Regexes: regexes, plainCount: kept}, bad
+	for name := range exact {
+		if trie.match(name) {
+			delete(exact, name)
+			continue
+		}
+		for _, r := range regexes {
+			if r.re.MatchString(name) {
+				delete(exact, name)
+				break
+			}
+		}
+	}
+	return MatcherSet{Trie: trie, Regexes: regexes, plainCount: kept, exact: exact}, bad
 }

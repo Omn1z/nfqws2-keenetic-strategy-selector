@@ -2,6 +2,8 @@
 
 package awgroute
 
+func (svc *Service) awgApplyFallbackPolicyOSErr() error { return nil }
+
 func (svc *Service) awgApplyMultiHostRoutesOS()          {}
 func (svc *Service) awgApplyMultiHostRoutesOSErr() error { return nil }
 func (svc *Service) awgClearMultiHostRoutesOS()          {}

@@ -16,9 +16,10 @@ func (s *Server) dnsServerStatus(w http.ResponseWriter, r *http.Request) {
 
 type dnsServerConfigRequest struct {
 	dnsserver.Config
-	CacheTTLSeconds *int    `json:"cache_ttl_seconds"`
-	FastDNS         *bool   `json:"fast_dns"`
-	RouteMode       *string `json:"route_mode"`
+	CacheTTLSeconds  *int    `json:"cache_ttl_seconds"`
+	FastDNS          *bool   `json:"fast_dns"`
+	SchedulerEnabled *bool   `json:"scheduler_enabled"`
+	RouteMode        *string `json:"route_mode"`
 }
 
 func (in dnsServerConfigRequest) merge(current dnsserver.Config) dnsserver.Config {
@@ -38,6 +39,10 @@ func (in dnsServerConfigRequest) merge(current dnsserver.Config) dnsserver.Confi
 	if in.FastDNS != nil {
 		cfg.FastDNS = *in.FastDNS
 	}
+	cfg.SchedulerEnabled = current.SchedulerEnabled
+	if in.SchedulerEnabled != nil {
+		cfg.SchedulerEnabled = *in.SchedulerEnabled
+	}
 	// Saving a tab opened before VPN-only existed must not reopen the WAN path.
 	cfg.RouteMode = current.RouteMode
 	if in.RouteMode != nil {
@@ -46,6 +51,9 @@ func (in dnsServerConfigRequest) merge(current dnsserver.Config) dnsserver.Confi
 	// Forms opened before DNS filtering existed must preserve the saved rules.
 	if cfg.Filtering == nil {
 		cfg.Filtering = current.Filtering
+	}
+	if cfg.ShadowDNS == nil {
+		cfg.ShadowDNS = current.ShadowDNS
 	}
 	// Older open tabs do not know about pools. Only an explicit empty array
 	// removes additional providers; unrelated edits must keep the saved pool.

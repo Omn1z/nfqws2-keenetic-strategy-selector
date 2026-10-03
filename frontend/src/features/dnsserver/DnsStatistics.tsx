@@ -6,8 +6,10 @@ export function DnsStatistics({ stats, cache }: { stats: DnsServerStats; cache: 
   const metrics = [
     { label: "Запросов", value: fmtNum(stats.queries) },
     { label: "Из кэша", value: fmtNum(stats.cache_hits), hint: `${hitRatio.toFixed(1)}% запросов` },
+    { label: "Общий ответ", value: fmtNum(stats.shared_responses ?? 0), hint: "Ожидали уже выполняющийся запрос" },
     { label: "Через NFQWS", value: fmtNum(stats.nfqws_success) },
     { label: "Через AWG", value: fmtNum(stats.awg_success) },
+    { label: "Shadow DNS", value: fmtNum(stats.shadow_success ?? 0), hint: "Ответов напрямую от DNS провайдера" },
     { label: "Ошибок", value: fmtNum(stats.failures) },
     { label: "Записей в кэше", value: `${fmtNum(cache.entries)} / ${fmtNum(cache.capacity)}`, hint: cache.capacity ? `Хранение до ${fmtNum(cache.ttl_seconds)} сек.` : "Кэш выключен" },
     { label: "Заблокировано", value: fmtNum(stats.blocked_total ?? 0) },

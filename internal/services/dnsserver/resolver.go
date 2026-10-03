@@ -34,6 +34,7 @@ type Outcome struct {
 	Route         string `json:"route"`
 	Upstream      string `json:"upstream"`
 	Cached        bool   `json:"cached"`
+	Shared        bool   `json:"shared,omitempty"`
 	Blocked       bool   `json:"blocked,omitempty"`
 	BlockCategory string `json:"block_category,omitempty"`
 	BlockRule     string `json:"block_rule,omitempty"`
@@ -51,9 +52,12 @@ type CacheStatus struct {
 // CancellationSummary counts only dispatched, canceled attempts belonging to
 // one network query. It never combines concurrent queries for the same name.
 type CancellationSummary struct {
-	Domain string
-	Type   string
-	Count  int
+	Domain    string
+	Type      string
+	Count     int
+	ClientIP  string
+	Source    string
+	Transport string
 }
 
 type dnsCacheEntry struct {
@@ -80,6 +84,7 @@ type Resolver struct {
 	mu              sync.Mutex
 	cache           map[string]dnsCacheEntry
 	cacheGeneration uint64
+	inflight        map[resolverFlightKey]*resolverFlight
 	endpoints       map[string]endpointEntry
 	clients         map[string]*http.Client
 	ipCursor        map[string]int
@@ -95,12 +100,16 @@ type Resolver struct {
 	maintenanceOnce sync.Once
 	methods         *methodPolicy
 	blocker         atomic.Pointer[Blocker]
+	shadow          *shadowMatcher
+	shadowStatus    ShadowDNSStatus
 }
 
 func NewResolver(cfg Config, backend Backend) *Resolver {
 	lifetime, cancel := context.WithCancel(context.Background())
 	r := &Resolver{cfg: cloneConfig(cfg), backend: backend, cache: map[string]dnsCacheEntry{}, endpoints: map[string]endpointEntry{}, clients: map[string]*http.Client{}, ipCursor: map[string]int{}, attempts: make(chan struct{}, maxConcurrentRouteAttempts), lifetime: lifetime, cancel: cancel, now: time.Now, scheduler: NewScheduler()}
 	r.methods = newMethodPolicy(cfg.DisabledMethods)
+	r.shadow = newShadowMatcher(r.cfg.ShadowDNS)
+	r.shadowStatus = initialShadowStatus(r.cfg.ShadowDNS)
 	if cfg.FastDNS {
 		r.fastDNS = NewFastDNSCache(lifetime, func(ctx context.Context, route, host string) ([]string, error) {
 			ips, _, err := r.lookupEndpointIPs(ctx, route, host)
@@ -204,14 +213,26 @@ func (r *Resolver) Resolve(ctx context.Context, raw []byte) ([]byte, Outcome, er
 	}
 	pool, _ := r.cfg.upstreamsFor(domain)
 	out.Upstream = pool[0].Address
+	if r.shadow.matches(domain) {
+		out.Route, out.Upstream = shadowRoute, ""
+	}
 	query := q.Copy()
 	query.Id = 0
 	wire, err := query.Pack()
 	if err != nil {
 		return nil, out, err
 	}
-	key := string(wire)
-	if cached, route, upstream := r.cacheGet(key, q.Id); cached != nil {
+	keyWire := wire
+	if lower := strings.ToLower(query.Question[0].Name); lower != query.Question[0].Name {
+		keyQuery := query.Copy()
+		keyQuery.Question[0].Name = lower
+		keyWire, err = keyQuery.Pack()
+		if err != nil {
+			return nil, out, err
+		}
+	}
+	key := string(keyWire)
+	if cached, route, upstream := r.cacheGet(key, q); cached != nil {
 		out.Cached = true
 		out.Route = route
 		out.Upstream = upstream
@@ -226,6 +247,33 @@ func (r *Resolver) Resolve(ctx context.Context, raw []byte) ([]byte, Outcome, er
 	}
 	ctx, cancel := context.WithTimeout(ctx, 25*time.Second)
 	defer cancel()
+	response, out, err := r.resolveShared(ctx, key, cacheGeneration, query, wire, domain)
+	if err != nil {
+		return nil, out, err
+	}
+	if r.filterResponse(q, response, &out) {
+		answer, err := blockedReply(q)
+		return answer, out, err
+	}
+	response.Id = q.Id
+	response.Question = append([]mdns.Question(nil), q.Question...)
+	answer, err := response.Pack()
+	if err != nil {
+		out.Error = err.Error()
+	}
+	return answer, out, err
+}
+
+// A single immutable upstream result can serve several client requests. All
+// client IDs, question casing, filtering and routing observation stay outside.
+func (r *Resolver) resolveUncached(ctx context.Context, query *mdns.Msg, wire []byte, domain string) (*mdns.Msg, Outcome, error) {
+	if r.shadow.matches(domain) {
+		return r.resolveShadow(ctx, query, domain)
+	}
+	pool, _ := r.cfg.upstreamsFor(domain)
+	out := Outcome{Domain: domain, Upstream: pool[0].Address}
+	ctx, cancel := context.WithTimeout(ctx, 25*time.Second)
+	defer cancel()
 	stopClose := context.AfterFunc(r.lifetime, cancel)
 	defer stopClose()
 	r.mu.Lock()
@@ -233,6 +281,8 @@ func (r *Resolver) Resolve(ctx context.Context, raw []byte) ([]byte, Outcome, er
 	r.mu.Unlock()
 	policy := r.policyConfig()
 	ordered := scheduler.order(policy, r.backend.Routes(), domain)
+	schedulerActive := policy.SchedulerEnabled && len(ordered) > 1
+	origin := requestOriginFromContext(ctx)
 	type result struct {
 		index int
 		msg   *mdns.Msg
@@ -248,7 +298,7 @@ func (r *Resolver) Resolve(ctx context.Context, raw []byte) ([]byte, Outcome, er
 		defer func() {
 			workers.Wait()
 			if count := int(canceled.Load()); count > 0 && cancelObserver != nil {
-				cancelObserver(CancellationSummary{Domain: domain, Type: mdns.TypeToString[query.Question[0].Qtype], Count: count})
+				cancelObserver(CancellationSummary{Domain: domain, Type: mdns.TypeToString[query.Question[0].Qtype], Count: count, ClientIP: origin.ClientIP, Source: origin.Source, Transport: origin.Transport})
 			}
 		}()
 		for index, candidate := range ordered {
@@ -269,7 +319,9 @@ func (r *Resolver) Resolve(ctx context.Context, raw []byte) ([]byte, Outcome, er
 				results <- result{index: index, err: methodErr}
 				continue
 			}
-			scheduler.started(candidate.route.ID, candidate.upstream.Address)
+			if schedulerActive {
+				scheduler.started(candidate.route.ID, candidate.upstream.Address)
+			}
 			workers.Add(1)
 			go func(index int, candidate attemptCandidate) {
 				defer workers.Done()
@@ -280,13 +332,16 @@ func (r *Resolver) Resolve(ctx context.Context, raw []byte) ([]byte, Outcome, er
 				stop()
 				<-r.attempts
 				event := AttemptEvent{Domain: domain, Type: mdns.TypeToString[query.Question[0].Qtype], Route: candidate.route.ID, RouteName: candidate.route.Name, Upstream: candidate.upstream.Address, DurationMS: time.Since(started).Milliseconds(), Success: err == nil, Canceled: err != nil && (ctx.Err() != nil || r.lifetime.Err() != nil || errors.Is(err, errMethodDisabled) || errors.Is(context.Cause(methodCtx), errMethodDisabled))}
+				event.ClientIP, event.Source, event.Transport = origin.ClientIP, origin.Source, origin.Transport
 				if err != nil && !event.Canceled {
 					event.Error = err.Error()
 				}
 				if event.Canceled {
 					canceled.Add(1)
 				}
-				scheduler.record(event)
+				if schedulerActive {
+					scheduler.record(event)
+				}
 				if observer != nil {
 					observer(event)
 				}
@@ -313,17 +368,7 @@ collect:
 			cancel()
 			out.Route = route.ID
 			out.Upstream = candidate.upstream.Address
-			if r.filterResponse(q, result.msg, &out) {
-				answer, err := blockedReply(q)
-				return answer, out, err
-			}
-			r.cachePut(key, result.msg, route.ID, candidate.upstream.Address, cacheGeneration)
-			result.msg.Id = q.Id
-			answer, err := result.msg.Pack()
-			if err != nil {
-				out.Error = err.Error()
-			}
-			return answer, out, err
+			return result.msg, out, nil
 		}
 	}
 	var failures []string
@@ -342,7 +387,7 @@ collect:
 	if ctx.Err() != nil {
 		failures = append(failures, ctx.Err().Error())
 	}
-	err = fmt.Errorf("DNS недоступен: %s", strings.Join(failures, "; "))
+	err := fmt.Errorf("DNS недоступен: %s", strings.Join(failures, "; "))
 	out.Error = err.Error()
 	return nil, out, err
 }
@@ -701,7 +746,7 @@ func bootstrapAnswerIPs(msg *mdns.Msg, host string) ([]string, uint32) {
 	return nil, 0
 }
 
-func (r *Resolver) cacheGet(key string, id uint16) ([]byte, string, string) {
+func (r *Resolver) cacheGet(key string, query *mdns.Msg) ([]byte, string, string) {
 	r.mu.Lock()
 	e, ok := r.cache[key]
 	if ok && !r.now().Before(e.expires) {
@@ -713,21 +758,11 @@ func (r *Resolver) cacheGet(key string, id uint16) ([]byte, string, string) {
 		return nil, "", ""
 	}
 	msg := e.msg.Copy()
-	age := uint32(r.now().Sub(e.created) / time.Second)
+	age := r.now().Sub(e.created)
 	r.mu.Unlock()
-	for _, section := range [][]mdns.RR{msg.Answer, msg.Ns, msg.Extra} {
-		for _, rr := range section {
-			if rr.Header().Rrtype == mdns.TypeOPT {
-				continue
-			}
-			if rr.Header().Ttl > age {
-				rr.Header().Ttl -= age
-			} else {
-				rr.Header().Ttl = 0
-			}
-		}
-	}
-	msg.Id = id
+	dnsAgeMessage(msg, age)
+	msg.Id = query.Id
+	msg.Question = append([]mdns.Question(nil), query.Question...)
 	b, err := msg.Pack()
 	if err != nil {
 		return nil, "", ""
@@ -736,25 +771,21 @@ func (r *Resolver) cacheGet(key string, id uint16) ([]byte, string, string) {
 }
 
 func (r *Resolver) cachePut(key string, msg *mdns.Msg, route, upstream string, generation uint64) {
-	if r.cfg.CacheSize == 0 || msg.Rcode != mdns.RcodeSuccess || len(msg.Answer) == 0 || msg.IsTsig() != nil {
+	r.cachePutAt(key, msg, route, upstream, generation, r.now())
+}
+
+func (r *Resolver) cachePutAt(key string, msg *mdns.Msg, route, upstream string, generation uint64, now time.Time) {
+	if r.cfg.CacheSize == 0 || msg.IsTsig() != nil {
 		return
 	}
 	wire, err := msg.Pack()
 	if err != nil || len(wire) > 4096 || len(key) > 4096 {
 		return
 	}
-	ttl := uint32(r.cfg.CacheTTLSeconds)
-	for _, section := range [][]mdns.RR{msg.Answer, msg.Ns, msg.Extra} {
-		for _, rr := range section {
-			if rr.Header().Rrtype != mdns.TypeOPT && rr.Header().Ttl < ttl {
-				ttl = rr.Header().Ttl
-			}
-		}
-	}
+	ttl, negative := dnsCacheLifetime(msg, uint32(r.cfg.CacheTTLSeconds))
 	if ttl == 0 {
 		return
 	}
-	now := r.now()
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if generation != r.cacheGeneration || r.closed {
@@ -775,7 +806,15 @@ func (r *Resolver) cachePut(key string, msg *mdns.Msg, route, upstream string, g
 			delete(r.cache, oldest)
 		}
 	}
-	r.cache[key] = dnsCacheEntry{msg: msg.Copy(), created: now, expires: now.Add(time.Duration(ttl) * time.Second), route: route, upstream: upstream}
+	stored := msg.Copy()
+	if negative {
+		for _, rr := range stored.Ns {
+			if soa, ok := rr.(*mdns.SOA); ok && soa.Hdr.Ttl > soa.Minttl {
+				soa.Hdr.Ttl = soa.Minttl
+			}
+		}
+	}
+	r.cache[key] = dnsCacheEntry{msg: stored, created: now, expires: now.Add(time.Duration(ttl) * time.Second), route: route, upstream: upstream}
 }
 
 // CacheStatus counts live DNS answers only; bootstrap addresses are separate.

@@ -2,12 +2,13 @@ import { defineConfig } from "vite";
 import { fileURLToPath, URL } from "node:url";
 import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
-import { viteSingleFile } from "vite-plugin-singlefile";
+import { routerSingleFile } from "./scripts/inline-bundle.mjs";
 
 // The whole UI builds into ONE self-contained internal/server/web/index.html
 // (JS + CSS inlined) which the Go binary embeds and serves gzipped.
 export default defineConfig({
-  plugins: [react(), tailwindcss(), viteSingleFile()],
+  plugins: [react(), tailwindcss(), routerSingleFile()],
+  base: "./",
   resolve: {
     alias: { "@": fileURLToPath(new URL("./src", import.meta.url)) },
   },
@@ -24,6 +25,7 @@ export default defineConfig({
     minify: "esbuild",
     cssCodeSplit: false,
     assetsInlineLimit: 100_000_000,
+    assetsDir: "",
     chunkSizeWarningLimit: 4000,
     rollupOptions: { output: { inlineDynamicImports: true } },
   },

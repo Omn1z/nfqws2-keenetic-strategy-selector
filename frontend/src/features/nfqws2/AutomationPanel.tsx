@@ -81,7 +81,7 @@ export function AutomationPanel() {
       title={hint}
       className={cn(
         "border-r border-line px-3 py-1.5 text-[13px] outline-none transition last:border-r-0 focus-visible:ring-2 focus-visible:ring-ring/40",
-        st.mode === m ? "bg-accent text-white" : "bg-panel text-ink-soft hover:bg-line-soft",
+        st.mode === m ? "bg-accent text-primary-foreground" : "bg-panel text-ink-soft hover:bg-line-soft",
       )}
     >
       {label}

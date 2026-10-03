@@ -92,6 +92,12 @@ func runMain(args []string) error {
 		printUsage(os.Stderr)
 		return fmt.Errorf("missing command")
 	}
+	if strings.TrimSpace(globals.host) == "" {
+		return fmt.Errorf("router host is required: set --host or ROUTER_HOST")
+	}
+	if globals.password == "" {
+		return fmt.Errorf("router password is required: set --password or ROUTER_PASS")
+	}
 	client, err := dial(globals)
 	if err != nil {
 		return err
@@ -117,10 +123,10 @@ func parseGlobal(args []string) (globalArgs, string, []string, error) {
 	fs := flag.NewFlagSet("router-ssh", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	g := globalArgs{
-		host:     envDefault("ROUTER_HOST", "192.168.3.1"),
+		host:     envDefault("ROUTER_HOST", ""),
 		port:     envIntDefault("ROUTER_PORT", 222),
 		user:     envDefault("ROUTER_USER", "root"),
-		password: envDefault("ROUTER_PASS", "keenetic"),
+		password: os.Getenv("ROUTER_PASS"),
 	}
 	fs.StringVar(&g.host, "host", g.host, "router host")
 	fs.IntVar(&g.port, "port", g.port, "router SSH port")
@@ -365,7 +371,8 @@ func posixBase(path string) string {
 }
 
 func printUsage(w io.Writer) {
-	fmt.Fprintln(w, "usage: router-ssh [--host 192.168.3.1] [--port 222] [--user root] [--password keenetic] <command> [args]")
+	fmt.Fprintln(w, "usage: router-ssh [--host <host>] [--port 222] [--user root] [--password <password>] <command> [args]")
+	fmt.Fprintln(w, "host and password are required via flags or ROUTER_HOST / ROUTER_PASS environment variables")
 	fmt.Fprintln(w, "")
 	fmt.Fprintln(w, "commands:")
 	fmt.Fprintln(w, "  exec [--timeout 60s] <command>")

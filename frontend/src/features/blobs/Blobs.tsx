@@ -208,7 +208,7 @@ export default function Blobs() {
 
   const cb = "h-4 w-4 rounded-[4px] accent-[var(--c-accent)] outline-none focus-visible:ring-2 focus-visible:ring-ring/40";
   const seg = (m: "capture" | "generate", label: string) => (
-    <button type="button" onClick={() => setMode(m)} className={cn("rounded-md px-3 py-1.5 text-[13px] font-semibold outline-none transition focus-visible:ring-2 focus-visible:ring-ring/40", mode === m ? "bg-accent text-white" : "text-ink-soft hover:bg-line-soft")}>{label}</button>
+    <button type="button" onClick={() => setMode(m)} className={cn("rounded-md px-3 py-1.5 text-[13px] font-semibold outline-none transition focus-visible:ring-2 focus-visible:ring-ring/40", mode === m ? "bg-accent text-primary-foreground" : "text-ink-soft hover:bg-line-soft")}>{label}</button>
   );
 
   return (
@@ -247,7 +247,7 @@ export default function Blobs() {
                 </div>
                 {capturing && (
                   <div className="mb-2 h-2 overflow-hidden rounded-full bg-line">
-                    <div className="h-full rounded-full bg-gradient-to-r from-accent to-[#5cb3ff] transition-[width]" style={{ width: `${Math.min(100, (Date.now() / 1000 - cap.started_at) / cap.seconds * 100)}%` }} />
+                    <div className="h-full rounded-full bg-accent transition-[width]" style={{ width: `${Math.min(100, (Date.now() / 1000 - cap.started_at) / cap.seconds * 100)}%` }} />
                   </div>
                 )}
                 {!capturing && cap.status === "done" && (cap.candidates ?? []).length === 0 && (

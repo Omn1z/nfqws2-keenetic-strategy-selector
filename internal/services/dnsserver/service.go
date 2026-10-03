@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"reflect"
 	"strconv"
 	"sync"
 	"time"
@@ -24,18 +25,26 @@ type Stats struct {
 	BlockedMixed    uint64 `json:"blocked_mixed"`
 	Queries         uint64 `json:"queries"`
 	CacheHits       uint64 `json:"cache_hits"`
+	SharedResponses uint64 `json:"shared_responses"`
 	NFQWSSuccess    uint64 `json:"nfqws_success"`
 	AWGSuccess      uint64 `json:"awg_success"`
+	ShadowSuccess   uint64 `json:"shadow_success"`
 	Failures        uint64 `json:"failures"`
 	LastDomain      string `json:"last_domain"`
 	LastRoute       string `json:"last_route"`
 	LastUpstream    string `json:"last_upstream"`
+	LastCached      bool   `json:"last_cached"`
+	LastShared      bool   `json:"last_shared"`
 	LastError       string `json:"last_error"`
+	LastClientIP    string `json:"last_client_ip"`
+	LastSource      string `json:"last_source"`
+	LastTransport   string `json:"last_transport"`
 }
 type Endpoints struct {
 	DNS string `json:"dns"`
 }
 type Status struct {
+	ShadowDNS  ShadowDNSStatus  `json:"shadow_dns"`
 	Filtering  FilteringStatus  `json:"filtering"`
 	Config     Config           `json:"config"`
 	Running    bool             `json:"running"`
@@ -73,7 +82,7 @@ type Service struct {
 
 func New(st *store.Store, backend Backend, resolveHost func(string) (string, error)) *Service {
 	cfg := Default()
-	loaded := Config{LoggingEnabled: true, CacheTTLSeconds: cfg.CacheTTLSeconds, FastDNS: cfg.FastDNS}
+	loaded := Config{LoggingEnabled: true, CacheTTLSeconds: cfg.CacheTTLSeconds, FastDNS: cfg.FastDNS, SchedulerEnabled: true}
 	s := &Service{store: st, backend: backend, resolveHost: resolveHost, cfg: cfg, logs: NewLogBuffer(), scheduler: NewScheduler()}
 	if err := st.Load(configFile, &loaded); err == nil {
 		legacy := loaded.DNSPort == 0
@@ -116,6 +125,10 @@ func (s *Service) Status() Status {
 	s.mu.RLock()
 	st := Status{Config: cloneConfig(s.cfg), Running: s.active != nil, ListenHost: s.host, LastError: s.lastError, Stats: s.stats}
 	st.Cache = s.cacheStatusLocked()
+	st.ShadowDNS = initialShadowStatus(s.cfg.ShadowDNS)
+	if s.active != nil {
+		st.ShadowDNS = s.active.resolver.ShadowStatus()
+	}
 	st.FastDNS.Enabled = s.cfg.FastDNS
 	if s.active != nil && s.active.resolver.fastDNS != nil {
 		st.FastDNS = s.active.resolver.fastDNS.Snapshot()
@@ -141,6 +154,7 @@ func (s *Service) SetConfig(cfg Config) error {
 }
 
 func (s *Service) setConfigLocked(cfg Config) error {
+	cfg = cloneConfig(cfg)
 	if err := cfg.NormalizeValidate(); err != nil {
 		return err
 	}
@@ -150,6 +164,16 @@ func (s *Service) setConfigLocked(cfg Config) error {
 	}
 	if err := validateNoSelfUpstream(cfg, host); err != nil {
 		return err
+	}
+	s.mu.RLock()
+	run := s.active
+	unchanged := cfg.Enabled && s.lastError == "" && s.controlCancel != nil && host == s.host && reflect.DeepEqual(cfg, s.cfg) &&
+		run != nil && run.resolver.lifetime.Err() == nil && run.listeners.ctx.Err() == nil
+	s.mu.RUnlock()
+	if unchanged {
+		// An identical save or repeated start must not discard live answers,
+		// counters or transports. Failed/stopped runs still take the retry path.
+		return nil
 	}
 	if err := s.filtering.ConfigurePersist(cfg.Filtering, func() error { return s.store.Save(configFile, cfg) }); err != nil {
 		return err
@@ -310,6 +334,7 @@ func allowLANClients(host string) func(net.IP) bool {
 
 func (s *Service) exchange(ctx context.Context, run *serviceRun, q []byte) ([]byte, Outcome, error) {
 	started := time.Now()
+	origin := requestOriginFromContext(ctx)
 	resp, out, err := run.resolver.Resolve(ctx, q)
 	if err == nil && !out.Blocked {
 		resp, err = s.backend.ObserveAnswer(ctx, out.Domain, resp, ContextClientIP(ctx))
@@ -324,7 +349,10 @@ func (s *Service) exchange(ctx context.Context, run *serviceRun, q []byte) ([]by
 		s.stats.LastDomain = out.Domain
 		s.stats.LastRoute = out.Route
 		s.stats.LastUpstream = out.Upstream
+		s.stats.LastCached = err == nil && !out.Blocked && out.Cached
+		s.stats.LastShared = err == nil && !out.Blocked && !out.Cached && out.Shared
 		s.stats.LastError = out.Error
+		s.stats.LastClientIP, s.stats.LastSource, s.stats.LastTransport = origin.ClientIP, origin.Source, origin.Transport
 		if err != nil {
 			s.stats.Failures++
 		} else if out.Blocked {
@@ -339,27 +367,35 @@ func (s *Service) exchange(ctx context.Context, run *serviceRun, q []byte) ([]by
 			}
 		} else if out.Cached {
 			s.stats.CacheHits++
+		} else if out.Shared {
+			s.stats.SharedResponses++
 		} else if out.Route == "nfqws" {
 			s.stats.NFQWSSuccess++
+		} else if out.Route == shadowRoute {
+			s.stats.ShadowSuccess++
 		} else {
 			s.stats.AWGSuccess++
 		}
 	}
 	s.mu.Unlock()
-	entry := LogEntry{Level: "info", Event: "answer", Domain: out.Domain, Upstream: out.Upstream, Route: out.Route, DurationMS: time.Since(started).Milliseconds()}
-	if parsed, _, e := parseQuery(q); e == nil {
-		entry.QType = mdns.TypeToString[parsed.Question[0].Qtype]
+	if s.logs.Enabled() {
+		entry := LogEntry{Level: "info", Event: "answer", Domain: out.Domain, Upstream: out.Upstream, Route: out.Route, ClientIP: origin.ClientIP, Source: origin.Source, Transport: origin.Transport, DurationMS: time.Since(started).Milliseconds()}
+		if parsed, _, e := parseQuery(q); e == nil {
+			entry.QType = mdns.TypeToString[parsed.Question[0].Qtype]
+		}
+		if err != nil {
+			entry.Level, entry.Event, entry.Message = "error", "error", err.Error()
+		} else if out.Blocked {
+			entry.Event = "blocked"
+			entry.BlockCategory, entry.BlockRule, entry.BlockSource = out.BlockCategory, out.BlockRule, out.BlockSource
+			entry.BlockDomain = out.BlockDomain
+		} else if out.Cached {
+			entry.Event = "cache"
+		} else if out.Shared {
+			entry.Event, entry.Message = "shared", "Ответ получен из совместного DNS-запроса"
+		}
+		s.logs.Append(entry)
 	}
-	if err != nil {
-		entry.Level, entry.Event, entry.Message = "error", "error", err.Error()
-	} else if out.Blocked {
-		entry.Event = "blocked"
-		entry.BlockCategory, entry.BlockRule, entry.BlockSource = out.BlockCategory, out.BlockRule, out.BlockSource
-		entry.BlockDomain = out.BlockDomain
-	} else if out.Cached {
-		entry.Event = "cache"
-	}
-	s.logs.Append(entry)
 	// Transport succeeded even for SERVFAIL: clients receive a DNS error, and
 	// the next query continues recovery instead of losing the listener.
 	return resp, out, nil
@@ -402,6 +438,8 @@ type TestResult struct {
 	BlockSource   string   `json:"block_source,omitempty"`
 	BlockDomain   string   `json:"block_domain,omitempty"`
 	OK            bool     `json:"ok"`
+	Cached        bool     `json:"cached"`
+	Shared        bool     `json:"shared"`
 	Domain        string   `json:"domain"`
 	Type          string   `json:"type"`
 	Route         string   `json:"route"`
@@ -409,11 +447,19 @@ type TestResult struct {
 	Answers       []string `json:"answers"`
 	DurationMS    int64    `json:"duration_ms"`
 	Error         string   `json:"error,omitempty"`
+	ClientIP      string   `json:"client_ip,omitempty"`
+	Source        string   `json:"source"`
+	Transport     string   `json:"transport"`
 }
 
 func (s *Service) Test(ctx context.Context, domain, kind string) TestResult {
 	started := time.Now()
-	result := TestResult{Domain: domain, Type: kind, Answers: []string{}}
+	origin := requestOrigin{Source: "diagnostic", Transport: "api"}
+	if ip := ContextClientIP(ctx); ip != nil {
+		origin.ClientIP = ip.String()
+	}
+	ctx = withRequestOrigin(ctx, origin)
+	result := TestResult{Domain: domain, Type: kind, Answers: []string{}, ClientIP: origin.ClientIP, Source: origin.Source, Transport: origin.Transport}
 	name, err := normalizeDomain(domain)
 	if err != nil {
 		result.Error = err.Error()
@@ -459,6 +505,8 @@ func (s *Service) Test(ctx context.Context, domain, kind string) TestResult {
 		result.Answers = append(result.Answers, rr.String())
 	}
 	result.OK = result.Error == "" && (msg.Rcode == mdns.RcodeSuccess || msg.Rcode == mdns.RcodeNameError)
+	result.Cached = result.OK && !result.Blocked && out.Cached
+	result.Shared = result.OK && !result.Blocked && !out.Cached && out.Shared
 	return result
 }
 

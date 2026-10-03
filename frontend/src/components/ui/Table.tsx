@@ -2,7 +2,7 @@ import type { ReactNode } from "react";
 import { cn } from "@/lib/cn";
 
 export const tableCls = "w-full border-collapse text-[13px]";
-export const thBase = "sticky top-0 z-10 whitespace-nowrap border-b border-line bg-panel px-2.5 py-2.5 text-left text-xs font-semibold uppercase tracking-wide text-muted";
+export const thBase = "sticky top-0 z-10 h-10 whitespace-nowrap border-b border-line bg-panel px-2.5 py-2 text-left align-middle text-sm font-medium text-foreground";
 export const tdCls = "border-b border-line-soft px-2.5 py-2.5 align-top";
 
 export interface Sort {

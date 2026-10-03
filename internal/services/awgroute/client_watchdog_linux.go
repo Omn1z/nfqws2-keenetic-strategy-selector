@@ -118,7 +118,7 @@ func (svc *Service) awgRecoverClientOS(am *awg.Manager) error {
 // Recovering one interface does not stop DNS, flush learned ipsets, change the
 // selected profile, or toggle committed routing. Re-pin endpoints and restore
 // device routes lost by ip link del, then re-render the existing hook in place.
-func (svc *Service) awgRestoreClientRoutesOS(am *awg.Manager) error {
+func (svc *Service) awgRestoreClientRoutesOS(am *awg.Manager) (restoreErr error) {
 	if am == nil || !awgShouldRestoreRouting(am.RuntimeConfig()) {
 		return nil
 	}
@@ -132,46 +132,53 @@ func (svc *Service) awgRestoreClientRoutesOS(am *awg.Manager) error {
 		}
 		return nil
 	}
+	wasReady := svc.RoutingDNSReadiness().Ready
+	finishDNS := svc.routingDNSGate.begin(false)
+	defer func() { finishDNS(restoreErr) }()
 	_, missing := os.Stat(awgMultiHookPath)
-	if missing != nil {
-		// Boot (or externally removed hook): initialize once. Never clear an
-		// already-running proxy during ordinary tunnel recovery.
-		if err := awgWriteMultiSets(rules); err != nil {
-			return err
-		}
+	// A failed apply can leave the hook file present but its sets incomplete.
+	// Healthy tunnel recovery keeps learned sets; failed readiness repairs them.
+	if err := awgRestoreRoutingSets(missing != nil, wasReady, func() error { return awgWriteMultiSets(rules) }); err != nil {
+		return err
 	}
 	if err := svc.awgInstallMultiRoutes(tunnels); err != nil {
 		return err
 	}
 	svc.route.mu.Lock()
-	dnsOn := svc.route.dnsProxy != nil
+	proxy := svc.route.dnsProxy
 	svc.route.mu.Unlock()
-	if !dnsOn {
+	dnsOn := proxy != nil && proxy.Running()
+	if !dnsOn || missing != nil || !wasReady {
 		dnsOn = svc.awgEnsureMultiDNSProxy(rules)
 	}
-	if err := awgWriteMultiHook(tunnels, rules, dnsOn, svc.dnsChainEnabled()); err != nil {
+	if awgMultiDynamicRuleCount(rules) > 0 && !dnsOn {
+		return fmt.Errorf("multi-routing: DNS route learner failed to start")
+	}
+	if err := awgWriteMultiHook(tunnels, rules, dnsOn); err != nil {
 		return err
 	}
 	awgSetAccel(false)
-	svc.route.mu.Lock()
-	refreshing := svc.route.multiStopRefresh != nil
-	svc.route.mu.Unlock()
-	if !refreshing {
-		svc.awgStartMultiPolicyRefresh()
-	}
+	// Recovery may resolve a new engine endpoint or choose a new fallback.
+	// Replace the watchdog's installed-policy snapshot too; keeping the old
+	// snapshot would reassert the previous endpoint/rules on its next tick.
+	svc.awgStartMultiPolicyRefresh(rules, tunnels)
 	return nil
 }
 
 // The legacy full-tunnel mode has no zones and therefore no multi-policy
 // rules. Preserve its committed datapath without resetting DNS/learned sets.
-func (svc *Service) awgRestoreLegacyClientRoutesOS(am *awg.Manager) error {
+func (svc *Service) awgRestoreLegacyClientRoutesOS(am *awg.Manager) (restoreErr error) {
 	cfg := am.RuntimeConfig()
-	endpointIP := svc.cachedPolicyHostIP(hostOf(cfg.Endpoint))
+	endpointIP := svc.cachedPolicyEndpointIP(hostOf(cfg.Endpoint))
 	gw, dev := awgDefaultRoute()
 	if endpointIP == "" || dev == "" {
 		return fmt.Errorf("не удалось определить WAN-маршрут до endpoint")
 	}
-	if _, err := os.Stat(awgHookPath); err != nil {
+	wasReady := svc.RoutingDNSReadiness().Ready
+	finishDNS := svc.routingDNSGate.begin(false)
+	defer func() { finishDNS(restoreErr) }()
+	_, missing := os.Stat(awgHookPath)
+	if err := awgRestoreRoutingSets(missing != nil, wasReady, func() error {
 		// Full mode needs only empty set definitions; packet routing is in
 		// the blanket firewall rule, not a bulk resolution of old zones.
 		if err := svc.awgBuildRecoveryFullSets(); err != nil {
@@ -180,6 +187,9 @@ func (svc *Service) awgRestoreLegacyClientRoutesOS(am *awg.Manager) error {
 		if awgUsesDNSProxy(&cfg) {
 			awgRestoreSets()
 		}
+		return nil
+	}); err != nil {
+		return err
 	}
 	if err := awgRunCheck(awgEndpointRouteCmd(endpointIP, gw, dev)); err != nil {
 		return err
@@ -204,7 +214,7 @@ func (svc *Service) awgRestoreLegacyClientRoutesOS(am *awg.Manager) error {
 	if !dnsOn {
 		dnsOn = svc.awgEnsureDNSProxy(&cfg)
 	}
-	if err := awgWriteHook(awgEffectiveMode(cfg.Routing), endpointIP, dev, awgTunnelMTU(cfg), dnsOn, svc.dnsChainEnabled(), awgTunnelV6Reaches(), cfg.Routing.Zones); err != nil {
+	if err := awgWriteHook(awgEffectiveMode(cfg.Routing), endpointIP, dev, awgTunnelMTU(cfg), dnsOn, awgTunnelV6Reaches(), cfg.Routing.Zones); err != nil {
 		return err
 	}
 	awgSetAccel(false)

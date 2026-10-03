@@ -57,8 +57,10 @@ type RouteDecision struct {
 // Built once per zones edit (apply / watchdog / source-bound change) and
 // swapped atomically. Readers never block.
 //
-// `hash` is the sha256 of the inputs that drove this build (zones + tunnelV6
-// + expand-cache version). republishRouteTable uses it to short-circuit a
+// `hash` is the sha256 of the inputs that drove this build (zones + tunnelV6).
+// `revision` also tracks notified expansion/config changes without changing
+// those zone strings. It does not watch external list-file edits on its own.
+// republishRouteTable uses both to short-circuit a
 // rebuild when nothing changed — saving the 4-6× duplicate expandEntries +
 // matcher compilation per apply that the audit found.
 type routeTable struct {
@@ -66,6 +68,7 @@ type routeTable struct {
 	source   []sourceZoneDecision // source-bound zones (per-device pre-resolved)
 	tunnelV6 bool                 // snapshotted at build time
 	hash     string               // input fingerprint for cache short-circuit
+	revision int64                // expansion generation captured before this build
 }
 
 // sourceZoneDecision augments sourceZoneMatchers with the route + ipset name
@@ -149,17 +152,17 @@ func (svc *Service) routeFor(qname, srcIP string) RouteDecision {
 // invisible to MatcherSet.MatchAny, which is exactly what broke the AAAA
 // blocker (it then matched every name via the bare matcher).
 func (svc *Service) awgZoneMatchersOrdered(cfg *awg.ServerConfig) []orderedZoneMatcher {
-	ez := effectiveZones(cfg.Routing)
-	out := make([]orderedZoneMatcher, 0, len(ez))
-	for i, z := range ez {
-		if !z.Enabled || len(z.SourceIPs) > 0 {
+	catchAll := firstCatchAllZoneIndex(cfg.Routing)
+	out := make([]orderedZoneMatcher, 0, len(cfg.Routing.Zones))
+	for i, z := range cfg.Routing.Zones {
+		if !z.Enabled || z.WaitingForConnection || len(z.SourceIPs) > 0 || catchAll >= 0 && i > catchAll {
 			continue
 		}
 		var ms awg.MatcherSet
 		if z.IsCatchAll() {
 			ms, _ = awg.CompileMatcherSet([]string{"[re]^"})
 		} else {
-			exp, _ := svc.expandEntries(z.Domains)
+			exp, _ := svc.expandZoneEntries(z)
 			ms, _ = awg.CompileMatcherSet(awgDropCatchAll(exp))
 		}
 		out = append(out, orderedZoneMatcher{
@@ -180,7 +183,7 @@ func (svc *Service) awgZoneSourceMatchers(cfg *awg.ServerConfig) []sourceZoneMat
 	sb := sourceBoundZones(cfg.Routing.Zones)
 	out := make([]sourceZoneMatchers, 0, len(sb))
 	for i, z := range sb {
-		exp, _ := svc.expandEntries(z.Domains)
+		exp, _ := svc.expandZoneEntries(z)
 		ms, _ := awg.CompileMatcherSet(awgDropCatchAll(exp))
 		out = append(out, sourceZoneMatchers{Matchers: &ms, SetName: sourceZoneSetName(i)})
 	}
@@ -196,6 +199,7 @@ func (svc *Service) awgZoneSourceMatchers(cfg *awg.ServerConfig) []sourceZoneMat
 // build-tag-free for unit-testing on macOS, but awgTunnelV6Reaches is a Linux
 // helper. The caller passes the bool it computed.
 func (svc *Service) buildRouteTable(cfg *awg.ServerConfig, tunnelV6 bool) *routeTable {
+	revision := svc.zonesRevision.Load()
 	ordered := svc.awgZoneMatchersOrdered(cfg)
 	source := svc.buildSourceZoneDecisions(cfg)
 	return &routeTable{
@@ -203,6 +207,7 @@ func (svc *Service) buildRouteTable(cfg *awg.ServerConfig, tunnelV6 bool) *route
 		source:   source,
 		tunnelV6: tunnelV6,
 		hash:     routeTableInputHash(cfg, tunnelV6),
+		revision: revision,
 	}
 }
 
@@ -213,11 +218,18 @@ func (svc *Service) buildRouteTable(cfg *awg.ServerConfig, tunnelV6 bool) *route
 func routeTableInputHash(cfg *awg.ServerConfig, tunnelV6 bool) string {
 	h := sha256.New()
 	for _, z := range cfg.Routing.Zones {
-		fmt.Fprintf(h, "z|%t|%s|%s|", z.Enabled, z.Mode, z.Route)
+		fmt.Fprintf(h, "z|%t|%t|%s|%s|", z.Enabled, z.WaitingForConnection, z.Mode, z.Route)
 		for _, d := range z.Domains {
 			h.Write([]byte("d:"))
 			h.Write([]byte(d))
 			h.Write([]byte{0})
+		}
+		if z.IncludeSubdomains == nil {
+			h.Write([]byte("subdomains:legacy"))
+		} else if *z.IncludeSubdomains {
+			h.Write([]byte("subdomains:on"))
+		} else {
+			h.Write([]byte("subdomains:off"))
 		}
 		for _, ip := range z.IPs {
 			h.Write([]byte("i:"))
@@ -239,19 +251,48 @@ func routeTableInputHash(cfg *awg.ServerConfig, tunnelV6 bool) string {
 }
 
 // republishRouteTable rebuilds + stores the snapshot ONLY when the input
-// fingerprint differs from the currently-published table. Returns the
+// fingerprint or expansion revision differs from the published table. Returns the
 // (possibly re-used) snapshot so the caller can pass it to downstream
 // builders without an extra Load(). Both awgEnsureDNSProxy and
 // awgEnsureSNISniff call this; on apply both fire back-to-back so the second
 // call returns the cached snapshot for free.
 func (svc *Service) republishRouteTable(cfg *awg.ServerConfig, tunnelV6 bool) *routeTable {
 	want := routeTableInputHash(cfg, tunnelV6)
-	if cur := svc.route.routeTable.Load(); cur != nil && cur.hash == want {
+	revision := svc.zonesRevision.Load()
+	if cur := svc.route.routeTable.Load(); cur != nil && cur.hash == want && cur.revision == revision && svc.zonesRevision.Load() == revision {
 		return cur
 	}
-	tbl := svc.buildRouteTable(cfg, tunnelV6)
-	svc.route.routeTable.Store(tbl)
-	return tbl
+	return svc.republishRouteTableFresh(want, func() *routeTable {
+		return svc.buildRouteTable(cfg, tunnelV6)
+	})
+}
+
+// The reader must return a newly allocated snapshot. It is injected only on
+// cache misses so generation changes can be exercised without runtime work.
+// A bounded retry prevents repeated edits from trapping an HTTP apply forever.
+func (svc *Service) republishRouteTableFresh(want string, build func() *routeTable) *routeTable {
+	var table *routeTable
+	for attempt := 0; attempt < 2; attempt++ {
+		revision := svc.zonesRevision.Load()
+		previous := svc.route.routeTable.Load()
+		table = build()
+		table.hash, table.revision = want, revision
+		if svc.zonesRevision.Load() != revision {
+			continue // never mark a stale list expansion as the new generation
+		}
+		// Do not overwrite a snapshot published by another builder while this
+		// one was expanding. Its generation may already be newer than ours.
+		if svc.route.routeTable.CompareAndSwap(previous, table) {
+			return table
+		}
+		if current := svc.route.routeTable.Load(); current != nil && current.hash == want && current.revision == revision && svc.zonesRevision.Load() == revision {
+			return current
+		}
+	}
+	// Leave the last published snapshot alone if both attempts raced an edit.
+	// The returned build keeps the revision it actually read and is not cached;
+	// the next ensure/apply will try again instead of accepting it as current.
+	return table
 }
 
 // buildSourceZoneDecisions converts each source-bound zone into a
@@ -270,7 +311,7 @@ func (svc *Service) buildSourceZoneDecisions(cfg *awg.ServerConfig) []sourceZone
 	out := make([]sourceZoneDecision, 0)
 	sbCounter := 0
 	for i, z := range cfg.Routing.Zones {
-		if !z.Enabled || len(z.SourceIPs) == 0 {
+		if !z.Enabled || z.WaitingForConnection || len(z.SourceIPs) == 0 {
 			continue
 		}
 		var ms awg.MatcherSet
@@ -281,7 +322,7 @@ func (svc *Service) buildSourceZoneDecisions(cfg *awg.ServerConfig) []sourceZone
 			// here and let routeFor short-circuit on a per-device match.
 			ms, _ = awg.CompileMatcherSet([]string{"[re]^"})
 		} else if len(z.Domains) > 0 {
-			exp, _ := svc.expandEntries(z.Domains)
+			exp, _ := svc.expandZoneEntries(z)
 			ms, _ = awg.CompileMatcherSet(awgDropCatchAll(exp))
 		}
 		out = append(out, sourceZoneDecision{

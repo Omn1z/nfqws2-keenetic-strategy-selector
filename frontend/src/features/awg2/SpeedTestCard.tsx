@@ -2,7 +2,7 @@ import { useRef, useState } from "react";
 import { Card } from "@/components/ui/Card";
 import { Button } from "@/components/ui/Button";
 import { Badge } from "@/components/ui/Badge";
-import { Input } from "@/components/ui/form";
+import { Input, Select } from "@/components/ui/form";
 import { toast } from "@/components/ui/Toast";
 import { cn } from "@/lib/cn";
 
@@ -161,14 +161,14 @@ export function SpeedTestPanel({ className, serverLabel, tunnelIface }: SpeedTes
       <div className="flex flex-wrap items-end gap-3">
         <label className="min-w-[142px] flex-1 text-[11px] text-muted sm:flex-none">
           Размер
-          <select
+          <Select
             value={preset}
             onChange={(e) => { setPreset(e.target.value); setCustomUrl(""); }}
             disabled={!!customUrl.trim() || busy}
-            className="mt-1 h-9 w-full rounded border border-line bg-panel px-2 text-[13px] text-ink"
+            className="mt-1 h-9 text-[13px]"
           >
             {PRESETS.map((p) => <option key={p.key} value={p.key}>{p.label}</option>)}
-          </select>
+          </Select>
         </label>
 
         <label className="min-w-[220px] flex-[2] text-[11px] text-muted">
@@ -205,7 +205,7 @@ export function SpeedTestPanel({ className, serverLabel, tunnelIface }: SpeedTes
             type="button"
             aria-pressed={unit === "bits"}
             onClick={() => setUnit("bits")}
-            className={cn("h-8 px-3 text-[12px] font-semibold", unit === "bits" ? "bg-accent text-white" : "bg-panel text-ink-soft hover:bg-line-soft")}
+            className={cn("h-8 px-3 text-[12px] font-semibold", unit === "bits" ? "bg-accent text-primary-foreground" : "bg-panel text-ink-soft hover:bg-line-soft")}
           >
             Мбит/с
           </button>
@@ -213,7 +213,7 @@ export function SpeedTestPanel({ className, serverLabel, tunnelIface }: SpeedTes
             type="button"
             aria-pressed={unit === "bytes"}
             onClick={() => setUnit("bytes")}
-            className={cn("h-8 border-l border-line px-3 text-[12px] font-semibold", unit === "bytes" ? "bg-accent text-white" : "bg-panel text-ink-soft hover:bg-line-soft")}
+            className={cn("h-8 border-l border-line px-3 text-[12px] font-semibold", unit === "bytes" ? "bg-accent text-primary-foreground" : "bg-panel text-ink-soft hover:bg-line-soft")}
           >
             МБ/с
           </button>

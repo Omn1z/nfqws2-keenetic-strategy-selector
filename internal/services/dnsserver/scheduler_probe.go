@@ -24,12 +24,33 @@ type schedulerProbe struct {
 }
 
 func schedulerProbeCandidates(cfg Config, routes []dnsroute.Route) []schedulerProbe {
+	if !cfg.SchedulerEnabled {
+		return nil
+	}
 	eligible := eligibleRoutes(cfg, routes)
 	disabled := disabledMethodSet(cfg.DisabledMethods)
 	result := make([]schedulerProbe, 0)
 	seen := make(map[string]bool)
+	shadow := newShadowMatcher(cfg.ShadowDNS)
 	addPool := func(domain string, qtype uint16) {
+		if shadow.matches(domain) {
+			return
+		}
 		pool, _ := cfg.upstreamsFor(domain)
+		// A domain group with only one usable provider/route has nothing to
+		// rank. Count before global deduplication: a pair may still need probes
+		// because it competes in another group's pool.
+		available := 0
+		for _, upstream := range pool {
+			for _, route := range eligible {
+				if route.Available && !disabled[schedulerKey(route.ID, upstream.Address)] {
+					available++
+				}
+			}
+		}
+		if available <= 1 {
+			return
+		}
 		for _, upstream := range pool {
 			for _, route := range eligible {
 				key := schedulerKey(route.ID, upstream.Address)

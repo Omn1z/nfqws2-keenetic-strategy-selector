@@ -525,6 +525,7 @@ function SystemPanel({ d }: { d: DashboardData }) {
         </Card>
 
         <Card title="Топ процессов" sub="по RAM · CPU · аптайм" className={CARD}>
+          <p className="mb-2 text-[11px] text-muted">100% CPU процесса = одно ядро; общий CPU усреднён по ядрам.</p>
           {sys.services && sys.services.length > 0 ? (
             <div className="space-y-1 text-[12px]">
               <div className="grid grid-cols-[1fr_56px_60px_60px] gap-1.5 border-b border-line pb-1 text-[10.5px] uppercase tracking-wide text-muted">

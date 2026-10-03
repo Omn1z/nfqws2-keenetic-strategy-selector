@@ -366,6 +366,9 @@ export interface DnsServerRule {
   upstream: DnsServerUpstream;
   pool?: DnsServerUpstream[];
 }
+export interface DnsShadowDomain { domain: string; include_subdomains: boolean }
+export interface DnsShadowConfig { enabled: boolean; servers: string[]; domains: DnsShadowDomain[] }
+export interface DnsShadowStatus { enabled: boolean; automatic: boolean; servers: string[]; error?: string }
 export interface DnsServerConfig {
   enabled: boolean;
   listen_host: string;
@@ -374,6 +377,7 @@ export interface DnsServerConfig {
   default_pool?: DnsServerUpstream[];
   logging_enabled: boolean;
   fast_dns: boolean;
+  scheduler_enabled?: boolean;
   disabled_methods?: DnsServerDisabledMethod[];
   awg_fallback: string;
   route_mode?: "auto" | "vpn_only" | "";
@@ -382,12 +386,51 @@ export interface DnsServerConfig {
   cache_ttl_seconds: number;
   rules: DnsServerRule[];
   filtering?: DnsFilteringConfig;
+  shadow_dns?: DnsShadowConfig;
 }
+export interface DnsServerSettingsDocument {
+  format: "nfqws2-strategy-dnsserver";
+  version: 1;
+  exported_at: string;
+  config: DnsServerConfig;
+  connections?: DnsSettingsConnection[];
+}
+export interface DnsSettingsConnection {
+  ref: string;
+  label: string;
+  endpoint: string;
+  client_iface: string;
+  protocol: string;
+  server_public_key?: string;
+  fingerprint: string;
+}
+export interface DnsSettingsImportPlan {
+  config: DnsServerConfig;
+  base_hash: string;
+  listener: { host: string; port: number; address: string; enabled: boolean };
+  vpn: {
+    source_id: string;
+    state: "auto" | "off" | "matched" | "selection_required" | "missing" | "ambiguous";
+    matched_id?: string;
+    candidates: DnsSettingsConnection[];
+  };
+  warnings: string[];
+}
+export interface DnsSettingsImportRequest {
+  document: string;
+  base_hash: string;
+  mapping?: string;
+  mapping_fingerprint?: string;
+}
+export type DnsRequestSource = "client" | "local" | "diagnostic" | "internal" | "probe" | "";
+export type DnsRequestTransport = "udp" | "tcp" | "api" | "";
 export interface DnsServerStats {
   queries: number;
   cache_hits: number;
+  shared_responses?: number;
   nfqws_success: number;
   awg_success: number;
+  shadow_success?: number;
   failures: number;
   blocked_total?: number;
   blocked_ads?: number;
@@ -396,6 +439,11 @@ export interface DnsServerStats {
   last_domain?: string;
   last_route?: string;
   last_upstream?: string;
+  last_cached?: boolean;
+  last_shared?: boolean;
+  last_client_ip?: string;
+  last_source?: DnsRequestSource;
+  last_transport?: DnsRequestTransport;
   last_error?: string;
 }
 export interface DnsServerCache {
@@ -422,16 +470,22 @@ export interface DnsServerStatus {
   cache: DnsServerCache;
   fast_dns?: DnsServerFastDNSStatus;
   filtering?: DnsFilteringStatus;
+  shadow_dns?: DnsShadowStatus;
   routes: { id: string; name: string; interface: string; available: boolean; error?: string }[];
 }
 export interface DnsServerTestResult {
   ok: boolean;
   domain: string;
-  type: "A" | "AAAA";
+  type: "A" | "AAAA" | "CNAME" | "HTTPS" | "SVCB";
   route: string;
   upstream: string;
   answers: string[];
   duration_ms: number;
+  cached?: boolean;
+  shared?: boolean;
+  client_ip?: string;
+  source?: DnsRequestSource;
+  transport?: DnsRequestTransport;
   error?: string;
   blocked?: boolean;
   block_category?: DnsBlockCategory;
@@ -446,6 +500,9 @@ export interface DnsServerLogEntry {
   event: string;
   domain?: string;
   qtype?: string;
+  client_ip?: string;
+  source?: DnsRequestSource;
+  transport?: DnsRequestTransport;
   upstream?: string;
   route?: string;
   duration_ms?: number;
@@ -457,6 +514,8 @@ export interface DnsServerLogEntry {
   block_domain?: string;
 }
 export interface DnsServerLogSnapshot {
+  /** Omitted by older panels; changes only when their in-memory ring is replaced. */
+  instance_id?: string;
   enabled: boolean;
   bytes: number;
   max_bytes: number;
@@ -492,6 +551,10 @@ export interface DnsServerSchedulerCandidate {
   exploration: boolean;
 }
 export interface DnsServerSchedulerSnapshot {
+  enabled?: boolean;
+  effective?: boolean;
+  reason?: "" | "disabled" | "single_candidate" | "no_candidates" | "shadow";
+  effective_candidate_count?: number;
   domain: string;
   pool_source: string;
   formula: string;
@@ -539,12 +602,16 @@ export interface AwgPeer {
 export interface AwgZone {
   name: string;
   tunnel_id?: string;
+  /** Retain this rule without silently assigning a different VPN connection. */
+  waiting_for_connection?: boolean;
   /** Ordered backups: primary tunnel_id is tried first, then these IDs. */
   fallback_tunnel_ids?: string[];
   order?: number;
   route?: "tunnel" | "direct";
   mode?: string; // legacy: "include"|"exclude"
   domains: string[];
+  /** Omitted preserves legacy semantics; false makes plain domains exact. */
+  include_subdomains?: boolean;
   ips: string[];
   source_ips?: string[];
   enabled: boolean;
@@ -553,6 +620,58 @@ export interface AwgRoutingConfig {
   mode: string; zones: AwgZone[]; mtu: number; killswitch: boolean; domain_source: string;
   sni_routing?: boolean;
   active?: boolean;
+}
+export interface AwgRoutingState {
+  revision: number;
+  applying: boolean;
+  ready: boolean;
+  error?: string;
+}
+export interface AwgConnectionReference {
+  ref: string;
+  label: string;
+  endpoint?: string;
+  client_iface?: string;
+  protocol?: string;
+  server_public_key?: string;
+  fingerprint?: string;
+}
+export interface AwgRulesDocument {
+  format: "nfqws2-strategy-routing";
+  version: 1;
+  routing: AwgRoutingConfig;
+  connections: AwgConnectionReference[];
+  warnings?: string[];
+}
+export interface AwgRulesImportConnection {
+  source: AwgConnectionReference;
+  matched_tunnel_id?: string;
+  state: "matched" | "missing" | "ambiguous" | "changed";
+  candidates: { id: string; label: string; endpoint?: string; client_iface?: string; protocol?: string; fingerprint: string }[];
+  reason?: "identity_changed";
+}
+export interface AwgRulesImportPlan {
+  connections: AwgRulesImportConnection[];
+  rule_count: number;
+  waiting_rule_count: number;
+  warnings?: string[];
+  policy_hash: string;
+}
+export type AwgRulesMappings = Record<string, string>;
+export type AwgRulesImportMode = "replace" | "append";
+export interface AwgRulesImportRequest {
+  document: string;
+  mappings: AwgRulesMappings;
+  mapping_fingerprints: Record<string, string>;
+  mode: AwgRulesImportMode;
+  base_routing?: AwgRoutingConfig;
+  expected_policy_hash: string;
+}
+export interface AwgRulesImportResult {
+  rule_count: number;
+  waiting_rule_count: number;
+  routing_revision: number;
+  routing: AwgRoutingConfig;
 }
 export interface AwgClientConfig { enabled: boolean; peer_id: string }
 export interface AwgServerConfig {
@@ -621,6 +740,10 @@ export interface Awg2Status {
   active_server_id: string;
   servers: Awg2ServerSummary[];
   routing_rules?: AwgZone[];
+  /** Shared router routing settings, independent of the selected VPN profile. */
+  routing_config?: AwgRoutingConfig;
+  routing_state?: AwgRoutingState;
+  connection_refs?: Record<string, AwgConnectionReference>;
   has_password: boolean;
   has_key: boolean;
   has_server_key: boolean;
@@ -669,37 +792,6 @@ export interface SystemStats {
   uptime_sec: number;
   temps: TempZone[];
   services: ServiceStat[];
-}
-
-export interface PiholeConfig {
-  password: string;
-  dns_port: number;
-  ui_port: number;
-  data_root: string;
-  timezone: string;
-  dns_chain_enabled: boolean;
-}
-export interface PiholeStatus extends PiholeConfig {
-  installed: boolean;
-  running: boolean;
-  healthy: boolean;
-  state: string;
-  container_id: string;
-  uptime_sec: number;
-  image_digest: string;
-  upgrade_avail: boolean;
-  error?: string;
-}
-export interface PiholeStats {
-  total_queries: number;
-  blocked_queries: number;
-  percent_blocked: number;
-  domains_on_list: number;
-  unique_domains: number;
-  unique_clients: number;
-  active_clients: number;
-  blocking_status: string;
-  error?: string;
 }
 
 export interface AutomationStatus {
@@ -909,6 +1001,7 @@ export interface Nfqws2File {
 
 export interface Nfqws2Version {
   package: string;
+  package_status?: "installed" | "missing" | "unknown";
   engine: string;
   latest: string;
   available: boolean;

@@ -51,11 +51,11 @@ func (s *Service) recordAttempt(attempt AttemptEvent) {
 	if attempt.Success || attempt.Canceled {
 		return
 	}
-	s.logs.Append(LogEntry{Level: "warn", Event: "attempt_error", Domain: attempt.Domain, QType: attempt.Type, Upstream: attempt.Upstream, Route: attempt.Route, DurationMS: attempt.DurationMS, Message: attempt.Error})
+	s.logs.Append(LogEntry{Level: "warn", Event: "attempt_error", Domain: attempt.Domain, QType: attempt.Type, Upstream: attempt.Upstream, Route: attempt.Route, ClientIP: attempt.ClientIP, Source: attempt.Source, Transport: attempt.Transport, DurationMS: attempt.DurationMS, Message: attempt.Error})
 }
 
 func (s *Service) recordCancellations(summary CancellationSummary) {
 	if summary.Count > 0 {
-		s.logs.Append(LogEntry{Level: "debug", Event: "canceled", Domain: summary.Domain, QType: summary.Type, Count: summary.Count})
+		s.logs.Append(LogEntry{Level: "debug", Event: "canceled", Domain: summary.Domain, QType: summary.Type, ClientIP: summary.ClientIP, Source: summary.Source, Transport: summary.Transport, Count: summary.Count})
 	}
 }

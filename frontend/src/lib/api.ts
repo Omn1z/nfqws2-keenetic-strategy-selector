@@ -10,24 +10,47 @@ interface ApiError {
   error?: string;
 }
 
+export class ApiHTTPError extends Error {
+  constructor(message: string, public readonly status: number) { super(message); this.name = "ApiHTTPError"; }
+}
+
 const AWG_RULES_TIMEOUT_MS = 180_000;
+const READ_TIMEOUT_MS = 30_000;
 const awgRulesMutation = (method: string, path: string) =>
   method.toUpperCase() === "POST" &&
-  /^\/api\/awg2\/routing\/rules(?:\/(?:copy|insert-top))?$/.test(path);
+  /^\/api\/awg2\/routing\/rules(?:\/(?:copy|insert-top|import))?$/.test(path);
 
-export async function api<T = unknown>(method: string, path: string, body?: unknown): Promise<T> {
+export interface ApiOptions {
+  /** Text assets use the same authentication, cancellation and read deadline. */
+  responseType?: "json" | "text";
+  signal?: AbortSignal;
+  timeoutMs?: number;
+  /** Some POST endpoints only preview or export a supplied draft. */
+  readOnly?: boolean;
+}
+
+export function api(method: string, path: string, body: unknown, options: ApiOptions & { responseType: "text" }): Promise<string>;
+export function api<T = unknown>(method: string, path: string, body?: unknown, options?: ApiOptions): Promise<T>;
+export async function api<T = unknown>(method: string, path: string, body?: unknown, options: ApiOptions = {}): Promise<T | string> {
   const opt: RequestInit = { method };
   if (body !== undefined) {
     opt.headers = { "Content-Type": "application/json" };
     opt.body = JSON.stringify(body);
   }
-  const controller = awgRulesMutation(method, path) ? new AbortController() : null;
-  if (controller) opt.signal = controller.signal;
+  const readOnly = method.toUpperCase() === "GET" || options.readOnly === true;
+  // Provisioning/downloading a VPN engine can legitimately take much longer.
+  // Bound reads and the existing routing mutation deadline, not every POST.
+  const timeoutMs = options.timeoutMs ?? (readOnly ? READ_TIMEOUT_MS : awgRulesMutation(method, path) ? AWG_RULES_TIMEOUT_MS : 0);
+  const controller = new AbortController();
+  opt.signal = controller.signal;
+  const abort = () => controller.abort(options.signal?.reason);
+  if (options.signal?.aborted) abort();
+  else options.signal?.addEventListener("abort", abort, { once: true });
   let timedOut = false;
-  const timeout = controller ? globalThis.setTimeout(() => {
+  const timeout = timeoutMs > 0 ? globalThis.setTimeout(() => {
     timedOut = true;
     controller.abort();
-  }, AWG_RULES_TIMEOUT_MS) : null;
+  }, timeoutMs) : null;
   try {
     const res = await fetch(path, opt);
     if (res.status === 401) {
@@ -35,15 +58,18 @@ export async function api<T = unknown>(method: string, path: string, body?: unkn
       throw new Error("Требуется вход");
     }
     const txt = await res.text();
-    const data = txt ? JSON.parse(txt) : null;
-    if (!res.ok) throw new Error((data as ApiError)?.error || res.statusText);
+    const data = res.ok && options.responseType === "text" ? txt : txt ? JSON.parse(txt) : null;
+    if (!res.ok) throw new ApiHTTPError((data as ApiError)?.error || res.statusText, res.status);
     return data as T;
   } catch (error) {
     if (timedOut && error instanceof Error && error.name === "AbortError") {
-      throw new Error("Ожидание ответа превысило 3 минуты; проверьте состояние правил перед повторной попыткой — сохранение могло завершиться.");
+      throw new Error(readOnly
+        ? "Роутер не ответил вовремя. Повторите обновление; сохранённые данные остаются на экране."
+        : "Роутер не ответил вовремя; проверьте состояние перед повторной попыткой — настройка могла сохраниться.");
     }
     throw error;
   } finally {
+    options.signal?.removeEventListener("abort", abort);
     if (timeout !== null) globalThis.clearTimeout(timeout);
   }
 }
@@ -55,7 +81,7 @@ export async function uploadForm<T = unknown>(path: string, form: FormData): Pro
     throw new Error("Требуется вход");
   }
   const data = (await res.json().catch(() => null)) as (T & ApiError) | null;
-  if (!res.ok) throw new Error(data?.error || res.statusText);
+  if (!res.ok) throw new ApiHTTPError(data?.error || res.statusText, res.status);
   return data as T;
 }
 

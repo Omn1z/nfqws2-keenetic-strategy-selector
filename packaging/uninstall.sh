@@ -77,6 +77,12 @@ remove_bypass_files() {
     "$cmd" -w -t mangle -F nfqws2_bypass 2>/dev/null || true
     "$cmd" -w -t mangle -X nfqws2_bypass 2>/dev/null || true
   done
+  # Release only panel-owned sets, after removing their firewall references.
+  if command -v ipset >/dev/null 2>&1; then
+    for set in n2s_nfqb4 n2s_nfqb6 n2s_nfqb4_new n2s_nfqb6_new; do
+      ipset destroy "$set" 2>/dev/null || true
+    done
+  fi
 }
 
 [ -x "$INIT" ] && "$INIT" stop 2>/dev/null || true

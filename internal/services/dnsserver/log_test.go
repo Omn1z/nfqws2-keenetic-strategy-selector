@@ -12,6 +12,9 @@ import (
 
 func assertLogSnapshot(t *testing.T, snapshot LogSnapshot) {
 	t.Helper()
+	if snapshot.InstanceID == "" {
+		t.Fatal("log snapshot is missing its instance identity")
+	}
 	if snapshot.Bytes < 0 || snapshot.Bytes > MaxLogBytes || snapshot.MaxBytes != MaxLogBytes {
 		t.Fatalf("invalid log size metadata: %+v", snapshot)
 	}
@@ -40,6 +43,56 @@ func assertLogSnapshot(t *testing.T, snapshot LogSnapshot) {
 		}
 	} else if snapshot.OldestID != snapshot.Entries[0].ID {
 		t.Fatalf("oldest ID=%d, first entry=%d", snapshot.OldestID, snapshot.Entries[0].ID)
+	}
+}
+
+func TestDNSLogBufferInstanceIdentityDistinguishesRestartAfterCursorOvertake(t *testing.T) {
+	before := NewLogBuffer()
+	before.SetEnabled(true)
+	for i := 0; i < 3; i++ {
+		before.Append(LogEntry{Message: "before restart"})
+	}
+	old := before.Snapshot(0)
+	assertLogSnapshot(t, old)
+	// The replacement journal can already overtake the old cursor. Neither
+	// LastID nor the number of dropped entries then proves a restart.
+	after := NewLogBuffer()
+	after.SetEnabled(true)
+	for i := 0; i < 10; i++ {
+		after.Append(LogEntry{Message: "after restart"})
+	}
+	newer := after.Snapshot(old.LastID)
+	if newer.InstanceID == "" || newer.InstanceID == old.InstanceID || newer.LastID <= old.LastID || len(newer.Entries) != 7 || newer.Dropped != old.Dropped {
+		t.Fatalf("replacement journal lacks a distinct identity after cursor overtake: old=%+v newer=%+v", old, newer)
+	}
+	identity := after.Snapshot(0).InstanceID
+	after.Clear()
+	after.SetEnabled(false)
+	cleared := after.Snapshot(0)
+	assertLogSnapshot(t, cleared)
+	if cleared.InstanceID != identity || cleared.LastID != newer.LastID || cleared.Bytes != 0 || len(cleared.Entries) != 0 {
+		t.Fatalf("clear changed journal identity or cursor semantics: %+v", cleared)
+	}
+	after.SetEnabled(true)
+	after.Append(LogEntry{Message: "after clear"})
+	if appended := after.Snapshot(newer.LastID); appended.InstanceID != identity || len(appended.Entries) != 1 || appended.Entries[0].ID != newer.LastID+1 {
+		t.Fatalf("append after clear changed identity or missed cursor: %+v", appended)
+	}
+}
+
+func TestDNSLogBufferInstanceIdentityUniqueForSimultaneousBuffers(t *testing.T) {
+	const count = 128
+	identities := make(chan string, count)
+	for i := 0; i < count; i++ {
+		go func() { identities <- NewLogBuffer().Snapshot(0).InstanceID }()
+	}
+	seen := make(map[string]bool, count)
+	for i := 0; i < count; i++ {
+		identity := <-identities
+		if identity == "" || seen[identity] {
+			t.Fatalf("simultaneous journal reused identity %q", identity)
+		}
+		seen[identity] = true
 	}
 }
 

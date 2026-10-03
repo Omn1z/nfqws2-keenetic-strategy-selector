@@ -88,7 +88,7 @@ func awgApplyKillswitch(on bool) {
 // (-i awg0) the PMTU clamp resolves to the LAN MTU (1500), not the tunnel, so it
 // fails to shrink client→server segments and oversized uploads (large cookies,
 // speed-test POSTs) blackhole → pages "load then stall/RESET".
-func awgFirewallHook(mode, endpointIP, wandev string, mtu int, dnsRedirect, chainEnabled, tunnelV6 bool, zones []awg.Zone) string {
+func awgFirewallHook(mode, endpointIP, wandev string, mtu int, dnsRedirect, tunnelV6 bool, zones []awg.Zone) string {
 	if mtu <= 0 {
 		mtu = 1280
 	}
@@ -384,16 +384,14 @@ func awgFirewallHook(mode, endpointIP, wandev string, mtu int, dnsRedirect, chai
 	v6doc.WriteString("-A PREROUTING -j " + awgChain + "6\n")
 	v6doc.WriteString("-A OUTPUT -j " + awgChain + "6\n")
 	v6doc.WriteString("COMMIT\n")
-	s.WriteString("if ! iptables-restore --noflush <<'AWGV4'\n")
-	s.WriteString(v4doc.String())
-	s.WriteString("AWGV4\n")
-	s.WriteString("then\n")
+	s.WriteString(awgFirewallRestoreShell("awg_restore_v4", "iptables-restore", "AWGV4", v4doc.String()))
+	s.WriteString("if awg_restore_v4; then :; else\n")
+	s.WriteString("  AWG_RESTORE_STATUS=$?\n  [ \"$AWG_RESTORE_STATUS\" -eq 4 ] && exit \"$AWG_RESTORE_STATUS\"\n")
 	s.WriteString(restoreFallback("iptables", v4doc.String()))
 	s.WriteString("fi\n")
-	s.WriteString("if ! ip6tables-restore --noflush <<'AWGV6'\n")
-	s.WriteString(v6doc.String())
-	s.WriteString("AWGV6\n")
-	s.WriteString("then\n")
+	s.WriteString(awgFirewallRestoreShell("awg_restore_v6", "ip6tables-restore", "AWGV6", v6doc.String()))
+	s.WriteString("if awg_restore_v6; then :; else\n")
+	s.WriteString("  AWG_RESTORE_STATUS=$?\n  [ \"$AWG_RESTORE_STATUS\" -eq 4 ] && exit \"$AWG_RESTORE_STATUS\"\n")
 	s.WriteString(restoreFallback("ip6tables", v6doc.String()))
 	s.WriteString("fi\n")
 	mssRule := func(direction string) string {
@@ -416,31 +414,17 @@ func awgFirewallHook(mode, endpointIP, wandev string, mtu int, dnsRedirect, chai
 		}
 	}
 	if dnsRedirect {
-		// Domain-mask DNS interception: redirect LAN :53 to Pi-hole (:5353), which
-		// then forwards to our DNS proxy (:5354) as its upstream. Pi-hole sees the
-		// real client IP (not 127.0.0.1) so per-client query logs work. The proxy
-		// classifies (SNI/zones) on what pi-hole forwards.
-		//
-		// We gate on the proxy port being up because pi-hole's upstream is the
-		// proxy; if it's down, gating prevents a window where we redirect to
-		// pi-hole and pi-hole then can't reach upstream. Check /proc/net/udp +
-		// /proc/net/udp6 (Go's 0.0.0.0:5354 listener appears as ":::14EA" on this
-		// kernel via dual-stack — invisible to a v4-only grep).
-		// Port depends on chain mode. Chain on → pi-hole sits in front, REDIRECT
-		// to its FTL port (clients visible in pi-hole's per-client log). Chain off
-		// → REDIRECT straight to our proxy, pi-hole is out of the path entirely.
+		// Intercept LAN DNS only while our route-learning proxy is listening.
+		// Check both families: Go's dual-stack listener can appear only in udp6.
 		redirectPort := awgDNSPort
-		if chainEnabled {
-			redirectPort = awgPiholeDNSPort
-		}
 		s.WriteString("if grep -qi ':" + dnsPortHex + " ' /proc/net/udp /proc/net/udp6 2>/dev/null; then\n")
 		s.WriteString("  for br in $(ls /sys/class/net/ 2>/dev/null | grep '^br'); do\n")
 		for _, proto := range []string{"udp", "tcp"} {
 			r := "-i $br -p " + proto + " --dport 53 -j REDIRECT --to-ports " + redirectPort
-			s.WriteString("    iptables -t nat -C PREROUTING " + r + " 2>/dev/null || iptables -t nat -A PREROUTING " + r + "\n")
+			s.WriteString("    iptables -w -t nat -C PREROUTING " + r + " 2>/dev/null || iptables -w -t nat -A PREROUTING " + r + "\n")
 			// iOS prefers IPv6 DNS when RA advertises RDNSS; without v6 REDIRECT
 			// queries hit the host's native dnsmasq and bypass the chain.
-			s.WriteString("    ip6tables -t nat -C PREROUTING " + r + " 2>/dev/null || ip6tables -t nat -A PREROUTING " + r + "\n")
+			s.WriteString("    ip6tables -w -t nat -C PREROUTING " + r + " 2>/dev/null || ip6tables -w -t nat -A PREROUTING " + r + "\n")
 		}
 		s.WriteString("  done\nfi\n")
 	}
@@ -449,16 +433,17 @@ func awgFirewallHook(mode, endpointIP, wandev string, mtu int, dnsRedirect, chai
 
 // awgWriteHook writes the netfilter.d hook for the given mode/endpoint and runs
 // it once immediately (applying the rules now, not just on the next ndm rebuild).
-func awgWriteHook(mode, endpointIP, wandev string, mtu int, dnsRedirect, chainEnabled, tunnelV6 bool, zones []awg.Zone) error {
+func awgWriteHook(mode, endpointIP, wandev string, mtu int, dnsRedirect, tunnelV6 bool, zones []awg.Zone) error {
 	if err := os.MkdirAll(filepath.Dir(awgHookPath), 0o755); err != nil {
 		return err
 	}
-	if err := os.WriteFile(awgHookPath, []byte(awgFirewallHook(mode, endpointIP, wandev, mtu, dnsRedirect, chainEnabled, tunnelV6, zones)), 0o755); err != nil {
+	if err := os.WriteFile(awgHookPath, []byte(awgFirewallHook(mode, endpointIP, wandev, mtu, dnsRedirect, tunnelV6, zones)), 0o755); err != nil {
 		return err
 	}
 	awgEnsureFW4IncludeOS([]string{awgIface})
 	if out, err := awgRun("sh " + awgHookPath); err != nil {
 		logbuf.Append("awg2", "warn", "firewall-хук: "+strs.LastLines(out, 2))
+		return awgCmdErr("firewall hook", out, err)
 	}
 	return nil
 }

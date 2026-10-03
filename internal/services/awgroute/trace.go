@@ -226,20 +226,26 @@ func (svc *Service) TraceCounters() TraceCounters {
 	}
 }
 
-// TraceSetEnabled flips the toggle AND persists it into the active server's
-// Routing config so the choice survives a watchdog re-render. Returns the new
+// TraceSetEnabled flips the toggle AND persists it into the shared router
+// policy so the choice survives selection changes and watchdog re-renders. Returns the new
 // state. When turning off, existing entries stay in the ring for inspection.
 func (svc *Service) TraceSetEnabled(on bool) bool {
 	_, unlock := svc.lockClientOps(false)
 	defer unlock()
 	traceSetEnabled(on)
-	if m := svc.awgActive(); m != nil {
-		c := m.Config()
-		if c.Routing.TraceEnabled != on {
-			c.Routing.TraceEnabled = on
-			_ = m.SetConfig(&c)
-			svc.awgSave()
+	settings := svc.currentRoutingSettings()
+	changed := settings.TraceEnabled != on
+	settings.TraceEnabled = on
+	svc.rememberRoutingSettings(settings)
+	for _, srv := range svc.serverSnapshot() {
+		routing := srv.Manager.Config().Routing
+		if routingSettingsFrom(routing) != settings {
+			srv.Manager.SetRoutingState(settings.apply(routing), routing.Active)
+			changed = true
 		}
+	}
+	if changed {
+		svc.awgSave()
 	}
 	return on
 }

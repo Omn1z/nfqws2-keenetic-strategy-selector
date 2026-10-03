@@ -43,7 +43,7 @@ export function ConfirmHost() {
           <Button
             variant="primary"
             autoFocus={!req.danger}
-            className={req.danger ? "border-bad bg-bad text-white hover:border-bad/90 hover:bg-bad/90" : undefined}
+            className={req.danger ? "border-destructive bg-destructive text-destructive-foreground hover:border-destructive/90 hover:bg-destructive/90" : undefined}
             onClick={() => done(true)}
           >
             {req.confirmLabel ?? "ОК"}

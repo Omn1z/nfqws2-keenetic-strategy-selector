@@ -52,6 +52,7 @@ type Adapter struct {
 	runCtx              context.Context
 	conns               map[*routedConn]struct{}
 	done                chan struct{}
+	shadow              shadowState
 }
 
 type routedConn struct {

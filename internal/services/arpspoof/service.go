@@ -426,13 +426,6 @@ func suggestedInterfaceNames(ifaces []Interface) []string {
 			out = append(out, iface.Name)
 		}
 	}
-	if len(out) == 0 {
-		for _, iface := range ifaces {
-			if iface.Up {
-				out = append(out, iface.Name)
-			}
-		}
-	}
 	return out
 }
 

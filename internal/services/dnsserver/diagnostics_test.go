@@ -189,13 +189,18 @@ func TestDNSDiagnosticsFailedSaveKeepsLoggingAndDNS(t *testing.T) {
 func TestDNSDiagnosticsSchedulerAndLogSurviveConfigSave(t *testing.T) {
 	s, backend, client := newDNSServiceFixture(t, 8)
 	backend.mu.Lock()
-	backend.routes = []dnsroute.Route{{ID: "nfqws", Name: "NFQWS", Available: true}}
+	backend.routes = []dnsroute.Route{{ID: "nfqws", Name: "NFQWS", Available: true}, {ID: "awg:first", Name: "AWG", Available: true}}
 	backend.mu.Unlock()
+	backend.setFailures("awg:first")
 	if msg := queryDNSService(t, client, s.Status().Endpoints.DNS, 330); msg.Rcode != mdns.RcodeSuccess {
 		t.Fatalf("initial DNS request failed: %s", mdns.RcodeToString[msg.Rcode])
 	}
+	waitFastDNS(t, func() bool {
+		history, err := s.SchedulerSnapshot("example.com")
+		return err == nil && len(history.Candidates) == 2 && history.Candidates[0].Successes == 1 && history.Candidates[1].Failures == 1
+	})
 	before, err := s.SchedulerSnapshot("EXAMPLE.COM.")
-	if err != nil || before.Domain != "example.com" || len(before.Candidates) != 1 || before.Candidates[0].Successes != 1 || before.Candidates[0].Attempts != 1 {
+	if err != nil || before.Domain != "example.com" || len(before.Candidates) != 2 || before.Candidates[0].Successes != 1 || before.Candidates[0].Attempts != 1 {
 		t.Fatalf("actual query did not teach the scheduler: %v %+v", err, before)
 	}
 	scheduler, logs, run := s.scheduler, s.logs, activeDNSRun(s)

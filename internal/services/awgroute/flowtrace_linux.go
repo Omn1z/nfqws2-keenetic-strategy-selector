@@ -165,7 +165,7 @@ func (svc *Service) awgFlowTraceRules() []awgFlowTraceRule {
 	}
 	out := []awgFlowTraceRule{}
 	for i, z := range svc.awgRoutingRules() {
-		if !z.Enabled {
+		if !z.Enabled || z.WaitingForConnection {
 			continue
 		}
 		srv := servers[strings.TrimSpace(z.TunnelID)]
@@ -187,7 +187,9 @@ func (svc *Service) awgFlowTraceRules() []awgFlowTraceRule {
 				continue
 			}
 		}
-		entries, catchAll, staticOK := svc.awgMultiRuleEntries(z)
+		// Diagnostics must not create DNS traffic for every configured domain.
+		// Use only answers already observed while applying/serving the policy.
+		entries, catchAll, staticOK := svc.awgMultiRuleEntriesWithLookup(z, svc.policyDNSLookup(false, nil))
 		prefixes := awgFlowTracePrefixes(entries)
 		if !catchAll && len(prefixes) == 0 && !staticOK {
 			continue

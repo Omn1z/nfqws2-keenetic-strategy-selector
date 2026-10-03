@@ -20,7 +20,7 @@ func (svc *Service) awgMultiRuleEntriesWithLookup(z awg.Zone, lookup func(string
 	}
 	catchAll := z.IsCatchAll()
 	staticOK := len(z.Domains) == 0 && len(z.IPs) == 0
-	expDomains, expIPs := svc.expandEntries(z.Domains)
+	expDomains, expIPs := svc.expandZoneEntries(z)
 	for _, ip := range append(append([]string{}, z.IPs...), expIPs...) {
 		if awgIsCatchAll(ip) {
 			catchAll = true
@@ -46,7 +46,7 @@ func (svc *Service) awgMultiRuleEntriesWithLookup(z awg.Zone, lookup func(string
 	}
 	if len(queries) < 8 {
 		for _, i := range queries {
-			answers[i] = lookup(strings.TrimSpace(expDomains[i]))
+			answers[i] = lookup(routingResolveName(expDomains[i]))
 		}
 	} else {
 		workers := len(queries)
@@ -60,7 +60,7 @@ func (svc *Service) awgMultiRuleEntriesWithLookup(z awg.Zone, lookup func(string
 			go func() {
 				defer wg.Done()
 				for i := range jobs {
-					answers[i] = lookup(strings.TrimSpace(expDomains[i]))
+					answers[i] = lookup(routingResolveName(expDomains[i]))
 				}
 			}()
 		}

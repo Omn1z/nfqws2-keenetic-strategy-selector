@@ -33,6 +33,13 @@ func (svc *Service) awgApplyMultiHostRoutesOSErr() error {
 	return svc.awgApplyMultiPolicyOS()
 }
 
+// Automatic fallback only changes the target connection, not domain intent.
+// The DNS learner installs newly observed addresses before replying to clients.
+func (svc *Service) awgApplyFallbackPolicyOSErr() error {
+	svc.awgClearLegacyHostRoutesOS()
+	return svc.awgApplyMultiPolicyCachedOS()
+}
+
 func (svc *Service) awgApplyLegacyMultiHostRoutesOS() {
 	desired := svc.awgDesiredHostRoutes()
 	prev := awgLoadHostRoutes()
@@ -86,17 +93,17 @@ func (svc *Service) awgDesiredHostRoutes() []awgHostRoute {
 			continue
 		}
 		for _, z := range effectiveZones(cfg.Routing) {
-			if !z.Enabled || z.RouteValue() != "tunnel" || len(z.SourceIPs) > 0 || z.IsCatchAll() {
+			if !z.Enabled || z.WaitingForConnection || z.RouteValue() != "tunnel" || len(z.SourceIPs) > 0 || z.IsCatchAll() {
 				continue
 			}
-			domains, ips := svc.expandEntries(z.Domains)
+			domains, ips := svc.expandZoneEntries(z)
 			for _, raw := range append(append([]string{}, z.IPs...), ips...) {
 				if dest, v6, ok := normalizeHostRouteDest(raw); ok && !hostRouteExcluded(dest, cfg.Endpoint) {
 					add(dest, iface, v6)
 				}
 			}
 			for _, d := range domains {
-				for _, ip := range resolveDomainAll(d) {
+				for _, ip := range resolveDomainAll(routingResolveName(d)) {
 					if dest, v6, ok := normalizeHostRouteDest(ip); ok && !hostRouteExcluded(dest, cfg.Endpoint) {
 						add(dest, iface, v6)
 					}

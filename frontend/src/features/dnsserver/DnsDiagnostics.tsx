@@ -10,7 +10,11 @@ import { toast } from "@/components/ui/Toast";
 import type { DnsServerConfig, DnsServerLogSnapshot, DnsServerSchedulerCandidate, DnsServerSchedulerSnapshot, DnsServerStatus } from "@/types/api";
 import { DnsLogRows } from "./DnsLogRows";
 import { isLogProblem, matchesLogFilter } from "./dnsLogPresentation";
+import { DNS_FORWARDER_NOTE } from "./dnsRequestSource";
+import { DnsLogFeed } from "./dnsLogFeed";
 import { allAvailableSchedulerMethodsDisabled, applyDisabledSchedulerMethods, schedulerMethodKey } from "./schedulerMethods";
+import { dnsSchedulerState } from "./dnsSchedulerState";
+import { dnsRouteLabel } from "./shadowDnsForm";
 
 const duration = (v: number) => `${Math.round(v)} мс`;
 const clock = (v: string) => {
@@ -82,8 +86,9 @@ function SchedulerPanel({ running }: { running: boolean }) {
       void refresh();
     }
   };
+  const schedulerState = snapshot ? dnsSchedulerState(snapshot) : null;
   return <Card title="Планировщик DNS" sub="очередь сочетаний маршрута и DoH по сохранённым настройкам">
-    <p className="mb-3 text-xs text-muted">Чем больше очков, тем выше приоритет. Быстрые успешные ответы поднимают сочетание в очереди, ошибки и серии неудач опускают его. Приоритет определяет порядок запуска параллельных попыток: готовый ответ не ждёт остальных.</p>
+    {schedulerState && !schedulerState.active ? <p role="status" className="mb-3 text-xs text-muted">{schedulerState.message}</p> : <p className="mb-3 text-xs text-muted">Чем больше очков, тем выше приоритет. Быстрые успешные ответы поднимают сочетание в очереди, ошибки и серии неудач опускают его. Приоритет определяет порядок запуска параллельных попыток: готовый ответ не ждёт остальных.</p>}
     <p className="mb-3 text-xs text-muted">Переключатель сразу сохраняет участие пары «DoH + маршрут» во всех пулах и доменах. Выключенный метод не участвует в запросах и фоновых замерах; его можно включить здесь же.</p>
     <div className="mb-3 flex flex-wrap gap-2" role="group" aria-label="Режим планировщика">
       <Button mini variant={mode === "general" ? "primary" : "default"} aria-pressed={mode === "general"} onClick={() => changeMode("general")}>Общий</Button>
@@ -97,10 +102,11 @@ function SchedulerPanel({ running }: { running: boolean }) {
     {error && <p role="alert" className="mt-3 text-xs text-bad">Не удалось обновить планировщик: {error}{snapshot ? ". Показано последнее полученное состояние." : ""}</p>}
     {!snapshot && !error && <p className="mt-3 text-xs text-muted">{mode === "domain" && !domain ? "Введите домен и нажмите «Показать очередь», чтобы увидеть подходящий ему пул." : loading ? "Загрузка планировщика…" : "Ожидание обновления планировщика…"}</p>}
     {snapshot && <>
-      <div className="mt-3 flex flex-wrap items-center gap-2 text-xs"><Badge kind="neutral">{snapshot.pool_source === "default" ? "Пул по умолчанию" : `Пул: ${snapshot.pool_source}`}</Badge><span className="text-muted">{mode === "general" ? "Общий планировщик" : snapshot.domain} · Вариантов: {snapshot.candidates.length} · Одновременно: до {snapshot.parallel_limit}</span>{snapshot.active_probes !== undefined && <Badge kind="neutral">Фоновых замеров: {snapshot.active_probes}</Badge>}</div>
-      {snapshot.formula && <div className="mt-3 rounded-lg border border-line p-3 text-xs"><p className="mb-1 font-semibold text-ink-soft">Расчёт очков</p><p className="whitespace-pre-wrap [overflow-wrap:anywhere]">{snapshot.formula}</p></div>}
+      <div className="mt-3 flex flex-wrap items-center gap-2 text-xs"><Badge kind="neutral">{snapshot.pool_source === "shadow" ? "Shadow DNS → провайдер" : snapshot.pool_source === "default" ? "Пул по умолчанию" : `Пул: ${snapshot.pool_source}`}</Badge><span className="text-muted">{mode === "general" ? "Общий планировщик" : snapshot.domain}{snapshot.reason !== "shadow" && <> · Вариантов: {snapshot.candidates.length} · Одновременно: до {snapshot.parallel_limit}</>}</span>{snapshot.reason !== "shadow" && snapshot.active_probes !== undefined && <Badge kind="neutral">Фоновых замеров: {snapshot.active_probes}</Badge>}</div>
+      {schedulerState?.active && snapshot.formula && <div className="mt-3 rounded-lg border border-line p-3 text-xs"><p className="mb-1 font-semibold text-ink-soft">Расчёт очков</p><p className="whitespace-pre-wrap [overflow-wrap:anywhere]">{snapshot.formula}</p></div>}
       {allAvailableSchedulerMethodsDisabled(snapshot) && <p role="status" className="mt-3 text-xs text-warn">Все доступные методы в этом пуле выключены. Для запросов без кэша включите хотя бы один метод.</p>}
-      <div className="mt-3 max-h-[34rem] overflow-auto rounded-lg border border-line">
+      {!schedulerState?.active && <div className="mt-3 space-y-2 rounded-lg border border-line p-3">{snapshot.candidates.map((v) => <div key={`${v.route}\n${v.upstream}`} className="flex flex-wrap items-center gap-3 text-xs"><Switch checked={!v.disabled} disabled={!!methodBusy} onChange={(enabled) => setMethod(v, enabled)} label={`Метод ${v.upstream} через ${v.route_name || v.route}`} /><Badge kind={v.disabled || !v.available ? "neutral" : "ok"}>{v.disabled ? "выключен" : v.available ? "доступен" : "недоступен"}</Badge></div>)}</div>}
+      {schedulerState?.active && <div className="mt-3 max-h-[34rem] overflow-auto rounded-lg border border-line">
         <table className="w-full min-w-[1040px] text-left text-xs">
           <thead className="sticky top-0 z-10 bg-card text-muted"><tr>{["Вкл. / место / маршрут", "DoH", "Очки", "Задержка", "Успешность", "Попытки / ошибки", "Фоновые замеры"].map((label) => <th key={label} className="border-b border-line px-3 py-2 font-semibold">{label}</th>)}</tr></thead>
           <tbody>{snapshot.candidates.map((v) => <tr key={`${v.route}\n${v.upstream}`} className="border-b border-line last:border-0">
@@ -114,10 +120,10 @@ function SchedulerPanel({ running }: { running: boolean }) {
           </tr>)}</tbody>
         </table>
         {!snapshot.candidates.length && <p className="p-4 text-xs text-muted">{mode === "general" ? "В пуле по умолчанию пока нет вариантов маршрута и DoH." : "Для выбранного домена пока нет вариантов маршрута и DoH."}</p>}
-      </div>
-      <p className="mt-3 text-xs text-muted">{snapshot.probe_interval_seconds && snapshot.probe_recheck_seconds ? `Фоновая очередь проверяется каждые ${snapshot.probe_interval_seconds} с: сначала варианты без замеров, затем без нового результата ${snapshot.probe_recheck_seconds} с и дольше. ` : ""}Фоновый замер дожидается ответа или ошибки независимо от победителя основного запроса. Отмена не обновляет время результата и не начисляет штраф. Оценки хранятся в памяти; перезапуск панели сбрасывает обучение.</p>
+      </div>}
+      {schedulerState?.active && <p className="mt-3 text-xs text-muted">{snapshot.probe_interval_seconds && snapshot.probe_recheck_seconds ? `Фоновая очередь проверяется каждые ${snapshot.probe_interval_seconds} с: сначала варианты без замеров, затем без нового результата ${snapshot.probe_recheck_seconds} с и дольше. ` : ""}Фоновый замер дожидается ответа или ошибки независимо от победителя основного запроса. Отмена не обновляет время результата и не начисляет штраф. Оценки хранятся в памяти; перезапуск панели сбрасывает обучение.</p>}
     </>}
-    {!running && <p className="mt-3 text-xs text-muted">DNS-сервер не работает. Фоновые замеры возобновятся после запуска.</p>}
+    {!running && <p className="mt-3 text-xs text-muted">DNS-сервер не работает. Фоновые замеры выполняются только при включённом планировщике и наличии альтернативных сочетаний в пуле.</p>}
   </Card>;
 }
 
@@ -132,44 +138,54 @@ export function DnsDiagnostics({ loggingEnabled, running, routes, onLoggingChang
   const [filter, setFilter] = useState("");
   const fetching = useRef(false);
   const acting = useRef(false);
-  const revision = useRef(0);
+  const feed = useRef(new DnsLogFeed());
   const consoleRef = useRef<HTMLDivElement>(null);
-  const refresh = async () => {
-    if (fetching.current || acting.current || document.hidden) return;
+  const refresh = async (signal: AbortSignal) => {
+    if (fetching.current || acting.current || document.hidden || signal.aborted) return;
     fetching.current = true;
-    const before = revision.current;
+    let read = feed.current.read();
     try {
-      const result = await api<DnsServerLogSnapshot>("GET", "/api/dnsserver/logs");
-      if (before === revision.current) { setLogs(result); setError(""); }
-    } catch (e) { if (before === revision.current) setError((e as Error).message); }
+      // A new ring instance or lower cursor needs one full snapshot. Ordinary
+      // and unchanged tails always require just the incremental request.
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const result = await api<DnsServerLogSnapshot>("GET", read.path, undefined, { signal });
+        if (signal.aborted) return;
+        const accepted = feed.current.accept(read, result);
+        if (!accepted) return;
+        setLogs(accepted.snapshot); setError("");
+        if (!accepted.reload) break;
+        read = feed.current.read();
+      }
+    } catch (e) { if (!signal.aborted && feed.current.isCurrent(read)) setError((e as Error).message); }
     finally { fetching.current = false; }
   };
   usePoll(refresh, 2500, !paused);
   const mutate = async (path: "logging" | "logs/clear", body: unknown) => {
     if (acting.current) return;
-    acting.current = true; revision.current++; setBusy(true);
+    acting.current = true; feed.current.invalidate(); setBusy(true);
     try {
       const result = await api<DnsServerLogSnapshot>("POST", `/api/dnsserver/${path}`, body);
-      setLogs(result); setError(""); onLoggingChange(result.enabled);
+      setLogs(feed.current.replace(result)); setError(""); onLoggingChange(result.enabled);
     } catch (e) { toast((e as Error).message, "err"); }
     finally { acting.current = false; setBusy(false); }
   };
   useEffect(() => {
     if (follow && !paused && consoleRef.current) consoleRef.current.scrollTop = consoleRef.current.scrollHeight;
   }, [logs?.last_id, follow, paused, problemsOnly, filter]);
-  const routeName = (id: string) => routes.find((v) => v.id === id)?.name || (id === "nfqws" ? "NFQWS" : id === "cache" ? "Кэш" : id === "blocked" ? "Локальная блокировка" : id);
+  const routeName = (id: string) => dnsRouteLabel(id, routes);
   const entries = (logs?.entries ?? []).filter((entry) => (!problemsOnly || isLogProblem(entry)) && matchesLogFilter(entry, filter, routeName));
   const maxLogKiB = Math.round((logs?.max_bytes || 128 * 1024) / 1024);
   return <>
     <SchedulerPanel running={running} />
     <Card title="Консоль DNS" sub={`журнал в памяти · до ${maxLogKiB} КиБ · старые записи удаляются автоматически`} head={<Switch checked={loggingEnabled} disabled={busy} onChange={(enabled) => mutate("logging", { enabled })} label="Логирование" />}>
       <div className="flex flex-wrap items-end gap-3">
-        <Field label="Поиск в журнале" className="min-w-[180px] flex-1"><Input value={filter} onChange={(e) => setFilter(e.target.value)} placeholder="Домен, DoH, маршрут или ошибка" /></Field>
+        <Field label="Поиск в журнале" className="min-w-[180px] flex-1"><Input value={filter} onChange={(e) => setFilter(e.target.value)} placeholder="Домен, IP, источник, DoH или маршрут" /></Field>
         <Button mini onClick={() => setPaused((v) => !v)}>{paused ? "Продолжить просмотр" : "Пауза просмотра"}</Button>
         <Button mini disabled={busy || !logs?.entries.length} onClick={() => mutate("logs/clear", {})}>Очистить журнал</Button>
       </div>
       <div className="my-3 flex flex-wrap items-center gap-4 text-xs"><Switch checked={follow} onChange={setFollow} label="Автопрокрутка" /><Switch checked={problemsOnly} onChange={setProblemsOnly} label="Только ошибки" />{logs && <span className="text-muted">{(logs.bytes / 1024).toFixed(1)} / {maxLogKiB} КиБ · Записей: {logs.entries.length}{logs.dropped > 0 ? ` · Удалено старых: ${logs.dropped}` : ""}</span>}</div>
-      <div className="mb-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px] text-muted" aria-label="Обозначения журнала"><span><b className="text-ok">✓</b> ответ</span><span><b className="text-accent">⚡</b> кэш</span><span><b className="text-warn">⊠</b> локальная блокировка</span><span><b>⊘ ×N</b> отмены без штрафа</span><span><b className="text-bad">!</b> ошибка</span><span className="ml-auto">⌄ подробности</span></div>
+      <div className="mb-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-[11px] text-muted" aria-label="Обозначения журнала"><span><b className="text-ok">✓</b> ответ</span><span><b className="text-accent">⚡</b> кэш</span><span><b className="text-accent">⇄</b> общий ответ</span><span><b className="text-warn">⊠</b> локальная блокировка</span><span><b>⊘ ×N</b> отмены без штрафа</span><span><b className="text-bad">!</b> ошибка</span><span className="ml-auto">⌄ подробности</span></div>
+      <p className="mb-2 text-[11px] text-muted">DNS-запрос не означает, что сайт открыли в браузере: обращения могут выполнять приложения, роутер и фоновые проверки. {DNS_FORWARDER_NOTE}</p>
       {paused && <p className="mb-3 text-xs text-warn">Просмотр приостановлен. Сервер продолжает записывать события, если логирование включено.</p>}
       {error && <p role="alert" className="mb-3 text-xs text-bad">Не удалось обновить журнал: {error}</p>}
       <div ref={consoleRef} role="log" aria-label="Журнал DNS" aria-live="off" tabIndex={0} className="h-80 overflow-auto rounded-lg border border-line bg-input px-3 py-1 font-mono text-[11px] leading-relaxed">

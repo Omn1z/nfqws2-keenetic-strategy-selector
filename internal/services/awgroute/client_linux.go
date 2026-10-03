@@ -401,7 +401,7 @@ func (svc *Service) awgClientUpManagerOS(am *awg.Manager) error {
 		return nil
 	}
 	host, portStr, _ := net.SplitHostPort(strings.TrimSpace(cfg.Endpoint))
-	endpointIP := resolveHostIP(host)
+	endpointIP := svc.resolvePolicyHostIP(host)
 	port, _ := strconv.Atoi(portStr)
 	if endpointIP == "" || port == 0 {
 		return fmt.Errorf("не удалось разрешить адрес сервера (endpoint)")

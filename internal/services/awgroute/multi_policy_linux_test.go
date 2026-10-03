@@ -20,12 +20,13 @@ func TestMultiFirewallHookWaitsForXtablesLock(t *testing.T) {
 		SetName: "awgm_000",
 		HasDst:  true,
 		Sources: []string{"192.168.3.151"},
-	}}, false, false)
+	}}, false)
 	for _, want := range []string{
-		"iptables -w -t mangle -D PREROUTING",
+		"iptables -w -t mangle -S PREROUTING",
 		"IPTABLES_RESTORE='iptables-restore --noflush'",
 		"iptables-restore -w --noflush",
-		"$IPTABLES_RESTORE <<'AWGMV4'",
+		"$IPTABLES_RESTORE <<'AWGMV4' 2>&1",
+		"awg_restore_multi\n",
 		"iptables -w -t mangle -I PREROUTING 1 -j AWG2_MULTI",
 		"iptables -w -t nat -A POSTROUTING -o awg0 -j MASQUERADE",
 		"iptables -w -t mangle -A FORWARD -o awg0",
@@ -37,6 +38,9 @@ func TestMultiFirewallHookWaitsForXtablesLock(t *testing.T) {
 		}
 	}
 	for _, bad := range []string{
+		"iptables -w -t mangle -D PREROUTING",
+		"iptables -w -t mangle -D OUTPUT",
+		"iptables -w -t mangle -F AWG2_MULTI",
 		"iptables -t mangle -D PREROUTING",
 		"iptables-restore --noflush <<",
 		"iptables -t nat -A POSTROUTING",
@@ -52,7 +56,7 @@ func TestMultiFirewallHookWaitsForXtablesLock(t *testing.T) {
 	if numericWait.MatchString(hook) {
 		t.Fatalf("multi hook uses an unsupported numeric xtables wait:\n%s", hook)
 	}
-	legacyHook := awgFirewallHook("full", "138.124.229.182", "eth3", 1280, false, false, false, nil)
+	legacyHook := awgFirewallHook("full", "138.124.229.182", "eth3", 1280, false, false, nil)
 	if numericWait.MatchString(legacyHook) {
 		t.Fatalf("legacy hook uses an unsupported numeric xtables wait:\n%s", legacyHook)
 	}
@@ -69,11 +73,11 @@ func TestMultiFirewallHookCanRedirectDNS(t *testing.T) {
 		Tunnel:  &awgMultiTunnel{Mark: awgMultiMark(1)},
 		SetName: "awgm_000",
 		HasDst:  true,
-	}}, true, false)
+	}}, true)
 	for _, want := range []string{
 		"grep -qi ':14EA ' /proc/net/udp /proc/net/udp6",
 		"--dport 53 -j REDIRECT --to-ports 5354",
-		"ip6tables -t nat -C PREROUTING",
+		"ip6tables -w -t nat -C PREROUTING",
 	} {
 		if !strings.Contains(hook, want) {
 			t.Fatalf("multi hook misses DNS redirect %q:\n%s", want, hook)

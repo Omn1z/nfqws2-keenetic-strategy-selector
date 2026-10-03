@@ -15,6 +15,9 @@ func (r *Resolver) StartMaintenance() {
 		if r.fastDNS != nil {
 			r.fastDNS.Start()
 		}
+		if !r.cfg.SchedulerEnabled {
+			return
+		}
 		go func() {
 			ticker := time.NewTicker(schedulerProbeInterval)
 			defer ticker.Stop()
@@ -31,7 +34,7 @@ func (r *Resolver) StartMaintenance() {
 }
 
 func (r *Resolver) runSchedulerProbe() {
-	if r.lifetime.Err() != nil {
+	if !r.cfg.SchedulerEnabled || r.lifetime.Err() != nil {
 		return
 	}
 	// A background measurement occupies one ordinary attempt slot and never
@@ -53,7 +56,7 @@ func (r *Resolver) runSchedulerProbe() {
 		return
 	}
 	started := time.Now()
-	event := AttemptEvent{Domain: probe.domain, Type: mdns.TypeToString[probe.qtype], Route: probe.route.ID, RouteName: probe.route.Name, Upstream: probe.upstream.Address, Canceled: true}
+	event := AttemptEvent{Domain: probe.domain, Type: mdns.TypeToString[probe.qtype], Route: probe.route.ID, RouteName: probe.route.Name, Upstream: probe.upstream.Address, Source: "probe", Canceled: true}
 	defer func() {
 		scheduler.finishProbe(probe, event)
 		if observer != nil && !event.Success && !event.Canceled {

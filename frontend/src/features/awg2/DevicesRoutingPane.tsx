@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { api } from "@/lib/api";
+import { usePoll } from "@/lib/hooks";
 import { cn } from "@/lib/cn";
 import { Card } from "@/components/ui/Card";
 import { Badge } from "@/components/ui/Badge";
@@ -67,68 +68,75 @@ function applyMode(zones: AwgZone[], ip: string, mode: DeviceMode, fallbackTunne
     : { name, mode: "exclude", route: "direct", domains: [], ips: [], source_ips: [ip], enabled: true };
   return [...without, z];
 }
-const routingFromStatus = (st: Awg2Status): AwgRoutingConfig => ({
-  ...st.config.routing,
-  mode: st.config.routing?.mode || "zones",
-  zones: st.routing_rules || st.config.routing?.zones || [],
-});
+const routingFromStatus = (st: Awg2Status): AwgRoutingConfig => {
+  const routing = st.routing_config ?? st.config.routing;
+  return { ...routing, mode: routing?.mode || "zones", zones: st.routing_config?.zones ?? st.routing_rules ?? st.config.routing?.zones ?? [] };
+};
 
 interface Props {
   st: Awg2Status;
-  reload: () => void;
+  reload: () => Promise<void>;
+  active: boolean;
+  onBusyChange: (busy: boolean) => void;
+  externalBusy: boolean;
 }
 
-export default function DevicesRoutingPane({ st, reload }: Props) {
+export default function DevicesRoutingPane({ st, reload, active, onBusyChange, externalBusy }: Props) {
   const [devices, setDevices] = useState<Device[]>([]);
   const [routing, setRouting] = useState<AwgRoutingConfig>(() => routingFromStatus(st));
   const [busy, setBusy] = useState(false);
   const [search, setSearch] = useState("");
-  // While an autosave is in flight (or a mode click came within ~1 s of the
-  // last upstream poll), skip re-syncing routing from upstream — otherwise
-  // an inflight POST + a status-snapshot tick race, and the user sees their
-  // click "snap back" before the save lands.
-  const lastEditAt = useRef<number>(0);
+  const saveInFlight = useRef(false);
+  const routingKey = JSON.stringify(routingFromStatus(st));
+  const observedRoutingKey = useRef(routingKey);
+  const pendingRouting = useRef<AwgRoutingConfig | null>(null);
+  const confirmedRouting = useRef(routingFromStatus(st));
+  confirmedRouting.current = routingFromStatus(st);
   const tunnels = useMemo(() => (st.servers || []).filter((s) => s.enabled && (s.imported || s.deployed || s.endpoint)), [st.servers]);
   const defaultTunnelID = tunnels.find((s) => s.connected)?.id || tunnels[0]?.id || st.active_server_id || "";
   const tunnelByID = useMemo(() => new Map(tunnels.map((s) => [s.id, s] as const)), [tunnels]);
   useEffect(() => {
-    if (busy) return;
-    if (Date.now() - lastEditAt.current < 1500) return;
-    setRouting(routingFromStatus(st));
-  }, [st, busy]);
+    if (routingKey !== observedRoutingKey.current) {
+      observedRoutingKey.current = routingKey;
+      pendingRouting.current = routingFromStatus(st);
+    }
+    if (busy || !pendingRouting.current) return;
+    setRouting(pendingRouting.current);
+    pendingRouting.current = null;
+  }, [routingKey, st, busy]);
 
   // Live-poll the device list (same data the Devices tab uses).
-  useEffect(() => {
-    let cancelled = false;
-    const fetchOnce = async () => {
-      try {
-        const v = await api<{ devices: Device[] }>("GET", "/api/devices");
-        if (cancelled) return;
-        setDevices((v.devices ?? []).filter((d) => d.ip));
-      } catch { /* keep last */ }
-    };
-    void fetchOnce();
-    const id = window.setInterval(fetchOnce, 5000);
-    return () => { cancelled = true; window.clearInterval(id); };
-  }, []);
+  usePoll(async (signal) => {
+    const v = await api<{ devices: Device[] }>("GET", "/api/devices", undefined, { signal });
+    if (!signal.aborted) setDevices((v.devices ?? []).filter((d) => d.ip));
+  }, 5000, active && !busy && !externalBusy);
 
   // Autosave: every mode click immediately POSTs the updated config and (if
   // routing is live) applies + commits, so the user never has to hit a button.
   // Optimistic local update first → API call → toast on error/rollback.
   const onSet = async (ip: string, mode: DeviceMode) => {
-    if (busy) return;
-    lastEditAt.current = Date.now();
+    if (saveInFlight.current || externalBusy) return;
+    saveInFlight.current = true;
     const next = { ...routing, mode: routing.mode === "off" ? "zones" : routing.mode, zones: applyMode(routing.zones ?? [], ip, mode, defaultTunnelID) };
     setRouting(next);
     setBusy(true);
+    onBusyChange(true);
     try {
       await api("POST", "/api/awg2/routing/rules", next);
-      void reload();
+      // A queued pre-save snapshot cannot undo an acknowledged write if the
+      // follow-up read fails. A fresh status response may still reconcile it.
+      pendingRouting.current = null;
+      await reload();
     } catch (e) {
       toast((e as Error).message, "err");
-      setRouting(routing); // rollback
+      await reload();
+      // A deadline does not prove that POST failed. Reconcile with the most
+      // recent server snapshot, even if its JSON equals the previous poll.
+      setRouting(confirmedRouting.current);
     } finally {
+      saveInFlight.current = false;
       setBusy(false);
+      onBusyChange(false);
     }
   };
 
@@ -193,7 +201,7 @@ export default function DevicesRoutingPane({ st, reload }: Props) {
                     {d.established || 0} ESTABL · {d.failing || 0} fail
                   </td>
                   <td className="px-2 py-1.5">
-                    <DeviceRouteSelect value={mode} tunnels={tunnels} defaultTunnelID={defaultTunnelID} onChange={(m) => onSet(d.ip, m)} />
+                    <DeviceRouteSelect value={mode} tunnels={tunnels} defaultTunnelID={defaultTunnelID} disabled={busy || externalBusy} onChange={(m) => onSet(d.ip, m)} />
                   </td>
                   <td className="hidden px-2 py-1.5 text-right md:table-cell">
                     <Badge kind={modeKind(mode)}>{modeLabel(mode, tunnelByID)}</Badge>
@@ -228,16 +236,19 @@ function DeviceRouteSelect({
   value,
   tunnels,
   defaultTunnelID,
+  disabled,
   onChange,
 }: {
   value: DeviceMode;
   tunnels: { id: string; label: string; client_iface?: string; connected?: boolean }[];
   defaultTunnelID: string;
+  disabled: boolean;
   onChange: (m: DeviceMode) => void;
 }) {
   const selectValue = value === "custom" ? "custom" : value.startsWith("tunnel:") ? value : value;
   return (
     <Select
+      disabled={disabled}
       value={selectValue}
       onChange={(e) => {
         const v = e.target.value as DeviceMode;

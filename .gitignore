@@ -17,3 +17,6 @@ build/
 /.codex/awg31-compat/
 /.codex/engine-smoke/
 /.codex/recovery-smoke/
+# Local router backups, credentials, diagnostics and temporary test runtimes.
+/.tools/
+/.codex/

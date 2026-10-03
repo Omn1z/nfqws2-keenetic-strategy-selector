@@ -4,6 +4,8 @@ import (
 	"context"
 	"net"
 	"strings"
+
+	"nfqws2strategy/internal/services/awg"
 )
 
 // DNSRouteInfo deliberately contains no endpoint credentials or key material.
@@ -18,10 +20,11 @@ type DNSRouteInfo struct {
 func (svc *Service) DNSRouteCandidates() []DNSRouteInfo {
 	out := []DNSRouteInfo{}
 	for _, srv := range svc.serverSnapshot() {
-		cfg := srv.Manager.RuntimeConfig()
-		if !cfg.Enabled || !cfg.Client.Enabled || strings.TrimSpace(cfg.Endpoint) == "" {
+		identity := srv.Manager.RuntimeLocalClientIdentity()
+		if !identity.Enabled || !identity.ClientEnabled || strings.TrimSpace(identity.Endpoint) == "" {
 			continue
 		}
+		cfg := awg.ServerConfig{Endpoint: identity.Endpoint, ClientIface: identity.ClientIface}
 		iface := awgClientIfaceName(cfg)
 		out = append(out, DNSRouteInfo{ID: srv.ID, Name: awgServerLabel(srv, cfg), Interface: iface, Available: awgDNSRunningOS(iface)})
 	}
@@ -35,18 +38,37 @@ func (svc *Service) ObserveDNSAnswer(ctx context.Context, domain string, respons
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	release, err := svc.routingDNSGate.acquire(ctx, 0, false)
+	if err != nil {
+		if ctx.Err() == nil && svc.routingDNSGate.failed() {
+			// Preserve only a validated, unfiltered upstream address hint. Do
+			// not deliver the answer or install routes while policy is broken.
+			// This lets a later apply prepare endpoints/static sets even when
+			// the native resolver feeds back into this DNS service.
+			if ips, validationErr := awg.ValidatedDNSAnswerIPs(domain, response); validationErr == nil {
+				svc.rememberPolicyDNS(domain, ips)
+			}
+		}
+		return nil, err
+	}
 	svc.route.mu.Lock()
 	p := svc.route.dnsProxy
 	svc.route.mu.Unlock()
+	generation := svc.routingDNSGate.version()
 	if p == nil {
-		return response, nil
+		defer release()
+		return response, svc.routingDNSGate.verify(generation)
 	}
+	release()
 	src := ""
 	if clientIP != nil {
 		src = clientIP.String()
 	}
-	filtered, err := p.ObserveAnswer(src, domain, response)
+	filtered, err := p.ObserveAnswerContext(ctx, src, domain, response)
 	if err != nil {
+		return nil, err
+	}
+	if err := svc.routingDNSGate.verify(generation); err != nil {
 		return nil, err
 	}
 	if err = ctx.Err(); err != nil {

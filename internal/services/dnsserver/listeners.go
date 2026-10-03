@@ -151,15 +151,14 @@ func validDNSQuery(query []byte) bool {
 	return msg.Unpack(query) == nil && len(msg.Question) == 1 && msg.Opcode == mdns.OpcodeQuery
 }
 
-func (s *Listeners) exchange(ctx context.Context, query []byte, remote string) ([]byte, error) {
+func (s *Listeners) exchange(ctx context.Context, query []byte, remote, transport string) ([]byte, error) {
 	select {
 	case s.querySlots <- struct{}{}:
 		defer func() { <-s.querySlots }()
 	default:
 		return nil, errors.New("DNS server is busy")
 	}
-	host, _, _ := net.SplitHostPort(remote)
-	ctx = context.WithValue(ctx, clientIPContextKey{}, net.ParseIP(host))
+	ctx = withListenerOrigin(ctx, remote, s.opts.BindHost, transport)
 	ctx, cancel := context.WithTimeout(ctx, s.opts.RequestTimeout)
 	defer cancel()
 	response, err := s.opts.Exchange(ctx, query)
@@ -197,7 +196,7 @@ func (s *Listeners) serveUDP() {
 		go func() {
 			defer s.wg.Done()
 			defer func() { <-s.requestSlots }()
-			response, err := s.exchange(s.ctx, query, remote.String())
+			response, err := s.exchange(s.ctx, query, remote.String(), "udp")
 			if err != nil {
 				response = dnsServFail(query)
 			}
@@ -268,7 +267,7 @@ func (s *Listeners) serveTCP(conn net.Conn) {
 		if err != nil || !validDNSQuery(query) {
 			return
 		}
-		response, err := s.exchange(s.ctx, query, conn.RemoteAddr().String())
+		response, err := s.exchange(s.ctx, query, conn.RemoteAddr().String(), "tcp")
 		if err != nil {
 			response = dnsServFail(query)
 		}

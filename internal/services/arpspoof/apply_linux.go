@@ -37,45 +37,74 @@ func (s *Service) refreshConfig(cfg Config) error {
 
 func (s *Service) applyConfigLinux(cfg Config, logAnnounce bool) error {
 	_ = os.Remove(legacyHookPath)
-	if !cfg.Enabled {
-		return s.restoreOriginalMACs()
+	ndmc := lookupTool("ndmc")
+	ops := macOperations{
+		targets: func(c Config) ([]string, error) {
+			wan := append([]string(nil), s.cfg.WANIfaces...)
+			wan = append(wan, resolveApplyTargets(s.cfg.WANIfaces)...)
+			ifaces := c.Ifaces
+			if len(ifaces) == 0 {
+				ifaces = suggestedInterfaceNames(interfaceCandidates(wan))
+			}
+			targets := resolveApplyTargets(ifaces)
+			for _, name := range targets {
+				for _, excluded := range wan {
+					if name == excluded {
+						return nil, fmt.Errorf("refusing to change WAN interface %s", name)
+					}
+				}
+			}
+			return targets, nil
+		},
+		read: func(name string) (macState, error) {
+			kernel, err := interfaceMAC(name)
+			if err != nil {
+				return macState{}, err
+			}
+			if ndmc == "" {
+				return macState{MAC: kernel}, nil
+			}
+			native, err := keeneticMAC(ndmc, name)
+			// An old ip-link-only installation can report the new MAC here
+			// while NDM's packet generators still use the old one. A native
+			// command is therefore mandatory once on start/explicit apply.
+			return macState{MAC: native, Inconsistent: native != kernel || logAnnounce}, err
+		},
+		write: func(name, mac string) error {
+			if ndmc != "" {
+				return setKeeneticMAC(ndmc, name, mac)
+			}
+			if lookupTool("ip") == "" {
+				return fmt.Errorf("ip tool not found")
+			}
+			if out, err := runShell("ip link set dev " + shell.Quote(name) + " address " + shell.Quote(mac)); err != nil {
+				return fmt.Errorf("%v: %s", err, strs.LastLines(out, 4))
+			}
+			actual, err := interfaceMAC(name)
+			if err != nil || actual != mac {
+				return fmt.Errorf("kernel MAC verification failed: got %q, want %q (%v)", actual, mac, err)
+			}
+			logbuf.Append("arp-spoofing", "info", "interface "+name+" MAC -> "+mac)
+			return nil
+		},
+		announce: announceARP,
 	}
-	if lookupTool("ip") == "" {
-		return fmt.Errorf("ip tool not found")
+	return s.applyMACConfig(cfg, logAnnounce, ops)
+}
+
+func interfaceMAC(name string) (string, error) {
+	iface, err := net.InterfaceByName(name)
+	if err != nil {
+		if _, statErr := os.Stat(filepath.Join("/sys/class/net", name)); os.IsNotExist(statErr) {
+			return "", os.ErrNotExist
+		}
+		return "", err
 	}
-	ifaces := cfg.Ifaces
-	if len(ifaces) == 0 {
-		ifaces = suggestedInterfaceNames(interfaceCandidates(s.cfg.WANIfaces))
+	mac, err := normalizeMAC(iface.HardwareAddr.String())
+	if err != nil || mac == "" {
+		return "", fmt.Errorf("interface %s has no valid Ethernet MAC", name)
 	}
-	targets := resolveApplyTargets(ifaces)
-	if len(targets) == 0 {
-		return fmt.Errorf("AUTO did not find a LAN bridge, select br0 via API if needed")
-	}
-	for _, name := range targets {
-		iface, err := net.InterfaceByName(name)
-		if err != nil {
-			return fmt.Errorf("interface %s: %w", name, err)
-		}
-		current := strings.ToUpper(iface.HardwareAddr.String())
-		if current == "" {
-			return fmt.Errorf("interface %s has no Ethernet MAC", name)
-		}
-		if _, ok := s.origMACs[name]; !ok && current != cfg.MAC {
-			s.origMACs[name] = current
-		}
-		if current == cfg.MAC {
-			announceARP(name, logAnnounce)
-			continue
-		}
-		if out, err := runShell("ip link set dev " + shell.Quote(name) + " address " + shell.Quote(cfg.MAC)); err != nil {
-			msg := strs.LastLines(out, 4)
-			logbuf.Append("arp-spoofing", "warn", "set "+name+": "+msg)
-			return fmt.Errorf("set %s MAC: %v: %s", name, err, msg)
-		}
-		logbuf.Append("arp-spoofing", "info", "interface "+name+" MAC -> "+cfg.MAC)
-		announceARP(name, logAnnounce)
-	}
-	return nil
+	return mac, nil
 }
 
 func resolveApplyTargets(ifaces []string) []string {
@@ -112,8 +141,10 @@ func announceARP(iface string, logAnnounce bool) {
 	}
 	ips := ifaceIPv4Addrs(iface)
 	for _, ip := range ips {
-		_, _ = runShell("arping -q -U -c 3 -I " + shell.Quote(iface) + " -s " + shell.Quote(ip) + " " + shell.Quote(ip))
-		_, _ = runShell("arping -q -A -c 2 -I " + shell.Quote(iface) + " -s " + shell.Quote(ip) + " " + shell.Quote(ip))
+		if out, err := runShell("arping -q -U -c 2 -I " + shell.Quote(iface) + " -s " + shell.Quote(ip) + " " + shell.Quote(ip)); err != nil {
+			logbuf.Append("arp-spoofing", "warn", "ARP announcement on "+iface+": "+strs.LastLines(out, 3))
+			return
+		}
 	}
 	if logAnnounce && len(ips) > 0 {
 		logbuf.Append("arp-spoofing", "info", "gratuitous ARP sent on "+iface+" for "+strings.Join(ips, ", "))
@@ -132,37 +163,6 @@ func ifaceIPv4Addrs(iface string) []string {
 		}
 	}
 	return ips
-}
-
-func (s *Service) restoreOriginalMACs() error {
-	if len(s.origMACs) == 0 {
-		return nil
-	}
-	if lookupTool("ip") == "" {
-		return fmt.Errorf("ip tool not found")
-	}
-	var firstErr error
-	for name, mac := range s.origMACs {
-		iface, err := net.InterfaceByName(name)
-		if err != nil {
-			delete(s.origMACs, name)
-			continue
-		}
-		current := strings.ToUpper(iface.HardwareAddr.String())
-		if current != mac {
-			if out, err := runShell("ip link set dev " + shell.Quote(name) + " address " + shell.Quote(mac)); err != nil {
-				msg := strs.LastLines(out, 4)
-				logbuf.Append("arp-spoofing", "warn", "restore "+name+": "+msg)
-				if firstErr == nil {
-					firstErr = fmt.Errorf("restore %s MAC: %v: %s", name, err, msg)
-				}
-				continue
-			}
-			logbuf.Append("arp-spoofing", "info", "interface "+name+" MAC restored -> "+mac)
-		}
-		delete(s.origMACs, name)
-	}
-	return firstErr
 }
 
 func runShell(cmd string) (string, error) {

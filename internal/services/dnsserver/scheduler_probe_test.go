@@ -62,7 +62,7 @@ func TestSchedulerProbeUsesOnlyMatchingActivePoolsAndRoutes(t *testing.T) {
 	routes := schedulerTestRoutes()
 	routes[0].Available = false
 	candidates := schedulerProbeCandidates(cfg, append(routes, routes[1]))
-	if len(candidates) != 5 {
+	if len(candidates) != 4 {
 		t.Fatalf("wrong active unique pair count: %+v", candidates)
 	}
 	seen := map[string]bool{}
@@ -85,6 +85,9 @@ func TestSchedulerProbeUsesOnlyMatchingActivePoolsAndRoutes(t *testing.T) {
 	}
 	if seen[cfg.Rules[3].Upstream.Address] {
 		t.Fatal("disabled rule was probed")
+	}
+	if seen[cfg.Rules[1].Upstream.Address] {
+		t.Fatal("single-candidate nested rule was needlessly probed")
 	}
 	cfg.AWGFallback = "off"
 	if got := schedulerProbeCandidates(cfg, routes); len(got) != 0 {
@@ -176,12 +179,16 @@ func TestSchedulerProbeRefreshDropsStaleFailureAndLatencyHistory(t *testing.T) {
 	s.now = func() time.Time { return now }
 	cfg := Default()
 	cfg.Rules = nil
-	routes := schedulerTestRoutes()[:1]
+	routes := schedulerTestRoutes()[:2]
+	// The unrelated competitor has a recent result, so the stale first path
+	// is the one needing recovery evidence in this genuinely competitive pool.
+	s.record(AttemptEvent{Route: routes[1].ID, Upstream: cfg.DefaultUpstream.Address, Success: true, DurationMS: 20})
 	s.record(AttemptEvent{Route: routes[0].ID, Upstream: cfg.DefaultUpstream.Address, Success: true, DurationMS: 2500})
 	for range 5 {
 		s.record(AttemptEvent{Route: routes[0].ID, Upstream: cfg.DefaultUpstream.Address, Error: "old failure"})
 	}
 	now = now.Add(schedulerStaleAfter)
+	s.record(AttemptEvent{Route: routes[1].ID, Upstream: cfg.DefaultUpstream.Address, Success: true, DurationMS: 20})
 	probe, ok := s.nextProbe(cfg, routes)
 	if !ok {
 		t.Fatal("stale failed path was not scheduled")
@@ -199,7 +206,7 @@ func TestSchedulerProbeBoundedHistoryRetainsActiveLease(t *testing.T) {
 	s.now = func() time.Time { return now }
 	cfg := Default()
 	cfg.Rules = nil
-	probe, ok := s.nextProbe(cfg, schedulerTestRoutes()[:1])
+	probe, ok := s.nextProbe(cfg, schedulerTestRoutes()[:2])
 	if !ok {
 		t.Fatal("missing probe")
 	}

@@ -5,7 +5,7 @@ import { toast } from "@/components/ui/Toast";
 import { Card } from "@/components/ui/Card";
 import { Badge } from "@/components/ui/Badge";
 import { Button } from "@/components/ui/Button";
-import { Input } from "@/components/ui/form";
+import { Input, Select } from "@/components/ui/form";
 import { confirmDialog } from "@/components/ui/Confirm";
 import type { LogEntry } from "@/types/api";
 
@@ -127,23 +127,23 @@ export default function Logs() {
       <div className="flex flex-wrap items-center gap-3 py-3">
         <Button mini variant="ghost" onClick={onClear}>Очистить</Button>
         <span className="ml-2 text-[12px] text-muted">Модуль:</span>
-        <select value={moduleFilter} onChange={(e) => { setModuleFilter(e.target.value); setPage(1); }} className="h-7 rounded border border-line bg-panel px-2 text-[12px]">
+        <Select value={moduleFilter} onChange={(e) => { setModuleFilter(e.target.value); setPage(1); }} className="h-7 min-h-7 w-auto text-[12px]">
           <option value="all">все</option>
           {modules.map((m) => <option key={m} value={m}>{m}</option>)}
-        </select>
+        </Select>
         <span className="ml-2 text-[12px] text-muted">Уровень:</span>
-        <select value={levelFilter} onChange={(e) => { setLevelFilter(e.target.value as typeof levelFilter); setPage(1); }} className="h-7 rounded border border-line bg-panel px-2 text-[12px]">
+        <Select value={levelFilter} onChange={(e) => { setLevelFilter(e.target.value as typeof levelFilter); setPage(1); }} className="h-7 min-h-7 w-auto text-[12px]">
           <option value="all">все</option>
           <option value="error">error</option>
           <option value="warn">warn</option>
           <option value="info">info</option>
           <option value="debug">debug</option>
-        </select>
+        </Select>
         <span className="ml-auto text-[12px] text-muted">
           Show
-          <select value={pageSize} onChange={(e) => { setPageSize(parseInt(e.target.value, 10)); setPage(1); }} className="mx-1 h-7 rounded border border-line bg-panel px-1 text-[12px]">
+          <Select value={pageSize} onChange={(e) => { setPageSize(parseInt(e.target.value, 10)); setPage(1); }} className="mx-1 h-7 min-h-7 w-auto text-[12px]">
             {PAGE_SIZES.map((s) => <option key={s} value={s}>{s}</option>)}
-          </select>
+          </Select>
           entries
         </span>
       </div>

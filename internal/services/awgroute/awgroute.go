@@ -3,6 +3,7 @@ package awgroute
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -18,8 +19,11 @@ import (
 const awgConfigFile = "awg.json"
 
 type awgPersisted struct {
-	ActiveID string               `json:"active_id"`
-	Servers  []awgPersistedServer `json:"servers"`
+	ActiveID       string                       `json:"active_id"`
+	Servers        []awgPersistedServer         `json:"servers"`
+	Routing        *awgRoutingSettings          `json:"routing,omitempty"`
+	PendingRules   []awg.Zone                   `json:"pending_rules,omitempty"`
+	ConnectionRefs map[string]AWG2ConnectionRef `json:"connection_refs,omitempty"`
 }
 
 type awgPersistedServer struct {
@@ -66,20 +70,23 @@ type AWG2DeployServerResult struct {
 
 // AWG2Status is the combined view the AWG2 tab polls.
 type AWG2Status struct {
-	Config            awg.ServerConfig    `json:"config"` // redacted (no secrets)
-	ActiveID          string              `json:"active_server_id"`
-	Servers           []AWG2ServerSummary `json:"servers"`
-	RoutingRules      []awg.Zone          `json:"routing_rules"`
-	HasPassword       bool                `json:"has_password"`
-	HasKey            bool                `json:"has_key"`
-	HasServerKey      bool                `json:"has_server_key"`
-	Deployed          bool                `json:"deployed"`
-	LastDeploy        *awg.DeployResult   `json:"last_deploy"`
-	Status            *awg.Status         `json:"status"`
-	Endpoint          string              `json:"endpoint"`
-	Engine            EngineInfo          `json:"engine"`
-	Client            *ClientStatus       `json:"client"`
-	DeploymentPending bool                `json:"deployment_pending"`
+	Config            awg.ServerConfig             `json:"config"` // redacted (no secrets)
+	ActiveID          string                       `json:"active_server_id"`
+	Servers           []AWG2ServerSummary          `json:"servers"`
+	RoutingRules      []awg.Zone                   `json:"routing_rules"`
+	RoutingConfig     awg.RoutingConfig            `json:"routing_config"` // shared policy, independent of the profile being edited
+	RoutingState      RoutingDNSReadiness          `json:"routing_state"`
+	ConnectionRefs    map[string]AWG2ConnectionRef `json:"connection_refs,omitempty"`
+	HasPassword       bool                         `json:"has_password"`
+	HasKey            bool                         `json:"has_key"`
+	HasServerKey      bool                         `json:"has_server_key"`
+	Deployed          bool                         `json:"deployed"`
+	LastDeploy        *awg.DeployResult            `json:"last_deploy"`
+	Status            *awg.Status                  `json:"status"`
+	Endpoint          string                       `json:"endpoint"`
+	Engine            EngineInfo                   `json:"engine"`
+	Client            *ClientStatus                `json:"client"`
+	DeploymentPending bool                         `json:"deployment_pending"`
 }
 
 // initAWG loads the persisted AWG2 config (or defaults). It NEVER auto-deploys —
@@ -104,13 +111,21 @@ func awgShouldRestoreRouting(c awg.ServerConfig) bool {
 }
 
 func (svc *Service) awgSave() {
-	state := svc.snapshotAWGState()
-	if err := svc.store.SaveSecret(awgConfigFile, &state); err != nil {
+	if err := svc.awgSaveErr(); err != nil {
 		log.Printf("awg: save config failed: %v", err)
 	}
+}
+
+func (svc *Service) awgSaveErr() error {
+	state := svc.snapshotAWGState()
+	svc.mu.Lock()
+	svc.connectionRefs = cloneAWGConnectionRefs(state.ConnectionRefs)
+	svc.mu.Unlock()
+	err := svc.store.SaveSecret(awgConfigFile, &state)
 	// Bump on every persisted edit so the expand-entries cache + watchdog
 	// short-circuit pick up zones changes without us tracking each callsite.
 	svc.BumpZonesRevision()
+	return err
 }
 
 func (svc *Service) loadAWGState() awgPersisted {
@@ -122,7 +137,7 @@ func (svc *Service) loadAWGState() awgPersisted {
 	if json.Unmarshal(b, &shape) == nil {
 		if _, ok := shape["servers"]; ok {
 			var st awgPersisted
-			if json.Unmarshal(b, &st) == nil && len(st.Servers) > 0 {
+			if json.Unmarshal(b, &st) == nil {
 				return normalizeAWGState(st)
 			}
 			log.Printf("awg: persisted multi-server config is invalid, using defaults without legacy remap")
@@ -142,15 +157,26 @@ func (svc *Service) loadAWGState() awgPersisted {
 
 func defaultAWGState() awgPersisted {
 	cfg := awg.Default()
+	settings := routingSettingsFrom(cfg.Routing)
 	return awgPersisted{
 		ActiveID: "awg0",
 		Servers:  []awgPersistedServer{{ID: "awg0", Config: *cfg}},
+		Routing:  &settings,
 	}
 }
 
 func normalizeAWGState(st awgPersisted) awgPersisted {
 	if len(st.Servers) == 0 {
-		return defaultAWGState()
+		defaults := defaultAWGState()
+		if awgPendingReferencesID(st.PendingRules, defaults.ActiveID) || st.ConnectionRefs[defaults.ActiveID].Ref != "" {
+			defaults.ActiveID = "awg-" + storeutil.NewID()
+			defaults.Servers[0].ID = defaults.ActiveID
+		}
+		st.Servers = defaults.Servers
+		st.ActiveID = defaults.ActiveID
+		if st.Routing == nil {
+			st.Routing = defaults.Routing
+		}
 	}
 	seen := map[string]bool{}
 	out := make([]awgPersistedServer, 0, len(st.Servers))
@@ -164,6 +190,11 @@ func normalizeAWGState(st awgPersisted) awgPersisted {
 		srv.Name = strings.TrimSpace(srv.Name)
 		repairImportedInstallMarker(&srv.Config)
 		srv.Config.Normalize()
+		if srv.Config.Routing.Mode == "off" {
+			// A stale committed bit on a disabled legacy profile must not turn
+			// into an active tunnel when shared settings are migrated below.
+			srv.Config.Routing.Active = false
+		}
 		out = append(out, srv)
 	}
 	assignAWGClientIfaces(out)
@@ -171,6 +202,16 @@ func normalizeAWGState(st awgPersisted) awgPersisted {
 	if strings.TrimSpace(st.ActiveID) == "" || !seen[st.ActiveID] {
 		st.ActiveID = st.Servers[0].ID
 	}
+	settings := legacyRoutingSettings(st.Servers, st.ActiveID)
+	if st.Routing != nil {
+		// An explicit shared policy is authoritative, including mode=off.
+		settings = routingSettingsFrom(st.Routing.apply(awg.RoutingConfig{}))
+	}
+	st.Routing = &settings
+	for i := range st.Servers {
+		st.Servers[i].Config.Routing = settings.apply(st.Servers[i].Config.Routing)
+	}
+	normalizeAWGPendingRules(&st)
 	return st
 }
 
@@ -284,6 +325,10 @@ func (svc *Service) installAWGState(st awgPersisted) {
 	svc.servers = servers
 	svc.order = order
 	svc.activeID = st.ActiveID
+	settings := *st.Routing
+	svc.routing = &settings
+	svc.pendingRules = cloneAWGZones(st.PendingRules)
+	svc.connectionRefs = cloneAWGConnectionRefs(st.ConnectionRefs)
 	if active := servers[svc.activeID]; active != nil {
 		svc.awg = active.Manager
 	} else if len(order) > 0 {
@@ -297,6 +342,8 @@ func (svc *Service) installAWGState(st awgPersisted) {
 func (svc *Service) snapshotAWGState() awgPersisted {
 	svc.mu.RLock()
 	activeID := svc.activeID
+	pendingRules := cloneAWGZones(svc.pendingRules)
+	connectionRefs := cloneAWGConnectionRefs(svc.connectionRefs)
 	entries := make([]*managedServer, 0, len(svc.order))
 	for _, id := range svc.order {
 		if srv := svc.servers[id]; srv != nil {
@@ -305,7 +352,8 @@ func (svc *Service) snapshotAWGState() awgPersisted {
 	}
 	svc.mu.RUnlock()
 
-	st := awgPersisted{ActiveID: activeID, Servers: make([]awgPersistedServer, 0, len(entries))}
+	settings := svc.currentRoutingSettings()
+	st := awgPersisted{ActiveID: activeID, Servers: make([]awgPersistedServer, 0, len(entries)), Routing: &settings, PendingRules: pendingRules, ConnectionRefs: connectionRefs}
 	for _, srv := range entries {
 		st.Servers = append(st.Servers, awgPersistedServer{
 			ID:            srv.ID,
@@ -315,8 +363,9 @@ func (svc *Service) snapshotAWGState() awgPersisted {
 		})
 	}
 	if len(st.Servers) == 0 {
-		return defaultAWGState()
+		return normalizeAWGState(st)
 	}
+	st.ConnectionRefs = awgRetainedConnectionRefs(st.ConnectionRefs, st.PendingRules, st.Servers)
 	return st
 }
 
@@ -354,14 +403,19 @@ func (svc *Service) activeServerID() string {
 // SAME Manager — pin via awgActive() so a concurrent SelectServer/DeleteServer
 // can't tear the snapshot into a Frankenstein of two servers.
 func (svc *Service) AWG2StatusView() AWG2Status {
+	rules := svc.awgRoutingRules()
+	routing := svc.globalRoutingConfig(rules)
 	am := svc.awgActive()
 	if am == nil {
 		return AWG2Status{
-			ActiveID:     svc.activeServerID(),
-			Servers:      svc.awgServerSummaries(),
-			RoutingRules: svc.awgRoutingRules(),
-			Engine:       svc.AWG2EngineInfo(),
-			Client:       svc.awgClientStatus(),
+			ActiveID:       svc.activeServerID(),
+			Servers:        svc.awgServerSummaries(),
+			RoutingRules:   rules,
+			RoutingConfig:  routing,
+			RoutingState:   svc.RoutingDNSReadiness(),
+			ConnectionRefs: svc.connectionRefSnapshot(),
+			Engine:         svc.AWG2EngineInfo(),
+			Client:         svc.awgClientStatus(),
 		}
 	}
 	full := am.Config()
@@ -369,7 +423,10 @@ func (svc *Service) AWG2StatusView() AWG2Status {
 		Config:            am.Redacted(),
 		ActiveID:          svc.activeServerID(),
 		Servers:           svc.awgServerSummaries(),
-		RoutingRules:      svc.awgRoutingRules(),
+		RoutingRules:      rules,
+		RoutingConfig:     routing,
+		RoutingState:      svc.RoutingDNSReadiness(),
+		ConnectionRefs:    svc.connectionRefSnapshot(),
 		HasPassword:       strings.TrimSpace(full.Conn.Password) != "",
 		HasKey:            strings.TrimSpace(full.Conn.KeyPEM) != "",
 		HasServerKey:      strings.TrimSpace(full.PrivateKey) != "",
@@ -458,13 +515,12 @@ func (svc *Service) awgRoutingRules() []awg.Zone {
 	}
 	items := []item{}
 	fallback := 1
-	for _, srv := range svc.serverSnapshot() {
-		cfg := srv.Manager.Config()
-		for _, z := range cfg.Routing.Zones {
-			z.TunnelID = strings.TrimSpace(z.TunnelID)
-			if z.TunnelID == "" {
-				z.TunnelID = srv.ID
-			}
+	appendRule := func(z awg.Zone, ownerID string) {
+		z.TunnelID = strings.TrimSpace(z.TunnelID)
+		if z.TunnelID == "" && !z.WaitingForConnection {
+			z.TunnelID = ownerID
+		}
+		if !z.WaitingForConnection {
 			if z.RouteValue() == "tunnel" {
 				candidates := fallbackCandidates(z.TunnelID, z.FallbackTunnelIDs)
 				if len(candidates) > 1 {
@@ -475,21 +531,34 @@ func (svc *Service) awgRoutingRules() []awg.Zone {
 			} else {
 				z.FallbackTunnelIDs = nil
 			}
-			if z.Domains == nil {
-				z.Domains = []string{}
-			}
-			if z.IPs == nil {
-				z.IPs = []string{}
-			}
-			if z.SourceIPs == nil {
-				z.SourceIPs = []string{}
-			}
-			if z.Route != "tunnel" && z.Route != "direct" {
-				z.Route = z.RouteValue()
-			}
-			items = append(items, item{z: z, fallback: fallback})
-			fallback++
 		}
+		if z.Domains == nil {
+			z.Domains = []string{}
+		}
+		if z.IPs == nil {
+			z.IPs = []string{}
+		}
+		if z.SourceIPs == nil {
+			z.SourceIPs = []string{}
+		}
+		if z.Route != "tunnel" && z.Route != "direct" {
+			z.Route = z.RouteValue()
+		}
+		items = append(items, item{z: z, fallback: fallback})
+		fallback++
+	}
+	for _, srv := range svc.serverSnapshot() {
+		cfg := srv.Manager.Config()
+		for _, z := range cfg.Routing.Zones {
+			appendRule(z, srv.ID)
+		}
+	}
+	svc.mu.RLock()
+	pending := cloneAWGZones(svc.pendingRules)
+	svc.mu.RUnlock()
+	for _, z := range pending {
+		z.WaitingForConnection = true
+		appendRule(z, "")
 	}
 	sort.SliceStable(items, func(i, j int) bool {
 		oi, oj := items[i].z.Order, items[j].z.Order
@@ -536,19 +605,57 @@ func (svc *Service) defaultRoutingTunnelID() string {
 func (svc *Service) AWG2SetRoutingRules(rc awg.RoutingConfig) error {
 	_, unlock := svc.lockClientOps(false)
 	defer unlock()
-	defaultID := svc.defaultRoutingTunnelID()
-	if defaultID == "" {
-		return fmt.Errorf("AWG2-подключения не найдены")
+	if err := svc.awgSaveRoutingRules(rc); err != nil {
+		return err
 	}
+	return svc.awgApplyMultiHostRoutesOSErr()
+}
+
+// awgSaveRoutingRules changes persisted policy only. The caller owns client
+// operations; separating the save from kernel installation also keeps policy
+// normalization tests independent of the host's live firewall and routes.
+func (svc *Service) awgSaveRoutingRules(rc awg.RoutingConfig) error {
+	return svc.awgSaveRoutingRulesWithRefs(rc, nil)
+}
+
+// The caller owns client operations. Import supplies validated public source
+// references here so their metadata and detached rules are persisted together.
+func (svc *Service) awgSaveRoutingRulesWithRefs(rc awg.RoutingConfig, extraRefs map[string]AWG2ConnectionRef) error {
+	defaultID := ""
 	byID := map[string]*managedServer{}
 	for _, srv := range svc.serverSnapshot() {
 		byID[srv.ID] = srv
 	}
 	part := map[string][]awg.Zone{}
+	var pending []awg.Zone
+	refs := svc.connectionRefSnapshot()
+	for id, ref := range extraRefs {
+		if strings.TrimSpace(id) == "" || ref.Ref != id {
+			return fmt.Errorf("неверная ссылка подключения: %s", id)
+		}
+		if byID[id] == nil {
+			refs[id] = ref
+		}
+	}
 	referenced := map[string]bool{}
 	for i, z := range rc.Zones {
 		z.TunnelID = strings.TrimSpace(z.TunnelID)
+		if z.WaitingForConnection {
+			// Waiting is explicit: neither selecting nor adding a connection
+			// may silently attach this rule to the current default tunnel.
+			z.Order = i + 1
+			pending = append(pending, z)
+			continue
+		}
 		if z.TunnelID == "" {
+			if len(byID) == 0 {
+				return fmt.Errorf("AWG2-подключения не найдены")
+			}
+			// Explicit and waiting rules need no live tunnel probes merely to
+			// persist. Resolve a default only for the legacy empty-ID format.
+			if defaultID == "" {
+				defaultID = svc.defaultRoutingTunnelID()
+			}
 			z.TunnelID = defaultID
 		}
 		if byID[z.TunnelID] == nil {
@@ -559,7 +666,8 @@ func (svc *Service) AWG2SetRoutingRules(rc awg.RoutingConfig) error {
 		}
 		if z.Route == "tunnel" {
 			fallbacks, err := normalizeFallbackTunnelIDs(z.TunnelID, z.FallbackTunnelIDs, func(id string) bool {
-				return byID[id] != nil
+				_, retained := refs[id]
+				return byID[id] != nil || retained
 			})
 			if err != nil {
 				return fmt.Errorf("правило %q: %w", z.Name, err)
@@ -596,27 +704,43 @@ func (svc *Service) AWG2SetRoutingRules(rc awg.RoutingConfig) error {
 			}
 		}
 	}
-	mode := rc.Mode
-	if mode == "" || mode == "include" || mode == "exclude" {
-		mode = "zones"
+	if rc.Mode == "" || rc.Mode == "include" || rc.Mode == "exclude" {
+		rc.Mode = "zones"
 	}
-	for _, srv := range svc.serverSnapshot() {
-		cfg := srv.Manager.Config()
-		next := cfg.Routing
-		next.Zones = part[srv.ID]
-		next.Mode = mode
-		next.Killswitch = rc.Killswitch
-		next.DomainSource = rc.DomainSource
-		next.SNIRouting = rc.SNIRouting
-		next.TraceEnabled = rc.TraceEnabled
+	if rc.MTU <= 0 {
+		rc.MTU = svc.currentRoutingSettings().MTU
+	}
+	settings := routingSettingsFrom(rc)
+	// Persist a private candidate before publishing it. A disk error must not
+	// leave managers, DNS consumers or a later save observing uncommitted edits.
+	candidate := svc.snapshotAWGState()
+	candidate.Routing = &settings
+	candidate.PendingRules = cloneAWGZones(pending)
+	for i := range candidate.Servers {
+		server := &candidate.Servers[i]
+		next := settings.apply(server.Config.Routing)
+		next.Zones = cloneAWGZones(part[server.ID])
 		// Backup-only connections have no zones of their own, but must stay
 		// active so the selector can move traffic to them and back again.
-		srv.Manager.SetRoutingState(next, mode != "off" && (len(next.Zones) > 0 || referenced[srv.ID]))
+		next.Active = settings.Mode != "off" && (len(next.Zones) > 0 || referenced[server.ID])
+		next.Normalize()
+		server.Config.Routing = next
 	}
-	svc.awgSave()
-	if err := svc.awgApplyMultiHostRoutesOSErr(); err != nil {
+	candidate.ConnectionRefs = awgRetainedConnectionRefs(refs, candidate.PendingRules, candidate.Servers)
+	if err := svc.store.SaveSecret(awgConfigFile, &candidate); err != nil {
 		return err
 	}
+	svc.mu.Lock()
+	svc.routing = &settings
+	svc.pendingRules = cloneAWGZones(candidate.PendingRules)
+	svc.connectionRefs = cloneAWGConnectionRefs(candidate.ConnectionRefs)
+	svc.mu.Unlock()
+	for _, server := range candidate.Servers {
+		if current := byID[server.ID]; current != nil {
+			current.Manager.SetRoutingState(server.Config.Routing, server.Config.Routing.Active)
+		}
+	}
+	svc.BumpZonesRevision()
 	return nil
 }
 
@@ -625,6 +749,7 @@ func (svc *Service) AWG2AddServer(name string) AWG2Status {
 	defer unlock()
 	cfg := awg.Default()
 	cfg.ClientIface = svc.nextAWGClientIface()
+	cfg.Routing = svc.currentRoutingSettings().apply(cfg.Routing)
 	id := "awg-" + storeutil.NewID()
 	srv := &managedServer{ID: id, Name: strings.TrimSpace(name), Manager: awg.NewManager(cfg)}
 	_, _, _ = srv.Manager.EnsureRouterPeerLocal()
@@ -659,6 +784,9 @@ func (svc *Service) AWG2SelectServer(id string) error {
 	if id == oldID {
 		return nil
 	}
+	settings := svc.currentRoutingSettings()
+	selected := srv.Manager.Config().Routing
+	srv.Manager.SetRoutingState(settings.apply(selected), selected.Active)
 
 	svc.mu.Lock()
 	svc.activeID = id
@@ -746,6 +874,13 @@ func awgCanStartLocalClient(cfg awg.ServerConfig) bool {
 func (svc *Service) AWG2DeleteServer(id string) error {
 	_, unlock := svc.lockClientOps(true)
 	defer unlock()
+	return svc.awgDeleteServerWithOps(id, svc.awgTeardownRoutingOS, svc.awgClientDownManagerOS, svc.awgApplyMultiHostRoutesOSErr)
+}
+
+// Injected lifecycle operations keep deletion/persistence regression tests
+// independent of the host's firewall, routes and running VPN interfaces.
+func (svc *Service) awgDeleteServerWithOps(id string, teardown func() error, down func(*awg.Manager) error, apply func() error) error {
+	settings := svc.currentRoutingSettings()
 	id = strings.TrimSpace(id)
 	svc.mu.RLock()
 	srv := svc.servers[id]
@@ -754,15 +889,18 @@ func (svc *Service) AWG2DeleteServer(id string) error {
 	if srv == nil {
 		return fmt.Errorf("AWG2-сервер не найден")
 	}
+	rules := svc.awgRoutingRules()
+	deletedRef := awgConnectionReference(srv)
+	var operationErr error
 	srv.Manager.SetEnabled(false)
 	srv.Manager.SetClientEnabled(false)
 	svc.forgetClientRecovery(srv.Manager)
 	if active {
-		_ = svc.awgTeardownRoutingOS()
+		operationErr = teardown()
 	}
 	srv.Manager.SetClientEnabled(false)
 	srv.Manager.SetRoutingActive(false)
-	_ = svc.awgClientDownManagerOS(srv.Manager)
+	operationErr = errors.Join(operationErr, down(srv.Manager))
 
 	svc.mu.Lock()
 	delete(svc.servers, id)
@@ -775,48 +913,69 @@ func (svc *Service) AWG2DeleteServer(id string) error {
 	svc.order = nextOrder
 	if len(svc.order) == 0 {
 		cfg := awg.Default()
-		def := &managedServer{ID: "awg0", Manager: awg.NewManager(cfg)}
-		svc.servers["awg0"] = def
-		svc.order = append(svc.order, "awg0")
-		svc.activeID = "awg0"
+		cfg.Routing = settings.apply(cfg.Routing)
+		// Never reuse a removed ID: its public identity still belongs to the
+		// waiting rules, including the historical default ID "awg0".
+		blankID := "awg-" + storeutil.NewID()
+		def := &managedServer{ID: blankID, Manager: awg.NewManager(cfg)}
+		svc.servers[blankID] = def
+		svc.order = append(svc.order, blankID)
+		svc.activeID = blankID
 		svc.awg = def.Manager
 	} else if active {
 		svc.activeID = svc.order[0]
 		svc.awg = svc.servers[svc.activeID].Manager
 	}
+	if svc.connectionRefs == nil {
+		svc.connectionRefs = map[string]AWG2ConnectionRef{}
+	}
+	svc.connectionRefs[id] = deletedRef
 	svc.mu.Unlock()
-	// A deleted connection may still be present in another rule's fallback
-	// queue. Remove that dangling reference while retaining the remaining
-	// priority order; otherwise the next rules save would fail validation.
+	// Rules retain their original primary and fallback references. A deleted
+	// primary waits for an explicit choice rather than switching to its backup
+	// or to whichever connection happens to be selected next.
+	part := map[string][]awg.Zone{}
+	priorReferences := map[string]bool{}
+	remainingReferences := map[string]bool{}
+	var pending []awg.Zone
+	for _, z := range rules {
+		if !z.WaitingForConnection && z.RouteValue() == "tunnel" {
+			for _, candidate := range fallbackCandidates(z.TunnelID, z.FallbackTunnelIDs) {
+				priorReferences[candidate] = true
+			}
+		}
+		if z.WaitingForConnection || z.TunnelID == id {
+			z.WaitingForConnection = true
+			pending = append(pending, z)
+		} else {
+			part[z.TunnelID] = append(part[z.TunnelID], z)
+			remainingReferences[z.TunnelID] = true
+			if z.RouteValue() == "tunnel" {
+				for _, candidate := range z.FallbackTunnelIDs {
+					remainingReferences[candidate] = true
+				}
+			}
+		}
+	}
+	svc.mu.Lock()
+	svc.pendingRules = cloneAWGZones(pending)
+	svc.mu.Unlock()
 	for _, other := range svc.serverSnapshot() {
 		cfg := other.Manager.Config()
-		changed := false
-		for i := range cfg.Routing.Zones {
-			z := &cfg.Routing.Zones[i]
-			kept := make([]string, 0, len(z.FallbackTunnelIDs))
-			zoneChanged := false
-			for _, candidate := range z.FallbackTunnelIDs {
-				if strings.TrimSpace(candidate) == id {
-					zoneChanged = true
-					continue
-				}
-				kept = append(kept, candidate)
-			}
-			if zoneChanged {
-				changed = true
-				z.FallbackTunnelIDs = kept
-			}
+		cfg.Routing.Zones = part[other.ID]
+		activeState := cfg.Routing.Active
+		if len(cfg.Routing.Zones) == 0 && !remainingReferences[other.ID] {
+			// A backup that was active solely for the removed primary must
+			// not become a legacy full-mode owner during supervisor recovery.
+			// Preserve an independently committed, zone-less legacy full owner.
+			activeState = activeState && cfg.Routing.Mode == "full" && !priorReferences[other.ID]
 		}
-		if changed {
-			activeState := cfg.Routing.Active
-			other.Manager.SetRoutingState(cfg.Routing, activeState)
-		}
+		other.Manager.SetRoutingState(cfg.Routing, activeState)
 	}
 	svc.syncActiveAWGIface()
 	svc.route.tunnelUpAt.Store(0)
-	svc.awgSave()
-	svc.awgApplyMultiHostRoutesOS()
-	return nil
+	operationErr = errors.Join(operationErr, svc.awgSaveErr())
+	return errors.Join(operationErr, apply())
 }
 
 // AWG2InsertTopRule prepends a new rule to the global routing list
@@ -839,28 +998,21 @@ func (svc *Service) AWG2InsertTopRule(domain, route, name string) error {
 	if name == "" {
 		name = "trace:" + domain
 	}
+	includeSubdomains := true
 	rule := awg.Zone{
-		Name:     name,
-		TunnelID: tunnelID,
-		Order:    1,
-		Route:    route,
-		Domains:  []string{domain},
-		Enabled:  true,
+		Name:              name,
+		TunnelID:          tunnelID,
+		Order:             1,
+		Route:             route,
+		Domains:           []string{domain},
+		IncludeSubdomains: &includeSubdomains,
+		Enabled:           true,
 	}
 	rules := svc.awgRoutingRules()
 	for i := range rules {
 		rules[i].Order = i + 2
 	}
-	rc := awg.RoutingConfig{Mode: "zones", Zones: append([]awg.Zone{rule}, rules...)}
-	if am := svc.awgActive(); am != nil {
-		cfg := am.Config()
-		rc.Mode = cfg.Routing.Mode
-		rc.MTU = cfg.Routing.MTU
-		rc.Killswitch = cfg.Routing.Killswitch
-		rc.DomainSource = cfg.Routing.DomainSource
-		rc.SNIRouting = cfg.Routing.SNIRouting
-		rc.TraceEnabled = cfg.Routing.TraceEnabled
-	}
+	rc := svc.currentRoutingSettings().apply(awg.RoutingConfig{Zones: append([]awg.Zone{rule}, rules...)})
 	if rc.Mode == "" || rc.Mode == "off" {
 		rc.Mode = "zones"
 	}
@@ -891,7 +1043,9 @@ func (svc *Service) AWG2CopyRulesFromServer(fromServerID string) (int, error) {
 		return 0, err
 	}
 	svc.awgSave()
-	svc.awgApplyMultiHostRoutesOS()
+	if err := svc.awgApplyMultiHostRoutesOSErr(); err != nil {
+		return len(dstCfg.Routing.Zones), err
+	}
 	return len(dstCfg.Routing.Zones), nil
 }
 
@@ -1187,21 +1341,38 @@ func (svc *Service) AWG2SetRouting(rc awg.RoutingConfig) error {
 	if m == nil {
 		return fmt.Errorf("AWG2-сервер не выбран")
 	}
-	m.SetRouting(rc)
+	if rc.MTU <= 0 {
+		rc.MTU = svc.currentRoutingSettings().MTU
+	}
+	rc.Normalize()
+	settings := routingSettingsFrom(rc)
+	svc.rememberRoutingSettings(settings)
+	hadActive := m.Config().Routing.Active
+	m.SetRouting(settings.apply(rc))
+	for _, srv := range svc.serverSnapshot() {
+		if srv.Manager == m {
+			continue
+		}
+		other := srv.Manager.Config().Routing
+		hadActive = hadActive || other.Active
+		srv.Manager.SetRoutingState(settings.apply(other), other.Active && settings.Mode != "off")
+	}
+	if settings.Mode == "off" {
+		m.SetRoutingActive(false)
+	}
 	svc.awgSave()
-	cfg := m.Config()
-	if !cfg.Routing.Active {
+	if !hadActive {
 		return nil // not active yet — user activates with «Применить»
 	}
-	if cfg.Routing.Mode == "off" {
-		m.SetRoutingActive(false)
-		svc.awgSave()
+	if settings.Mode == "off" {
 		err := svc.awgTeardownRoutingOS()
-		svc.awgApplyMultiHostRoutesOS()
+		applyErr := svc.awgApplyMultiHostRoutesOSErr()
+		if err == nil {
+			err = applyErr
+		}
 		return err
 	}
 	// Re-apply through the multi-policy datapath so config edits update AWG2_MULTI
 	// and awgm_* before the HTTP request returns.
-	svc.awgApplyMultiHostRoutesOS()
-	return nil
+	return svc.awgApplyMultiHostRoutesOSErr()
 }

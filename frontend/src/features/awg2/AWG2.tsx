@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "@/lib/api";
 import { cn } from "@/lib/cn";
 import { vpnEngineIssue, vpnProfileLabel } from "@/lib/awg";
@@ -18,7 +18,7 @@ import RoutingPane from "./RoutingPane";
 import DevicesRoutingPane from "./DevicesRoutingPane";
 import TracePane from "./TracePane";
 import { SpeedTestPanel } from "./SpeedTestCard";
-import type { Awg2ServerSummary, Awg2Status, AwgClientStatus, AwgDeployResult } from "@/types/api";
+import type { Awg2ServerSummary, Awg2Status, AwgClientStatus, AwgDeployResult, AwgRoutingConfig } from "@/types/api";
 
 type Sub = "server" | "routing" | "devices" | "trace";
 type DeployOpts = { quiet?: boolean; skipReload?: boolean };
@@ -89,9 +89,11 @@ function RecoveryStatus({ client }: { client: AwgClientStatus }) {
 export default function AWG2() {
   const [sub, setSub] = useState<Sub>("server");
   const [st, setSt] = useState<Awg2Status | null>(null);
+  const [statusError, setStatusError] = useState("");
   const [deploying, setDeploying] = useState<Record<string, boolean>>({});
   const [toggling, setToggling] = useState<Record<string, boolean>>({});
   const [selectingID, setSelectingID] = useState("");
+  const [deletingID, setDeletingID] = useState("");
   const [selected, setSelected] = useState<Record<string, boolean>>({});
   const [batch, setBatch] = useState<{ done: number; total: number } | null>(null);
   const [addOpen, setAddOpen] = useState(false);
@@ -103,38 +105,89 @@ export default function AWG2() {
   const [newConn, setNewConn] = useState(emptyNewConnection);
   const [creating, setCreating] = useState(false);
   const [formatBusy, setFormatBusy] = useState(false);
+  const [serverBusy, setServerBusy] = useState(false);
+  const [routingBusy, setRoutingBusy] = useState(false);
+  const [traceBusy, setTraceBusy] = useState(false);
+  const traceTail = useRef<Promise<void>>(Promise.resolve());
+  const tracePending = useRef(0);
+  // Keep trace writes serialized across pane unmount/remount. A pending rule
+  // insertion and its auto-record cleanup must finish before another edit.
+  const runTraceMutation = useCallback((work: () => Promise<void>): Promise<void> => {
+    tracePending.current++;
+    setTraceBusy(true);
+    const next = traceTail.current.then(work);
+    traceTail.current = next.catch(() => {});
+    return next.finally(() => {
+      tracePending.current--;
+      setTraceBusy(tracePending.current > 0);
+    });
+  }, []);
+  const [reconnectRevision, setReconnectRevision] = useState(0);
+  const initialRoutingRevision = useRef<number | null>(null);
+  const lastConfirmedRoutingRevision = useRef(0);
   const [speedServer, setSpeedServer] = useState<Awg2ServerSummary | null>(null);
+  const statusEpoch = useRef(0);
+  const statusRequest = useRef(0);
+  const otherMutationBusy = creating || renaming || !!selectingID || !!deletingID || !!batch || formatBusy || serverBusy || routingBusy ||
+    Object.values(deploying).some(Boolean) || Object.values(toggling).some(Boolean);
+  const mutationBusy = otherMutationBusy || traceBusy;
 
-  usePoll(async () => {
+  const acceptStatus = (next: Awg2Status) => {
+    // An earlier GET must never overwrite the response of a completed mutation.
+    statusEpoch.current++;
+    setSt(next);
+    setStatusError("");
+  };
+  const acceptRouting = (routing: AwgRoutingConfig) => {
+    statusEpoch.current++;
+    setSt((previous) => previous ? { ...previous, routing_config: routing, routing_rules: routing.zones,
+      config: { ...previous.config, routing } } : previous);
+    setStatusError("");
+  };
+  const reload = async (signal?: AbortSignal) => {
+    const request = ++statusRequest.current;
+    const epoch = statusEpoch.current;
     try {
-      setSt(await api<Awg2Status>("GET", "/api/awg2"));
-    } catch {
-      /* keep last */
+      const next = await api<Awg2Status>("GET", "/api/awg2", undefined, { signal });
+      if (!signal?.aborted && request === statusRequest.current && epoch === statusEpoch.current) {
+        setSt(next);
+        setStatusError("");
+      }
+    } catch (e) {
+      /* Keep the last complete snapshot; the next poll can recover. */
+      if (!signal?.aborted && request === statusRequest.current && epoch === statusEpoch.current) setStatusError((e as Error).message);
     }
-  }, 2500);
+  };
+
+  usePoll(reload, 2500, !mutationBusy);
+  const routingState = st?.routing_state;
+  useEffect(() => {
+    if (!routingState) return;
+    if (initialRoutingRevision.current === null || routingState.revision < lastConfirmedRoutingRevision.current) {
+      // Initial loading and a service restart are not a user routing change.
+      initialRoutingRevision.current = routingState.revision;
+      lastConfirmedRoutingRevision.current = routingState.revision;
+      setReconnectRevision(0);
+      return;
+    }
+    if (!routingState.ready || routingState.applying || routingState.revision <= 0) return;
+    if (routingState.revision > initialRoutingRevision.current && routingState.revision > lastConfirmedRoutingRevision.current) {
+      lastConfirmedRoutingRevision.current = routingState.revision;
+      setReconnectRevision(routingState.revision);
+    }
+  }, [routingState?.revision, routingState?.ready, routingState?.applying]);
 
   // Periodically refresh live server status (SSH `awg show`) while the tab is open,
   // plus once right after mount — otherwise `status` stays null and the card reads
   // «нет связи» even when the server is up.
   const stRef = useRef<Awg2Status | null>(st);
   stRef.current = st;
-  useEffect(() => {
-    const tick = () => {
-      const cur = stRef.current;
-      if (cur?.deployed && cur.config.install !== "imported") void api("POST", "/api/awg2/status/refresh", {}).catch(() => {});
-    };
-    tick();
-    const id = window.setInterval(tick, 15000);
-    return () => window.clearInterval(id);
-  }, []);
-
-  const reload = async () => {
-    try {
-      setSt(await api<Awg2Status>("GET", "/api/awg2"));
-    } catch {
-      /* ignore */
+  usePoll(async (signal) => {
+    const cur = stRef.current;
+    if (cur?.deployed && cur.config.install !== "imported") {
+      await api("POST", "/api/awg2/status/refresh", {}, { signal, timeoutMs: 30_000 });
     }
-  };
+  }, 15000, !mutationBusy);
 
   const openRename = (srv: Awg2ServerSummary) => {
     setRenameServer(srv);
@@ -142,11 +195,11 @@ export default function AWG2() {
   };
 
   const submitRename = async () => {
-    if (!renameServer || renaming) return;
+    if (!renameServer || mutationBusy) return;
     setRenaming(true);
     try {
       const next = await api<Awg2Status>("POST", `/api/awg2/servers/${encodeURIComponent(renameServer.id)}/rename`, { name: renameName.trim() });
-      setSt(next);
+      acceptStatus(next);
       setRenameServer(null);
       toast("Имя подключения сохранено", "ok");
     } catch (e) {
@@ -190,7 +243,7 @@ export default function AWG2() {
   };
 
   const deploySelected = async () => {
-    if (!st || batch) return;
+    if (!st || mutationBusy) return;
     const ids = st.servers.filter((s) => selected[s.id] && s.enabled && !s.imported).map((s) => s.id);
     if (ids.length === 0) {
       toast("Выберите включённые VPS-серверы без imported-профилей", "err");
@@ -228,7 +281,7 @@ export default function AWG2() {
   };
 
   const submitNewConnection = async () => {
-    if (creating) return;
+    if (mutationBusy) return;
     if (newMode === "selfhosted" && st) {
       const issue = vpnEngineIssue(st.engine, newConn.trafficObfuscation);
       if (issue) { toast(issue, "err"); return; }
@@ -288,8 +341,7 @@ export default function AWG2() {
           toast("Self-hosted подключение создано, но deploy завершился с ошибкой: " + (d.error || d.result?.error || "см. журнал"), "err");
         }
       }
-      setSt(next);
-      setSub("server");
+      acceptStatus(next);
       setAddOpen(false);
       setNewMode("import");
       setNewConn(emptyNewConnection());
@@ -318,12 +370,12 @@ export default function AWG2() {
       setSub("server");
       return;
     }
-    if (selectingID) return;
+    if (mutationBusy) return;
     setSelectingID(id);
     try {
       const next = await api<Awg2Status>("POST", `/api/awg2/servers/${encodeURIComponent(id)}/select`, {});
       toast("Открыты настройки подключения", "ok");
-      setSt(next);
+      acceptStatus(next);
       setSub("server");
     } catch (e) {
       toast((e as Error).message, "err");
@@ -333,11 +385,11 @@ export default function AWG2() {
   };
 
   const toggleServer = async (id: string, enabled: boolean) => {
-    if (toggling[id]) return;
+    if (mutationBusy) return;
     setToggling((m) => ({ ...m, [id]: true }));
     try {
       const next = await api<Awg2Status>("POST", `/api/awg2/servers/${encodeURIComponent(id)}/enabled`, { enabled });
-      setSt(next);
+      acceptStatus(next);
       toast(enabled ? "Подключение включено, туннель поднимается" : "Подключение выключено", "ok");
     } catch (e) {
       toast((e as Error).message, "err");
@@ -347,29 +399,35 @@ export default function AWG2() {
   };
 
   const deleteServer = async (id: string) => {
-    if (!id) return;
+    if (!id || mutationBusy) return;
     if (!(await confirmDialog({ title: "Удалить VPN-подключение?", body: "Конфиг, ключи и пиры этого сервера будут удалены из панели. На самом VPS уже установленный сервис не трогается.", confirmLabel: "Удалить", danger: true }))) return;
+    setDeletingID(id);
     try {
       const next = await api<Awg2Status>("DELETE", `/api/awg2/servers/${encodeURIComponent(id)}`);
-      setSt(next);
-      setSub("server");
+      acceptStatus(next);
       toast("VPN-подключение удалено", "ok");
     } catch (e) {
       toast((e as Error).message, "err");
+    } finally {
+      setDeletingID("");
     }
   };
 
   const openClients = async (srv: Awg2ServerSummary) => {
+    if (mutationBusy) return;
     if (srv.imported) {
       toast("Imported-профиль подключает только этот роутер к чужому серверу — добавлять клиентов к нему нельзя", "err");
       return;
     }
     if (!srv.active) {
+      setSelectingID(srv.id);
       try {
-        setSt(await api<Awg2Status>("POST", `/api/awg2/servers/${encodeURIComponent(srv.id)}/select`, {}));
+        acceptStatus(await api<Awg2Status>("POST", `/api/awg2/servers/${encodeURIComponent(srv.id)}/select`, {}));
       } catch (e) {
         toast((e as Error).message, "err");
         return;
+      } finally {
+        setSelectingID("");
       }
     }
     setClientsOpen(true);
@@ -378,15 +436,15 @@ export default function AWG2() {
   const seg = (m: Sub, label: string) => (
     <button
       type="button"
-      disabled={formatBusy}
+      disabled={formatBusy || (m === "trace" && otherMutationBusy)}
       onClick={() => setSub(m)}
-      className={cn("border-r border-line px-4 py-1.5 text-[13px] outline-none transition last:border-r-0 focus-visible:relative focus-visible:ring-2 focus-visible:ring-ring/40 disabled:cursor-not-allowed disabled:opacity-50", sub === m ? "bg-accent text-white" : "bg-panel text-ink-soft hover:bg-line-soft")}
+      className={cn("border-r border-line px-4 py-1.5 text-[13px] outline-none transition last:border-r-0 focus-visible:relative focus-visible:ring-2 focus-visible:ring-ring/40 disabled:cursor-not-allowed disabled:opacity-50", sub === m ? "bg-accent text-primary-foreground" : "bg-panel text-ink-soft hover:bg-line-soft")}
     >
       {label}
     </button>
   );
 
-  if (!st) return <Card><span className="text-xs text-muted">Загрузка…</span></Card>;
+  if (!st) return <Card><span className="text-xs text-muted">{statusError || "Загрузка…"}</span>{statusError && <Button mini className="ml-2" onClick={() => { void reload(); }}>Повторить</Button>}</Card>;
 
   const dep = st.last_deploy;
   const servers = st.servers ?? [];
@@ -408,6 +466,19 @@ export default function AWG2() {
 
   return (
     <>
+      {statusError && <Card><p className="text-xs text-warn" role="status">Статус временно недоступен: {statusError} Показаны последние полученные данные.</p><Button mini className="mt-2" disabled={mutationBusy} onClick={() => { void reload(); }}>Обновить статус</Button></Card>}
+      {(routingState?.applying || routingState?.error || (routingState && routingState.revision > 0 && !routingState.ready) || reconnectRevision > 0) && (
+        <Card title="Состояние маршрутизации">
+          {routingState?.applying
+            ? <p className="text-xs text-muted" role="status"><MiniSpinner /> Настройки применяются: подготавливаем DNS и маршруты.</p>
+            : routingState?.error
+            ? <p className="text-xs text-bad" role="alert">Не удалось подготовить маршруты: {routingState.error}</p>
+            : routingState && routingState.revision > 0 && !routingState.ready
+            ? <p className="text-xs text-warn" role="status">Готовность маршрутов пока не подтверждена.</p>
+            : reconnectRevision > 0 && <p className="text-xs text-ink-soft" role="status">Маршруты применены. Открытые соединения нужно переподключить: перезагрузите уже открытый сайт или повторно подключите приложение.</p>}
+          {reconnectRevision > 0 && !routingState?.applying && routingState?.ready && <Button mini className="mt-2" onClick={() => setReconnectRevision(0)}>Понятно</Button>}
+        </Card>
+      )}
       <Card
         title="AmneziaWG VPN"
         sub="свой VPS или imported .conf/.vpn + сплит-роутинг"
@@ -439,12 +510,12 @@ export default function AWG2() {
       <Card
         title="VPN-подключения"
         sub="self-hosted, WARP и импортированные подключения"
-        head={<Button mini onClick={() => setAddOpen(true)} disabled={formatBusy}>Новое подключение</Button>}
+        head={<Button mini onClick={() => setAddOpen(true)} disabled={mutationBusy}>Новое подключение</Button>}
       >
         {selectedIDs.length > 0 && (
           <div className="mb-3 flex flex-wrap items-center gap-2 rounded-lg border border-line bg-line-soft px-3 py-2">
             <span className="text-xs font-semibold text-ink-soft">Выбрано: {selectedIDs.length}</span>
-            <Button mini variant="primary" onClick={deploySelected} disabled={formatBusy || !!batch || !canDeploySelected}>
+            <Button mini variant="primary" onClick={deploySelected} disabled={mutationBusy || !canDeploySelected}>
               {batch ? `Деплой ${batch.done}/${batch.total}` : "Переразвернуть выбранные"}
             </Button>
             <Button mini variant="ghost" onClick={() => setSelected({})} disabled={!!batch}>Снять выбор</Button>
@@ -478,7 +549,7 @@ export default function AWG2() {
                     <div className="flex min-h-6 items-center gap-2">
                       <button
                         type="button"
-                        disabled={formatBusy}
+                        disabled={mutationBusy}
                         title="Переименовать"
                         onClick={(e) => { e.stopPropagation(); openRename(srv); }}
                         className="min-w-0 max-w-full truncate text-left text-[13px] font-semibold text-ink outline-none transition hover:text-accent focus-visible:ring-2 focus-visible:ring-ring/40"
@@ -490,7 +561,7 @@ export default function AWG2() {
                     <div className="mt-0.5 truncate text-[11.5px] text-muted">{srv.endpoint || srv.host || "адрес не задан"}{srv.client_iface ? ` · ${srv.client_iface}` : ""}</div>
                   </div>
                   <span onClick={(e) => e.stopPropagation()}>
-                    <Switch checked={!!srv.enabled} onChange={(v) => toggleServer(srv.id, v)} disabled={formatBusy || !!toggling[srv.id]} />
+                    <Switch checked={!!srv.enabled} onChange={(v) => toggleServer(srv.id, v)} disabled={mutationBusy} aria-label={`VPN-подключение «${srv.label || srv.id}» включено`} />
                   </span>
                 </div>
 
@@ -515,19 +586,19 @@ export default function AWG2() {
                   </div>
                 )}
                 <div className="mt-3 flex flex-wrap items-center gap-2">
-                  <Button mini variant="primary" onClick={() => { void selectServer(srv.id); }} disabled={formatBusy}>
+                  <Button mini variant="primary" onClick={() => { void selectServer(srv.id); }} disabled={mutationBusy}>
                     Настройки
                   </Button>
-                  <Button mini onClick={(e) => { e.stopPropagation(); void deployServer(srv.id); }} disabled={formatBusy || busy || !srv.enabled || srv.imported || !srv.host}>
+                  <Button mini onClick={(e) => { e.stopPropagation(); void deployServer(srv.id); }} disabled={mutationBusy || busy || !srv.enabled || srv.imported || !srv.host}>
                     {busy ? "Деплой..." : srv.deployed ? "Переразвернуть" : "Развернуть"}
                   </Button>
-                  <Button mini onClick={(e) => { e.stopPropagation(); void openClients(srv); }} disabled={formatBusy || !srv.enabled || srv.imported}>
+                  <Button mini onClick={(e) => { e.stopPropagation(); void openClients(srv); }} disabled={mutationBusy || !srv.enabled || srv.imported}>
                     {srv.deployment_pending ? "Клиенты и экспорт" : "Добавить клиента"}
                   </Button>
-                  <Button mini onClick={(e) => { e.stopPropagation(); setSpeedServer(srv); }} disabled={!srv.client_iface || !srv.client?.running}>
+                  <Button mini onClick={(e) => { e.stopPropagation(); setSpeedServer(srv); }} disabled={mutationBusy || !srv.client_iface || !srv.client?.running}>
                     Замер
                   </Button>
-                  <Button mini variant="danger" onClick={(e) => { e.stopPropagation(); void deleteServer(srv.id); }} disabled={formatBusy}>
+                  <Button mini variant="danger" onClick={(e) => { e.stopPropagation(); void deleteServer(srv.id); }} disabled={mutationBusy}>
                     Удалить
                   </Button>
                 </div>
@@ -544,12 +615,16 @@ export default function AWG2() {
         {seg("trace", "Трассировка")}
       </div>
 
-      {sub === "server" && <>
-        <ServerPane st={st} reload={reload} deployActive={() => activeServer ? deployServer(activeServer.id) : Promise.resolve(false)} deploying={!!(activeServer && deploying[activeServer.id])} onFormatBusyChange={setFormatBusy} onOpenEngineSettings={() => setSub("routing")} />
-      </>}
-      {sub === "routing" && <RoutingPane st={st} reload={reload} />}
-      {sub === "devices" && <DevicesRoutingPane st={st} reload={reload} />}
-      {sub === "trace" && <TracePane />}
+      <div hidden={sub !== "server"} className="space-y-4">
+        <ServerPane st={st} reload={reload} acceptStatus={acceptStatus} deployActive={() => activeServer ? deployServer(activeServer.id) : Promise.resolve(false)} deploying={!!(activeServer && deploying[activeServer.id])} onFormatBusyChange={setFormatBusy} onBusyChange={setServerBusy} externalBusy={mutationBusy} onOpenEngineSettings={() => setSub("routing")} />
+      </div>
+      <div hidden={sub !== "routing"} className="space-y-4">
+        <RoutingPane st={st} reload={reload} visible={sub === "routing"} onBusyChange={setRoutingBusy} externalBusy={mutationBusy} acceptRouting={acceptRouting} />
+      </div>
+      <div hidden={sub !== "devices"}>
+        <DevicesRoutingPane st={st} reload={reload} active={sub === "devices"} onBusyChange={setRoutingBusy} externalBusy={mutationBusy} />
+      </div>
+      {sub === "trace" && <fieldset disabled={mutationBusy}><TracePane externalBusy={mutationBusy} runMutation={runTraceMutation} reload={reload} /></fieldset>}
       {clientsOpen && <PeerShareModal st={st} reload={reload} onClose={() => setClientsOpen(false)} />}
       {speedServer && (
         <Modal
@@ -567,7 +642,7 @@ export default function AWG2() {
         <Modal
           title="Переименовать подключение"
           onClose={() => !renaming && setRenameServer(null)}
-          actions={<><Button onClick={() => setRenameServer(null)} disabled={renaming}>Отмена</Button><Button variant="primary" onClick={submitRename} disabled={renaming}>{renaming ? "..." : "Сохранить"}</Button></>}
+          actions={<><Button onClick={() => setRenameServer(null)} disabled={renaming}>Отмена</Button><Button variant="primary" onClick={submitRename} disabled={mutationBusy}>{renaming ? "..." : "Сохранить"}</Button></>}
         >
           <Field label="Название">
             <Input value={renameName} autoFocus onChange={(e) => setRenameName(e.target.value)} />
@@ -579,7 +654,7 @@ export default function AWG2() {
           title="Новое подключение"
           onClose={closeNewConnection}
           size="lg"
-          actions={<><Button onClick={closeNewConnection} disabled={creating}>Отмена</Button><Button variant="primary" onClick={submitNewConnection} disabled={creating || !!newEngineIssue}>{creating ? "..." : newConnectionSubmitLabel}</Button></>}
+          actions={<><Button onClick={closeNewConnection} disabled={creating}>Отмена</Button><Button variant="primary" onClick={submitNewConnection} disabled={mutationBusy || !!newEngineIssue}>{creating ? "..." : newConnectionSubmitLabel}</Button></>}
         >
           <div className="space-y-3">
             <div className="grid gap-2 sm:grid-cols-3">

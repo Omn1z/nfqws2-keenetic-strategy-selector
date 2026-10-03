@@ -1,6 +1,7 @@
 package awg
 
 import (
+	"context"
 	"errors"
 	"net"
 	"sync"
@@ -25,12 +26,18 @@ type DNSProxy struct {
 	// CDNs). The per-IP work — ipset add, family bookkeeping — happens
 	// inside the callback; the per-NAME decision (FMW route + source-zone
 	// match) is computed once at the top, not 2-8x per query.
-	onMatch func(name string, ips []string)
+	onMatch     func(name string, ips []string)
+	replayMatch atomic.Pointer[func(string, []string)]
 	// onQuery, if set, is invoked once per successfully forwarded DNS query with
 	// the client IP, qname, qtype mnemonic ("A"/"AAAA"/raw uint), the resolved
 	// IPs, and whether the response was sinkholed. The route layer uses it for
 	// trace rows and source-aware DNS learning before the response returns.
 	onQuery func(srcIP, qname, qtype string, ips []string, sinkholed bool)
+	// beforeReply is the source-aware routing barrier. Unlike trace callbacks,
+	// its errors stop delivery of an address that has no installed route.
+	beforeReply    atomic.Pointer[func(context.Context, string, string, []string) error]
+	retired        atomic.Bool
+	policyIdentity atomic.Pointer[string]
 	// onBlock, if set, is invoked when maybeBlockAAAA synthesizes an empty NOERROR
 	// response for a matched AAAA query — so trace can show "AAAA blocked, fallback to v4".
 	onBlock  func(srcIP, qname string)
@@ -125,6 +132,46 @@ func (p *DNSProxy) SetOnQuery(cb func(srcIP, qname, qtype string, ips []string, 
 	p.onQuery = cb
 }
 
+// SetBeforeReply installs a synchronous route learner for live DNS replies.
+// onMatch remains available for recent-answer replay, but is not also called
+// for live replies while this callback is installed. Set it before Start.
+func (p *DNSProxy) SetBeforeReply(cb func(context.Context, string, string, []string) error) {
+	if cb == nil {
+		p.beforeReply.Store(nil)
+		return
+	}
+	p.beforeReply.Store(&cb)
+}
+
+// SetReplayMatch replaces the recent-answer learner without racing a running
+// proxy. SetMatchers captures this callback with its matcher snapshot, so an
+// older replay cannot inherit a later routing generation.
+func (p *DNSProxy) SetReplayMatch(cb func(string, []string)) {
+	if cb == nil {
+		p.replayMatch.Store(nil)
+		return
+	}
+	p.replayMatch.Store(&cb)
+}
+
+func (p *DNSProxy) matchCallback() func(string, []string) {
+	if cb := p.replayMatch.Load(); cb != nil {
+		return *cb
+	}
+	return p.onMatch
+}
+
+// PolicyChanged is used by serialized lifecycle callers to avoid re-learning
+// the entire recent cache on an unchanged watchdog tick. It does not compare
+// or hash matcher data on the query path.
+func (p *DNSProxy) PolicyChanged(identity string) bool {
+	if previous := p.policyIdentity.Load(); previous != nil && *previous == identity {
+		return false
+	}
+	p.policyIdentity.Store(&identity)
+	return true
+}
+
 // SetOnBlock wires the trace callback for "AAAA blocked" events. Pass nil to disable.
 func (p *DNSProxy) SetOnBlock(cb func(srcIP, qname string)) {
 	p.onBlock = cb
@@ -152,7 +199,8 @@ func (p *DNSProxy) SetMatchers(ms *MatcherSet) {
 		ms = &empty
 	}
 	p.matchers.Store(ms)
-	if p.onMatch == nil {
+	callback := p.matchCallback()
+	if callback == nil {
 		return
 	}
 	p.rmu.Lock()
@@ -166,8 +214,11 @@ func (p *DNSProxy) SetMatchers(ms *MatcherSet) {
 	}
 	go func() {
 		for name, ips := range snapshot {
+			if p.retired.Load() {
+				return
+			}
 			if ms.MatchAny(name) {
-				p.onMatch(name, ips)
+				callback(name, ips)
 			}
 		}
 	}()
@@ -234,6 +285,7 @@ func (p *DNSProxy) Start() error {
 		return err
 	}
 	p.udp, p.tcp, p.stop, p.running = uc, tl, make(chan struct{}), true
+	p.retired.Store(false)
 	go p.serveUDP(uc)
 	go p.serveTCP(tl)
 	return nil
@@ -241,6 +293,7 @@ func (p *DNSProxy) Start() error {
 
 // Stop closes the listeners. Idempotent.
 func (p *DNSProxy) Stop() {
+	p.retired.Store(true)
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if !p.running {
@@ -284,8 +337,7 @@ func (p *DNSProxy) handleUDP(uc *net.UDPConn, client *net.UDPAddr, bp *[]byte, n
 	if client != nil && client.IP != nil {
 		srcIP = client.IP.String()
 	}
-	// EDNS Client Subnet wins over the socket peer — pi-hole sits between LAN
-	// and us, so without ECS the trace would show every query as 127.0.0.1.
+	// A forwarding resolver can carry the original source in EDNS Client Subnet.
 	if ecs, ok := parseECSFromQuery(query); ok {
 		srcIP = ecs
 	}
@@ -293,7 +345,15 @@ func (p *DNSProxy) handleUDP(uc *net.UDPConn, client *net.UDPAddr, bp *[]byte, n
 	// label-walk happened in maybeBlockAAAA, inspect, traceQuery, and the
 	// onBlock branch — 2-4× redundant per query at ~50 QPS on a busy LAN.
 	qname, qtype, qok := questionInfo(query)
+	policy := p.beforeReply.Load()
 	if blk, ok := p.maybeBlockAAAAParsed(srcIP, query, qname, qtype, qok); ok {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		err := p.prepareReplySnapshot(ctx, srcIP, qname, qok, blk, policy)
+		cancel()
+		if err != nil {
+			_, _ = uc.WriteToUDP(dnsFailureResponse(query), client)
+			return
+		}
 		_, _ = uc.WriteToUDP(blk, client)
 		if p.onBlock != nil && qname != "" {
 			p.onBlock(srcIP, qname)
@@ -308,7 +368,14 @@ func (p *DNSProxy) handleUDP(uc *net.UDPConn, client *net.UDPAddr, bp *[]byte, n
 		return
 	}
 	resp := respBuf[:respN]
-	p.inspectParsed(qname, qok, resp)
+	resp = p.filterIPv6Hints(srcIP, qname, qtype, query, resp)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	err = p.prepareReplySnapshot(ctx, srcIP, qname, qok, resp, policy)
+	cancel()
+	if err != nil {
+		_, _ = uc.WriteToUDP(dnsFailureResponse(query), client)
+		return
+	}
 	p.traceQueryParsed(srcIP, qname, qtype, qok, resp)
 	_, _ = uc.WriteToUDP(resp, client)
 }
@@ -426,7 +493,15 @@ func (p *DNSProxy) handleTCP(conn net.Conn) {
 		srcIP = ecs
 	}
 	qname, qtype, qok := questionInfo(query)
+	policy := p.beforeReply.Load()
 	if blk, ok := p.maybeBlockAAAAParsed(srcIP, query, qname, qtype, qok); ok {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		err := p.prepareReplySnapshot(ctx, srcIP, qname, qok, blk, policy)
+		cancel()
+		if err != nil {
+			_ = writeTCPMsg(conn, dnsFailureResponse(query))
+			return
+		}
 		_ = writeTCPMsg(conn, blk)
 		if p.onBlock != nil && qname != "" {
 			p.onBlock(srcIP, qname)
@@ -453,7 +528,14 @@ func (p *DNSProxy) handleTCP(conn net.Conn) {
 	out := make([]byte, n)
 	copy(out, respBuf[:n])
 	p.bufPool.Put(bp)
-	p.inspectParsed(qname, qok, out)
+	out = p.filterIPv6Hints(srcIP, qname, qtype, query, out)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	err = p.prepareReplySnapshot(ctx, srcIP, qname, qok, out, policy)
+	cancel()
+	if err != nil {
+		_ = writeTCPMsg(conn, dnsFailureResponse(query))
+		return
+	}
 	p.traceQueryParsed(srcIP, qname, qtype, qok, out)
 	_ = writeTCPMsg(conn, out)
 }
@@ -474,8 +556,8 @@ func (p *DNSProxy) inspectParsed(name string, ok bool, resp []byte) {
 	if ms == nil || !ms.MatchAny(name) {
 		return
 	}
-	if p.onMatch != nil {
-		p.onMatch(name, ips)
+	if callback := p.matchCallback(); callback != nil {
+		callback(name, ips)
 	}
 }
 

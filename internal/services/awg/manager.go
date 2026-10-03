@@ -114,6 +114,48 @@ func (m *Manager) Config() ServerConfig {
 	return m.cfg.clone()
 }
 
+// ConnectionIdentity is the public wire identity needed by routing references.
+// It deliberately has no credential, peer, private-key or routing containers.
+type ConnectionIdentity struct {
+	Endpoint        string
+	ClientIface     string
+	Protocol        string
+	ProtocolVersion string
+	ServerPublicKey string
+}
+
+// PublicConnectionIdentity avoids deep-copying potentially large domain lists
+// on every status poll. Strings are immutable values, so the result neither
+// exposes secrets nor gives the caller mutable access to the manager's state.
+func (m *Manager) PublicConnectionIdentity() ConnectionIdentity {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return ConnectionIdentity{
+		Endpoint:        m.cfg.Endpoint,
+		ClientIface:     m.cfg.ClientIface,
+		Protocol:        m.cfg.Protocol,
+		ProtocolVersion: m.cfg.EffectiveProtocolVersion(),
+		ServerPublicKey: m.cfg.PublicKey,
+	}
+}
+
+type LocalClientIdentity struct {
+	Enabled, ClientEnabled bool
+	Endpoint, ClientIface  string
+}
+
+// RuntimeLocalClientIdentity is the small public subset needed by DNS route
+// availability. Polling it must not clone all peers, credentials and domains.
+func (m *Manager) RuntimeLocalClientIdentity() LocalClientIdentity {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	endpoint := m.cfg.Endpoint
+	if m.applied != nil {
+		endpoint = m.applied.Endpoint
+	}
+	return LocalClientIdentity{Enabled: m.cfg.Enabled, ClientEnabled: m.cfg.Client.Enabled, Endpoint: endpoint, ClientIface: m.cfg.ClientIface}
+}
+
 // SetAppliedConfig installs a last-successful deployment snapshot. The service
 // layer persists it separately from the public desired config. Nil clears it.
 func (m *Manager) SetAppliedConfig(cfg *ServerConfig) {

@@ -1,5 +1,17 @@
 # Third-party notices
 
+## Web interface
+
+The web interface uses Base UI (MIT), CodeMirror and Lezer (MIT), React and other
+dependencies pinned in `frontend/package-lock.json`. Shared controls adapt the
+shadcn/ui Rhea style (MIT). Inter variable font 5.3.0 is bundled locally under the
+SIL Open Font License 1.1. Syntax colors follow the VS Code palette used by
+nfqws-keenetic-web; no remote editor or font assets are loaded.
+
+Complete frontend notices and license texts are in
+`THIRD_PARTY_LICENSES/Frontend-LICENSES.txt` and are appended to the release asset
+`THIRD-PARTY-NOTICES.txt`.
+
 DNS dependencies added for DNS Server. Exact panel dependency versions are recorded in go.mod and go.sum. Existing TG WS Proxy and AmneziaWG notices are distributed separately.
 
 ## AdGuard urlfilter v0.23.4

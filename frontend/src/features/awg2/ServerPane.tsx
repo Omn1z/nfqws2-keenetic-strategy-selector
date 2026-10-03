@@ -73,7 +73,7 @@ const collect = (f: Form) => ({
 
 const formatKey = (f: Form) => JSON.stringify({ version: f.protocol_version, enabled: f.traffic_obfuscation, obf: collect(f).obf });
 
-export default function ServerPane({ st, reload, deployActive, deploying, onFormatBusyChange, onOpenEngineSettings }: { st: Awg2Status; reload: () => void; deployActive: () => Promise<boolean>; deploying: boolean; onFormatBusyChange: (busy: boolean) => void; onOpenEngineSettings: () => void }) {
+export default function ServerPane({ st, reload, acceptStatus, deployActive, deploying, onFormatBusyChange, onBusyChange, externalBusy, onOpenEngineSettings }: { st: Awg2Status; reload: () => Promise<void>; acceptStatus: (next: Awg2Status) => void; deployActive: () => Promise<boolean>; deploying: boolean; onFormatBusyChange: (busy: boolean) => void; onBusyChange: (busy: boolean) => void; externalBusy: boolean; onOpenEngineSettings: () => void }) {
   const [form, setForm] = useState<Form>(() => toForm(st.config));
   const [saving, setSaving] = useState(false);
   const [dirty, setDirty] = useState(false);
@@ -84,14 +84,17 @@ export default function ServerPane({ st, reload, deployActive, deploying, onForm
     setForm(toForm(st.config));
     setDirty(false);
   }, [st.active_server_id]);
-  const set = <K extends keyof Form>(k: K, v: Form[K]) => { setDirty(true); setForm((f) => ({ ...f, [k]: v })); };
   const imported = st.config.install === "imported";
   const activeServer = st.servers.find((s) => s.id === st.active_server_id);
   const deploymentNeeded = !!st.deployment_pending;
   const awg3 = form.protocol_version === "3.1";
   const engineIssue = imported ? "" : vpnEngineIssue(st.engine, form.traffic_obfuscation && awg3);
   const formatChanged = !imported && formatKey(form) !== formatKey(toForm(st.config));
-  const working = saving || deploying || applyingFormat;
+  const ownWorking = saving || deploying || applyingFormat;
+  const working = ownWorking || externalBusy;
+  const set = <K extends keyof Form>(k: K, v: Form[K]) => { if (working) return; setDirty(true); setForm((f) => ({ ...f, [k]: v })); };
+  useEffect(() => { onBusyChange(ownWorking); }, [ownWorking, onBusyChange]);
+  useEffect(() => () => { onBusyChange(false); }, [onBusyChange]);
   const configKey = JSON.stringify(st.config);
   useEffect(() => {
     if (!dirty && !working) setForm(toForm(st.config));
@@ -101,6 +104,9 @@ export default function ServerPane({ st, reload, deployActive, deploying, onForm
     setSaving(true);
     try {
       const next = await api<Awg2Status>("POST", "/api/awg2/config", collect(form));
+      // Keep the acknowledged configuration even if the follow-up read fails.
+      // The parent also invalidates status reads started before this write.
+      acceptStatus(next);
       setForm(toForm(next.config));
       setDirty(false);
       await reload();
@@ -141,7 +147,7 @@ export default function ServerPane({ st, reload, deployActive, deploying, onForm
   };
 
   return (
-    <>
+    <fieldset disabled={working} className="min-w-0 space-y-4">
       {!imported && (
         <Card
           title="Развертывание VPS"
@@ -299,6 +305,6 @@ export default function ServerPane({ st, reload, deployActive, deploying, onForm
         <div className="mt-3 flex flex-wrap items-center gap-2.5"><Button variant="primary" onClick={saveAndDeploy} disabled={working || !!engineIssue || !form.host.trim() || !st.config.enabled || (!formatChanged && !deploymentNeeded)}>{applyingFormat ? "Развёртывание…" : "Сохранить и развернуть"}</Button></div>
       </Card>
       ) : null}
-    </>
+    </fieldset>
   );
 }

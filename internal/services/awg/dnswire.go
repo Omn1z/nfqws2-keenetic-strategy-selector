@@ -115,6 +115,13 @@ func answerIPs(msg []byte) []string {
 		}
 	}
 	var out []string
+	seen := make(map[string]struct{})
+	add := func(ip string) {
+		if _, exists := seen[ip]; !exists {
+			seen[ip] = struct{}{}
+			out = append(out, ip)
+		}
+	}
 	for i := 0; i < an; i++ {
 		_, np, ok := readName(msg, pos)
 		if !ok {
@@ -132,13 +139,62 @@ func answerIPs(msg []byte) []string {
 		}
 		switch {
 		case typ == 1 && rdlen == 4:
-			out = append(out, net.IPv4(msg[pos], msg[pos+1], msg[pos+2], msg[pos+3]).String())
+			add(net.IPv4(msg[pos], msg[pos+1], msg[pos+2], msg[pos+3]).String())
 		case typ == 28 && rdlen == 16:
 			ip := make(net.IP, 16)
 			copy(ip, msg[pos:pos+16])
-			out = append(out, ip.String())
+			add(ip.String())
+		case typ == 64 || typ == 65: // SVCB / HTTPS socket destinations
+			for _, ip := range serviceBindingHints(msg, pos, pos+rdlen) {
+				add(ip)
+			}
 		}
 		pos += rdlen
+	}
+	return out
+}
+
+// serviceBindingHints reads RFC 9460 ipv4hint/ipv6hint parameters. Browsers may
+// dial these addresses without another A/AAAA query, so learning only address
+// records misses the very first connection. AliasMode carries no usable hints.
+func serviceBindingHints(msg []byte, start, end int) []string {
+	if start < 0 || end > len(msg) || end-start < 3 || msg[start] == 0 && msg[start+1] == 0 {
+		return nil
+	}
+	_, pos, ok := readName(msg, start+2)
+	if !ok || pos > end {
+		return nil
+	}
+	lastKey := -1
+	var out []string
+	for pos < end {
+		if end-pos < 4 {
+			return nil
+		}
+		key := int(msg[pos])<<8 | int(msg[pos+1])
+		length := int(msg[pos+2])<<8 | int(msg[pos+3])
+		pos += 4
+		if key <= lastKey || length > end-pos {
+			return nil
+		}
+		lastKey = key
+		switch key {
+		case 4:
+			if length == 0 || length%4 != 0 {
+				return nil
+			}
+			for i := pos; i < pos+length; i += 4 {
+				out = append(out, net.IP(msg[i:i+4]).String())
+			}
+		case 6:
+			if length == 0 || length%16 != 0 {
+				return nil
+			}
+			for i := pos; i < pos+length; i += 16 {
+				out = append(out, net.IP(msg[i:i+16]).String())
+			}
+		}
+		pos += length
 	}
 	return out
 }
@@ -216,13 +272,9 @@ func toLower(s string) string {
 // (RFC 6891) and within it for the EDNS0 Client Subnet option (RFC 7871,
 // code 8). Returns the client IP string when found.
 //
-// Why we need this: pi-hole sits in front of our proxy (LAN :53 → pi-hole →
-// 127.0.0.1:5354). From the proxy's socket perspective every query arrives
-// from localhost, so the trace log would show "src=127.0.0.1" for everything.
-// Pi-hole, when configured with `add-subnet=32,128`, copies the original
-// client IP into the OPT record's Client Subnet option, and this parser
-// recovers it. When the option isn't present we return ("", false) and the
-// caller falls back to the socket peer.
+// A forwarding resolver can supply the original client subnet in ECS when the
+// socket peer itself is local. When the option is absent the caller falls back
+// to the socket peer.
 func parseECSFromQuery(msg []byte) (string, bool) {
 	if len(msg) < 12 {
 		return "", false

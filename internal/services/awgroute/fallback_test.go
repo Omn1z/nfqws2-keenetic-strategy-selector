@@ -71,13 +71,15 @@ func TestSetRoutingRulesNormalizesFallbackList(t *testing.T) {
 		},
 		awg: primary,
 	}
-	err = svc.AWG2SetRoutingRules(awg.RoutingConfig{Mode: "off", Zones: []awg.Zone{{
+	_, unlock := svc.lockClientOps(false)
+	defer unlock()
+	err = svc.awgSaveRoutingRules(awg.RoutingConfig{Mode: "off", Zones: []awg.Zone{{
 		Name:              "fallback",
 		TunnelID:          "primary",
 		FallbackTunnelIDs: []string{"backup", "backup"},
 		Route:             "tunnel",
-		// Keep the rule match empty: this test exercises persistence and
-		// activation without asking the host running the test to install ipsets.
+		// Exercise persistence only; the save helper cannot install or clear
+		// the host's live routing policy even when the rule is inactive.
 		Domains: []string{},
 		Enabled: true,
 	}}})

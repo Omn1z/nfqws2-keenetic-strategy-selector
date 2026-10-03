@@ -1,5 +1,7 @@
 import type { DnsServerLogEntry } from "@/types/api";
-import { cancellationChips, compactLogMessage, groupLogRows, isLogProblem, logCount, logEventPresentation, shortProvider } from "./dnsLogPresentation";
+import { cancellationChips, compactLogMessage, groupLogRows, isCacheEvent, isSharedEvent, isLogProblem, logCount, logEventPresentation, shortProvider } from "./dnsLogPresentation";
+import { DNS_CACHE_NOTE, DNS_SHARED_NOTE } from "./DnsAnswerPresentation";
+import { DnsRequestOrigin, DnsRequestOriginDetails } from "./DnsRequestOrigin";
 
 const clock = (value: string) => {
   const date = new Date(value);
@@ -16,10 +18,15 @@ function EntryTime({ entry }: { entry: DnsServerLogEntry }) {
 }
 
 function EntryDetails({ entry, routeName }: { entry: DnsServerLogEntry; routeName: (id: string) => string }) {
+  const cached = isCacheEvent(entry);
+  const shared = isSharedEvent(entry);
+  const reused = cached || shared;
   return <div className="flex flex-wrap gap-x-3 gap-y-1 text-muted [overflow-wrap:anywhere]">
     <span>{fullTime(entry.time)}</span>
-    {entry.route && <span>{routeName(entry.route)}{routeName(entry.route) !== entry.route ? ` (${entry.route})` : ""}</span>}
-    {entry.upstream && <span>{entry.upstream}</span>}
+    <DnsRequestOriginDetails source={entry.source} clientIP={entry.client_ip} transport={entry.transport} />
+    {reused && <span>{cached ? DNS_CACHE_NOTE : DNS_SHARED_NOTE}</span>}
+    {entry.route && entry.route !== "cache" && <span>{reused ? "Маршрут первичного запроса" : "Маршрут"}: {routeName(entry.route)}{routeName(entry.route) !== entry.route ? ` (${entry.route})` : ""}</span>}
+    {entry.upstream && <span>{reused ? "Первичный источник" : "DNS-провайдер"}: {entry.upstream}</span>}
     {entry.duration_ms !== undefined && <span>{Math.round(entry.duration_ms)} мс</span>}
     {entry.block_category && <span>Категория: {entry.block_category === "ads" ? "реклама" : entry.block_category === "mixed" ? "реклама и трекеры" : "трекеры"}</span>}
     {entry.block_source && <span>Источник: {entry.block_source}</span>}
@@ -32,15 +39,19 @@ function EventRow({ entry, routeName }: { entry: DnsServerLogEntry; routeName: (
   const meta = logEventPresentation(entry);
   const message = compactLogMessage(entry);
   const problem = isLogProblem(entry);
-  const hasDetails = Boolean(entry.upstream || entry.route || entry.block_category || entry.block_source || entry.block_rule);
+  const cached = isCacheEvent(entry);
+  const reused = cached || isSharedEvent(entry);
+  const hasDetails = Boolean(reused || entry.upstream || entry.route || entry.source || entry.client_ip || entry.transport || entry.block_category || entry.block_source || entry.block_rule);
   const content = <>
     <div className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
       <EntryTime entry={entry} />
       <span className={`w-4 shrink-0 text-center font-semibold ${tones[meta.tone]}`} title={meta.label} aria-label={meta.label}>{meta.symbol}</span>
       {entry.domain ? <><span className="font-semibold text-ink-soft">{entry.domain}</span>{entry.qtype && <span className="text-muted">{entry.qtype}</span>}</> : <span className={tones[meta.tone]}>{meta.label}</span>}
       {entry.count !== undefined && <span className="text-muted">×{logCount(entry)}</span>}
-      {entry.upstream && <span className="min-w-0 text-muted" title={entry.upstream}>{shortProvider(entry.upstream)}</span>}
-      {entry.route && entry.route !== "cache" && entry.route !== "blocked" && <span className="rounded bg-line-soft px-1.5 text-ink-soft" title={entry.route}>{routeName(entry.route)}</span>}
+      <DnsRequestOrigin source={entry.source} clientIP={entry.client_ip} transport={entry.transport} />
+      {reused && entry.domain && <span className="rounded bg-line-soft px-1.5 text-accent">{meta.label}</span>}
+      {!reused && entry.upstream && <span className="min-w-0 text-muted" title={entry.upstream}>{shortProvider(entry.upstream)}</span>}
+      {!reused && entry.route && entry.route !== "cache" && entry.route !== "blocked" && <span className="rounded bg-line-soft px-1.5 text-ink-soft" title={entry.route}>{routeName(entry.route)}</span>}
       {entry.event === "blocked" && <span className="text-warn">{entry.block_category === "ads" ? "реклама" : entry.block_category === "mixed" ? "реклама и трекеры" : entry.block_category === "trackers" ? "трекеры" : "локально"}{entry.block_source ? ` · ${entry.block_source}` : ""}{entry.block_rule ? ` · ${entry.block_rule}` : ""}</span>}
       {entry.duration_ms !== undefined && <span className="ml-auto shrink-0 text-muted tabular-nums">{Math.round(entry.duration_ms)} мс</span>}
       {hasDetails && <><span className="text-[10px] text-muted group-open:hidden" aria-hidden="true">⌄</span><span className="hidden text-[10px] text-muted group-open:inline" aria-hidden="true">⌃</span></>}

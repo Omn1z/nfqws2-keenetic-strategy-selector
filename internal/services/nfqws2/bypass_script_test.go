@@ -263,23 +263,23 @@ func TestGeneratedBypassReportsMissingIPv4JumpButAllowsDisabledIPv6(t *testing.T
 	if err := os.MkdirAll(binDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	for _, name := range []string{"iptables", "ip6tables"} {
+	for _, name := range []string{"iptables", "ip6tables", "iptables-restore", "ip6tables-restore"} {
 		if err := os.WriteFile(filepath.Join(binDir, name), []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
 			t.Fatal(err)
 		}
 	}
 	helper := filepath.Join(dir, "nfqws-bypass.sh")
-	if err := os.WriteFile(helper, []byte(generatedBypassScript), 0o755); err != nil {
+	if err := os.WriteFile(helper, []byte(isolatedBypassScript(t, dir)), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	for _, tc := range []struct {
 		family, want string
 	}{
-		{"iptables", "NFQUEUE bypass: cannot create"},
+		{"iptables", "NFQUEUE bypass: missing iptables chain"},
 		{"ip6tables", ""},
 	} {
 		cmd := exec.Command("sh", helper, tc.family)
-		cmd.Env = append(os.Environ(), "PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+		cmd.Env = append(os.Environ(), "PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"), "TMPDIR="+dir)
 		out, err := cmd.CombinedOutput()
 		if tc.want == "" {
 			if err != nil {
@@ -313,7 +313,7 @@ func TestGeneratedBypassUsesResolvedCacheAndBulkRestore(t *testing.T) {
 		}
 	}
 	help := filepath.Join(dir, "nfqws-strategy-bypass.sh")
-	if err := os.WriteFile(help, []byte(generatedBypassScript), 0o755); err != nil {
+	if err := os.WriteFile(help, []byte(isolatedBypassScript(t, dir)), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	stateDir := filepath.Join(dir, "state")
@@ -334,8 +334,11 @@ func TestGeneratedBypassUsesResolvedCacheAndBulkRestore(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(binDir, "iptables-restore"), []byte("#!/bin/sh\ncat > "+shell.Quote(restoreStream)+"\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(filepath.Join(binDir, "ipset"), []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
 	cmd := exec.Command("sh", help, "iptables")
-	cmd.Env = append(os.Environ(), "PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	cmd.Env = append(os.Environ(), "PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"), "TMPDIR="+dir)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("bulk helper failed: %v: %s", err, out)
 	}
@@ -352,13 +355,13 @@ func TestGeneratedBypassUsesResolvedCacheAndBulkRestore(t *testing.T) {
 		t.Fatalf("unexpected IPv4 restore stream: %q", got)
 	}
 	for _, parent := range []string{"nfqws_post", "nfqws_pre"} {
-		if _, err := os.Stat(filepath.Join(stateDir, parent)); err != nil {
-			t.Fatalf("%s jump was not inserted: %v", parent, err)
+		if !strings.Contains(got, "-I "+parent+" 1 -j nfqws2_bypass") {
+			t.Fatalf("%s jump was not included in atomic restore: %s", parent, got)
 		}
 	}
 }
 
-func TestGeneratedBypassFallsBackWhenRestoreUnsupported(t *testing.T) {
+func TestGeneratedBypassRetainsPolicyWhenRestoreUnsupported(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("requires POSIX sh")
 	}
@@ -372,7 +375,7 @@ func TestGeneratedBypassFallsBackWhenRestoreUnsupported(t *testing.T) {
 		t.Fatal(err)
 	}
 	helper := filepath.Join(dir, "nfqws-strategy-bypass.sh")
-	if err := os.WriteFile(helper, []byte(generatedBypassScript), 0o755); err != nil {
+	if err := os.WriteFile(helper, []byte(isolatedBypassScript(t, dir)), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	stateDir := filepath.Join(dir, "state")
@@ -391,24 +394,27 @@ func TestGeneratedBypassFallsBackWhenRestoreUnsupported(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "bin", "iptables-restore"), []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.WriteFile(filepath.Join(dir, "bin", "ipset"), []byte("#!/bin/sh\nexit 1\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
 	cmd := exec.Command("sh", helper, "iptables")
-	cmd.Env = append(os.Environ(), "PATH="+filepath.Join(dir, "bin")+string(os.PathListSeparator)+os.Getenv("PATH"))
-	if out, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("fallback helper failed: %v: %s", err, out)
+	cmd.Env = append(os.Environ(), "PATH="+filepath.Join(dir, "bin")+string(os.PathListSeparator)+os.Getenv("PATH"), "TMPDIR="+dir)
+	if out, err := cmd.CombinedOutput(); err == nil || !strings.Contains(string(out), "retaining previous policy") {
+		t.Fatalf("restore failure was not reported: %v: %s", err, out)
 	}
 	log, err := os.ReadFile(logFile)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{
+	for _, forbidden := range []string{
 		"-F nfqws2_bypass",
 		"-A nfqws2_bypass -d 203.0.113.10 -j ACCEPT",
 		"-A nfqws2_bypass -s 203.0.113.10 -j ACCEPT",
 		"-I nfqws_post 1 -j nfqws2_bypass",
 		"-I nfqws_pre 1 -j nfqws2_bypass",
 	} {
-		if !strings.Contains(string(log), want) {
-			t.Fatalf("legacy fallback omitted %q: %s", want, log)
+		if strings.Contains(string(log), forbidden) {
+			t.Fatalf("failed restore changed live firewall with %q: %s", forbidden, log)
 		}
 	}
 }

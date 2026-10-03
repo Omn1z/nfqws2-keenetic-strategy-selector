@@ -41,6 +41,19 @@ func TestAWGRunShellFeedsStdin(t *testing.T) {
 	}
 }
 
+func TestFirewallRestoreRetriesRespectOuterCommandDeadline(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel()
+	script := "iptables-restore() { if [ \"$1\" = --help ]; then echo usage; return 0; fi; cat >/dev/null; echo 'Another app is currently holding the xtables lock.' >&2; return 4; }\n"
+	script += awgFirewallRestoreShell("awg_restore_test", "iptables-restore", "TESTRESTORE", "*mangle\n:AWG2_MULTI -\nCOMMIT\n")
+	script += "awg_restore_test\n"
+	started := time.Now()
+	_, err := awgRunShell(ctx, script, "")
+	if !errors.Is(err, context.DeadlineExceeded) || time.Since(started) > 2*time.Second {
+		t.Fatalf("restore retries outlived the shared command deadline: %v elapsed=%s", err, time.Since(started))
+	}
+}
+
 func TestSelectDefaultRouteKeepsGatewayAndDeviceFromSameLine(t *testing.T) {
 	for name, out := range map[string]string{
 		"gateway-first": `default via 192.168.0.1 dev br0 metric 100

@@ -19,6 +19,7 @@ func (svc *Service) AWG2Import(text, name string) (AWG2Status, error) {
 		return svc.AWG2StatusView(), err
 	}
 	cfg.ClientIface = svc.nextAWGClientIface()
+	cfg.Routing = svc.currentRoutingSettings().apply(cfg.Routing)
 
 	id := "awg-" + storeutil.NewID()
 	srv := &managedServer{ID: id, Name: strings.TrimSpace(name), Manager: awg.NewManager(cfg)}

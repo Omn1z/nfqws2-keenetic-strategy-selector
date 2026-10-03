@@ -30,7 +30,7 @@ interface SelfUpdateStatus {
   error?: string;
 }
 
-const iconBtn = "grid h-7 w-7 place-items-center rounded-lg text-ink-soft transition hover:bg-line-soft hover:text-accent";
+const iconBtn = "grid h-8 w-8 place-items-center rounded-md text-ink-soft outline-none transition-colors hover:bg-line-soft hover:text-ink focus-visible:ring-[3px] focus-visible:ring-ring/25";
 
 const updateStageText: Record<string, string> = {
   queued: "Готовим обновление…",
@@ -75,7 +75,7 @@ export function TopBar({ authEnabled, onMenu }: { authEnabled: boolean; onMenu: 
   // Every component with a pending update, unified into one button + modal.
   const pending: Pending[] = [];
   if (latest) pending.push({ id: "app", label: "Панель управления", from: version, to: latest });
-  if (n2s?.available && n2s.latest) pending.push({ id: "nfqws2", label: "Движок NFQWS2", from: n2s.package, to: n2s.latest });
+  if (n2s?.available && n2s.latest && n2s.package_status !== "unknown" && (n2s.package || (n2s.package_status === "missing" && !n2s.engine))) pending.push({ id: "nfqws2", label: "Пакет NFQWS2", from: n2s.package || "не установлен", to: n2s.latest });
 
   // Update flows (no confirm — the modal is the confirmation).
   const appUpdateFlow = async () => {
@@ -132,22 +132,22 @@ export function TopBar({ authEnabled, onMenu }: { authEnabled: boolean; onMenu: 
   const logout = async () => { try { await api("POST", "/api/auth/logout"); } catch { /* ignore */ } location.reload(); };
 
   return (
-    <header className="relative z-20 flex h-[58px] shrink-0 items-center justify-between border-b border-border bg-card px-3 shadow-sm sm:px-5">
+    <header className="relative z-20 flex h-[58px] shrink-0 items-center justify-between border-b border-border bg-card px-3 sm:px-5">
       <div className="flex min-w-0 items-center gap-2 text-base sm:gap-2.5">
         <button className={cn(iconBtn, "shrink-0 md:hidden")} title="Меню" aria-label="Открыть меню" onClick={onMenu}>
           <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 6h18M3 12h18M3 18h18" /></svg>
         </button>
-        <span className="grid h-[30px] w-[30px] shrink-0 place-items-center rounded-[9px] bg-gradient-to-br from-[#36a3ff] to-accent-d text-white shadow">
+        <span className="grid h-[30px] w-[30px] shrink-0 place-items-center rounded-lg bg-primary text-primary-foreground">
           <svg viewBox="0 0 24 24" width="20" height="20"><path d="M13 2 4 14h6l-1 8 9-12h-6z" fill="currentColor" /></svg>
         </span>
-        <span className="truncate">NFQWS2<b className="hidden font-bold text-accent sm:inline"> Strategy</b></span>
+        <span className="truncate font-semibold tracking-tight">NFQWS2<span className="hidden font-normal text-muted sm:inline"> Strategy</span></span>
       </div>
       <div className="flex items-center gap-2 sm:gap-3.5">
         {config?.wan_ifaces && <span className="hidden text-xs text-muted lg:inline">iface {config.wan_ifaces.join(",")}</span>}
-        <div className="flex items-center gap-2 rounded-full bg-line-soft py-1 pl-3 pr-2">
+        <div className="flex items-center gap-2 rounded-md border border-line bg-panel py-0.5 pl-2.5 pr-1">
           <span className="hidden text-xs text-muted sm:inline">версия</span>
           <span className="font-semibold tabular-nums">{version}</span>
-          <button className={cn("hidden h-7 w-7 place-items-center rounded-lg text-ink-soft transition hover:bg-line-soft hover:text-accent sm:grid", checking && "animate-spin")} title="Проверить обновления" onClick={recheck}>
+          <button className={cn(iconBtn, "hidden sm:grid", checking && "animate-spin")} title="Проверить обновления" onClick={recheck}>
             <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36M21 3v6h-6" /></svg>
           </button>
         </div>
@@ -156,7 +156,7 @@ export function TopBar({ authEnabled, onMenu }: { authEnabled: boolean; onMenu: 
           <button
             onClick={() => { setUpdSel(pending.map((p) => p.id)); setUpdOpen(true); }}
             title="Доступны обновления"
-            className="shrink-0 animate-pulse rounded-full bg-gradient-to-br from-[#ffb33e] to-warn px-2.5 py-1.5 text-xs font-semibold text-white shadow sm:px-3"
+            className="shrink-0 rounded-md border border-warn/25 bg-warn-bg px-2.5 py-1.5 text-xs font-medium text-warn outline-none transition-colors hover:border-warn/50 focus-visible:ring-[3px] focus-visible:ring-ring/25 sm:px-3"
           >
             <span className="sm:hidden">↑{pending.length}</span>
             <span className="hidden sm:inline">Обновления · {pending.length}</span>
@@ -199,8 +199,8 @@ export function TopBar({ authEnabled, onMenu }: { authEnabled: boolean; onMenu: 
       )}
 
       {updating && (
-        <div className="fixed inset-0 z-[60] grid place-items-center bg-[rgba(20,30,45,.55)] backdrop-blur-sm">
-          <div className="w-[340px] rounded-2xl border border-line bg-panel p-9 text-center shadow-2xl">
+        <div className="fixed inset-0 z-[60] grid place-items-center bg-black/50 backdrop-blur-sm">
+          <div className="w-[340px] max-w-[calc(100vw-2rem)] rounded-lg border border-line bg-panel p-8 text-center shadow-xl">
             <Spinner className="mx-auto" />
             <h3 className="mb-2 mt-4 text-lg font-semibold">Обновление панели до {updating.target}</h3>
             <p className="text-xs text-muted">{updating.msg}</p>
@@ -208,8 +208,8 @@ export function TopBar({ authEnabled, onMenu }: { authEnabled: boolean; onMenu: 
         </div>
       )}
       {n2sUpdating && (
-        <div className="fixed inset-0 z-[60] grid place-items-center bg-[rgba(20,30,45,.55)] backdrop-blur-sm">
-          <div className="w-[340px] rounded-2xl border border-line bg-panel p-9 text-center shadow-2xl">
+        <div className="fixed inset-0 z-[60] grid place-items-center bg-black/50 backdrop-blur-sm">
+          <div className="w-[340px] max-w-[calc(100vw-2rem)] rounded-lg border border-line bg-panel p-8 text-center shadow-xl">
             <Spinner className="mx-auto" />
             <h3 className="mb-2 mt-4 text-lg font-semibold">Обновление nfqws2 до {n2sUpdating.target}</h3>
             <p className="text-xs text-muted">{n2sUpdating.msg}</p>

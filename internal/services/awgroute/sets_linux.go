@@ -133,6 +133,23 @@ func (svc *Service) awgBuildSets(cfg *awg.ServerConfig) error {
 // re-resolving 14 k entries and re-warming the geo parse cache (~150 MB).
 // Apply / on-zone-change always passes force=true so a user edit always rebuilds.
 func (svc *Service) awgBuildSetsForce(cfg *awg.ServerConfig, force bool) error {
+	return svc.awgCommitSetPlan(svc.awgPrepareSetPlan(cfg, force))
+}
+
+type awgSetPlan struct {
+	globalScript  string
+	sourceScript  string
+	zonesHash     string
+	migrate       bool
+	skip          bool
+	tunnelEntries int
+	directEntries int
+}
+
+// Prepare may expand lists and resolve thousands of names. It must happen
+// before the DNS readiness barrier: the native resolver can itself forward to
+// our DNS service, whose answer observer waits on that same barrier.
+func (svc *Service) awgPrepareSetPlan(cfg *awg.ServerConfig, force bool) awgSetPlan {
 	zb, _ := json.Marshal(cfg.Routing.Zones)
 	sum := sha256.Sum256(zb)
 	h := hex.EncodeToString(sum[:])
@@ -147,10 +164,11 @@ func (svc *Service) awgBuildSetsForce(cfg *awg.ServerConfig, force bool) error {
 	}
 	if !force && !migrate {
 		if last := svc.route.lastZonesHash.Load(); last != nil && *last == h {
-			return nil // zones unchanged since last build — leave the kernel ipsets alone
+			return awgSetPlan{skip: true} // zones unchanged — leave the kernel sets alone
 		}
 	}
-	defer svc.route.lastZonesHash.Store(&h)
+	lookup, cancel := svc.policyDNSWarmupLookup(resolveDomainAllContext)
+	defer cancel()
 
 	// Batch create + (optional) flush into the SAME `ipset restore -exist`
 	// stream as the per-entry adds below. Was: 4 create forks + 4 flush
@@ -171,11 +189,6 @@ func (svc *Service) awgBuildSetsForce(cfg *awg.ServerConfig, force bool) error {
 		preamble.WriteString("flush " + awgSetInc + "_6\n")
 		preamble.WriteString("flush " + awgSetExc + "_6\n")
 	}
-	if migrate {
-		_ = os.Remove(awgRecentFile)
-		logbuf.Append("awg2", "info", "first-match-wins: миграция — ipset awg2_inc/exc сброшены, recent-кеш удалён")
-	}
-
 	// Build the whole load script and pipe it into a single `ipset restore`. With
 	// catch-all zones (geosite:cn + geoip:cn) the entries can be > 30k; one
 	// fork+exec saves minutes vs N invocations of `ipset add`.
@@ -234,7 +247,7 @@ func (svc *Service) awgBuildSetsForce(cfg *awg.ServerConfig, force bool) error {
 		// Expand xray-style prefixes (geosite:/geoip:/list:/domain:/full:) into the
 		// flat (plain domains, plain IPs) the resolver and ipset below already know.
 		// Plain entries pass through unchanged, so legacy zones stay byte-identical.
-		expDomains, expIPs := svc.expandEntries(z.Domains)
+		expDomains, expIPs := svc.expandZoneEntries(z)
 		for _, ip := range append(append([]string{}, z.IPs...), expIPs...) {
 			ip = strings.TrimSpace(ip)
 			if ip == "" {
@@ -248,15 +261,15 @@ func (svc *Service) awgBuildSetsForce(cfg *awg.ServerConfig, force bool) error {
 				bump()
 			}
 		}
-		// Plain domains are resolved live via the shared parallel resolver (used
-		// by source-bound zones too). Mask/regex stays in DNSProxy/SNI matchers.
+		// Plain-domain warmup reuses routing hints and shares one operation
+		// budget across global and source-bound zones. Mask/regex stays in DNS/SNI.
 		var plain []string
 		for _, d := range expDomains {
 			if !isMaskEntry(d) {
-				plain = append(plain, d)
+				plain = append(plain, routingResolveName(d))
 			}
 		}
-		for _, r := range parallelResolve(plain, 32) {
+		for _, r := range parallelResolveWithLookup(plain, 32, lookup) {
 			for _, ip := range r {
 				if _, ok := sharedCDNProvider(ip); ok {
 					svc.awgNoteSharedCDNSkip("resolve", ip)
@@ -272,18 +285,38 @@ func (svc *Service) awgBuildSetsForce(cfg *awg.ServerConfig, force bool) error {
 			}
 		}
 	}
-	// Single fork: preamble (create + optional flush) ++ all adds. Replaces
-	// 8 standalone create/flush forks at apply start.
-	if preamble.Len() > 0 || b.Len() > 0 {
-		full := preamble.String() + b.String()
-		if _, err := awgRunStdin("ipset restore -exist", full); err != nil {
-			logbuf.Append("awg2", "warn", "ipset restore (global): "+err.Error())
-		}
+	return awgSetPlan{globalScript: preamble.String() + b.String(), sourceScript: svc.awgPrepareSourceSetsWithLookup(cfg, lookup), zonesHash: h, migrate: migrate, tunnelEntries: nInc, directEntries: nExc}
+}
+
+// Commit performs kernel writes only. A failed restore never publishes a
+// successful hash or migration marker, so the watchdog can retry it later.
+func (svc *Service) awgCommitSetPlan(plan awgSetPlan) error {
+	if plan.skip {
+		return nil
 	}
-	logbuf.Append("awg2", "info", fmt.Sprintf("ipset: tunnel=%d, direct=%d записей (first-match-wins)", nInc, nExc))
-	svc.awgBuildSourceSets(cfg)
-	if migrate {
-		_ = os.WriteFile(awgFMWMarker, []byte("ok\n"), 0o644)
+	if err := awgInstallSetScripts(plan, awgRunStdin); err != nil {
+		return err
+	}
+	if plan.migrate {
+		_ = os.Remove(awgRecentFile)
+		if err := os.WriteFile(awgFMWMarker, []byte("ok\n"), 0o644); err != nil {
+			return fmt.Errorf("routing migration marker: %w", err)
+		}
+		logbuf.Append("awg2", "info", "first-match-wins: миграция — ipset awg2_inc/exc сброшены, recent-кеш удалён")
+	}
+	svc.route.lastZonesHash.Store(&plan.zonesHash)
+	logbuf.Append("awg2", "info", fmt.Sprintf("ipset: tunnel=%d, direct=%d записей (first-match-wins)", plan.tunnelEntries, plan.directEntries))
+	return nil
+}
+
+func awgInstallSetScripts(plan awgSetPlan, run func(string, string) (string, error)) error {
+	for _, part := range []struct{ name, script string }{{"global", plan.globalScript}, {"source-bound", plan.sourceScript}} {
+		if part.script == "" {
+			continue
+		}
+		if out, err := run("ipset restore -exist", part.script); err != nil {
+			return awgCmdErr("ipset restore ("+part.name+")", out, err)
+		}
 	}
 	return nil
 }
@@ -293,7 +326,13 @@ func (svc *Service) awgBuildSetsForce(cfg *awg.ServerConfig, force bool) error {
 // sets in the per-source mangle rules (see firewall_linux.go). Source-bound
 // zones are intentionally isolated from awg2_inc/exc so they only affect the
 // devices named in `source_ips`, never the rest of the LAN.
-func (svc *Service) awgBuildSourceSets(cfg *awg.ServerConfig) {
+func (svc *Service) awgPrepareSourceSets(cfg *awg.ServerConfig) string {
+	lookup, cancel := svc.policyDNSWarmupLookup(resolveDomainAllContext)
+	defer cancel()
+	return svc.awgPrepareSourceSetsWithLookup(cfg, lookup)
+}
+
+func (svc *Service) awgPrepareSourceSetsWithLookup(cfg *awg.ServerConfig, lookup func(string) []string) string {
 	sb := sourceBoundZones(cfg.Routing.Zones)
 	// Single fork covers create + flush + every per-zone add across ALL
 	// source-bound zones. Was: 4 ipset forks per zone (create v4, create v6,
@@ -324,7 +363,7 @@ func (svc *Service) awgBuildSourceSets(cfg *awg.ServerConfig) {
 		if len(z.Domains) == 0 && len(z.IPs) == 0 {
 			continue // empty destinations = whole-source rule, no ipset entries needed
 		}
-		expDomains, expIPs := svc.expandEntries(z.Domains)
+		expDomains, expIPs := svc.expandZoneEntries(z)
 		for _, ip := range append(append([]string{}, z.IPs...), expIPs...) {
 			ip = strings.TrimSpace(ip)
 			if ip == "" {
@@ -336,17 +375,15 @@ func (svc *Service) awgBuildSourceSets(cfg *awg.ServerConfig) {
 			}
 			addLine(target, ip)
 		}
-		// Plain domains need a live DNS resolve each. With geosite:category-ru that
-		// is thousands of names; serial nslookup made apply take ~2 minutes. Fan
-		// out across a small worker pool — the router's resolver handles parallel
-		// queries fine and the wall-clock collapses to ~5 s.
+		// A bounded worker pool fills missing routing hints; the same warmup
+		// cache and deadline are shared with the global zones in this plan.
 		var plain []string
 		for _, d := range expDomains {
 			if !isMaskEntry(d) {
-				plain = append(plain, d)
+				plain = append(plain, routingResolveName(d))
 			}
 		}
-		for _, r := range parallelResolve(plain, 32) {
+		for _, r := range parallelResolveWithLookup(plain, 32, lookup) {
 			for _, ip := range r {
 				if _, ok := sharedCDNProvider(ip); ok {
 					continue
@@ -359,12 +396,7 @@ func (svc *Service) awgBuildSourceSets(cfg *awg.ServerConfig) {
 			}
 		}
 	}
-	// One ipset restore for the ENTIRE source-bound set tree.
-	if b.Len() > 0 {
-		if _, err := awgRunStdin("ipset restore -exist", b.String()); err != nil {
-			logbuf.Append("awg2", "warn", "ipset restore (source-bound): "+err.Error())
-		}
-	}
+	return b.String()
 }
 
 // awgResetSNISet was rewritten as a single create+flush over `ipset restore`

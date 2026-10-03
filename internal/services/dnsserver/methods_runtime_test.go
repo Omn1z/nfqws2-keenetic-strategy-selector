@@ -29,9 +29,9 @@ func disabledMethodQuery(t *testing.T) []byte {
 func TestMethodDisableCancelsActiveAttemptWithoutSchedulerPenalty(t *testing.T) {
 	cfg := Default()
 	cfg.FastDNS, cfg.CacheSize, cfg.Rules = false, 0, nil
-	started := make(chan struct{})
-	backend := &resolverTestBackend{routes: []dnsroute.Route{{ID: "nfqws", Available: true}}, dialHook: func(ctx context.Context, _, _, _ string) (net.Conn, error) {
-		close(started)
+	started := make(chan struct{}, 2)
+	backend := &resolverTestBackend{routes: schedulerTestRoutes()[:2], dialHook: func(ctx context.Context, _, _, _ string) (net.Conn, error) {
+		started <- struct{}{}
 		<-ctx.Done()
 		return nil, ctx.Err()
 	}}
@@ -45,8 +45,10 @@ func TestMethodDisableCancelsActiveAttemptWithoutSchedulerPenalty(t *testing.T) 
 		_, _, err := r.Resolve(context.Background(), wire)
 		done <- err
 	}()
-	<-started
-	r.setDisabledMethods([]DisabledMethod{{Upstream: cfg.DefaultUpstream.Address, Route: "nfqws"}})
+	for range 2 {
+		awaitResolverSignal(t, started, "active competing DNS attempt")
+	}
+	r.setDisabledMethods([]DisabledMethod{{Upstream: cfg.DefaultUpstream.Address, Route: "nfqws"}, {Upstream: cfg.DefaultUpstream.Address, Route: "awg:warp"}})
 	select {
 	case err := <-done:
 		if err == nil || !strings.Contains(err.Error(), errMethodDisabled.Error()) {
@@ -57,15 +59,23 @@ func TestMethodDisableCancelsActiveAttemptWithoutSchedulerPenalty(t *testing.T) 
 	}
 	select {
 	case summary := <-cancellations:
-		if summary.Count != 1 {
+		if summary.Count != 2 {
 			t.Fatalf("wrong neutral cancellation count: %+v", summary)
 		}
 	case <-time.After(time.Second):
 		t.Fatal("active cancellation not recorded as neutral")
 	}
-	view := r.SchedulerSnapshot("").Candidates[0]
-	if !view.Disabled || view.Position != 0 || view.Attempts != 1 || view.Successes != 0 || view.Failures != 0 || view.ConsecutiveFailures != 0 || view.LastResultAt != "" {
-		t.Fatalf("manual disable changed scheduler evidence: %+v", view)
+	// An inactive pool hides ranking metrics, but must not penalize the
+	// previously dispatched competitive attempts in retained evidence.
+	r.scheduler.mu.Lock()
+	defer r.scheduler.mu.Unlock()
+	if len(r.scheduler.entries) != 2 {
+		t.Fatalf("missing dispatched scheduler evidence: %+v", r.scheduler.entries)
+	}
+	for key, entry := range r.scheduler.entries {
+		if entry.attempts != 1 || entry.successes != 0 || entry.failures != 0 || entry.consecutiveFailures != 0 || !entry.lastResult.IsZero() {
+			t.Fatalf("manual disable changed scheduler evidence for %s: %+v", key, entry)
+		}
 	}
 }
 
@@ -73,7 +83,7 @@ func TestMethodDisableRechecksQueuedAttemptBeforeDial(t *testing.T) {
 	cfg := Default()
 	cfg.FastDNS, cfg.CacheSize, cfg.Rules = false, 0, nil
 	var calls atomic.Int32
-	backend := &resolverTestBackend{routes: []dnsroute.Route{{ID: "nfqws", Available: true}}, dialHook: func(context.Context, string, string, string) (net.Conn, error) {
+	backend := &resolverTestBackend{routes: schedulerTestRoutes()[:2], dialHook: func(context.Context, string, string, string) (net.Conn, error) {
 		calls.Add(1)
 		return nil, errors.New("unexpected dial")
 	}}
@@ -93,7 +103,7 @@ func TestMethodDisableRechecksQueuedAttemptBeforeDial(t *testing.T) {
 		defer r.scheduler.mu.Unlock()
 		return r.scheduler.races == 1
 	})
-	r.setDisabledMethods([]DisabledMethod{{Upstream: cfg.DefaultUpstream.Address, Route: "nfqws"}})
+	r.setDisabledMethods([]DisabledMethod{{Upstream: cfg.DefaultUpstream.Address, Route: "nfqws"}, {Upstream: cfg.DefaultUpstream.Address, Route: "awg:warp"}})
 	<-r.attempts
 	select {
 	case err := <-done:

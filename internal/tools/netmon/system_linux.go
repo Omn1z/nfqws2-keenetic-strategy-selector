@@ -13,64 +13,15 @@ import (
 	"time"
 )
 
-// SystemStats is a snapshot of router-wide load shown on the dashboard.
-//
-// Memory split into three honest buckets so the user can see WHERE the RAM
-// went — `free -h`'s single "used" number lies on this router because most of
-// it is the kernel's iptables/ipset slab (the ~14 k RU-bypass entries cost
-// ~220 MB of SUnreclaim), not actual applications. The dashboard shows:
-//   - MemAppsKB   — userspace RSS sum (the "apps actually" you can blame)
-//   - MemKernelKB — SUnreclaim kernel slab (mostly ipset/conntrack)
-//   - MemCacheKB  — reclaimable buffers + cache + SReclaimable
-type SystemStats struct {
-	CPUPercent  float64       `json:"cpu_percent"` // 0..100 averaged over the diff window; -1 on first call
-	LoadAvg     [3]float64    `json:"load_avg"`    // 1, 5, 15-minute averages from /proc/loadavg
-	MemTotalKB  int64         `json:"mem_total_kb"`
-	MemFreeKB   int64         `json:"mem_free_kb"`
-	MemAvailKB  int64         `json:"mem_avail_kb"`
-	MemUsedKB   int64         `json:"mem_used_kb"`   // `free -h` used (apps + kernel). Kept for back-compat.
-	MemAppsKB   int64         `json:"mem_apps_kb"`   // sum of userspace process RSS
-	MemKernelKB int64         `json:"mem_kernel_kb"` // SUnreclaim — kernel slab (ipset/conntrack/etc.)
-	MemCacheKB  int64         `json:"mem_cache_kb"`  // buff + cache + sreclaimable; reclaimable when apps need it
-	SwapTotalKB int64         `json:"swap_total_kb"`
-	SwapFreeKB  int64         `json:"swap_free_kb"`
-	UptimeSec   int64         `json:"uptime_sec"`
-	Temps       []TempZone    `json:"temps"`    // thermal zones, °C
-	Services    []ServiceStat `json:"services"` // top-N processes by RSS
-}
-
-// TempZone is one thermal sensor reading.
-type TempZone struct {
-	Label string `json:"label"`
-	C     int    `json:"c"`
-}
-
-// ServiceStat is the per-process snapshot for the dashboard's «Сервисы» row.
-// CPUPercent is delta-based like the global one (-1 on first sample); RSSKB is
-// the resident set; UptimeSec is wall-clock seconds since the process started.
-type ServiceStat struct {
-	Name       string  `json:"name"`
-	PID        int     `json:"pid"`
-	CPUPercent float64 `json:"cpu_percent"`
-	RSSKB      int64   `json:"rss_kb"`
-	UptimeSec  int64   `json:"uptime_sec"`
-}
-
-type cpuSample struct {
-	total, idle int64
-}
-
 var (
 	cpuMu   sync.Mutex
 	cpuLast cpuSample
 	cpuTS   time.Time
 )
 
-// System returns the current SystemStats snapshot. CPUPercent uses a delta
-// between successive calls; the first call after process start returns -1
-// (the UI hides the bar in that case). Best-effort: every field that fails to
-// parse stays at its zero value, so the response always renders.
-func System() SystemStats {
+// readSystem performs one best-effort OS sample. System throttles this scan
+// across all pollers so CPU deltas are not taken a few milliseconds apart.
+func readSystem() SystemStats {
 	var s SystemStats
 	s.LoadAvg = readLoadAvg()
 	mi := readMemInfo()
@@ -103,19 +54,14 @@ func System() SystemStats {
 // SEE where the RAM is going. So we just scan /proc, drop kernel threads, sort
 // by resident size, and keep the top few — same approach `htop` takes.
 const (
-	topProcN      = 10            // cards on the dashboard
-	topProcMinKB  = 1024          // ignore processes smaller than ~1 MB so the list isn't 50 tiny rows
+	topProcN     = 10   // cards on the dashboard
+	topProcMinKB = 1024 // ignore processes smaller than ~1 MB so the list isn't 50 tiny rows
 )
 
 var (
 	procCPUMu   sync.Mutex
 	procCPULast = map[int]procCPUSample{}
 )
-
-type procCPUSample struct {
-	ticks int64 // utime + stime
-	at    time.Time
-}
 
 // readServiceStats finds each named process (by Comm field of /proc/[pid]/stat,
 // which is what `ps` shows in the COMMAND column) and emits one ServiceStat.
@@ -162,8 +108,8 @@ func readServiceStats(sysUptime int64) ([]ServiceStat, int64) {
 		}
 		comm := string(stat[op+1 : lp])
 		fs := strings.Fields(strings.TrimSpace(string(stat[lp+1:])))
-		// Columns after `state` (index 0 here is "state"):
-		//   13: utime, 14: stime, 21: starttime (jiffies since boot)
+		// Field offsets after state (index 0): utime 11, stime 12,
+		// starttime 19 (jiffies since boot).
 		if len(fs) < 22 {
 			continue
 		}
@@ -172,7 +118,10 @@ func readServiceStats(sysUptime int64) ([]ServiceStat, int64) {
 		// RSS, so the rss filter below drops them naturally. Keep the simple path.
 		utime, _ := strconv.ParseInt(fs[11], 10, 64)
 		stime, _ := strconv.ParseInt(fs[12], 10, 64)
-		start, _ := strconv.ParseInt(fs[19], 10, 64)
+		start, parseErr := strconv.ParseInt(fs[19], 10, 64)
+		if parseErr != nil || start < 0 {
+			continue
+		}
 		totalTicks := utime + stime
 
 		var rssKB int64
@@ -191,17 +140,11 @@ func readServiceStats(sysUptime int64) ([]ServiceStat, int64) {
 		}
 
 		cpuPct := -1.0
-		if last, ok := procCPULast[pid]; ok && now.Sub(last.at) < 30*time.Second && now.After(last.at) {
-			dt := totalTicks - last.ticks
-			elapsed := now.Sub(last.at).Seconds()
-			if elapsed > 0 && dt >= 0 {
-				cpuPct = float64(dt) / float64(clk) / elapsed * 100
-				if cpuPct < 0 {
-					cpuPct = 0
-				}
-			}
+		current := procCPUSample{ticks: totalTicks, start: start, at: now}
+		if last, ok := procCPULast[pid]; ok {
+			cpuPct = processCPUPercent(last, current, clk)
 		}
-		procCPULast[pid] = procCPUSample{ticks: totalTicks, at: now}
+		procCPULast[pid] = current
 
 		uptimeSec := sysUptime - start/int64(clk)
 		if uptimeSec < 0 {
@@ -362,39 +305,19 @@ func readCPUPercent() float64 {
 		return -1
 	}
 	ln := strings.SplitN(string(b), "\n", 2)[0]
-	if !strings.HasPrefix(ln, "cpu ") && !strings.HasPrefix(ln, "cpu\t") {
+	current, ok := parseCPUSample(ln)
+	if !ok {
 		return -1
-	}
-	fs := strings.Fields(ln)[1:]
-	var total, idle int64
-	for i, f := range fs {
-		v := int64(atoi64(f))
-		total += v
-		if i == 3 { // idle column (user, nice, system, IDLE, iowait, ...)
-			idle = v
-		}
 	}
 	now := time.Now()
 	last := cpuLast
 	lastTS := cpuTS
-	cpuLast = cpuSample{total: total, idle: idle}
+	cpuLast = current
 	cpuTS = now
-	if last.total == 0 || now.Sub(lastTS) > 30*time.Second {
-		return -1 // first sample, or too stale
-	}
-	dt := float64(total - last.total)
-	di := float64(idle - last.idle)
-	if dt <= 0 {
+	if lastTS.IsZero() {
 		return -1
 	}
-	busy := 100 * (dt - di) / dt
-	if busy < 0 {
-		busy = 0
-	}
-	if busy > 100 {
-		busy = 100
-	}
-	return busy
+	return aggregateCPUPercent(last, current, now.Sub(lastTS))
 }
 
 func parseFloat(s string) (float64, error) {

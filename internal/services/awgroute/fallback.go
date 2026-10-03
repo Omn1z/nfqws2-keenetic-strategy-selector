@@ -112,7 +112,7 @@ func (svc *Service) fallbackRoutingSignature() (string, bool) {
 	var b strings.Builder
 	hasFallback := false
 	for i, z := range svc.awgRoutingRules() {
-		if !z.Enabled || z.RouteValue() != "tunnel" || len(z.FallbackTunnelIDs) == 0 {
+		if !z.Enabled || z.WaitingForConnection || z.RouteValue() != "tunnel" || len(z.FallbackTunnelIDs) == 0 {
 			continue
 		}
 		hasFallback = true
@@ -130,6 +130,10 @@ func (svc *Service) fallbackRoutingSignature() (string, bool) {
 // establishes the baseline and does not cause startup churn.
 func (svc *Service) refreshFallbackRoutingIfNeeded() bool {
 	signature, hasFallback := svc.fallbackRoutingSignature()
+	return svc.refreshFallbackRouting(signature, hasFallback, svc.awgApplyFallbackPolicyOSErr)
+}
+
+func (svc *Service) refreshFallbackRouting(signature string, hasFallback bool, apply func() error) bool {
 	svc.clients.mu.Lock()
 	if !hasFallback {
 		svc.clients.fallbackSignature = ""
@@ -137,9 +141,13 @@ func (svc *Service) refreshFallbackRoutingIfNeeded() bool {
 		svc.clients.mu.Unlock()
 		return false
 	}
-	changed := svc.clients.fallbackSignatureSeen && svc.clients.fallbackSignature != signature
-	svc.clients.fallbackSignature = signature
-	svc.clients.fallbackSignatureSeen = true
+	if !svc.clients.fallbackSignatureSeen {
+		svc.clients.fallbackSignature = signature
+		svc.clients.fallbackSignatureSeen = true
+		svc.clients.mu.Unlock()
+		return false
+	}
+	changed := svc.clients.fallbackSignature != signature
 	svc.clients.mu.Unlock()
 	if !changed {
 		return false
@@ -148,11 +156,16 @@ func (svc *Service) refreshFallbackRoutingIfNeeded() bool {
 	if !ok {
 		return false
 	}
-	err := svc.awgApplyMultiHostRoutesOSErr()
-	unlock()
+	defer unlock()
+	err := apply()
 	if err != nil {
 		logbuf.Append("awg2", "warn", "fallback-маршрутизация: "+err.Error())
 		return false
 	}
+	// A busy lifecycle or failed kernel write must not consume the change.
+	// The next supervisor pass retries with cached policy preparation.
+	svc.clients.mu.Lock()
+	svc.clients.fallbackSignature = signature
+	svc.clients.mu.Unlock()
 	return true
 }

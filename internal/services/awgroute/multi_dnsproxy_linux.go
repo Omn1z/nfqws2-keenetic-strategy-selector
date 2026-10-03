@@ -3,9 +3,11 @@
 package awgroute
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"strings"
+	"time"
 
 	"nfqws2strategy/internal/services/awg"
 	"nfqws2strategy/internal/tools/logbuf"
@@ -29,17 +31,20 @@ func (svc *Service) awgEnsureMultiDNSProxy(rules []awgMultiRule) bool {
 	svc.awgSaveRecent()
 	svc.awgStopDNSProxy()
 
-	np := awg.NewDNSProxy(awgDNSAddr, svc.awgEffectiveDNSUpstream(), func(name string, ips []string) {
+	generation := svc.routingDNSGate.version()
+	np := awg.NewDNSProxy(awgDNSAddr, awgDNSUpstream, func(name string, ips []string) {
 		// SetMatchers replay runs through onMatch without a client IP. Re-add
 		// cached global-domain answers without blocking the apply path.
-		svc.awgMultiLearnDNSAnswer(rules, name, "", ips, false)
+		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+		defer cancel()
+		if err := svc.awgMultiLearnDNSAnswer(ctx, rules, name, "", ips, generation); err != nil {
+			logbuf.Append("awg2", "warn", "multi-routing DNS replay: "+err.Error())
+		}
+	})
+	np.SetBeforeReply(func(ctx context.Context, srcIP, name string, ips []string) error {
+		return svc.awgMultiLearnDNSAnswer(ctx, rules, name, srcIP, ips, generation)
 	})
 	np.SetOnQuery(func(srcIP, qname, qtype string, ips []string, sinkholed bool) {
-		if !sinkholed {
-			// Live DNS answer: block until the destination is in awgm_XXX so the
-			// client's first connection after this DNS response sees the route.
-			svc.awgMultiLearnDNSAnswer(rules, qname, srcIP, ips, true)
-		}
 		svc.awgTraceMultiDNSQuery(rules, srcIP, qname, qtype, ips, sinkholed)
 	})
 	np.SetOnBlock(func(srcIP, qname string) {
@@ -105,24 +110,34 @@ func awgMultiRuleForName(rules []awgMultiRule, name, srcIP string) *awgMultiRule
 	return nil
 }
 
-func (svc *Service) awgMultiLearnDNSAnswer(rules []awgMultiRule, name, srcIP string, ips []string, immediate bool) {
+func (svc *Service) awgMultiLearnDNSAnswer(ctx context.Context, rules []awgMultiRule, name, srcIP string, ips []string, generation uint64) error {
+	release, err := svc.routingDNSGate.acquire(ctx, generation, true)
+	if err != nil {
+		return err
+	}
+	defer release()
 	r := awgMultiRuleForName(rules, name, srcIP)
 	if r == nil || !r.HasDst || strings.TrimSpace(r.SetName) == "" {
-		return
+		return svc.routingDNSGate.verify(generation)
 	}
 	v4 := awgDNSIPv4Answers(ips)
-	v4 = svc.awgFilterMultiDNSLearnIPs(v4)
+	// A source-bound rule already scopes an address to the explicitly selected
+	// devices. Keep the shared-CDN protection only for LAN-wide domain rules.
+	if len(r.Sources) == 0 {
+		v4 = svc.awgFilterMultiDNSLearnIPs(v4)
+	}
 	if len(v4) == 0 {
-		return
+		return svc.routingDNSGate.verify(generation)
 	}
 	svc.rememberPolicyDNS(name, v4)
-	if immediate {
-		awgIPSetAddManySync(r.SetName, v4)
-		return
-	}
+	requests := make([]ipsetAddReq, 0, len(v4))
 	for _, ip := range v4 {
-		ipsetAddAsync(r.SetName, ip)
+		requests = append(requests, ipsetAddReq{set: r.SetName, ip: ip})
 	}
+	if err := svc.awgIPSetLearnSync(ctx, requests); err != nil {
+		return err
+	}
+	return svc.routingDNSGate.verify(generation)
 }
 
 func (svc *Service) awgFilterMultiDNSLearnIPs(ips []string) []string {
@@ -159,22 +174,14 @@ func awgDNSIPv4Answers(ips []string) []string {
 	return out
 }
 
-func awgIPSetAddManySync(set string, ips []string) {
-	for _, ip := range ips {
-		if out, err := awgRun("ipset add " + set + " " + ip + " -exist"); err != nil {
-			logbuf.Append("awg2", "warn", "multi-routing: DNS learn ipset add failed for "+set+" "+ip+": "+err.Error()+" "+out)
-		}
-	}
-}
-
 func (svc *Service) awgTraceMultiDNSQuery(rules []awgMultiRule, srcIP, qname, qtype string, ips []string, sinkholed bool) {
 	if sinkholed {
 		if len(ips) == 0 {
-			traceAppend(TraceEntry{Src: srcIP, Kind: "dns", Name: qname, Qtype: qtype, Decision: "blocked", Reason: "pi-hole: domain blocked"})
+			traceAppend(TraceEntry{Src: srcIP, Kind: "dns", Name: qname, Qtype: qtype, Decision: "blocked", Reason: "DNS upstream: empty or negative answer"})
 			return
 		}
 		for _, ip := range ips {
-			traceAppend(TraceEntry{Src: srcIP, Kind: "dns", Name: qname, Qtype: qtype, Dst: ip, Decision: "blocked", Reason: "pi-hole: null-route"})
+			traceAppend(TraceEntry{Src: srcIP, Kind: "dns", Name: qname, Qtype: qtype, Dst: ip, Decision: "blocked", Reason: "DNS upstream: null-route"})
 		}
 		return
 	}
@@ -190,6 +197,12 @@ func (svc *Service) awgTraceMultiDNSQuery(rules []awgMultiRule, srcIP, qname, qt
 		return
 	}
 	for _, ip := range ips {
-		traceAppend(TraceEntry{Src: srcIP, Kind: "dns", Name: qname, Qtype: qtype, Dst: ip, Decision: decision, Rule: rule, Reason: reason})
+		d, why, matched := decision, reason, rule
+		if r != nil && r.HasDst && !r.CatchAll && len(r.Sources) == 0 && decision == "tunnel" {
+			if _, shared := sharedCDNProvider(ip); shared {
+				d, why, matched = "cdn-skip", "multi-routing: shared CDN address excluded from global DNS learning", 0
+			}
+		}
+		traceAppend(TraceEntry{Src: srcIP, Kind: "dns", Name: qname, Qtype: qtype, Dst: ip, Decision: d, Rule: matched, Reason: why})
 	}
 }

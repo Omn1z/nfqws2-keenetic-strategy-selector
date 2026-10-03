@@ -205,7 +205,7 @@ export default function PortForwarding() {
               {view.rules.map((rule) => (
                 <tr key={rule.id}>
                   <td className={tdCls}>
-                    <Switch checked={rule.enabled} onChange={(v) => toggleRule(rule, v)} />
+                    <Switch checked={rule.enabled} onChange={(v) => toggleRule(rule, v)} aria-label={`Правило проброса портов «${rule.name || rule.id}» включено`} />
                   </td>
                   <td className={tdCls}>
                     <div className="font-semibold text-ink">{rule.name}</div>

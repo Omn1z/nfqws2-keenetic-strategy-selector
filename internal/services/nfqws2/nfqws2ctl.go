@@ -43,6 +43,7 @@ import (
 type Manager struct {
 	cfg      *config.Config
 	bypassMu sync.Mutex
+	assetsMu sync.Mutex // serialize managed assets, imports and snapshots
 }
 
 // New builds a Manager reading the live app config (router paths + package name).
@@ -61,12 +62,13 @@ type File struct {
 // VersionInfo reports the installed engine version and (optionally) the latest
 // available release.
 type VersionInfo struct {
-	Package   string `json:"package"`         // apk/opkg package version, e.g. "1.1.5"
-	Engine    string `json:"engine"`          // binary --version, e.g. "v0.9.5.1"
-	Latest    string `json:"latest"`          // newest release (v-stripped)
-	Available bool   `json:"available"`       // Latest newer than Package
-	URL       string `json:"url"`             // release page
-	Error     string `json:"error,omitempty"` // soft network error
+	Package       string `json:"package"`         // apk/opkg package version, never the binary version
+	PackageStatus string `json:"package_status"`  // installed, missing, or unknown (query failed)
+	Engine        string `json:"engine"`          // binary --version, e.g. "v0.9.5.1"
+	Latest        string `json:"latest"`          // newest release (v-stripped)
+	Available     bool   `json:"available"`       // Latest newer than Package
+	URL           string `json:"url"`             // release page
+	Error         string `json:"error,omitempty"` // soft local-query or network error
 }
 
 const (
@@ -95,8 +97,6 @@ var nameRe = func() map[string]*regexp.Regexp {
 	}
 	return m
 }()
-
-var reEngineVer = regexp.MustCompile(`version\s+(v?[0-9][0-9A-Za-z._-]*)`)
 
 // dir maps a kind to its server-owned directory (always forward-slash so it's
 // correct regardless of the build OS — these are router paths).
@@ -264,7 +264,18 @@ func readCapped(p string) ([]byte, error) {
 		return nil, err
 	}
 	defer f.Close()
-	return io.ReadAll(io.LimitReader(f, readCap))
+	return readEditorLimited(f)
+}
+
+func readEditorLimited(r io.Reader) ([]byte, error) {
+	data, err := io.ReadAll(io.LimitReader(r, readCap+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > readCap {
+		return nil, fmt.Errorf("файл больше 8 МиБ: откройте его через File Explorer, редактор не будет обрезать содержимое")
+	}
+	return data, nil
 }
 
 // Read returns the file content, transparently gunzipping a .gz variant. A
@@ -290,7 +301,7 @@ func (m *Manager) Read(kind, name string) (string, error) {
 			return "", zerr
 		}
 		defer zr.Close()
-		b, rerr := io.ReadAll(io.LimitReader(zr, readCap))
+		b, rerr := readEditorLimited(zr)
 		return string(b), rerr
 	}
 	return "", nil
@@ -299,6 +310,7 @@ func (m *Manager) Read(kind, name string) (string, error) {
 // normalize mirrors the upstream normalizeString: LF endings, no runaway blank
 // lines, single trailing newline.
 func normalize(s string) string {
+	s = strings.TrimPrefix(s, "\ufeff")
 	s = strings.ReplaceAll(s, "\r\n", "\n")
 	s = strings.ReplaceAll(s, "\r", "\n")
 	s = regexp.MustCompile(`\n{3,}`).ReplaceAllString(s, "\n\n")
@@ -313,18 +325,22 @@ func normalize(s string) string {
 // via a temp file + rename in the same dir so a partial write can't corrupt a
 // live config.
 func (m *Manager) Save(kind, name, content string) error {
+	m.assetsMu.Lock()
+	defer m.assetsMu.Unlock()
 	basePath, base, err := m.resolve(kind, name)
 	if err != nil {
 		return err
 	}
 	data := []byte(normalize(content))
-	tmp := basePath + ".n2s-tmp"
-	if werr := os.WriteFile(tmp, data, 0o644); werr != nil {
-		return werr
+	var owner *assetOwner
+	if _, statErr := os.Lstat(basePath); os.IsNotExist(statErr) && kind == "list" {
+		owner, err = m.currentAutolistOwner("lists/" + base)
+		if err != nil {
+			return err
+		}
 	}
-	if rerr := os.Rename(tmp, basePath); rerr != nil {
-		_ = os.Remove(tmp)
-		return rerr
+	if err := writeAssetLocation(assetLocation{stdpath.Dir(basePath), stdpath.Base(basePath), kind}, data, 0o644, owner); err != nil {
+		return err
 	}
 	logbuf.Append("nfqws2", "info", "сохранён "+kind+"/"+base)
 	return nil
@@ -332,6 +348,8 @@ func (m *Manager) Save(kind, name, content string) error {
 
 // Create creates an empty file; fails if a plain or .gz variant exists.
 func (m *Manager) Create(kind, name string) error {
+	m.assetsMu.Lock()
+	defer m.assetsMu.Unlock()
 	basePath, base, err := m.resolve(kind, name)
 	if err != nil {
 		return err
@@ -342,8 +360,26 @@ func (m *Manager) Create(kind, name string) error {
 	if _, e := os.Stat(basePath + ".gz"); e == nil {
 		return fmt.Errorf("файл уже существует: %s", base)
 	}
-	if werr := os.WriteFile(basePath, nil, 0o644); werr != nil {
-		return werr
+	var owner *assetOwner
+	if kind == "list" {
+		owner, err = m.currentAutolistOwner("lists/" + base)
+		if err != nil {
+			return err
+		}
+	}
+	f, err := os.OpenFile(basePath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	if err != nil {
+		return err
+	}
+	if owner != nil {
+		if err = initializeAssetOwner(f, owner); err != nil {
+			f.Close()
+			_ = os.Remove(basePath)
+			return err
+		}
+	}
+	if err = f.Close(); err != nil {
+		return err
 	}
 	logbuf.Append("nfqws2", "info", "создан "+kind+"/"+base)
 	return nil
@@ -352,6 +388,8 @@ func (m *Manager) Create(kind, name string) error {
 // Delete removes the base AND its .gz variant (so a deleted lua can't resurrect
 // from its .gz). Protected files are refused.
 func (m *Manager) Delete(kind, name string) error {
+	m.assetsMu.Lock()
+	defer m.assetsMu.Unlock()
 	basePath, base, err := m.resolve(kind, name)
 	if err != nil {
 		return err
@@ -380,14 +418,28 @@ func (m *Manager) Delete(kind, name string) error {
 // Upload stores an uploaded file. Gzipped uploads are auto-decompressed (by
 // magic, regardless of name) so the result is editable plain text.
 func (m *Manager) Upload(kind, filename string, data []byte) error {
+	if len(data) > uploadCap {
+		return fmt.Errorf("файл превышает предел 16 МиБ")
+	}
 	if len(data) >= 2 && data[0] == 0x1f && data[1] == 0x8b {
 		zr, err := gzip.NewReader(bytes.NewReader(data))
-		if err == nil {
-			if dec, derr := io.ReadAll(io.LimitReader(zr, readCap)); derr == nil {
-				data = dec
-			}
-			_ = zr.Close()
+		if err != nil {
+			return fmt.Errorf("не удалось открыть gzip: %w", err)
 		}
+		dec, err := readEditorLimited(zr)
+		_ = zr.Close()
+		if err != nil {
+			return err
+		}
+		data = dec
+	}
+	if len(data) > readCap {
+		return fmt.Errorf("файл больше 8 МиБ: загрузите его через File Explorer")
+	}
+	var err error
+	data, _, err = prepareAssetData(kind, strings.TrimSuffix(filename, ".gz"), data)
+	if err != nil {
+		return err
 	}
 	return m.Save(kind, filename, string(data))
 }
@@ -401,9 +453,13 @@ func (m *Manager) Bytes(kind, name string) (data []byte, dlName string, err erro
 	}
 	if b, e := readCapped(basePath); e == nil {
 		return b, base, nil
+	} else if !os.IsNotExist(e) {
+		return nil, "", e
 	}
 	if b, e := readCapped(basePath + ".gz"); e == nil {
 		return b, base + ".gz", nil
+	} else if !os.IsNotExist(e) {
+		return nil, "", e
 	}
 	return nil, "", fmt.Errorf("файл не найден: %s", base)
 }
@@ -583,70 +639,26 @@ func parseAPKInstalledVersion(output string) string {
 		}
 		for j := i - 1; j >= 0; j-- {
 			line := strings.TrimSpace(lines[j])
-			if len(line) > 1 && line[0] >= '0' && line[0] <= '9' && strings.HasSuffix(line, ":") {
-				return strings.TrimSpace(strings.TrimSuffix(line, ":"))
+			if strings.HasSuffix(line, ":") {
+				// The nearest version heading owns this database marker. Never
+				// skip an invalid installed heading and return a repository candidate.
+				if len(line) > 1 && line[0] >= '0' && line[0] <= '9' {
+					return strings.TrimSpace(strings.TrimSuffix(line, ":"))
+				}
+				return ""
 			}
 		}
 	}
 	return ""
 }
 
-func apkPackageVersion(ctx context.Context, apk, pkg string) string {
-	// OpenWrt's apk `info -v` prints the package description, not a
-	// machine-readable version. `policy` keeps the installed version on its
-	// own line (for example `1.2.8:`) next to the local database marker. The
-	// info form is a compatibility fallback, but candidates without that marker
-	// are deliberately ignored.
-	for _, args := range [][]string{{"policy", pkg}, {"info", "-a", pkg}} {
-		out, err := exec.CommandContext(ctx, apk, args...).CombinedOutput()
-		if err != nil && len(out) == 0 {
-			continue
-		}
-		// Only a local-database marker proves installation.  The generic policy
-		// output also lists repository candidates, which must not make the UI
-		// report a missing engine as installed.
-		if version := parseAPKInstalledVersion(string(out)); version != "" {
-			return version
-		}
-	}
-	return ""
-}
-
-// Version reports the installed package + engine versions (fast, local).
-func (m *Manager) Version() VersionInfo {
-	ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
-	defer cancel()
-	info := VersionInfo{}
-	if pm, apk := packageManager(); pm != "" {
-		var out []byte
-		var err error
-		if apk {
-			info.Package = apkPackageVersion(ctx, pm, m.cfg.Nfqws2Pkg)
-		} else {
-			out, err = exec.CommandContext(ctx, "sh", "-c",
-				pm+" status "+m.cfg.Nfqws2Pkg+" | awk -F': ' '/^Version:/{print $2}'").Output()
-		}
-		if !apk && err == nil {
-			info.Package = strings.TrimSpace(string(out))
-		}
-	}
-	if out, err := exec.CommandContext(ctx, m.cfg.NfqwsBin, "--version").CombinedOutput(); err == nil {
-		if mm := reEngineVer.FindStringSubmatch(string(out)); mm != nil {
-			info.Engine = mm[1]
-		}
-	}
-	// A manually copied binary is still a valid NFQWS2 installation. Keep the
-	// UI useful even when no package database entry exists.
-	if info.Package == "" && info.Engine != "" {
-		info.Package = strings.TrimPrefix(info.Engine, "v")
-	}
-	return info
-}
-
 // CheckUpdate adds the latest GitHub release to the local version info and flags
 // whether it is newer than the installed package (mirrors selfupdate).
 func (m *Manager) CheckUpdate() VersionInfo {
 	info := m.Version()
+	if info.PackageStatus == packageUnknown {
+		return info
+	}
 	if m.cfg.Nfqws2Repo == "" {
 		info.Error = "repo not configured"
 		return info
@@ -676,12 +688,7 @@ func (m *Manager) CheckUpdate() VersionInfo {
 		info.Error = derr.Error()
 		return info
 	}
-	info.Latest = strings.TrimPrefix(rel.TagName, "v")
-	info.URL = rel.HTMLURL
-	// An APK/opkg package may be absent on a fresh panel install.  Still expose
-	// the release as actionable: the update endpoint uses `add`/`install` and
-	// therefore doubles as the NFQWS2 installer from the UI.
-	info.Available = info.Latest != "" && (info.Package == "" || info.Latest != info.Package)
+	info.applyRelease(rel.TagName, rel.HTMLURL)
 	return info
 }
 

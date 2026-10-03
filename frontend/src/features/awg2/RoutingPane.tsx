@@ -6,8 +6,10 @@ import { Card } from "@/components/ui/Card";
 import { Button } from "@/components/ui/Button";
 import { Switch } from "@/components/ui/Switch";
 import { Field, Select } from "@/components/ui/form";
-import type { Awg2Status, AwgRoutingConfig, AwgZone } from "@/types/api";
+import type { Awg2Status, AwgRoutingConfig, AwgRulesImportResult, AwgZone } from "@/types/api";
 import RulesTable from "./RulesTable";
+import type { ImportRoutingRules, RoutingReadTask } from "./RulesTransferModal";
+import { prepareRuleConnection } from "./routingRules";
 
 
 // One combined list per rule: domains/masks AND IPv4/IPv6/CIDR in the same box.
@@ -19,39 +21,40 @@ const cleanArr = (a: string[]) => (a || []).map((x) => x.trim()).filter(Boolean)
 const isIPish = (s: string) =>
   /^(\d{1,3}\.){3}\d{1,3}(\/\d{1,2})?$/.test(s) || // IPv4 / CIDR
   (s.includes(":") && /^[0-9a-fA-F:.]+(\/\d{1,3})?$/.test(s)); // IPv6 / CIDR
-const cleanRouting = (rc: AwgRoutingConfig): AwgRoutingConfig => ({
+const cleanRouting = (rc: AwgRoutingConfig, tunnelIDs: ReadonlySet<string>): AwgRoutingConfig => ({
   ...rc,
   zones: (rc.zones || []).map((z) => {
     const all = cleanArr(zoneLines(z));
-    return { ...z, domains: all.filter((x) => !isIPish(x)), ips: all.filter(isIPish) };
+    return { ...prepareRuleConnection(z, tunnelIDs), domains: all.filter((x) => !isIPish(x)), ips: all.filter(isIPish) };
   }),
 });
-const routingFromStatus = (st: Awg2Status): AwgRoutingConfig => ({
-  ...st.config.routing,
-  mode: st.config.routing?.mode || "zones",
-  zones: st.routing_rules || st.config.routing?.zones || [],
-});
+const routingFromStatus = (st: Awg2Status): AwgRoutingConfig => {
+  const routing = st.routing_config ?? st.config.routing;
+  return { ...routing, mode: routing?.mode || "zones", zones: st.routing_config?.zones ?? st.routing_rules ?? st.config.routing?.zones ?? [] };
+};
 
-export default function RoutingPane({ st, reload }: { st: Awg2Status; reload: () => void }) {
+export default function RoutingPane({ st, reload, visible, onBusyChange, externalBusy, acceptRouting }: { st: Awg2Status; reload: () => Promise<void>; visible: boolean; onBusyChange: (busy: boolean) => void; externalBusy: boolean; acceptRouting: (routing: AwgRoutingConfig) => void }) {
   const [r, setRState] = useState<AwgRoutingConfig>(() => routingFromStatus(st));
   const [dirty, setDirty] = useState(false);
   const [busy, setBusy] = useState(false);
-  const [countdown, setCountdown] = useState(0);
-  const timer = useRef<number | null>(null);
-  const autoTimer = useRef<number | null>(null);
-  const routingKey = JSON.stringify({ routing: st.config.routing || {}, rules: st.routing_rules || [] });
-  // Suppress poll-driven resync for a brief window after a save. Otherwise the
-  // parent's 2.5s usePoll can race with our local markSaved: a poll fetched at
-  // the same time as POST may have captured pre-save state, and its setSt then
-  // overrides our just-applied edits via the resync useEffect. 3s covers at
-  // least one full poll cycle so the next refetch sees the saved values.
-  const savedAtRef = useRef(0);
-  useEffect(() => () => { if (timer.current) window.clearInterval(timer.current); if (autoTimer.current) window.clearTimeout(autoTimer.current); }, []);
+  const [saveError, setSaveError] = useState("");
+  const saveInFlight = useRef(false);
+  const routingKey = JSON.stringify(routingFromStatus(st));
+  const observedRoutingKey = useRef(routingKey);
+  const pendingRouting = useRef<AwgRoutingConfig | null>(null);
+  const blocked = busy || externalBusy;
+  const tunnelIDs = new Set(st.servers.map((server) => server.id));
+  // Polls often change handshake counters without changing configuration.
+  // Only a genuinely new routing snapshot can replace a clean local form.
   useEffect(() => {
-    if (dirty) return;
-    if (Date.now() - savedAtRef.current < 3000) return;
-    setRState(routingFromStatus(st));
-  }, [routingKey, dirty, st]);
+    if (routingKey !== observedRoutingKey.current) {
+      observedRoutingKey.current = routingKey;
+      pendingRouting.current = routingFromStatus(st);
+    }
+    if (dirty || busy || !pendingRouting.current) return;
+    setRState(pendingRouting.current);
+    pendingRouting.current = null;
+  }, [routingKey, dirty, busy, st]);
   const setR = (next: AwgRoutingConfig | ((prev: AwgRoutingConfig) => AwgRoutingConfig)) => {
     setDirty(true);
     setRState(next);
@@ -59,23 +62,73 @@ export default function RoutingPane({ st, reload }: { st: Awg2Status; reload: ()
   const markSaved = (next: AwgRoutingConfig) => {
     setRState(next);
     setDirty(false);
-    savedAtRef.current = Date.now();
+  };
+  const runRead: RoutingReadTask = async (work) => {
+    if (saveInFlight.current || externalBusy) throw new Error("Дождитесь завершения текущей настройки.");
+    saveInFlight.current = true;
+    setBusy(true);
+    onBusyChange(true);
+    try { return await work(); }
+    finally { saveInFlight.current = false; setBusy(false); onBusyChange(false); }
+  };
+  const importRules: ImportRoutingRules = async (request) => {
+    if (saveInFlight.current || externalBusy) return false;
+    saveInFlight.current = true;
+    setBusy(true);
+    onBusyChange(true);
+    setSaveError("");
+    try {
+      const result = await api<AwgRulesImportResult>("POST", "/api/awg2/routing/rules/import", request);
+      // Import is atomic: preserve the visible draft until the backend confirms
+      // success, then accept its canonical result before a fallible status read.
+      pendingRouting.current = null;
+      acceptRouting(result.routing);
+      markSaved(result.routing);
+      toast(`Импорт завершён · всего правил: ${result.rule_count}${result.waiting_rule_count ? ` · ожидают подключения: ${result.waiting_rule_count}` : ""}`, "ok");
+      await reload();
+      return true;
+    } catch (e) {
+      const message = (e as Error).message;
+      setSaveError(message);
+      toast(message, "err");
+      // Validation or uncertain network failures cannot discard the local form.
+      return false;
+    } finally { saveInFlight.current = false; setBusy(false); onBusyChange(false); }
   };
 
   const eng = st.engine;
-  // Routing is "active" once committed; while active, saving zones/masks/killswitch
-  // applies to the live tunnel immediately (the backend refreshes membership without
-  // a dead-man's switch — it can't cut panel access).
-  const active = r.mode !== "off" && (r.zones || []).some((z) => z.enabled);
+  // Use the backend's applied state, not the selected profile or unsaved draft.
+  const active = st.routing_config?.active ?? st.config.routing?.active ?? false;
 
-  const post = async (path: string, body: unknown, ok: string, after?: () => void, savedRouting?: AwgRoutingConfig) => {
+  const saveRules = async (nextRouting: AwgRoutingConfig, ok?: string): Promise<boolean> => {
+    if (saveInFlight.current || externalBusy) return false;
+    saveInFlight.current = true;
     setBusy(true);
-    try { await api("POST", path, body); if (savedRouting) markSaved(savedRouting); toast(ok, "ok"); after?.(); await reload(); }
-    catch (e) { toast((e as Error).message, "err"); }
-    finally { setBusy(false); }
+    onBusyChange(true);
+    setSaveError("");
+    setRState(nextRouting);
+    setDirty(true);
+    try {
+      await api("POST", "/api/awg2/routing/rules", nextRouting);
+      // The acknowledged write supersedes snapshots received while editing.
+      // A failed follow-up GET must not replay one of those over the saved form.
+      pendingRouting.current = null;
+      markSaved(nextRouting);
+      if (ok) toast(ok, "ok");
+      await reload();
+      return true;
+    } catch (e) {
+      const message = (e as Error).message;
+      setSaveError(message);
+      toast(message, "err");
+      // Keep the draft: a timeout does not prove the server rolled it back.
+      return false;
+    } finally {
+      saveInFlight.current = false;
+      setBusy(false);
+      onBusyChange(false);
+    }
   };
-  const saveRules = (nextRouting: AwgRoutingConfig, ok: string, after?: () => void) =>
-    post("/api/awg2/routing/rules", nextRouting, ok, after, nextRouting);
 
   const install = async () => {
     if (!(await confirmDialog({
@@ -83,44 +136,31 @@ export default function RoutingPane({ st, reload }: { st: Awg2Status; reload: ()
       body: `Установит ${eng.target_version || "актуальную сборку"} на роутер. Действующие VPN-туннели будут перезапущены с сохранением профилей.`,
       confirmLabel: eng.installed ? "Обновить" : "Установить",
     }))) return;
+    if (blocked || saveInFlight.current) return;
+    saveInFlight.current = true;
     setBusy(true);
+    onBusyChange(true);
     try {
       const d = await api<{ ok: boolean; detail?: string; error?: string }>("POST", "/api/awg2/install", {});
       toast(d.ok ? "Движок AmneziaWG готов" : "Ошибка: " + (d.error || "?"), d.ok ? "ok" : "err");
       await reload();
-    } catch (e) { toast((e as Error).message, "err"); } finally { setBusy(false); }
+    } catch (e) { toast((e as Error).message, "err"); } finally { saveInFlight.current = false; setBusy(false); onBusyChange(false); }
   };
-
-  const stopCountdown = () => { setCountdown(0); if (timer.current) window.clearInterval(timer.current); if (autoTimer.current) { window.clearTimeout(autoTimer.current); autoTimer.current = null; } };
 
   const applyRouting = async () => {
     if (r.mode === "off") return teardown();
     if (!(await confirmDialog({
       title: "Применить маршрутизацию?",
-      body: `Режим «${r.mode}». Часть трафика пойдёт через VPN. Подтверждение произойдёт автоматически через несколько секунд; если применение оборвёт связь с панелью — будет авто-откат. Локальная сеть, приватные адреса и сам сервер VPN всегда в обход туннеля.`,
+      body: `Режим «${r.mode}». Правила будут сохранены и применены на роутере. Локальная сеть, приватные адреса и сам сервер VPN всегда в обход туннеля.`,
       confirmLabel: "Применить",
     }))) return;
-    setBusy(true);
-    try {
-      const nextRouting = cleanRouting(r);
-      await api("POST", "/api/awg2/routing/rules", nextRouting);
-      markSaved(nextRouting);
-      toast("Правила применены", "ok");
-      await reload();
-    } catch (e) { toast((e as Error).message, "err"); } finally { setBusy(false); }
+    await saveRules(cleanRouting(r, tunnelIDs), "Правила применены");
   };
-  const commit = () => stopCountdown();
 
   const teardown = () => {
-    const nextRouting = cleanRouting({ ...r, mode: "off" });
-    void saveRules(nextRouting, "Маршрутизация снята", stopCountdown);
+    const nextRouting = cleanRouting({ ...r, mode: "off" }, tunnelIDs);
+    void saveRules(nextRouting, "Маршрутизация снята");
   };
-
-  const setZone = (i: number, patch: Partial<AwgZone>) => setR((p) => ({ ...p, zones: p.zones.map((z, j) => (j === i ? { ...z, ...patch } : z)) }));
-  // Per-zone editor lives in RulesTable now — the legacy zone-form +
-  // include/exclude segment was replaced by a pi-hole-style table. setZone is
-  // kept for any in-place tweaks (the table calls it from row controls).
-  void setZone;
 
   return (
     <>
@@ -130,7 +170,7 @@ export default function RoutingPane({ st, reload }: { st: Awg2Status; reload: ()
           <p className="text-xs text-bad">Для архитектуры {eng.arch} готовой сборки движка нет.</p>
         ) : (
           <div className="flex flex-wrap items-center gap-3">
-            <Button variant="primary" onClick={install} disabled={busy}>{busy ? "Установка…" : `${eng.installed ? "Обновить движок" : "Установить движок"}${eng.target_version ? ` · ${eng.target_version}` : ""}`}</Button>
+            <Button variant="primary" onClick={install} disabled={blocked}>{busy ? "Установка…" : `${eng.installed ? "Обновить движок" : "Установить движок"}${eng.target_version ? ` · ${eng.target_version}` : ""}`}</Button>
             {!eng.tun_ok && <span className="text-xs text-warn">⚠ /dev/net/tun не найден — при установке будет попытка загрузить модуль</span>}
           </div>
         )}
@@ -141,43 +181,44 @@ export default function RoutingPane({ st, reload }: { st: Awg2Status; reload: ()
       <Card title="Сплит-маршрутизация" sub="локальные правила на роутере, независимо от настроек подключений">
         <div className="flex flex-wrap gap-4">
           <Field label="Режим" className="min-w-[280px] flex-1">
-            <Select value={r.mode === "include" || r.mode === "exclude" ? "zones" : r.mode} onChange={(e) => setR({ ...r, mode: e.target.value })}>
+            <Select disabled={blocked} value={r.mode === "include" || r.mode === "exclude" ? "zones" : r.mode} onChange={(e) => setR({ ...r, mode: e.target.value })}>
               <option value="off">Выключено</option>
               <option value="zones">По зонам (Включить/Исключить на каждой зоне)</option>
               <option value="full">Весь трафик — через VPN</option>
             </Select>
           </Field>
         </div>
-        <div className="mt-1 flex items-center gap-4"><Switch checked={!!r.killswitch} onChange={(v) => setR({ ...r, killswitch: v })} label="Эксклюзивный маршрут (kill-switch): если туннель недоступен — сайты из зон НЕ открываются" /></div>
+        <div className="mt-1 flex items-center gap-4"><Switch disabled={blocked} checked={!!r.killswitch} onChange={(v) => setR({ ...r, killswitch: v })} label="Эксклюзивный маршрут (kill-switch): если туннель недоступен — сайты из зон НЕ открываются" /></div>
         <p className="mt-0.5 text-[11px] text-muted">Включено — трафик зон идёт только через туннель; упал туннель → соединения нет (без утечки в обычный канал). Выключено — при недоступном туннеле сайты зон открываются обычным прямым соединением.</p>
-        <div className="mt-1 flex items-center gap-4"><Switch checked={r.domain_source === "dnsproxy"} onChange={(v) => setR({ ...r, domain_source: v ? "dnsproxy" : "resolve" })} label="Перехват DNS и для обычных доменов (поддомены + смена IP)" /></div>
-        <p className="mt-0.5 text-[11px] text-muted">Маски (<b>*.com</b>, <b>*ip*</b>, <b>[re]…</b>) включают перехват DNS <b>автоматически</b> — отдельно тумблер для них не нужен. Тумблер дополнительно заводит в туннель <b>обычные</b> домены со всеми поддоменами и новыми IP. Перехват ловит только нешифрованный DNS через роутер; DoH/DoT на устройстве его обходит — для «всё и всегда» ставьте <b>*</b> или режим «Весь трафик». Общие CDN-IP вроде Cloudflare автоматически не кэшируются, чтобы не зацепить соседние сайты.</p>
-        <div className="mt-1 flex items-center gap-4"><Switch checked={!!r.sni_routing} onChange={(v) => setR({ ...r, sni_routing: v })} label="SNI-маршрутизация (DoH; без общих CDN-IP) — дополнительный слой" /></div>
+        <div className="mt-1 flex items-center gap-4"><Switch disabled={blocked} checked={r.domain_source === "dnsproxy"} onChange={(v) => setR({ ...r, domain_source: v ? "dnsproxy" : "resolve" })} label="Перехват DNS и для обычных доменов (смена IP)" /></div>
+        <p className="mt-0.5 text-[11px] text-muted">Маски (<b>*.com</b>, <b>*ip*</b>, <b>[re]…</b>) включают перехват DNS <b>автоматически</b>. Тумблер дополнительно обрабатывает новые IP обычных доменов; учёт их поддоменов задаётся переключателем «Учитывать все поддомены автоматически» в поле «Что матчит» редактора правила. Перехват ловит только нешифрованный DNS через роутер; DoH/DoT на устройстве его обходит — для всего трафика ставьте <b>*</b> или режим «Весь трафик». Общие CDN-IP вроде Cloudflare автоматически не кэшируются, чтобы не зацепить соседние сайты.</p>
+        <div className="mt-1 flex items-center gap-4"><Switch disabled={blocked} checked={!!r.sni_routing} onChange={(v) => setR({ ...r, sni_routing: v })} label="SNI-маршрутизация (DoH; без общих CDN-IP) — дополнительный слой" /></div>
         <p className="mt-0.5 text-[11px] text-muted">Читает имя сайта прямо из TLS-рукопожатия — <b>не зависит от DNS</b> (работает при DoH/DoT). Домены из зон «Включить» заводятся в туннель по факту обращения и держатся ~1 ч. Первый коннект к новому адресу ещё уходит напрямую (по нему учимся), дальше — через VPN. Если адрес принадлежит общему CDN-edge Cloudflare, он пропускается; для такого случая нужен режим «Весь трафик» или явный IP/CIDR с пониманием, что это правило шире одного домена.</p>
         {r.domain_source === "dnsproxy" && (
-          <p className="mt-1 text-[11px] text-muted">Перехватывает DNS локальной сети и заводит в туннель IP по совпадению имени. Форматы строки: <b>youtube.com</b> — домен и все поддомены; <b>ip*</b> — всё, что начинается на «ip» (ipinfo.io, iphone.com) — точка НЕ нужна; <b>*ip*</b> — всё, что содержит «ip» (2ip.ru, ipinfo.io); <b>server*</b>, <b>test##.com</b> (<b>#</b> — один символ); регэксп <b>[re]^.*\.cdn\.net$</b>. ⚠️ <b>ip.*</b> (с точкой) совпадает только с «ip.что-то», НЕ с ipinfo.io — для «ipinfo» пишите <b>ip*</b> или <b>*ip*</b>. Маски действуют, только пока маршрутизация активна; шифрованный DNS (DoH/DoT) на устройстве это обходит.</p>
+          <p className="mt-1 text-[11px] text-muted">Перехватывает DNS локальной сети и заводит в туннель IP по совпадению имени. Форматы строки: <b>youtube.com</b> — домен, поддомены учитываются по переключателю правила; <b>ip*</b> — всё, что начинается на «ip» (ipinfo.io, iphone.com) — точка НЕ нужна; <b>*ip*</b> — всё, что содержит «ip» (2ip.ru, ipinfo.io); <b>server*</b>, <b>test##.com</b> (<b>#</b> — один символ); регэксп <b>[re]^.*\.cdn\.net$</b>. ⚠️ <b>ip.*</b> (с точкой) совпадает только с «ip.что-то», НЕ с ipinfo.io — для «ipinfo» пишите <b>ip*</b> или <b>*ip*</b>. Маски действуют, только пока маршрутизация активна; шифрованный DNS (DoH/DoT) на устройстве это обходит.</p>
         )}
         <div className="mt-2 flex flex-wrap items-center gap-2.5">
           {r.mode === "off" ? (
-            <Button variant="primary" onClick={teardown} disabled={busy}>Снять маршрутизацию</Button>
+            <Button variant="primary" onClick={teardown} disabled={blocked}>Снять маршрутизацию</Button>
           ) : active ? (
-            <Button variant="primary" onClick={() => { const nextRouting = cleanRouting(r); void saveRules(nextRouting, "Сохранено и применено"); }} disabled={busy}>Сохранить и применить</Button>
+            <Button variant="primary" onClick={() => { const nextRouting = cleanRouting(r, tunnelIDs); void saveRules(nextRouting, "Сохранено и применено"); }} disabled={blocked}>Сохранить и применить</Button>
           ) : (
             <>
-              <Button onClick={() => { const nextRouting = cleanRouting(r); void saveRules(nextRouting, "Маршрутизация сохранена"); }} disabled={busy}>Сохранить</Button>
-              <Button variant="primary" onClick={applyRouting} disabled={busy}>Применить</Button>
+              <Button onClick={() => { const nextRouting = cleanRouting(r, tunnelIDs); void saveRules(nextRouting, "Маршрутизация сохранена"); }} disabled={blocked}>Сохранить</Button>
+              <Button variant="primary" onClick={applyRouting} disabled={blocked}>Применить</Button>
             </>
           )}
-          {countdown > 0 && <Button variant="primary" onClick={commit} disabled={busy}>✓ Подтвердить ({countdown}с)</Button>}
-          {countdown > 0 && <span className="text-xs font-medium text-warn">← нажмите, иначе авто-откат</span>}
+          {busy && <span className="text-xs text-muted" role="status">Обрабатываем запрос…</span>}
+          {!busy && dirty && <span className="text-xs text-warn">Есть несохранённые изменения</span>}
         </div>
+        {saveError && <p className="mt-2 text-xs text-bad" role="alert">Изменения не подтверждены: {saveError}</p>}
         {active
           ? <p className="mt-2 text-[11px] font-medium text-ok">● Маршрутизация активна — правки режима, зон, масок и kill-switch применяются к туннелю сразу при сохранении.</p>
-          : <p className="mt-2 text-[11px] text-muted">Локальная сеть, приватные адреса и адрес сервера VPN всегда идут в обход туннеля. Первое применение защищено авто-откатом: если панель станет недоступна — маршрутизация откатится сама.</p>}
+          : <p className="mt-2 text-[11px] text-muted">Локальная сеть, приватные адреса и адрес сервера VPN всегда идут в обход туннеля.</p>}
       </Card>
 
       <Card title="Правила" sub="приоритет сверху вниз — первое совпадение определяет маршрут · применяются автоматически">
-        <RulesTable r={r} setR={setRState} st={st} reload={reload} />
+        <RulesTable r={r} saveRouting={saveRules} saving={blocked} visible={visible} st={st} reload={reload} runRead={runRead} importRules={importRules} hasDraft={dirty} />
       </Card>
     </>
   );

@@ -18,6 +18,11 @@ func TestDomainMatcher(t *testing.T) {
 		{"main.com", "mainXcom", false},
 		{"main.com", "main.community", false},
 		{".main.com", "a.main.com", true}, // leading dot tolerated
+		// full → only the named host, with the same normalization
+		{"full:main.com", "main.com", true},
+		{"full:MAIN.COM.", "MAIN.COM.", true},
+		{"full:main.com", "a.main.com", false},
+		{"full:main.com", "notmain.com", false},
 		// glob: * = any run, # = exactly one char
 		{"*main.com", "main.com", true},
 		{"*main.com", "xmain.com", true},
@@ -49,10 +54,40 @@ func TestDomainMatcher(t *testing.T) {
 }
 
 func TestDomainMatcherErrors(t *testing.T) {
-	for _, p := range []string{"", "   ", "[re]", "[re](unclosed"} {
+	for _, p := range []string{"", "   ", "full:", "[re]", "[re](unclosed"} {
 		if _, err := NewDomainMatcher(p); err == nil {
 			t.Errorf("NewDomainMatcher(%q): expected error", p)
 		}
+	}
+}
+
+func TestExactMatcherSet(t *testing.T) {
+	set, bad := CompileMatcherSet([]string{
+		"full:example.com", "full:EXAMPLE.COM.",
+		"full:cdn.example.net", "example.net",
+		"full:only.regex.test", "[re]^only\\.regex\\.test$",
+	})
+	if len(bad) != 0 || set.Len() != 3 {
+		t.Fatalf("exact dedup: bad=%v count=%d", bad, set.Len())
+	}
+	for name, want := range map[string]bool{
+		"EXAMPLE.COM.": true, "a.example.com": false, "notexample.com": false,
+		"cdn.example.net": true, "x.cdn.example.net": true,
+		"only.regex.test": true, "x.only.regex.test": false,
+	} {
+		if got := set.MatchAny(name); got != want {
+			t.Errorf("MatchAny(%q)=%v, want %v", name, got, want)
+		}
+	}
+}
+
+func TestApexRegexDoesNotRemoveSuffixDomain(t *testing.T) {
+	set, bad := CompileMatcherSet([]string{"[re]^example\\.com$", "example.com"})
+	if len(bad) != 0 || set.Len() != 2 {
+		t.Fatalf("apex regex cannot subsume suffix entry: bad=%v count=%d", bad, set.Len())
+	}
+	if !set.MatchAny("example.com") || !set.MatchAny("a.b.example.com") || set.MatchAny("notexample.com") {
+		t.Fatal("suffix matching was lost by regex deduplication")
 	}
 }
 
@@ -98,12 +133,12 @@ func TestCompileMatcherSetDedup(t *testing.T) {
 	set, bad := CompileMatcherSet([]string{
 		`[re]\.ru$`,
 		`[re]\.xn--p1ai$`,
-		"abr.ru",         // covered by \.ru$ regex
-		"vk.ru",          // covered by \.ru$ regex
-		"example.com",    // kept
+		"abr.ru",          // covered by \.ru$ regex
+		"vk.ru",           // covered by \.ru$ regex
+		"example.com",     // kept
 		"cdn.example.com", // covered by example.com
-		"main.com",       // kept
-		"main.com",       // exact duplicate of the above
+		"main.com",        // kept
+		"main.com",        // exact duplicate of the above
 	})
 	if len(bad) != 0 {
 		t.Fatalf("unexpected bad entries: %v", bad)

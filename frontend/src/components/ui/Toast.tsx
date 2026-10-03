@@ -16,7 +16,7 @@ interface ToastState {
   id: number;
 }
 
-const KIND: Record<ToastKind, string> = { ok: "bg-ok", err: "bg-bad", warn: "bg-warn" };
+const KIND: Record<ToastKind, string> = { ok: "border-ok/30 bg-ok-bg text-ok", err: "border-bad/30 bg-bad-bg text-bad", warn: "border-warn/30 bg-warn-bg text-warn" };
 
 export function Toaster() {
   const [t, setT] = useState<ToastState | null>(null);
@@ -36,8 +36,8 @@ export function Toaster() {
       role="status"
       aria-live="polite"
       className={cn(
-        "fixed bottom-4 left-4 right-4 z-[60] rounded-xl px-4 py-3 text-sm text-white shadow-2xl sm:bottom-5 sm:left-auto sm:right-5 sm:max-w-sm",
-        t.kind ? KIND[t.kind] : "bg-slate-800",
+        "fixed bottom-4 left-4 right-4 z-[60] rounded-lg border px-4 py-3 text-sm leading-5 shadow-lg sm:bottom-5 sm:left-auto sm:right-5 sm:max-w-sm",
+        t.kind ? KIND[t.kind] : "border-border bg-popover text-popover-foreground",
       )}
     >
       {t.msg}

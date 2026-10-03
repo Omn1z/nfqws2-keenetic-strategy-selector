@@ -21,9 +21,9 @@ export function Login({ onSuccess }: { onSuccess: () => void }) {
   };
 
   return (
-    <div className="fixed inset-0 z-[60] grid place-items-center bg-[rgba(20,30,45,.55)] backdrop-blur-sm">
-      <form onSubmit={submit} className="w-[340px] rounded-2xl border border-line bg-panel p-9 text-center shadow-2xl">
-        <span className="mx-auto mb-1 grid h-12 w-12 place-items-center rounded-[14px] bg-gradient-to-br from-[#36a3ff] to-accent-d text-white">
+    <div className="fixed inset-0 z-[60] grid place-items-center bg-black/50 backdrop-blur-sm">
+      <form onSubmit={submit} className="w-[340px] max-w-[calc(100vw-2rem)] rounded-lg border border-line bg-panel p-8 text-center shadow-xl">
+        <span className="mx-auto mb-1 grid h-12 w-12 place-items-center rounded-lg bg-primary text-primary-foreground">
           <svg viewBox="0 0 24 24" width="26" height="26"><path d="M13 2 4 14h6l-1 8 9-12h-6z" fill="currentColor" /></svg>
         </span>
         <h3 className="mb-0.5 mt-3 text-lg font-semibold">Вход</h3>

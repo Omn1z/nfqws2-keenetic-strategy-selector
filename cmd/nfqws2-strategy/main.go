@@ -23,7 +23,7 @@ import (
 
 func init() {
 	// Router-side runtime tuning. BE7000 has ~800 MiB RAM shared with vendor
-	// daemons + Docker + pi-hole — Go's default GC pacing (GOGC=100, no soft
+	// daemons and other router services — Go's default GC pacing (GOGC=100, no soft
 	// memory ceiling) is happy to keep doubling the heap, which on a router can
 	// trigger OOM-kill cascades. Two knobs:
 	//

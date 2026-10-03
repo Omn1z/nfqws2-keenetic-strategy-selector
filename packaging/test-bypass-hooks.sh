@@ -29,7 +29,11 @@ printf 'iptables %s\n' "$*" >> "$N2S_TEST_LOG"
 case " $* " in *' -C '*) exit 1 ;; esac
 EOF
 cp "$test_dir/bin/iptables" "$test_dir/bin/ip6tables"
-chmod +x "$test_dir/bin/uci" "$test_dir/bin/iptables" "$test_dir/bin/ip6tables"
+cat > "$test_dir/bin/ipset" <<'EOF'
+#!/bin/sh
+printf 'ipset %s\n' "$*" >> "$N2S_TEST_LOG"
+EOF
+chmod +x "$test_dir/bin/uci" "$test_dir/bin/iptables" "$test_dir/bin/ip6tables" "$test_dir/bin/ipset"
 PATH="$test_dir/bin:$PATH"
 N2S_TEST_LOG="$test_dir/calls"
 export PATH N2S_TEST_LOG
@@ -109,6 +113,9 @@ EOF
   : > "$helper"
   remove_bypass_init_hook
   remove_bypass_files
+  for set in n2s_nfqb4 n2s_nfqb6 n2s_nfqb4_new n2s_nfqb6_new; do
+    grep -Fq "ipset destroy $set" "$N2S_TEST_LOG"
+  done
   ! grep -Fq '# nfqws2-strategy: reapply NFQUEUE bypass' "$ENGINE_INIT"
   grep -Fq '# user customization is preserved' "$ENGINE_INIT"
   [ -f "$vendor" ]

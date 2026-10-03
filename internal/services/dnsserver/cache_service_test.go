@@ -12,23 +12,28 @@ import (
 
 func TestDNSServiceClearCacheKeepsResolverStatsAndHistory(t *testing.T) {
 	s, backend, client := newDNSServiceFixture(t, 8)
-	// One route makes the completed scheduler history deterministic: no losing
-	// attempts remain in flight when the cache is cleared.
+	// Keep a competitive pool, with a deterministic failing alternate route.
+	// A sole route deliberately does not collect scheduler history.
 	backend.mu.Lock()
-	backend.routes = []dnsroute.Route{{ID: "nfqws", Name: "NFQWS", Available: true}}
+	backend.routes = []dnsroute.Route{{ID: "nfqws", Name: "NFQWS", Available: true}, {ID: "awg:first", Name: "AWG", Available: true}}
 	backend.mu.Unlock()
+	backend.setFailures("awg:first")
 	initialRun := activeDNSRun(s)
 	for _, id := range []uint16{401, 402} {
 		if msg := queryDNSService(t, client, s.Status().Endpoints.DNS, id); msg.Rcode != mdns.RcodeSuccess {
 			t.Fatalf("initial DNS query failed: %s", mdns.RcodeToString[msg.Rcode])
 		}
 	}
+	waitFastDNS(t, func() bool {
+		history, err := s.SchedulerSnapshot("example.com")
+		return err == nil && len(history.Candidates) == 2 && history.Candidates[0].Successes == 1 && history.Candidates[1].Failures == 1
+	})
 	before := s.Status()
 	if before.Cache.Entries != 1 || before.Cache.Capacity != 8 || before.Cache.TTLSeconds != 3600 || before.Stats.Queries != 2 || before.Stats.CacheHits != 1 {
 		t.Fatalf("unexpected populated cache state: cache=%+v stats=%+v", before.Cache, before.Stats)
 	}
 	history, err := s.SchedulerSnapshot("example.com")
-	if err != nil || len(history.Candidates) != 1 || history.Candidates[0].Successes != 1 {
+	if err != nil || len(history.Candidates) != 2 || history.Candidates[0].Successes != 1 {
 		t.Fatalf("missing learned scheduler history: %v %+v", err, history)
 	}
 	retainedLogID := s.Logs(0).LastID

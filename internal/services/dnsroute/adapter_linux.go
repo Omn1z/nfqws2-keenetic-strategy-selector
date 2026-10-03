@@ -140,6 +140,8 @@ func (a *Adapter) prepareOS(ctx context.Context, l ListenOptions) error {
 	a.hookReady = true
 	a.routes = map[string]*routeState{}
 	a.nextSlot = 1
+	a.shadow.route = nil
+	a.shadow.checked = [2]time.Time{}
 	a.updated = time.Time{}
 	a.refreshLocked()
 	runCtx, cancel := context.WithCancel(context.Background())
@@ -160,20 +162,49 @@ func (a *Adapter) maintain(ctx context.Context, done chan struct{}) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			a.mu.Lock()
-			if a.started {
-				// ndm calls the hook after firewall reload. This check also repairs
-				// manual flushes, while each new dial verifies its own queue path.
-				if !a.inputFirewallReady(ctx) || !a.listen.DisableNFQWS && !a.firewallReady(ctx, "iptables") {
-					_, err := command(ctx, "sh", hookPath)
-					a.hookReady = err == nil
-				}
-				a.updated = time.Time{}
-				a.refreshLocked()
-			}
-			a.mu.Unlock()
+			a.maintainOnce(ctx)
 		}
 	}
+}
+
+func (a *Adapter) maintainOnce(ctx context.Context) {
+	a.mu.Lock()
+	if !a.started || a.runCtx != ctx || ctx.Err() != nil {
+		a.mu.Unlock()
+		return
+	}
+	listen, iface, subnet, queue := a.listen, a.lanIface, a.lanSubnet, a.cfg.MainQueue
+	a.mu.Unlock()
+
+	// Read-only iptables checks may wait on another process's xtables lock.
+	// Do not make every uncached DNS query and route/status lookup wait with
+	// them. The copied settings belong to this run, not a later restart.
+	ready := inputFirewallReady(ctx, listen, iface, subnet) &&
+		(listen.DisableNFQWS || firewallReady(ctx, "iptables", queue))
+	if ctx.Err() != nil {
+		return
+	}
+	if !ready {
+		// Close holds opMu while it cancels and joins this goroutine. Never
+		// wait for that lock here; a dial or the next tick can retry repair.
+		if !a.opMu.TryLock() {
+			return
+		}
+		defer a.opMu.Unlock()
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if !a.started || a.runCtx != ctx || ctx.Err() != nil {
+		return
+	}
+	if !ready {
+		// Actual writes stay serialized with new-dial repair and lifecycle
+		// cleanup. A stale inspection can never reinstall a stopped run.
+		_, err := command(ctx, "sh", hookPath)
+		a.hookReady = err == nil
+	}
+	a.updated = time.Time{}
+	a.refreshLocked()
 }
 
 func (a *Adapter) refreshLocked() {
@@ -209,7 +240,7 @@ func (a *Adapter) refreshLocked() {
 			seen[id] = true
 			r := a.routes[id]
 			if r == nil {
-				if a.nextSlot >= maxRouteSlots {
+				if a.nextSlot >= shadowRouteSlot {
 					continue
 				}
 				r = &routeState{slot: a.nextSlot}
@@ -267,11 +298,15 @@ func queueBound(number int) bool {
 }
 
 func (a *Adapter) firewallReady(ctx context.Context, family string) bool {
+	return firewallReady(ctx, family, a.cfg.MainQueue)
+}
+
+func firewallReady(ctx context.Context, family string, queue int) bool {
 	for _, x := range []struct{ parent, chain, match, direction string }{{"POSTROUTING", postChain, "mark", "original"}, {"PREROUTING", preChain, "connmark", "reply"}} {
 		if _, err := command(ctx, family, "-w", "-t", "mangle", "-C", x.parent, "-m", x.match, "--mark", routeSelector(0), "-j", x.chain); err != nil {
 			return false
 		}
-		if _, err := command(ctx, family, "-w", "-t", "mangle", "-C", x.chain, "-p", "tcp", "-m", "connbytes", "--connbytes", "1:32", "--connbytes-mode", "packets", "--connbytes-dir", x.direction, "-j", "NFQUEUE", "--queue-num", strconv.Itoa(a.cfg.MainQueue), "--queue-bypass"); err != nil {
+		if _, err := command(ctx, family, "-w", "-t", "mangle", "-C", x.chain, "-p", "tcp", "-m", "connbytes", "--connbytes", "1:32", "--connbytes-mode", "packets", "--connbytes-dir", x.direction, "-j", "NFQUEUE", "--queue-num", strconv.Itoa(queue), "--queue-bypass"); err != nil {
 			return false
 		}
 	}
@@ -279,18 +314,22 @@ func (a *Adapter) firewallReady(ctx context.Context, family string) bool {
 }
 
 func (a *Adapter) inputFirewallReady(ctx context.Context) bool {
+	return inputFirewallReady(ctx, a.listen, a.lanIface, a.lanSubnet)
+}
+
+func inputFirewallReady(ctx context.Context, listen ListenOptions, iface, subnet string) bool {
 	family := "iptables"
-	if net.ParseIP(a.listen.Host).To4() == nil {
+	if net.ParseIP(listen.Host).To4() == nil {
 		family = "ip6tables"
 	}
-	for _, port := range listenerPorts(a.listen) {
-		if _, err := command(ctx, family, "-w", "-t", "filter", "-C", "INPUT", "-d", a.listen.Host, "-p", port.protocol, "--dport", strconv.Itoa(port.port), "-j", inputChain); err != nil {
+	for _, port := range listenerPorts(listen) {
+		if _, err := command(ctx, family, "-w", "-t", "filter", "-C", "INPUT", "-d", listen.Host, "-p", port.protocol, "--dport", strconv.Itoa(port.port), "-j", inputChain); err != nil {
 			return false
 		}
 	}
 	for _, rule := range [][]string{
 		{"-i", "lo", "-j", "ACCEPT"},
-		{"-i", a.lanIface, "-s", a.lanSubnet, "-j", "ACCEPT"},
+		{"-i", iface, "-s", subnet, "-j", "ACCEPT"},
 		{"-j", "DROP"},
 	} {
 		if _, err := command(ctx, family, append([]string{"-w", "-t", "filter", "-C", inputChain}, rule...)...); err != nil {
@@ -418,19 +457,26 @@ func conntrackAccounting() bool {
 }
 
 func (a *Adapter) ensureRouteLocked(ctx context.Context, r *routeState, family string) (string, error) {
+	return a.ensureRouteForWANLocked(ctx, r, family, a.cfg.WANIfaces)
+}
+
+func (a *Adapter) ensureRouteForWANLocked(ctx context.Context, r *routeState, family string, wan []string) (string, error) {
 	iface, gw := r.Interface, ""
-	if r.ID == "nfqws" {
+	if r.ID == "nfqws" || r.ID == "shadow" {
 		out, err := command(ctx, "ip", family, "route", "show", "table", "main", "default")
 		if err != nil {
 			return "", err
 		}
-		iface, gw = pickWANDefault(out, a.cfg.WANIfaces)
+		iface, gw = pickWANDefault(out, wan)
 		if iface == "" {
 			return "", fmt.Errorf("no %s WAN default route for NFQWS", family)
 		}
 	}
 	if !validInterface(iface) {
 		return "", fmt.Errorf("invalid DNS route interface")
+	}
+	if r.ID == "shadow" && !validShadowWAN(iface) {
+		return "", fmt.Errorf("Shadow DNS requires a WAN interface, not %s", iface)
 	}
 	dev, err := net.InterfaceByName(iface)
 	if err != nil || dev.Flags&net.FlagUp == 0 {

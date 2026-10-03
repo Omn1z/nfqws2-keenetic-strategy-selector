@@ -44,28 +44,30 @@ type BlockingRule struct {
 }
 
 type Config struct {
-	Enabled         bool             `json:"enabled"`
-	ListenHost      string           `json:"listen_host"`
-	DNSPort         int              `json:"dns_port"`
-	DefaultUpstream Upstream         `json:"default_upstream"`
-	DefaultPool     []Upstream       `json:"default_pool"`
-	LoggingEnabled  bool             `json:"logging_enabled"`
-	FastDNS         bool             `json:"fast_dns"`
-	AWGFallback     string           `json:"awg_fallback"`
-	RouteMode       string           `json:"route_mode"`
-	Filtering       *FilteringConfig `json:"filtering,omitempty"`
-	TimeoutSeconds  int              `json:"timeout_seconds"`
-	CacheSize       int              `json:"cache_size"`
-	CacheTTLSeconds int              `json:"cache_ttl_seconds"`
-	Rules           []Rule           `json:"rules"`
-	DisabledMethods []DisabledMethod `json:"disabled_methods"`
+	ShadowDNS        *ShadowDNSConfig `json:"shadow_dns,omitempty"`
+	Enabled          bool             `json:"enabled"`
+	ListenHost       string           `json:"listen_host"`
+	DNSPort          int              `json:"dns_port"`
+	DefaultUpstream  Upstream         `json:"default_upstream"`
+	DefaultPool      []Upstream       `json:"default_pool"`
+	LoggingEnabled   bool             `json:"logging_enabled"`
+	FastDNS          bool             `json:"fast_dns"`
+	SchedulerEnabled bool             `json:"scheduler_enabled"`
+	AWGFallback      string           `json:"awg_fallback"`
+	RouteMode        string           `json:"route_mode"`
+	Filtering        *FilteringConfig `json:"filtering,omitempty"`
+	TimeoutSeconds   int              `json:"timeout_seconds"`
+	CacheSize        int              `json:"cache_size"`
+	CacheTTLSeconds  int              `json:"cache_ttl_seconds"`
+	Rules            []Rule           `json:"rules"`
+	DisabledMethods  []DisabledMethod `json:"disabled_methods"`
 }
 
 func Default() Config {
 	u := Upstream{Address: "https://xbox-dns.ru/dns-query", BootstrapIPs: []string{}}
-	c := Config{ListenHost: "auto", DNSPort: 5355,
+	c := Config{ListenHost: "auto", DNSPort: 5355, ShadowDNS: defaultShadowDNS(),
 		DefaultUpstream: Upstream{Address: "https://1.1.1.1/dns-query", BootstrapIPs: []string{}},
-		AWGFallback:     "auto", RouteMode: RouteModeAuto, Filtering: DefaultFilteringConfig(), TimeoutSeconds: 3, CacheSize: 512, CacheTTLSeconds: 3600, LoggingEnabled: true, FastDNS: true, DefaultPool: []Upstream{}, DisabledMethods: []DisabledMethod{}}
+		AWGFallback:     "auto", RouteMode: RouteModeAuto, Filtering: DefaultFilteringConfig(), TimeoutSeconds: 3, CacheSize: 512, CacheTTLSeconds: 3600, LoggingEnabled: true, FastDNS: true, SchedulerEnabled: true, DefaultPool: []Upstream{}, DisabledMethods: []DisabledMethod{}}
 	for i, domain := range []string{"claude.com", "grok.com", "claude.ai"} {
 		c.Rules = append(c.Rules, Rule{ID: fmt.Sprintf("rule-%d", i+1), Enabled: true, Domain: domain, IncludeSubdomains: true, Upstream: u})
 	}
@@ -151,6 +153,12 @@ func normalizeUpstream(u *Upstream) error {
 
 // NormalizeValidate never replaces explicit empty rule lists.
 func (c *Config) NormalizeValidate() error {
+	if c.ShadowDNS == nil {
+		c.ShadowDNS = defaultShadowDNS()
+	}
+	if err := c.ShadowDNS.normalizeValidate(); err != nil {
+		return err
+	}
 	c.ListenHost = strings.TrimSpace(c.ListenHost)
 	if c.ListenHost == "" {
 		c.ListenHost = "auto"
@@ -297,6 +305,12 @@ func cloneUpstreams(pool []Upstream) []Upstream {
 }
 
 func cloneConfig(c Config) Config {
+	if c.ShadowDNS != nil {
+		shadow := *c.ShadowDNS
+		shadow.Servers = append([]string{}, shadow.Servers...)
+		shadow.Domains = append([]ShadowDomain{}, shadow.Domains...)
+		c.ShadowDNS = &shadow
+	}
 	c.DisabledMethods = append([]DisabledMethod{}, c.DisabledMethods...)
 	c.DefaultUpstream.BootstrapIPs = append([]string{}, c.DefaultUpstream.BootstrapIPs...)
 	c.DefaultPool = cloneUpstreams(c.DefaultPool)
@@ -316,6 +330,14 @@ func cloneConfig(c Config) Config {
 }
 
 func validateNoSelfUpstream(c Config, host string) error {
+	if c.ShadowDNS != nil {
+		for _, address := range c.ShadowDNS.Servers {
+			server, _, _ := net.SplitHostPort(address)
+			if ip := net.ParseIP(server); ip != nil && ip.Equal(net.ParseIP(host)) {
+				return fmt.Errorf("Shadow DNS: адрес этого роутера создаёт петлю DNS; укажите DNS провайдера")
+			}
+		}
+	}
 	all := append([]Upstream{c.DefaultUpstream}, c.DefaultPool...)
 	for _, rule := range c.Rules {
 		if rule.Enabled {

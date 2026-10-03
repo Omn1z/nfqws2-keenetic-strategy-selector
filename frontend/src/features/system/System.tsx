@@ -6,7 +6,7 @@ import { Card } from "@/components/ui/Card";
 import { Switch } from "@/components/ui/Switch";
 import { Modal } from "@/components/ui/Modal";
 import { Button } from "@/components/ui/Button";
-import { Field, Input } from "@/components/ui/form";
+import { Field, Input, Select } from "@/components/ui/form";
 import type { SystemPorts, SystemSettings } from "@/types/api";
 
 const Row = ({ title, desc, children }: { title: string; desc: string; children: ReactNode }) => (
@@ -209,26 +209,26 @@ export default function System() {
         <Row title="Авторизация" desc="Запрашивать логин/пароль роутера при входе в веб-интерфейс.">
           {s.auth_forced_off
             ? <span className="text-xs text-muted">выключена через N2S_NOAUTH</span>
-            : <Switch checked={s.auth_enabled} onChange={onAuth} />}
+            : <Switch checked={s.auth_enabled} onChange={onAuth} aria-label="Авторизация включена" />}
         </Row>
         <Row title="Логирование" desc="Запись логов сервиса (вкладка «Логи» и файл). Выключение останавливает сбор.">
-          <Switch checked={s.logging_enabled} onChange={(on) => apply({ logging_enabled: on }, on ? "Логирование включено" : "Логирование выключено")} />
+          <Switch checked={s.logging_enabled} onChange={(on) => apply({ logging_enabled: on }, on ? "Логирование включено" : "Логирование выключено")} aria-label="Логирование включено" />
         </Row>
         <Row title="HTTP-логи запросов" desc="Строки «GET /api/… 14ms» в логах. Выключение убирает их шум, остальные логи остаются.">
-          <Switch checked={s.http_logs_enabled} onChange={(on) => apply({ http_logs_enabled: on }, on ? "HTTP-логи включены" : "HTTP-логи выключены")} />
+          <Switch checked={s.http_logs_enabled} onChange={(on) => apply({ http_logs_enabled: on }, on ? "HTTP-логи включены" : "HTTP-логи выключены")} aria-label="HTTP-логи запросов включены" />
         </Row>
         <Row title="Трассировка VPN" desc="Запись DNS/SNI-событий в буфер для вкладки «AmneziaWG → Трассировка». Счётчики (RPS на главной) тикают всегда — кольцо буфера наполняется только в выбранном режиме.">
-          <select
+          <Select
             value={s.trace_mode}
             onChange={(e) => void apply({ trace_mode: e.target.value as SystemSettings["trace_mode"] }, "Режим трассировки сохранён")}
-            className="h-9 rounded border border-line bg-panel px-2 text-[13px]"
+            className="h-9 w-auto max-w-[min(20rem,45vw)] text-[13px]"
           >
             <option value="off">Выкл (только счётчики)</option>
             <option value="auto">Авто — пока открыта вкладка</option>
             <option value="always">Всегда писать</option>
-          </select>
+          </Select>
         </Row>
-        <Row title="Перезапуск селектора" desc="SIGTERM текущему процессу и автоматический ре-стейт через xmir-init. ~6 секунд недоступности. Делает полную ре-инициализацию: маршрутизация, прокси, авто-AWG, pi-hole-хук — всё с нуля.">
+        <Row title="Перезапуск селектора" desc="SIGTERM текущему процессу и автоматический перезапуск сервиса. ~6 секунд недоступности. Повторно инициализирует маршрутизацию, прокси, авто-AWG и DNS-сервер.">
           <Button variant="danger" onClick={onRestart} disabled={restarting}>{restarting ? "перезапуск…" : "Перезапустить"}</Button>
         </Row>
       </Card>

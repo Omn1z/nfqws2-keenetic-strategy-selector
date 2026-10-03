@@ -30,6 +30,9 @@ type AttemptEvent struct {
 	Success    bool   `json:"success"`
 	Canceled   bool   `json:"canceled"`
 	Error      string `json:"error,omitempty"`
+	ClientIP   string `json:"client_ip,omitempty"`
+	Source     string `json:"source,omitempty"`
+	Transport  string `json:"transport,omitempty"`
 }
 
 type SchedulerCandidate struct {
@@ -60,15 +63,19 @@ type SchedulerCandidate struct {
 }
 
 type SchedulerSnapshot struct {
-	Domain               string               `json:"domain"`
-	PoolSource           string               `json:"pool_source"`
-	Formula              string               `json:"formula"`
-	ParallelLimit        int                  `json:"parallel_limit"`
-	TrackedPairs         int                  `json:"tracked_pairs"`
-	ActiveProbes         int                  `json:"active_probes"`
-	ProbeIntervalSeconds int                  `json:"probe_interval_seconds"`
-	ProbeRecheckSeconds  int                  `json:"probe_recheck_seconds"`
-	Candidates           []SchedulerCandidate `json:"candidates"`
+	Enabled                 bool                 `json:"enabled"`
+	Effective               bool                 `json:"effective"`
+	Reason                  string               `json:"reason"`
+	EffectiveCandidateCount int                  `json:"effective_candidate_count"`
+	Domain                  string               `json:"domain"`
+	PoolSource              string               `json:"pool_source"`
+	Formula                 string               `json:"formula"`
+	ParallelLimit           int                  `json:"parallel_limit"`
+	TrackedPairs            int                  `json:"tracked_pairs"`
+	ActiveProbes            int                  `json:"active_probes"`
+	ProbeIntervalSeconds    int                  `json:"probe_interval_seconds"`
+	ProbeRecheckSeconds     int                  `json:"probe_recheck_seconds"`
+	Candidates              []SchedulerCandidate `json:"candidates"`
 }
 
 type schedulerEntry struct {
@@ -201,41 +208,76 @@ func eligibleRoutes(cfg Config, routes []dnsroute.Route) []dnsroute.Route {
 
 func rounded(v float64) float64 { return math.Round(v*100) / 100 }
 
-func (s *Scheduler) orderedLocked(cfg Config, routes []dnsroute.Route, domain string, advance bool) ([]attemptCandidate, string) {
+// configuredCandidates preserves pool/route declaration order without reading
+// scheduler history. Active methods are partitioned ahead of unavailable or
+// disabled ones; disabling adaptive scheduling never disables an ordinary race.
+func configuredCandidates(cfg Config, routes []dnsroute.Route, domain string) ([]attemptCandidate, string) {
 	pool, source := cfg.upstreamsFor(domain)
 	eligible := eligibleRoutes(cfg, routes)
 	disabled := disabledMethodSet(cfg.DisabledMethods)
-	result := make([]attemptCandidate, 0, len(pool)*len(eligible))
+	active := make([]attemptCandidate, 0, len(pool)*len(eligible))
+	var inactive []attemptCandidate
 	for _, upstream := range pool {
 		for _, route := range eligible {
-			e := s.entries[schedulerKey(route.ID, upstream.Address)]
-			if e == nil {
-				e = &schedulerEntry{reliability: .5, latency: 500}
-			}
-			latencyPenalty := math.Min(80, e.latency/20)
-			failurePenalty := math.Min(100, float64(e.consecutiveFailures)*20)
-			view := SchedulerCandidate{Route: route.ID, RouteName: route.Name, Upstream: upstream.Address, Available: route.Available,
-				Disabled: disabled[schedulerKey(route.ID, upstream.Address)],
-				Score:    rounded(100*e.reliability - latencyPenalty - failurePenalty), Reliability: e.reliability, LatencyMS: rounded(e.latency), LatencyPenalty: rounded(latencyPenalty), FailurePenalty: failurePenalty,
-				Attempts: e.attempts, Successes: e.successes, Failures: e.failures, ConsecutiveFailures: e.consecutiveFailures, LastError: e.lastError}
-			view.Probing, view.ProbeAttempts, view.ProbeSuccesses, view.ProbeFailures = e.probing, e.probeAttempts, e.probeSuccesses, e.probeFailures
-			if view.Disabled {
-				view.Probing = false
-			}
+			view := SchedulerCandidate{Route: route.ID, RouteName: route.Name, Upstream: upstream.Address, Available: route.Available, Disabled: disabled[schedulerKey(route.ID, upstream.Address)]}
 			if !route.Available {
 				view.LastError = route.Error
 			}
-			if !e.lastAttempt.IsZero() {
-				view.LastAttemptAt = e.lastAttempt.UTC().Format(time.RFC3339Nano)
+			candidate := attemptCandidate{route: route, upstream: upstream, view: view}
+			if route.Available && !view.Disabled {
+				active = append(active, candidate)
+			} else {
+				inactive = append(inactive, candidate)
 			}
-			if !e.lastResult.IsZero() {
-				view.LastResultAt = e.lastResult.UTC().Format(time.RFC3339Nano)
-			}
-			if !e.lastProbe.IsZero() {
-				view.LastProbeAt = e.lastProbe.UTC().Format(time.RFC3339Nano)
-			}
-			result = append(result, attemptCandidate{route: route, upstream: upstream, view: view, lastResult: e.lastResult})
 		}
+	}
+	result := append(active, inactive...)
+	for i := range result {
+		if !result[i].view.Disabled {
+			result[i].view.Position = i + 1
+		}
+	}
+	return result, source
+}
+
+func activeCandidateCount(candidates []attemptCandidate) int {
+	count := 0
+	for count < len(candidates) && candidates[count].route.Available && !candidates[count].view.Disabled {
+		count++
+	}
+	return count
+}
+
+func (s *Scheduler) rankedLocked(result []attemptCandidate, source string, advance bool) ([]attemptCandidate, string) {
+	for i := range result {
+		upstream, route := result[i].upstream, result[i].route
+		e := s.entries[schedulerKey(route.ID, upstream.Address)]
+		if e == nil {
+			e = &schedulerEntry{reliability: .5, latency: 500}
+		}
+		latencyPenalty := math.Min(80, e.latency/20)
+		failurePenalty := math.Min(100, float64(e.consecutiveFailures)*20)
+		view := SchedulerCandidate{Route: route.ID, RouteName: route.Name, Upstream: upstream.Address, Available: route.Available,
+			Disabled: result[i].view.Disabled,
+			Score:    rounded(100*e.reliability - latencyPenalty - failurePenalty), Reliability: e.reliability, LatencyMS: rounded(e.latency), LatencyPenalty: rounded(latencyPenalty), FailurePenalty: failurePenalty,
+			Attempts: e.attempts, Successes: e.successes, Failures: e.failures, ConsecutiveFailures: e.consecutiveFailures, LastError: e.lastError}
+		view.Probing, view.ProbeAttempts, view.ProbeSuccesses, view.ProbeFailures = e.probing, e.probeAttempts, e.probeSuccesses, e.probeFailures
+		if view.Disabled {
+			view.Probing = false
+		}
+		if !route.Available {
+			view.LastError = route.Error
+		}
+		if !e.lastAttempt.IsZero() {
+			view.LastAttemptAt = e.lastAttempt.UTC().Format(time.RFC3339Nano)
+		}
+		if !e.lastResult.IsZero() {
+			view.LastResultAt = e.lastResult.UTC().Format(time.RFC3339Nano)
+		}
+		if !e.lastProbe.IsZero() {
+			view.LastProbeAt = e.lastProbe.UTC().Format(time.RFC3339Nano)
+		}
+		result[i].view, result[i].lastResult = view, e.lastResult
 	}
 	sort.SliceStable(result, func(i, j int) bool {
 		if result[i].view.Disabled != result[j].view.Disabled {
@@ -277,26 +319,48 @@ func (s *Scheduler) orderedLocked(cfg Config, routes []dnsroute.Route, domain st
 }
 
 func (s *Scheduler) order(cfg Config, routes []dnsroute.Route, domain string) []attemptCandidate {
+	ordered, source := configuredCandidates(cfg, routes, domain)
+	available := activeCandidateCount(ordered)
+	if !cfg.SchedulerEnabled || available <= 1 {
+		return ordered[:available]
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	ordered, _ := s.orderedLocked(cfg, routes, domain, true)
-	available := 0
-	for available < len(ordered) && ordered[available].route.Available && !ordered[available].view.Disabled {
-		available++
-	}
+	ordered, _ = s.rankedLocked(ordered, source, true)
 	return ordered[:available]
 }
 
 func (s *Scheduler) Snapshot(cfg Config, routes []dnsroute.Route, domain string) SchedulerSnapshot {
-	s.mu.Lock()
-	defer s.mu.Unlock()
 	domain = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(domain)), ".")
-	ordered, source := s.orderedLocked(cfg, routes, domain, false)
-	result := SchedulerSnapshot{Domain: domain, PoolSource: source, Formula: schedulerFormula, ParallelLimit: maxConcurrentRouteAttempts, TrackedPairs: len(s.entries), Candidates: make([]SchedulerCandidate, 0, len(ordered))}
-	result.ProbeIntervalSeconds, result.ProbeRecheckSeconds = int(schedulerProbeInterval/time.Second), int(schedulerProbeRecheck/time.Second)
-	if s.probeKey != "" {
-		result.ActiveProbes = 1
+	if newShadowMatcher(cfg.ShadowDNS).matches(domain) {
+		return SchedulerSnapshot{Enabled: cfg.SchedulerEnabled, Domain: domain, Reason: "shadow", PoolSource: "shadow", Candidates: []SchedulerCandidate{}, ParallelLimit: maxConcurrentRouteAttempts}
 	}
+	ordered, source := configuredCandidates(cfg, routes, domain)
+	available := activeCandidateCount(ordered)
+	result := SchedulerSnapshot{Enabled: cfg.SchedulerEnabled, Domain: domain, Formula: schedulerFormula, ParallelLimit: maxConcurrentRouteAttempts}
+	if cfg.SchedulerEnabled {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		if available > 1 {
+			ordered, source = s.rankedLocked(ordered, source, false)
+		}
+		result.TrackedPairs = len(s.entries)
+		if s.probeKey != "" {
+			result.ActiveProbes = 1
+		}
+	}
+	result.PoolSource, result.Candidates = source, make([]SchedulerCandidate, 0, len(ordered))
+	result.EffectiveCandidateCount = available
+	result.Effective = cfg.SchedulerEnabled && result.EffectiveCandidateCount > 1
+	switch {
+	case !cfg.SchedulerEnabled:
+		result.Reason = "disabled"
+	case result.EffectiveCandidateCount == 0:
+		result.Reason = "no_candidates"
+	case result.EffectiveCandidateCount == 1:
+		result.Reason = "single_candidate"
+	}
+	result.ProbeIntervalSeconds, result.ProbeRecheckSeconds = int(schedulerProbeInterval/time.Second), int(schedulerProbeRecheck/time.Second)
 	for _, candidate := range ordered {
 		result.Candidates = append(result.Candidates, candidate.view)
 	}

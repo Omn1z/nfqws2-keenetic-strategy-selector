@@ -270,6 +270,9 @@ func (s *Server) routes() {
 	m.HandleFunc("POST /api/arp-spoofing/enabled", s.setARPSpoofingEnabled)
 	m.HandleFunc("POST /api/arp-spoofing/generate", s.generateARPSpoofingMAC)
 	m.HandleFunc("GET /api/dnsserver", s.dnsServerStatus)
+	m.HandleFunc("GET /api/dnsserver/export", s.dnsServerExport)
+	m.HandleFunc("POST /api/dnsserver/import/preview", s.dnsServerImportPreview)
+	m.HandleFunc("POST /api/dnsserver/import", s.dnsServerImport)
 	m.HandleFunc("POST /api/dnsserver/config", s.dnsServerConfig)
 	m.HandleFunc("POST /api/dnsserver/start", s.dnsServerStart)
 	m.HandleFunc("POST /api/dnsserver/stop", s.dnsServerStop)
@@ -363,6 +366,10 @@ func (s *Server) routes() {
 	m.HandleFunc("POST /api/awg2/routing/commit", s.awg2RoutingCommit)
 	m.HandleFunc("POST /api/awg2/routing/teardown", s.awg2RoutingTeardown)
 	m.HandleFunc("POST /api/awg2/routing/rules", s.awg2RoutingRules)
+	m.HandleFunc("GET /api/awg2/routing/rules/export", s.awg2RulesExport)
+	m.HandleFunc("POST /api/awg2/routing/rules/export", s.awg2RulesExport)
+	m.HandleFunc("POST /api/awg2/routing/rules/import/preview", s.awg2RulesImportPreview)
+	m.HandleFunc("POST /api/awg2/routing/rules/import", s.awg2RulesImport)
 	m.HandleFunc("POST /api/awg2/routing/rules/insert-top", s.awg2RulesInsertTop)
 	m.HandleFunc("POST /api/awg2/routing/rules/copy", s.awg2RulesCopy)
 	m.HandleFunc("GET /api/awg2/trace", s.awg2TraceList)
@@ -400,30 +407,19 @@ func (s *Server) routes() {
 	m.HandleFunc("POST /api/nfqws2/start", s.nfqws2StartSvc)
 	m.HandleFunc("POST /api/nfqws2/stop", s.nfqws2StopSvc)
 	m.HandleFunc("GET /api/nfqws2/files", s.nfqws2Files)
+	m.HandleFunc("POST /api/nfqws2/paths", s.nfqws2Paths)
 	m.HandleFunc("GET /api/nfqws2/file", s.nfqws2GetFile)
 	m.HandleFunc("POST /api/nfqws2/file", s.nfqws2SaveFile)
 	m.HandleFunc("POST /api/nfqws2/file/create", s.nfqws2CreateFile)
 	m.HandleFunc("POST /api/nfqws2/file/upload", s.nfqws2UploadFile)
 	m.HandleFunc("DELETE /api/nfqws2/file", s.nfqws2DeleteFile)
 	m.HandleFunc("GET /api/nfqws2/file/download", s.nfqws2DownloadFile)
+	s.nfqws2AssetRoutes(m)
 
 	// Automation: NFQWS2 fallback watchdog + auto-pick (NFQWS2 tab panel).
 	m.HandleFunc("GET /api/nfqws2/automation", s.getAutomation)
 	m.HandleFunc("POST /api/nfqws2/automation", s.setAutomation)
 	m.HandleFunc("POST /api/nfqws2/automation/pick-now", s.triggerAutoPick)
-
-	// Pi-hole v6 (ad-block DNS sinkhole in a docker container).
-	m.HandleFunc("GET /api/pihole/status", s.piholeStatus)
-	m.HandleFunc("GET /api/pihole/stats", s.piholeStats)
-	m.HandleFunc("POST /api/pihole/config", s.piholeSaveConfig)
-	m.HandleFunc("POST /api/pihole/install", s.piholeInstall)
-	m.HandleFunc("POST /api/pihole/start", s.piholeStart)
-	m.HandleFunc("POST /api/pihole/stop", s.piholeStop)
-	m.HandleFunc("POST /api/pihole/restart", s.piholeRestart)
-	m.HandleFunc("POST /api/pihole/upgrade", s.piholeUpgrade)
-	m.HandleFunc("POST /api/pihole/remove", s.piholeRemove)
-	m.HandleFunc("GET /api/pihole/logs", s.piholeLogs)
-	m.HandleFunc("POST /api/pihole/chain", s.piholeSetChain)
 
 	// Single-file React app: any non-/api path serves the inlined index.html, so
 	// History-API routes (/lists, /runs, …) deep-link and refresh cleanly. /api/*
@@ -439,6 +435,12 @@ func (s *Server) routes() {
 // response is gzipped when the client accepts it (the inlined file is ~280 KB
 // → ~84 KB on the wire).
 func (s *Server) serveIndex(w http.ResponseWriter, r *http.Request) {
+	// Retired or unknown API endpoints must not look like successful JSON
+	// requests merely because the SPA accepts every browser navigation path.
+	if r.URL.Path == "/api" || strings.HasPrefix(r.URL.Path, "/api/") {
+		http.NotFound(w, r)
+		return
+	}
 	b, err := fs.ReadFile(webAssets, "web/index.html")
 	if err != nil {
 		http.Error(w, "index missing", 500)
@@ -1192,10 +1194,11 @@ func (s *Server) nfqws2CreateFile(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) nfqws2UploadFile(w http.ResponseWriter, r *http.Request) {
-	if err := r.ParseMultipartForm(16 << 20); err != nil {
-		httpErr(w, 400, err)
+	if err := parseAssetMultipart(w, r, 16<<20); err != nil {
+		assetHTTPError(w, err)
 		return
 	}
+	defer r.MultipartForm.RemoveAll()
 	kind := r.FormValue("kind")
 	f, hdr, err := r.FormFile("file")
 	if err != nil {
@@ -1203,9 +1206,13 @@ func (s *Server) nfqws2UploadFile(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer f.Close()
-	data, err := io.ReadAll(io.LimitReader(f, 16<<20))
+	data, err := io.ReadAll(io.LimitReader(f, (16<<20)+1))
 	if err != nil {
 		httpErr(w, 400, err)
+		return
+	}
+	if len(data) > 16<<20 {
+		assetHTTPError(w, &http.MaxBytesError{Limit: 16 << 20})
 		return
 	}
 	if err := s.app.SaveNfqws2Upload(kind, hdr.Filename, data); err != nil {
