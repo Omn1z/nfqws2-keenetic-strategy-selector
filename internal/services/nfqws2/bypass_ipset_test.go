@@ -18,11 +18,16 @@ func isolatedBypassScript(t *testing.T, lockDir string) string {
 	if strings.Count(generatedBypassScript, original) != 1 {
 		t.Fatal("production lock location changed: update the isolated test mapping")
 	}
+	return strings.Replace(generatedBypassScript, original, `lock=`+shell.Quote(filepath.ToSlash(lockDir))+`"/nfqws-bypass-$CMD.lock"`, 1)
+}
+
+func isolatedFunctionMockBypassScript(t *testing.T, lockDir string) string {
+	t.Helper()
+	isolated := isolatedBypassScript(t, lockDir)
 	const restore = `RESTORE="${CMD}-restore"`
-	if strings.Count(generatedBypassScript, restore) != 1 {
+	if strings.Count(isolated, restore) != 1 {
 		t.Fatal("production restore selector changed: update the isolated test mapping")
 	}
-	isolated := strings.Replace(generatedBypassScript, original, `lock=`+shell.Quote(filepath.ToSlash(lockDir))+`"/nfqws-bypass-$CMD.lock"`, 1)
 	// dash rejects hyphens in function names. Map only the executable selector
 	// to POSIX mock names so the unmodified transaction still runs under /bin/sh.
 	return strings.Replace(isolated, restore, `RESTORE="${CMD}_restore"`, 1)
@@ -138,7 +143,7 @@ func runMockBypass(t *testing.T, family, mode, ips, resolved string) bypassRun {
 		"n2s_nfqb4":                          "198.51.100.9\n",
 		"n2s_nfqb6":                          "2001:db8::9\n",
 		"chain":                              "original firewall\n",
-		"helper.sh":                          "#!/bin/sh\n" + bypassKernelMock + isolatedBypassScript(t, filepath.Join(dir, "tmp")),
+		"helper.sh":                          "#!/bin/sh\n" + bypassKernelMock + isolatedFunctionMockBypassScript(t, filepath.Join(dir, "tmp")),
 	} {
 		if err := os.WriteFile(filepath.Join(dir, name), []byte(data), 0o755); err != nil {
 			t.Fatal(err)
