@@ -465,6 +465,26 @@ func (a *Adapter) ensureRouteLocked(ctx context.Context, r *routeState, family s
 	return a.ensureRouteForWANLocked(ctx, r, family, a.cfg.WANIfaces)
 }
 
+// Full iproute2 reports an absent FIB table on stderr and exits nonzero,
+// whereas some router implementations return an empty successful dump.
+// command combines stdout/stderr: only this exact diagnostic is an empty
+// table, never arbitrary errors containing "does not exist" or route rows.
+func missingRouteTable(output, family string, err error) bool {
+	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	protocol := "ipv4"
+	if family == "-6" {
+		protocol = "ipv6"
+	} else if family != "-4" {
+		return false
+	}
+	diagnostic := strings.TrimSpace(strings.ReplaceAll(output, "\r\n", "\n"))
+	diagnostic = strings.TrimSuffix(diagnostic, "\nDump terminated")
+	return diagnostic == "Error: "+protocol+": FIB table does not exist." ||
+		diagnostic == "Error: FIB table does not exist."
+}
+
 func (a *Adapter) ensureRouteForWANLocked(ctx context.Context, r *routeState, family string, wan []string) (string, error) {
 	iface, gw := r.Interface, ""
 	if r.ID == "nfqws" || r.ID == "shadow" {
@@ -510,8 +530,11 @@ func (a *Adapter) ensureRouteForWANLocked(ctx context.Context, r *routeState, fa
 	// Check the desired route even after a successful previous dial: ip link del
 	// removes table routes, and a new awgN may keep the same name.
 	current, err := command(ctx, "ip", family, "route", "show", "table", table)
-	if err != nil && !strings.Contains(current, "does not exist") {
-		return "", err
+	if err != nil {
+		if !missingRouteTable(current, family, err) {
+			return "", err
+		}
+		current = ""
 	}
 	if *cache == signature && strings.Contains(current, "default") && strings.Contains(current, "dev "+iface) {
 		return iface, nil
