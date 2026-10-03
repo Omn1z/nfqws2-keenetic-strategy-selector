@@ -78,89 +78,84 @@
 
 ## Установка
 
-Выберите инструкцию для своей системы. Команды выполняются по SSH от `root`.
-Перед скачиванием `install.sh` нужно подготовить HTTPS-загрузчик и сертификаты:
-сам установщик ещё не может исправить загрузчик, которым его пытаются скачать.
+Одна команда для **Keenetic/Netcraze с Entware, OpenWrt до 24.10 и OpenWrt 25+**.
+Скопируйте блок целиком в SSH-оболочку `root`. Она сама выбирает пакетный менеджер,
+готовит HTTPS и запускает установку. Номер версии и архитектуру подставлять не нужно.
+
+```sh
+sh -c '
+set -e
+url=https://omn1z.github.io/nfqws2-keenetic-strategy-selector/install.sh
+if [ -f /etc/openwrt_release ] || { [ -f /etc/rc.common ] && [ -d /etc/init.d ]; }; then
+  if command -v apk >/dev/null 2>&1; then
+    apk --update-cache add ca-bundle ca-certificates curl
+  else
+    opkg update
+    opkg install ca-bundle ca-certificates curl
+  fi
+  client=curl
+else
+  export PATH="/opt/bin:/opt/sbin:$PATH"
+  opkg update
+  opkg install ca-certificates wget-ssl
+  client=wget
+fi
+f=$(mktemp /tmp/n2s-install.XXXXXX)
+trap "rm -f \"$f\"" 0
+if [ "$client" = curl ]; then
+  curl -fSL --proto "=https" --proto-redir "=https" --connect-timeout 15 --max-time 180 -o "$f" "$url" ||
+  curl -4 -fSL --proto "=https" --proto-redir "=https" --connect-timeout 15 --max-time 180 -o "$f" "$url"
+else
+  /opt/bin/wget --https-only --max-redirect=0 -T 30 -t 2 -O "$f" "$url"
+fi
+test -s "$f"
+sh "$f"
+'
+```
+
+Установщик и бинарники панели загружаются с **официального сайта проекта
+на GitHub Pages**, без перенаправления на `github.com` или
+`release-assets.githubusercontent.com`. Перед запуском проверяются SHA-256
+оригинальных файлов релиза. Зависимости загружаются из настроенных репозиториев
+прошивки/Entware, а NFQWS2 — из его официального репозитория `nfqws.github.io`.
+Доступ к этим адресам всё ещё необходим. Проверка сертификатов HTTPS включена.
 
 ### Keenetic/Netcraze и другие системы с Entware
 
-На роутере должна быть установлена [среда Entware](https://github.com/Entware/Entware/wiki).
-На Keenetic/Netcraze также включите компонент **«Модули ядра подсистемы Netfilter»**
-в настройках компонентов прошивки. Откройте именно оболочку Entware, а не штатную
-CLI KeeneticOS: обычно это SSH на порт `222`, пользователь `root` и ваш пароль Entware.
+Сначала установите [Entware](https://github.com/Entware/Entware/wiki).
+На Keenetic/Netcraze включите компонент **«Модули ядра подсистемы Netfilter»**
+в настройках компонентов прошивки. Команду выше запускайте в оболочке Entware,
+а не в штатной CLI KeeneticOS: обычно SSH на порт `222`, пользователь `root`.
 Подготовка роутера также описана в [инструкции NFQWS2](https://github.com/nfqws/nfqws2-keenetic).
 
-```sh
-export PATH="/opt/bin:/opt/sbin:$PATH"
-opkg update &&
-opkg install ca-certificates wget-ssl &&
-mkdir -p /opt/tmp &&
-/opt/bin/wget -4 -T 30 -t 3 -O /opt/tmp/n2s-install.sh \
-  'https://github.com/Omn1z/nfqws2-keenetic-strategy-selector/releases/latest/download/install.sh' &&
-sh /opt/tmp/n2s-install.sh
-```
-
-Здесь явно используется `/opt/bin/wget` из Entware: системный `wget` прошивки
-может не поддерживать HTTPS. У актуального `wget-ssl` приоритет выше, чем у
-`wget-nossl`, поэтому обязательное удаление `wget-nossl` не требуется.
-На старых ARM64-установках Entware возможен сбой `curl`; ниже приведён способ
-обновления с локальным бинарником.
+Команда использует Entware `wget-ssl`; вручную удалять `wget-nossl` не нужно.
+Если старый `curl` на ARM64 падает с `Segmentation fault`, загрузчик использует
+GNU `wget` из Entware. Переносить бинарник с компьютера не требуется.
 
 ### OpenWrt до 24.10 включительно — opkg
 
-Подключитесь к оболочке OpenWrt по SSH. Подготовьте сертификаты и `curl`, затем
-скачайте и запустите единый установщик:
-
-```sh
-opkg update &&
-opkg install ca-bundle ca-certificates curl &&
-curl -4 -fL --connect-timeout 15 --max-time 180 \
-  -o /tmp/n2s-install.sh \
-  'https://github.com/Omn1z/nfqws2-keenetic-strategy-selector/releases/latest/download/install.sh' &&
-sh /tmp/n2s-install.sh
-```
+Запустите ту же команду в SSH-оболочке OpenWrt. Она использует `opkg` для
+подготовки `ca-bundle`, `ca-certificates` и `curl`; единый установщик затем
+доустанавливает зависимости движка и панели.
 
 ### OpenWrt 25+ и Snapshot с apk
 
-В стабильной ветке OpenWrt 25.12 и новых Snapshot используется `apk`:
-
-```sh
-apk --update-cache add ca-bundle ca-certificates curl &&
-curl -4 -fL --connect-timeout 15 --max-time 180 \
-  -o /tmp/n2s-install.sh \
-  'https://github.com/Omn1z/nfqws2-keenetic-strategy-selector/releases/latest/download/install.sh' &&
-sh /tmp/n2s-install.sh
-```
-
-В нестандартной прошивке ориентируйтесь на фактически установленный пакетный
-менеджер: `command -v apk` или `command -v opkg`.
-
-Для OpenWrt выбран `curl`, чтобы не зависеть от того, какой вариант `wget`
-использует прошивка. `wget-ssl` тоже поддерживает HTTPS, но последовательность
-`apk add wget-ssl`, затем `apk del wget-nossl` может остановиться уже на первой
-команде из-за конфликта вариантов. Для установки через `curl` удалять
-`wget-nossl` или `uclient-fetch` не нужно.
+Используйте ту же команду. Если установлен `apk`, подготовка выполняется через
+`apk --update-cache add ca-bundle ca-certificates curl`. Выбор зависит от
+фактического пакетного менеджера, а не только номера прошивки.
+Удалять или заменять системный `wget`/`uclient-fetch` не требуется.
 
 ### После установки
 
 Откройте `http://<IP‑роутера>:8090`. Для проверки версии выполните
 `/opt/usr/bin/n2s version` на Entware или `/usr/bin/n2s version` на OpenWrt.
 
-Ссылки `/releases/latest/download/` всегда ведут к последнему стабильному релизу.
-Команды установки, обновления и удаления не требуют подстановки номера версии.
-В примерах загрузка выполняется по IPv4 (`-4`); в сети только с IPv6 уберите этот
-параметр. Скрипт запускается из файла только после успешного скачивания (`&&`),
-проверка TLS остаётся включённой.
-
-Единый установщик определяет `apk` (OpenWrt 25.12+) или `opkg`, доустанавливает
-недостающие зависимости, добавляет репозиторий NFQWS2 (на OpenWrt — с ключом
-проверки подписи) и устанавливает движок и панель. На OpenWrt он также устанавливает
-модули Netfilter/IPSet/TUN и регистрирует сервис через `procd`; процесс работает
-в foreground и перезапускается
-при падении. Отдельно добавлять репозиторий NFQWS2 по инструкции upstream не нужно.
-Повторный запуск сохраняет пользовательские конфиги и списки. Чтобы подготовить
-только зависимости и NFQWS2 без панели, запустите скачанный скрипт с
-`N2S_DEPS_ONLY=1` перед `sh`.
+Единый установщик добавляет репозиторий NFQWS2 (на OpenWrt — с ключом
+проверки подписи), устанавливает движок и панель. На OpenWrt он также устанавливает
+модули Netfilter/IPSet/TUN и регистрирует сервис через `procd`.
+Повторный запуск команды обновляет панель и сохраняет пользовательские конфиги
+и списки. После выпуска нового стабильного релиза сайт установки обновляется
+автоматически; пересборка бинарников для зеркала не выполняется.
 
 Сервис и данные выбираются автоматически:
 
@@ -169,55 +164,26 @@ sh /tmp/n2s-install.sh
 
 ### Если не удаётся скачать установщик
 
-- Ошибка `Failed to send request: Operation not permitted` от `uclient-fetch`
-  возникает до запуска установщика и сама по себе не доказывает недостаток прав.
-  Проверьте доступ роутера к сети, DNS и загрузку по IPv4.
-- `Server hostname does not match SSL certificate` означает, что загрузчик не
-  подтвердил соответствие сертификата имени сервера. Установка корневых
-  сертификатов сама по себе не исправляет несовпадение имени. Попробуйте `curl`
-  из инструкции OpenWrt; не добавляйте `-k` или `--no-check-certificate` при
-  скачивании исполняемого установщика.
+- Ошибки `Connection reset by peer` или несовпадения имени сертификата сами
+  по себе не доказывают блокировку провайдером. Команда выше использует другой
+  адрес доставки, но не может исправить любую проблему доступа к сети.
 - Если уже `apk --update-cache add` или `opkg update` не может скачать индексы,
-  сначала устраните доступ к штатным репозиториям. Не продолжайте установку
-  с неполным набором зависимостей и не заменяйте адреса репозиториев случайными зеркалами.
+  сначала восстановите доступ к штатным репозиториям.
+- Не добавляйте `-k` или `--no-check-certificate` при скачивании установщика.
+- Пустой или недокачанный файл не запускается: команда завершается ошибкой,
+  а не молча передаёт пустой ответ в `sh`.
 
-Для диагностики OpenWrt сохраните вывод ошибки и следующих команд. Последние
-две команды выполняются, если `curl` уже установлен:
+Для диагностики OpenWrt сохраните вывод ошибки и следующих команд. Последняя
+команда выполняется, если `curl` уже установлен:
 
 ```sh
 cat /etc/openwrt_release
 date
-nslookup github.com
-nslookup release-assets.githubusercontent.com
+nslookup omn1z.github.io
 ip -4 route
 curl -V
-curl -4 -vI --connect-timeout 15 --max-time 30 https://raw.githubusercontent.com/
+curl -4 -vI --connect-timeout 15 --max-time 30 https://omn1z.github.io/nfqws2-keenetic-strategy-selector/install.sh
 ```
-
-### Старый Keenetic ARM64: Segmentation fault при обновлении
-
-Если обновление старой версии на ARM64 обрывается после строки `downloading ...arm64`
-сообщениями `Segmentation fault` и `download failed`, сохраните файлы релиза
-через Entware `wget` и передайте установщику уже загруженный бинарник:
-
-```sh
-mkdir -p /opt/tmp/n2s-upgrade
-cd /opt/tmp/n2s-upgrade || exit 1
-base=https://github.com/Omn1z/nfqws2-keenetic-strategy-selector/releases/latest/download
-/opt/bin/wget -O install.sh "$base/install.sh" || exit 1
-/opt/bin/wget -O nfqws2-strategy-linux-arm64 "$base/nfqws2-strategy-linux-arm64" || exit 1
-/opt/bin/wget -O SHA256SUMS "$base/SHA256SUMS" || exit 1
-grep ' install.sh$' SHA256SUMS > CHECKSUMS || exit 1
-grep ' nfqws2-strategy-linux-arm64$' SHA256SUMS >> CHECKSUMS || exit 1
-sha256sum -c CHECKSUMS || exit 1
-N2S_BIN_SRC="$(pwd)/nfqws2-strategy-linux-arm64" sh ./install.sh
-/opt/usr/bin/n2s version
-```
-
-Если `/opt/bin/wget` тоже падает, загрузите эти три файла на компьютер и
-передайте по SCP в `/opt/tmp/n2s-upgrade/`. На роутере перейдите в этот каталог
-и выполните команды начиная с создания файла `CHECKSUMS`. Переустановка старой
-версии и удаление конфигурации не требуются.
 
 ## Использование
 

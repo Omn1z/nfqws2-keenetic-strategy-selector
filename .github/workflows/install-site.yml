@@ -1,0 +1,66 @@
+name: install-site
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'README.md'
+      - '.github/workflows/install-site.yml'
+      - 'packaging/bootstrap.sh'
+      - 'packaging/test-bootstrap.sh'
+      - 'scripts/build-install-site.py'
+      - 'scripts/test-install-site.py'
+  workflow_run:
+    workflows: [release]
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: install-pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: read
+    steps:
+      # Always use trusted main; a completed release only triggers a fresh
+      # lookup of the latest stable release, never a checkout of its head.
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Test download and installation bootstrap
+        run: |
+          sh packaging/test-bootstrap.sh
+          python scripts/test-install-site.py
+      - uses: actions/configure-pages@v5
+      - name: Build verified release mirror
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python scripts/build-install-site.py --output _site
+      - uses: actions/upload-pages-artifact@v4
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Publish installer and release files
+        id: deployment
+        uses: actions/deploy-pages@v4
