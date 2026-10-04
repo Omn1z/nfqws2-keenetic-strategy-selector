@@ -138,6 +138,12 @@ func (s *Service) Status() Status {
 		st.FastDNS.Enabled = s.cfg.FastDNS
 	}
 	s.mu.RUnlock()
+	if backend, ok := s.backend.(interface {
+		ShadowDiagnostics() dnsroute.ShadowDiagnostics
+	}); ok {
+		diagnostics := backend.ShadowDiagnostics()
+		st.ShadowDNS.Diagnostics = &diagnostics
+	}
 	st.Filtering = s.filtering.Status()
 	st.Routes = s.backend.Routes()
 	if st.Routes == nil {

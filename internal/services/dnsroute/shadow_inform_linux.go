@@ -32,9 +32,23 @@ func shadowDHCPInformDiscover(ctx context.Context, iface string, clientIP net.IP
 	return shadowDHCPInformOnWAN(ctx, iface, clientIP, nil, true)
 }
 
-func shadowDHCPInformOnWAN(ctx context.Context, iface string, clientIP, serverIP net.IP, discover bool) (net.IP, []string, error) {
+func shadowDHCPInformOnWAN(ctx context.Context, iface string, clientIP, serverIP net.IP, discover bool) (peer net.IP, servers []string, resultErr error) {
 	ctx, cancel := context.WithTimeout(ctx, shadowInformTimeout)
 	defer cancel()
+	started := time.Now()
+	mode, destinationText := "unicast", serverIP.String()
+	if discover {
+		mode, destinationText = "broadcast", "255.255.255.255"
+	}
+	budget, _ := ctx.Deadline()
+	shadowDiagnosticEvent(ctx, "dhcp.start", fmt.Sprintf("%s: WAN=%s, client=%s:68, destination=%s:67; окно ответа=%d мс", mode, iface, clientIP, destinationText, max(0, time.Until(budget).Milliseconds())), 0)
+	defer func() {
+		message := "DHCPINFORM завершён: DNS=" + fmt.Sprint(servers)
+		if resultErr != nil {
+			message = "DHCPINFORM " + mode + ": " + resultErr.Error()
+		}
+		shadowDiagnosticEvent(ctx, "dhcp.finish", message, time.Since(started))
+	}()
 	if err := ctx.Err(); err != nil {
 		return nil, nil, err
 	}
@@ -79,6 +93,8 @@ func shadowDHCPInformOnWAN(ctx context.Context, iface string, clientIP, serverIP
 	if err := ctx.Err(); err != nil {
 		return nil, nil, err
 	}
+	stopCapture := startShadowWireCapture(ctx, nic, id, discover)
+	defer stopCapture()
 	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_RAW|syscall.SOCK_CLOEXEC, syscall.IPPROTO_UDP)
 	if err != nil {
 		return nil, nil, fmt.Errorf("DHCPINFORM raw socket: %w", err)
@@ -152,6 +168,10 @@ func shadowInformReceiveError(err, rejected error) error {
 }
 
 func exchangeShadowInformFrom(ctx context.Context, socket shadowInformSocket, id shadowInformIdentity, discover bool) (net.IP, []string, error) {
+	received, matched, invalid := 0, 0, 0
+	defer func() {
+		shadowDiagnosticEvent(ctx, "dhcp.receive", fmt.Sprintf("Сокет DNS-сервиса: получено=%d, совпало с текущим запросом=%d, отклонено=%d. Этот счётчик учитывает пакеты после IP/firewall; захват WAN показан отдельно.", received, matched, invalid), 0)
+	}()
 	if err := ctx.Err(); err != nil {
 		return nil, nil, err
 	}
@@ -170,6 +190,7 @@ func exchangeShadowInformFrom(ctx context.Context, socket shadowInformSocket, id
 		}
 		return nil, nil, fmt.Errorf("send DHCPINFORM: %w", err)
 	}
+	shadowDiagnosticEvent(ctx, "dhcp.send", fmt.Sprintf("DHCPINFORM передан ядру; xid=%x. Фактическое наблюдение на WAN — в захвате ниже.", id.xid), 0)
 	buffer := make([]byte, 4096)
 	var rejected error
 	for attempt := 0; attempt < shadowInformMaxReads; attempt++ {
@@ -196,6 +217,11 @@ func exchangeShadowInformFrom(ctx context.Context, socket shadowInformSocket, id
 		if n < 0 || n > len(buffer) {
 			return nil, nil, fmt.Errorf("invalid DHCPINFORM socket length")
 		}
+		received++
+		matches := shadowInformReplyMatches(buffer[:n], id)
+		if matches {
+			matched++
+		}
 		var parseErr error
 		if discover {
 			if peer, servers, err := parseShadowInformDiscoverReply(buffer[:n], id); err == nil {
@@ -210,7 +236,11 @@ func exchangeShadowInformFrom(ctx context.Context, socket shadowInformSocket, id
 		}
 		// Unrelated DHCP traffic must not change this request's diagnosis.
 		// Parser errors are fixed descriptions, never packet contents.
-		if shadowInformReplyMatches(buffer[:n], id) {
+		if matches {
+			invalid++
+			if invalid <= 3 {
+				shadowDiagnosticEvent(ctx, "dhcp.reject", parseErr.Error(), 0)
+			}
 			rejected = parseErr
 		}
 	}

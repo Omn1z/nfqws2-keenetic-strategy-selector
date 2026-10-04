@@ -14,7 +14,7 @@ import (
 	"time"
 )
 
-func (a *Adapter) shadowServersOS(ctx context.Context) ([]string, error) {
+func (a *Adapter) shadowServersOS(ctx context.Context) (result []string, resultErr error) {
 	callerCtx := ctx
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -27,9 +27,13 @@ func (a *Adapter) shadowServersOS(ctx context.Context) ([]string, error) {
 	if time.Now().Before(a.shadow.discoveryUntil) {
 		return append([]string(nil), a.shadow.servers...), a.shadow.discoveryErr
 	}
+	ctx, finish := a.shadow.diagnostics.begin(ctx)
+	var nextRetry time.Time
+	defer func() { finish(result, resultErr, nextRetry) }()
 	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
 	a.loadShadowLeases()
+	shadowDiagnosticEvent(ctx, "state.loaded", fmt.Sprintf("Сохранённые аренды: %d; известные DHCP-серверы: %d", len(a.shadow.leases), len(a.shadow.inform.targets)), 0)
 	discoveryStarted := time.Now()
 	servers, err := discoverShadowServersWithState(ctx, a.cfg.WANIfaces, a.shadow.leases, &a.shadow.inform)
 	if err := shadowDiscoveryContextErr(callerCtx); err != nil {
@@ -57,6 +61,8 @@ func (a *Adapter) shadowServersOS(ctx context.Context) ([]string, error) {
 	if err != nil {
 		a.shadow.discoveryUntil = time.Now().Add(30 * time.Second)
 	}
+	nextRetry = a.shadow.discoveryUntil
+	shadowDiagnosticEvent(ctx, "discovery.result", fmt.Sprintf("Допустимых DNS-серверов: %d; ошибка: %t", len(servers), err != nil), time.Since(discoveryStarted))
 	return append([]string(nil), servers...), err
 }
 
@@ -101,17 +107,26 @@ func discoverShadowServersWithState(ctx context.Context, wan []string, remembere
 			}
 		}
 	}
+	var wanSummary []string
+	for ip, device := range wanDevices {
+		wanSummary = append(wanSummary, device+"="+ip)
+	}
+	sort.Strings(wanSummary)
+	shadowDiagnosticEvent(ctx, "wan.addresses", "Адреса настроенных WAN: "+strings.Join(wanSummary, ", "), 0)
 	var candidates []string
 	var informErr, nativeErr error
 	if ndmc, err := exec.LookPath("ndmc"); err == nil {
 		readNative := func(operation string) (string, error) {
+			started := time.Now()
 			out, err := command(ctx, ndmc, "-c", operation)
 			if err := shadowNativeCommandError(ctx, operation, out, err); err != nil {
+				shadowDiagnosticEvent(ctx, "native.command", operation+": ошибка чтения", time.Since(started))
 				if nativeErr == nil {
 					nativeErr = err
 				}
 				return "", err
 			}
+			shadowDiagnosticEvent(ctx, "native.command", operation+": прочитано", time.Since(started))
 			return out, nil
 		}
 		verified := map[string]bool{}
@@ -123,6 +138,7 @@ func discoverShadowServersWithState(ctx context.Context, wan []string, remembere
 				status, err := readNative("show interface " + iface)
 				statuses[iface] = status
 				verified[iface] = err == nil && keeneticInterfaceOwnsWAN(status, wanIPs)
+				shadowDiagnosticEvent(ctx, "wan.verify", fmt.Sprintf("%s: принадлежность адресу активного WAN подтверждена=%t", iface, verified[iface]), 0)
 			}
 			return verified[iface]
 		}
@@ -142,16 +158,20 @@ func discoverShadowServersWithState(ctx context.Context, wan []string, remembere
 				}
 				candidates = append(candidates, net.JoinHostPort(entry.address, port))
 			}
+			shadowDiagnosticEvent(ctx, "native.dns", fmt.Sprintf("DHCP/PPP DNS-записей: %d; принято после проверки WAN и адресов: %d", len(entries), len(filterShadowServers(candidates, local))), 0)
 		}
 		if len(filterShadowServers(candidates, local)) > 0 {
 			// Current authoritative DNS supersedes any older ignored lease.
 			clear(remembered)
 		} else {
 			key, defaultRoutes := "", ""
-			if routes, err := command(ctx, "ip", "-4", "route", "show", "table", "main", "default"); err == nil {
+			routeStarted := time.Now()
+			routes, routeErr := command(ctx, "ip", "-4", "route", "show", "table", "main", "default")
+			if routeErr == nil {
 				defaultRoutes = routes
 				key = shadowWANKey(routes, wan, wanIPs)
 			}
+			shadowDiagnosticEvent(ctx, "wan.default", fmt.Sprintf("Таблица main: прочитана=%t; принадлежность WAN подтверждена=%t", routeErr == nil, key != ""), time.Since(routeStarted))
 			now := time.Now()
 			for iface, lease := range remembered {
 				if !now.Before(lease.expires) || key != "" && !lease.valid(key, wanIPs, now) {
@@ -172,7 +192,9 @@ func discoverShadowServersWithState(ctx context.Context, wan []string, remembere
 				if clock, err := command(ctx, "date", "+%Y-%m-%dT%H:%M:%S%z"); err == nil {
 					routerNow, _ = time.Parse("2006-01-02T15:04:05-0700", strings.TrimSpace(clock))
 				}
-				for _, lease := range parseKeeneticShadowLeases(log) {
+				logLeases := parseKeeneticShadowLeases(log)
+				shadowDiagnosticEvent(ctx, "native.leases", fmt.Sprintf("Связанных DHCP ACK в журнале: %d", len(logLeases)), 0)
+				for _, lease := range logLeases {
 					if previous, ok := remembered[lease.iface]; ok {
 						observed := shadowLeaseObservedAt(lease.stamp, routerNow)
 						retained := shadowLeaseObservedAt(previous.stamp, routerNow)
@@ -236,6 +258,7 @@ func discoverShadowServersWithState(ctx context.Context, wan []string, remembere
 						if len(fallbackTargets) > 0 {
 							eligible = shadowBroadcastFallbackWANs(inform, key, eligible, fallbackTargets)
 						}
+						shadowDiagnosticEvent(ctx, "discovery.broadcast", fmt.Sprintf("Подходящих WAN для broadcast: %d; переходов с unicast: %d", len(eligible), len(fallbackTargets)), 0)
 						if len(eligible) > 0 {
 							fresh, err := discoverShadowBroadcast(ctx, inform, key, eligible, local)
 							informErr = err
@@ -259,10 +282,14 @@ func discoverShadowServersWithState(ctx context.Context, wan []string, remembere
 			}
 		}
 	} else if ubus, err := exec.LookPath("ubus"); err == nil {
+		started := time.Now()
 		out, e := command(ctx, ubus, "call", "network.interface", "dump")
 		if e == nil {
 			_, candidates = parseOpenWrtShadowWAN(out, wan, shadowDefaultDevices(ctx))
 		}
+		shadowDiagnosticEvent(ctx, "openwrt.dns", fmt.Sprintf("ubus: прочитан=%t; принято DNS-серверов: %d", e == nil, len(filterShadowServers(candidates, local))), time.Since(started))
+	} else {
+		shadowDiagnosticEvent(ctx, "discovery.source", "Не найдены ndmc и ubus", 0)
 	}
 	servers := filterShadowServers(candidates, local)
 	if len(servers) == 0 {
@@ -324,15 +351,19 @@ func discoverShadowInform(ctx context.Context, state *shadowInformState, key str
 		target := state.targets[iface]
 		device := devices[target.clientIP.String()]
 		if !target.valid(key, wanIPs) || !validShadowWAN(device) || !verify(iface, target.clientIP) {
+			shadowDiagnosticEvent(ctx, "discovery.target", iface+": сохранённый DHCP-сервер не прошёл проверку текущего WAN", 0)
 			continue
 		}
+		shadowDiagnosticEvent(ctx, "discovery.target", fmt.Sprintf("%s / %s; клиент %s; DHCP-сервер %s; broadcast=%t", iface, device, target.clientIP, target.serverIP, target.preferBroadcast), 0)
 		answer := state.answers[iface]
 		// Refresh one discovery interval before expiry so a transient failure
 		// can continue using still-valid information while the retry is cooled.
 		if !answer.refresh && now.Before(answer.expires.Add(-time.Minute)) {
+			shadowDiagnosticEvent(ctx, "discovery.cached", iface+": действующий ответ DHCPINFORM сохранён в кеше", 0)
 			return filterShadowServers(answer.servers, local), nil
 		}
 		if now.Before(state.retryAfter[iface]) {
+			shadowDiagnosticEvent(ctx, "discovery.cooldown", iface+": повторная попытка после "+state.retryAfter[iface].UTC().Format(time.RFC3339), 0)
 			if now.Before(answer.expires) {
 				return filterShadowServers(answer.servers, local), nil
 			}
@@ -340,6 +371,7 @@ func discoverShadowInform(ctx context.Context, state *shadowInformState, key str
 			continue
 		}
 		if target.preferBroadcast {
+			shadowDiagnosticEvent(ctx, "discovery.mode", iface+": следующий DHCPINFORM через broadcast", 0)
 			if now.Before(answer.expires) {
 				return filterShadowServers(answer.servers, local), nil
 			}
@@ -376,6 +408,7 @@ func discoverShadowInform(ctx context.Context, state *shadowInformState, key str
 			// probe timeout switches transport; cancellation never does.
 			target.preferBroadcast = true
 			state.targets[iface] = target
+			shadowDiagnosticEvent(ctx, "discovery.mode", iface+": таймаут unicast; следующая попытка через broadcast", 0)
 		}
 		if err == nil {
 			if state.answers == nil {

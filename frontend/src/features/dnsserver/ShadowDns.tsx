@@ -4,6 +4,7 @@ import { Field, Textarea } from "@/components/ui/form";
 import { Switch } from "@/components/ui/Switch";
 import type { DnsShadowStatus } from "@/types/api";
 import type { ShadowForm } from "./shadowDnsForm";
+import { ShadowDnsDiagnostics } from "./ShadowDnsDiagnostics";
 
 export function ShadowDns({ value, status, onChange }: { value: ShadowForm; status?: DnsShadowStatus; onChange: (value: ShadowForm) => void }) {
   const servers = status?.servers ?? [];
@@ -19,6 +20,7 @@ export function ShadowDns({ value, status, onChange }: { value: ShadowForm; stat
       {status?.enabled && !servers.length && !status.error && <p className="mt-1 text-muted">Адреса будут проверены при первом запросе из списка.</p>}
       {status?.error && <p role="status" className="mt-1 text-warn">{status.error}</p>}
     </div>
+    <ShadowDnsDiagnostics status={status} />
     <p className="mt-3 text-xs text-muted">Список имеет приоритет над группами DoH. Запросы идут напрямую через WAN, кэш и блокировка рекламы сохраняются. Если DNS провайдера недоступен, автоматического перехода к DoH или VPN нет.</p>
     <p className="mt-2 text-xs text-muted">Изменения применяются общей кнопкой «Сохранить настройки».</p>
   </Card>;

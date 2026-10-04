@@ -368,7 +368,26 @@ export interface DnsServerRule {
 }
 export interface DnsShadowDomain { domain: string; include_subdomains: boolean }
 export interface DnsShadowConfig { enabled: boolean; servers: string[]; domains: DnsShadowDomain[] }
-export interface DnsShadowStatus { enabled: boolean; automatic: boolean; servers: string[]; error?: string }
+export interface DnsShadowDiagnosticEvent { at: string; stage: string; message: string; duration_ms?: number }
+export interface DnsShadowDiagnosticAttempt {
+  id: number;
+  started_at: string;
+  finished_at?: string;
+  duration_ms: number;
+  error?: string;
+  servers: string[];
+  next_retry_at?: string;
+  events: DnsShadowDiagnosticEvent[];
+}
+export interface DnsShadowDiagnostics {
+  version: 1;
+  app_version?: string;
+  platform?: string;
+  captured_at: string;
+  in_progress: boolean;
+  attempts: DnsShadowDiagnosticAttempt[];
+}
+export interface DnsShadowStatus { enabled: boolean; automatic: boolean; servers: string[]; error?: string; diagnostics?: DnsShadowDiagnostics }
 export interface DnsServerConfig {
   enabled: boolean;
   listen_host: string;

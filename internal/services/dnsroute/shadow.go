@@ -17,6 +17,7 @@ import (
 const shadowRouteSlot = maxRouteSlots - 1
 
 type shadowState struct {
+	diagnostics shadowDiagnosticState
 	// Discovery has a separate lock so a slow firmware command cannot stall
 	// ordinary encrypted DNS, cache hits, or the adapter status endpoint.
 	discoveryMu    sync.Mutex

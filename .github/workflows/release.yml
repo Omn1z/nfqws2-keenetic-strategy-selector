@@ -29,8 +29,8 @@ jobs:
         run: |
           go test ./...
           go vet ./...
-      - name: Check TG WS and TLS root concurrency
-        run: go test -race ./internal/services/tgws ./internal/tools/tlsroots
+      - name: Check DNS, TG WS and TLS root concurrency
+        run: go test -race ./internal/services/dnsroute ./internal/services/dnsserver ./internal/services/tgws ./internal/tools/tlsroots
       - name: Test installation hooks
         run: |
           sh packaging/test-bypass-hooks.sh

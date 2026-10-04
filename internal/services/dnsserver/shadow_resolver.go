@@ -9,6 +9,7 @@ import (
 	"time"
 
 	mdns "github.com/miekg/dns"
+	"nfqws2strategy/internal/services/dnsroute"
 )
 
 // Optional so existing backends cannot silently send selected domains over an
@@ -19,10 +20,11 @@ type shadowBackend interface {
 }
 
 type ShadowDNSStatus struct {
-	Enabled   bool     `json:"enabled"`
-	Automatic bool     `json:"automatic"`
-	Servers   []string `json:"servers"`
-	Error     string   `json:"error"`
+	Enabled     bool                        `json:"enabled"`
+	Automatic   bool                        `json:"automatic"`
+	Servers     []string                    `json:"servers"`
+	Error       string                      `json:"error"`
+	Diagnostics *dnsroute.ShadowDiagnostics `json:"diagnostics,omitempty"`
 }
 
 func initialShadowStatus(cfg *ShadowDNSConfig) ShadowDNSStatus {
