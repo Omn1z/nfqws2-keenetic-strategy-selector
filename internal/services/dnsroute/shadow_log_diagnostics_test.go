@@ -13,6 +13,7 @@ import (
 func nativeLogDiagnosticsForTest(t *testing.T, log string, leases []keeneticShadowLease, now time.Time) []ShadowDiagnosticEvent {
 	t.Helper()
 	var state shadowDiagnosticState
+	state.setEnabled(true)
 	ctx, finish := state.begin(context.Background())
 	logShadowNativeLeases(ctx, log, leases, now)
 	finish(nil, nil, time.Time{})

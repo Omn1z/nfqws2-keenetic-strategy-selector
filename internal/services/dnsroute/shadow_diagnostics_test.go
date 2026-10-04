@@ -22,7 +22,7 @@ func TestShadowDiagnosticsPassiveSnapshotDoesNotWaitForDiscovery(t *testing.T) {
 	go func() { done <- a.ShadowDiagnostics() }()
 	select {
 	case snapshot := <-done:
-		if snapshot.Version != 1 || snapshot.AppVersion != "v-test" || snapshot.Platform != runtime.GOOS+"/"+runtime.GOARCH || snapshot.InProgress || snapshot.Attempts == nil || len(snapshot.Attempts) != 0 || snapshot.CapturedAt.IsZero() {
+		if snapshot.Enabled || snapshot.Version != 1 || snapshot.AppVersion != "v-test" || snapshot.Platform != runtime.GOOS+"/"+runtime.GOARCH || snapshot.InProgress || snapshot.Attempts == nil || len(snapshot.Attempts) != 0 || snapshot.CapturedAt.IsZero() {
 			t.Fatalf("invalid passive initial snapshot: %+v", snapshot)
 		}
 	case <-time.After(time.Second):
@@ -37,8 +37,121 @@ func TestShadowDiagnosticsPassiveSnapshotDoesNotWaitForDiscovery(t *testing.T) {
 	}
 }
 
+func TestShadowDiagnosticsDefaultOffHasNoCollectionOrAllocations(t *testing.T) {
+	var state shadowDiagnosticState
+	parent := context.Background()
+	state.mu.Lock() // Disabled begin/events must not even take the history mutex.
+	done := make(chan bool, 1)
+	go func() {
+		ctx, finish := state.begin(parent)
+		shadowDiagnosticEvent(ctx, "ignored", "disabled", 0)
+		finish([]string{"192.0.2.53"}, errors.New("ignored"), time.Now())
+		done <- ctx == parent && !shadowDiagnosticEnabled(ctx)
+	}()
+	select {
+	case unchanged := <-done:
+		if !unchanged {
+			t.Error("disabled collector changed context")
+		}
+	case <-time.After(time.Second):
+		t.Error("disabled collection waited for the history mutex")
+	}
+	state.mu.Unlock()
+	if got := state.snapshot(); got.Enabled || got.InProgress || len(got.Attempts) != 0 || state.nextID != 0 {
+		t.Fatal("diagnostics recorded while disabled", got)
+	}
+	if allocations := testing.AllocsPerRun(100, func() {
+		ctx, finish := state.begin(parent)
+		shadowDiagnosticEvent(ctx, "ignored", "disabled", 0)
+		finish(nil, nil, time.Time{})
+	}); allocations != 0 {
+		t.Fatalf("disabled diagnostic path allocated: %v", allocations)
+	}
+}
+
+func TestShadowDiagnosticsSwitchClearsAndRejectsOldEnableCycle(t *testing.T) {
+	a := New(nil, nil)
+	a.shadow.discoveryMu.Lock()
+	defer a.shadow.discoveryMu.Unlock()
+	toggled := make(chan struct{})
+	go func() { a.SetShadowDiagnostics(true); close(toggled) }()
+	select {
+	case <-toggled:
+	case <-time.After(time.Second):
+		t.Fatal("diagnostic toggle waited for discovery")
+	}
+	parent, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	old, finishOld := a.shadow.diagnostics.begin(parent)
+	oldCollector := old.Value(shadowDiagnosticContextKey{}).(shadowDiagnosticContext)
+	shadowDiagnosticEvent(old, "old", "clear me", 0)
+	oldID := a.ShadowDiagnostics().Attempts[0].ID
+	a.SetShadowDiagnostics(true)
+	if got := a.ShadowDiagnostics(); !got.Enabled || len(got.Attempts) != 1 {
+		t.Fatal("idempotent enable lost history", got)
+	}
+	a.SetShadowDiagnostics(false)
+	if shadowDiagnosticEnabled(old) || old.Err() != nil || oldCollector.session.ctx.Err() == nil {
+		t.Fatal("switch-off did not cancel only optional diagnostics")
+	}
+	if got := a.ShadowDiagnostics(); got.Enabled || got.InProgress || len(got.Attempts) != 0 {
+		t.Fatal("switch-off retained history", got)
+	}
+	a.SetShadowDiagnostics(true)
+	ctx, finish := a.shadow.diagnostics.begin(context.Background())
+	if shadowDiagnosticEnabled(old) || !shadowDiagnosticEnabled(ctx) {
+		t.Fatal("old context became enabled again")
+	}
+	shadowDiagnosticEvent(old, "late", "must not reach new cycle", 0)
+	finishOld([]string{"192.0.2.99"}, errors.New("old error"), time.Now())
+	got := a.ShadowDiagnostics()
+	if !got.Enabled || len(got.Attempts) != 1 || got.Attempts[0].ID <= oldID || got.Attempts[0].FinishedAt != nil || len(got.Attempts[0].Events) != 0 || len(got.Attempts[0].Servers) != 0 {
+		t.Fatal("old completion affected the new cycle", got)
+	}
+	shadowDiagnosticEvent(ctx, "new", "new cycle", 0)
+	finish(nil, nil, time.Time{})
+	if got := a.ShadowDiagnostics(); got.InProgress || len(got.Attempts[0].Events) != 1 {
+		t.Fatal("new cycle did not collect", got)
+	}
+	a.SetShadowDiagnostics(false)
+	a.SetShadowDiagnostics(false)
+	if got := New(nil, nil).ShadowDiagnostics(); got.Enabled {
+		t.Fatal("diagnostic preference persisted across new runtime")
+	}
+}
+
+func TestShadowDiagnosticsConcurrentToggleAndCollection(t *testing.T) {
+	var state shadowDiagnosticState
+	var workers sync.WaitGroup
+	for worker := 0; worker < 8; worker++ {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			for range 200 {
+				ctx, finish := state.begin(context.Background())
+				shadowDiagnosticEvent(ctx, "event", "bounded metadata", 0)
+				finish(nil, nil, time.Time{})
+				snapshot := state.snapshot()
+				if len(snapshot.Attempts) > shadowDiagnosticAttempts || !snapshot.Enabled && len(snapshot.Attempts) != 0 {
+					t.Error("unbounded or disabled history", snapshot)
+				}
+			}
+		}()
+	}
+	for range 200 {
+		state.setEnabled(true)
+		state.setEnabled(false)
+	}
+	workers.Wait()
+	state.setEnabled(false)
+	if got := state.snapshot(); got.Enabled || got.InProgress || len(got.Attempts) != 0 {
+		t.Fatal("final switch-off left history", got)
+	}
+}
+
 func TestShadowDiagnosticsCopiesCompletedAndInflightState(t *testing.T) {
 	var state shadowDiagnosticState
+	state.setEnabled(true)
 	parent, cancel := context.WithCancel(context.Background())
 	ctx, finish := state.begin(parent)
 	if !shadowDiagnosticEnabled(ctx) {
@@ -79,6 +192,7 @@ func TestShadowDiagnosticsCopiesCompletedAndInflightState(t *testing.T) {
 
 func TestShadowDiagnosticsBoundsHistoryEventsAndUTF8(t *testing.T) {
 	var state shadowDiagnosticState
+	state.setEnabled(true)
 	stale, _ := state.begin(context.Background())
 	for i := 0; i < 10; i++ {
 		ctx, finish := state.begin(context.Background())
@@ -114,6 +228,7 @@ func TestShadowDiagnosticsBoundsHistoryEventsAndUTF8(t *testing.T) {
 
 func TestShadowDiagnosticsConcurrentSnapshotAndEvents(t *testing.T) {
 	var state shadowDiagnosticState
+	state.setEnabled(true)
 	ctx, finish := state.begin(context.Background())
 	var workers sync.WaitGroup
 	for worker := 0; worker < 8; worker++ {

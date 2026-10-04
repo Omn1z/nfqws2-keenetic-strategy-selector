@@ -27,6 +27,7 @@ func TestShadowDiagnosticsDiscoveryCacheAndNativeOutputPrivacy(t *testing.T) {
 		return "private native log: vpn-password-secret", errors.New("output: vpn-password-secret")
 	}
 	a := New(nil, nil)
+	a.SetShadowDiagnostics(true)
 	a.cfg.DataDir = t.TempDir()
 	if servers, err := a.ShadowDNSServers(context.Background()); err == nil || len(servers) != 0 {
 		t.Fatalf("unexpected discovery result: %v %v", servers, err)

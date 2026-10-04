@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test, { type TestContext } from "node:test";
 import { renderToStaticMarkup } from "react-dom/server";
 import type { DnsShadowDiagnosticAttempt, DnsShadowStatus } from "@/types/api";
-import { ShadowDnsDiagnostics } from "./ShadowDnsDiagnostics";
+import { setShadowDiagnosticsEnabled, ShadowDnsDiagnostics } from "./ShadowDnsDiagnostics";
 import { copyShadowDiagnostics, downloadShadowDiagnostics, shadowDiagnosticsReport, shadowDiagnosticState } from "./shadowDiagnosticsReport";
 
 const attempt = (overrides: Partial<DnsShadowDiagnosticAttempt> = {}): DnsShadowDiagnosticAttempt => ({
@@ -13,13 +13,13 @@ const attempt = (overrides: Partial<DnsShadowDiagnosticAttempt> = {}): DnsShadow
 });
 const status = (overrides: Partial<DnsShadowStatus> = {}): DnsShadowStatus => ({
   enabled: true, automatic: true, servers: [], error: "context deadline exceeded",
-  diagnostics: { version: 1, app_version: "v1.7.42", platform: "linux/arm64", captured_at: "2026-10-04T00:00:02Z", in_progress: false, attempts: [attempt()] },
+  diagnostics: { version: 1, enabled: true, app_version: "v1.7.42", platform: "linux/arm64", captured_at: "2026-10-04T00:00:02Z", in_progress: false, attempts: [attempt()] },
   ...overrides,
 });
 
 test("Shadow diagnostics tolerate an older server and display a passive empty history", () => {
   assert.equal(renderToStaticMarkup(<ShadowDnsDiagnostics status={status({ diagnostics: undefined })} />), "");
-  const html = renderToStaticMarkup(<ShadowDnsDiagnostics status={status({ error: undefined, diagnostics: { version: 1, captured_at: "2026-10-04T00:00:00Z", in_progress: false, attempts: [] } })} />);
+  const html = renderToStaticMarkup(<ShadowDnsDiagnostics status={status({ error: undefined, diagnostics: { version: 1, enabled: true, captured_at: "2026-10-04T00:00:00Z", in_progress: false, attempts: [] } })} />);
   assert.match(html, /Попыток ещё нет/);
   assert.match(html, /Открытие и копирование отчёта не запускают проверку/);
   assert.equal(html.includes("open=\"\""), false);
@@ -29,7 +29,8 @@ test("Shadow diagnostics tolerate an older server and display a passive empty hi
 test("Shadow diagnostics distinguish a cached failure, a fresh running attempt and an elapsed retry", () => {
   const failed = status();
   const html = renderToStaticMarkup(<ShadowDnsDiagnostics status={failed} />);
-  assert.match(html, /<details open=""/);
+  assert.match(html, /role="switch"/);
+  assert.match(html, /aria-checked="true"/);
   assert.match(html, /Ожидание повторной попытки/);
   assert.match(html, /при следующем запросе к домену/);
   assert.match(html, /broadcast eth3/);
@@ -47,7 +48,7 @@ test("Shadow diagnostics distinguish a cached failure, a fresh running attempt a
 });
 
 test("Shadow diagnostics show accepted servers and safely escape diagnostic text", () => {
-  const success = status({ error: undefined, servers: ["192.0.2.53:53"], diagnostics: { version: 1, captured_at: "2026-10-04T00:00:02Z", in_progress: false, attempts: [attempt({ error: undefined, next_retry_at: undefined, servers: ["192.0.2.53:53"], events: [{ at: "2026-10-04T00:00:01Z", stage: "native", message: "<script>untrusted</script>" }] })] } });
+  const success = status({ error: undefined, servers: ["192.0.2.53:53"], diagnostics: { version: 1, enabled: true, captured_at: "2026-10-04T00:00:02Z", in_progress: false, attempts: [attempt({ error: undefined, next_retry_at: undefined, servers: ["192.0.2.53:53"], events: [{ at: "2026-10-04T00:00:01Z", stage: "native", message: "<script>untrusted</script>" }] })] } });
   const html = renderToStaticMarkup(<ShadowDnsDiagnostics status={success} />);
   assert.equal(shadowDiagnosticState(success), "success");
   assert.match(html, /DNS обнаружены/);
@@ -147,4 +148,52 @@ for (const mode of ["absent", "denied", "legacy-denied", "legacy-throws"] as con
 test("Shadow download fails before touching the browser when no diagnostic report exists", (t) => {
   t.mock.method(URL, "createObjectURL", () => { throw new Error("unexpected file"); });
   assert.throws(() => downloadShadowDiagnostics(status({ diagnostics: undefined })), /недоступна/);
+});
+
+test("Disabled diagnostics hide stale history and export controls even when Shadow DNS has an error", async (t) => {
+  const off = status({ diagnostics: { ...status().diagnostics!, enabled: false, in_progress: true } });
+  const request = t.mock.method(globalThis, "fetch", () => { throw new Error("render must not enable diagnostics"); });
+  const html = renderToStaticMarkup(<ShadowDnsDiagnostics status={off} />);
+  assert.match(html, /role="switch"/);
+  assert.match(html, /aria-checked="false"/);
+  assert.match(html, /Диагностика выключена/);
+  assert.match(html, /после перезапуска NFQWS2 Strategy она также выключена/);
+  for (const hidden of ["Скопировать диагностику", "Скачать JSON", "broadcast eth3", "Отправлено: 1", "Поиск DNS выполняется"]) assert.equal(html.includes(hidden), false);
+  assert.equal(shadowDiagnosticState(off), "disabled");
+  assert.throws(() => shadowDiagnosticsReport(off), /выключена/);
+  assert.throws(() => downloadShadowDiagnostics(off), /выключена/);
+  await assert.rejects(copyShadowDiagnostics(off), /выключена/);
+  assert.equal(request.mock.callCount(), 0);
+});
+
+test("Older diagnostics remain read-compatible but cannot issue the new toggle mutation", async (t) => {
+  const old = status({ diagnostics: { ...status().diagnostics!, enabled: undefined } });
+  const request = t.mock.method(globalThis, "fetch", () => { throw new Error("older server must not receive toggle"); });
+  const html = renderToStaticMarkup(<ShadowDnsDiagnostics status={old} />);
+  assert.match(html, /disabled=""/);
+  assert.match(html, /обновите NFQWS2 Strategy/);
+  assert.equal(html.includes("Скопировать диагностику"), false);
+  await assert.rejects(setShadowDiagnosticsEnabled(old, true), /обновите/);
+  assert.equal(request.mock.callCount(), 0);
+  assert.equal(JSON.parse(shadowDiagnosticsReport(old)).diagnostics.attempts.length, 1);
+});
+
+test("The diagnostics switch changes runtime collection without configuration writes or DHCP renewal", async (t) => {
+  const calls: boolean[] = [];
+  const request = t.mock.method(globalThis, "fetch", async (url: string | URL | Request, options?: RequestInit) => {
+    assert.equal(url, "/api/dnsserver/shadow/diagnostics");
+    assert.equal(options?.method, "POST");
+    const body = JSON.parse(options?.body as string);
+    assert.deepEqual(Object.keys(body), ["enabled"]);
+    assert.equal(typeof body.enabled, "boolean");
+    calls.push(body.enabled);
+    return new Response(JSON.stringify({ shadow_dns: { ...status(), diagnostics: { ...status().diagnostics, enabled: body.enabled, attempts: [], in_progress: false } }, config: { preserved: true } }), { status: 200 });
+  });
+  const on = await setShadowDiagnosticsEnabled(status({ diagnostics: { ...status().diagnostics!, enabled: false } }), true);
+  assert.equal(on.shadow_dns?.diagnostics?.enabled, true);
+  const off = await setShadowDiagnosticsEnabled(on.shadow_dns, false);
+  assert.equal(off.shadow_dns?.diagnostics?.enabled, false);
+  assert.deepEqual(off.shadow_dns?.diagnostics?.attempts, []);
+  assert.deepEqual(calls, [true, false]);
+  assert.equal(request.mock.callCount(), 2);
 });

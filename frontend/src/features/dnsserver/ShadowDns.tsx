@@ -2,12 +2,12 @@ import { Badge } from "@/components/ui/Badge";
 import { Card } from "@/components/ui/Card";
 import { Field, Textarea } from "@/components/ui/form";
 import { Switch } from "@/components/ui/Switch";
-import type { DnsShadowRenewResult, DnsShadowStatus } from "@/types/api";
+import type { DnsServerStatus, DnsShadowRenewResult, DnsShadowStatus } from "@/types/api";
 import type { ShadowForm } from "./shadowDnsForm";
 import { ShadowDnsDiagnostics } from "./ShadowDnsDiagnostics";
 import { ShadowDnsRenew } from "./ShadowDnsRenew";
 
-export function ShadowDns({ value, status, onChange, busy, onRenewBusyChange, onRefresh, onRenewResult }: { value: ShadowForm; status?: DnsShadowStatus; onChange: (value: ShadowForm) => void; busy?: boolean; onRenewBusyChange?: (busy: boolean) => boolean; onRefresh?: () => Promise<void> | void; onRenewResult?: (result: DnsShadowRenewResult) => void }) {
+export function ShadowDns({ value, status, onChange, busy, onRenewBusyChange, onRefresh, onRenewResult, onDiagnosticsStatus }: { value: ShadowForm; status?: DnsShadowStatus; onChange: (value: ShadowForm) => void; busy?: boolean; onRenewBusyChange?: (busy: boolean) => boolean; onRefresh?: () => Promise<void> | void; onRenewResult?: (result: DnsShadowRenewResult) => void; onDiagnosticsStatus?: (status: DnsServerStatus) => void }) {
   const servers = status?.servers ?? [];
   return <Card title="Shadow DNS" sub="выбранные домены через DNS провайдера">
     <Switch checked={value.enabled} onChange={(enabled) => onChange({ ...value, enabled })} label="Shadow DNS" />
@@ -22,8 +22,8 @@ export function ShadowDns({ value, status, onChange, busy, onRenewBusyChange, on
       {status?.error && <p role="status" className="mt-1 text-warn">{status.error}</p>}
     </div>
     <ShadowDnsRenew status={status} disabled={busy} onBusyChange={onRenewBusyChange} onRefresh={onRefresh} onResult={onRenewResult} />
-    <ShadowDnsDiagnostics status={status} />
+    <ShadowDnsDiagnostics status={status} disabled={busy} onBusyChange={onRenewBusyChange} onStatus={onDiagnosticsStatus} onRefresh={onRefresh} />
     <p className="mt-3 text-xs text-muted">Список имеет приоритет над группами DoH. Запросы идут напрямую через WAN, кэш и блокировка рекламы сохраняются. Если DNS провайдера недоступен, автоматического перехода к DoH или VPN нет.</p>
-    <p className="mt-2 text-xs text-muted">Изменения применяются общей кнопкой «Сохранить настройки».</p>
+    <p className="mt-2 text-xs text-muted">Изменения списка применяются общей кнопкой «Сохранить настройки». Переключатель диагностики действует сразу.</p>
   </Card>;
 }

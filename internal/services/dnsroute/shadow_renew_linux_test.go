@@ -32,6 +32,7 @@ func TestShadowRenewalUsesOneVerifiedNativeCommand(t *testing.T) {
 	for _, kind := range []string{"ack", "ack_no_dns", "nak"} {
 		t.Run(kind, func(t *testing.T) {
 			a, reader, fallback := shadowRenewFixture(t)
+			a.SetShadowDiagnostics(true)
 			mutations := 0
 			command = func(ctx context.Context, name string, args ...string) (string, error) {
 				if len(args) == 2 && strings.HasPrefix(args[1], "interface ") {

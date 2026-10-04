@@ -151,6 +151,7 @@ func TestShadowNativeWithdrawalAndWANLoss(t *testing.T) {
 
 func TestShadowNativeRevisionDoesNotBypassErrorCache(t *testing.T) {
 	a, reader, _ := shadowNativeFixture(t)
+	a.SetShadowDiagnostics(true)
 	shadowNativeTestACK(reader, time.Now())
 	previous := command
 	calls := 0
@@ -195,12 +196,61 @@ func TestShadowNativeSocketShutdownWakesIdlePoll(t *testing.T) {
 
 func TestShadowNativeDiagnosticsExplainWaiting(t *testing.T) {
 	a, _, wan := shadowNativeFixture(t)
+	a.SetShadowDiagnostics(true)
 	ctx, finish := a.shadow.diagnostics.begin(context.Background())
 	a.observeShadowNative(ctx, a.shadow.native.key, []shadowBroadcastWAN{wan}, nil, time.Now())
 	finish(nil, nil, time.Time{})
 	text := a.ShadowDiagnostics().Attempts[0].Events[0].Message
 	if !strings.Contains(text, "штатное обновление") || !strings.Contains(text, "REQUEST=0") {
 		t.Fatal(text)
+	}
+}
+
+func TestShadowNativeDNSWorksWithDiagnosticsOffAndToggleHasNoSideEffects(t *testing.T) {
+	a, reader, _ := shadowNativeFixture(t)
+	fallback := command
+	calls := 0
+	command = func(ctx context.Context, name string, args ...string) (string, error) {
+		calls++
+		return fallback(ctx, name, args...)
+	}
+	if diagnostics := a.ShadowDiagnostics(); diagnostics.Enabled || len(diagnostics.Attempts) != 0 {
+		t.Fatal("diagnostics must start disabled", diagnostics)
+	}
+	if _, err := a.ShadowDNSServers(context.Background()); err == nil {
+		t.Fatal("expected initial missing-DNS error")
+	}
+	beforeCalls, beforeCache, beforeReader := calls, a.shadow.discoveryUntil, a.shadow.native.reader
+	for _, enabled := range []bool{true, false, true, false} {
+		a.SetShadowDiagnostics(enabled)
+		if a.ShadowDiagnostics().Enabled != enabled {
+			t.Fatal("diagnostic switch not applied")
+		}
+		if calls != beforeCalls || a.shadow.native.reader != beforeReader || reader.stopped || !a.shadow.discoveryUntil.Equal(beforeCache) {
+			t.Fatal("diagnostic switch changed discovery, capture, or cache")
+		}
+	}
+	// The functional DHCP observer remains alive even when optional diagnostic
+	// history and additional packet diagnostics are disabled.
+	shadowNativeTestACK(reader, time.Now())
+	a.shadow.inform.probe = func(context.Context, string, net.IP, net.IP) ([]string, error) {
+		t.Fatal("valid observed lease triggered another INFORM")
+		return nil, nil
+	}
+	servers, err := a.ShadowDNSServers(context.Background())
+	if err != nil || len(servers) != 1 || servers[0] != "192.0.2.53:53" {
+		t.Fatal("native DHCP DNS not applied while diagnostics disabled", servers, err)
+	}
+	if diagnostics := a.ShadowDiagnostics(); diagnostics.Enabled || len(diagnostics.Attempts) != 0 || diagnostics.InProgress {
+		t.Fatal("disabled diagnostics collected discovery history", diagnostics)
+	}
+	beforeCalls, beforeCache = calls, a.shadow.discoveryUntil
+	expires, revision := a.shadow.leases["GigabitEthernet1"].expires, a.shadow.native.applied
+	a.SetShadowDiagnostics(true)
+	a.SetShadowDiagnostics(false)
+	servers, err = a.ShadowDNSServers(context.Background())
+	if err != nil || len(servers) != 1 || calls != beforeCalls || !a.shadow.discoveryUntil.Equal(beforeCache) || !a.shadow.leases["GigabitEthernet1"].expires.Equal(expires) || a.shadow.native.applied != revision || reader.stopped {
+		t.Fatal("toggling diagnostics invalidated an already learned DNS lease", servers, err)
 	}
 }
 

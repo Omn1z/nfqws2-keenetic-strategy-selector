@@ -381,6 +381,7 @@ export interface DnsShadowDiagnosticAttempt {
 }
 export interface DnsShadowDiagnostics {
   version: 1;
+  enabled?: boolean;
   app_version?: string;
   platform?: string;
   captured_at: string;

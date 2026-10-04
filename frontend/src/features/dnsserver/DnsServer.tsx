@@ -214,6 +214,7 @@ export default function DnsServer() {
 
       <fieldset disabled={busy || testing} inert={openWrtBusy} className="min-w-0">
         <ShadowDns value={form.shadow_dns} status={live.shadow_dns} onChange={(value) => set("shadow_dns", value)} busy={busy || testing || filterUpdating || importing}
+          onDiagnosticsStatus={(value) => { setLive(value); setLoadError(""); }}
           onRefresh={refresh} onRenewResult={(result) => {
             // A successful renewal supersedes the previous cached failure
             // immediately, even while an older status poll is still finishing.

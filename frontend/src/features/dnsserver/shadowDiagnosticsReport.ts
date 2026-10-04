@@ -1,11 +1,13 @@
 import type { DnsShadowDiagnosticAttempt, DnsShadowStatus } from "@/types/api";
 
 export function latestShadowAttempt(status?: DnsShadowStatus): DnsShadowDiagnosticAttempt | undefined {
+  if (status?.diagnostics?.enabled === false) return undefined;
   return status?.diagnostics?.attempts.at(-1);
 }
 
-export function shadowDiagnosticState(status?: DnsShadowStatus): "empty" | "running" | "waiting" | "failed" | "success" {
+export function shadowDiagnosticState(status?: DnsShadowStatus): "disabled" | "empty" | "running" | "waiting" | "failed" | "success" {
   const trace = status?.diagnostics;
+  if (trace?.enabled === false) return "disabled";
   if (trace?.in_progress) return "running";
   const attempt = latestShadowAttempt(status);
   if (!attempt) return "empty";
@@ -19,6 +21,7 @@ export function shadowDiagnosticState(status?: DnsShadowStatus): "empty" | "runn
 export function shadowDiagnosticsReport(status: DnsShadowStatus): string {
   const trace = status.diagnostics;
   if (!trace || trace.version !== 1) throw new Error("Диагностика пока недоступна");
+  if (trace.enabled === false) throw new Error("Диагностика выключена, история очищена");
   // Explicit fields keep this report independent from settings, credentials and
   // future additions to the status object. Limits are enforced by the backend.
   return JSON.stringify({
@@ -27,7 +30,7 @@ export function shadowDiagnosticsReport(status: DnsShadowStatus): string {
     captured_at: trace.captured_at,
     shadow_dns: { enabled: status.enabled, automatic: status.automatic, servers: status.servers, error: status.error },
     diagnostics: {
-      version: trace.version, app_version: trace.app_version, platform: trace.platform,
+      version: trace.version, enabled: trace.enabled, app_version: trace.app_version, platform: trace.platform,
       captured_at: trace.captured_at, in_progress: trace.in_progress,
       attempts: trace.attempts.map((attempt) => ({
         id: attempt.id, started_at: attempt.started_at, finished_at: attempt.finished_at,

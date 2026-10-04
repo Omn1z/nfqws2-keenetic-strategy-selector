@@ -1,7 +1,9 @@
 import { useEffect, useRef, useState } from "react";
 import { Badge } from "@/components/ui/Badge";
 import { Button } from "@/components/ui/Button";
-import type { DnsShadowDiagnosticAttempt, DnsShadowStatus } from "@/types/api";
+import { Switch } from "@/components/ui/Switch";
+import { api } from "@/lib/api";
+import type { DnsServerStatus, DnsShadowDiagnosticAttempt, DnsShadowStatus } from "@/types/api";
 import { copyShadowDiagnostics, downloadShadowDiagnostics, latestShadowAttempt, shadowDiagnosticState } from "./shadowDiagnosticsReport";
 
 function timestamp(value: string): string {
@@ -28,25 +30,55 @@ function AttemptTimeline({ attempt }: { attempt: DnsShadowDiagnosticAttempt }) {
   </div>;
 }
 
-export function ShadowDnsDiagnostics({ status }: { status?: DnsShadowStatus }) {
-  const [open, setOpen] = useState(!!status?.error);
-  const expandedForError = useRef(!!status?.error);
+export async function setShadowDiagnosticsEnabled(status: DnsShadowStatus | undefined, enabled: boolean): Promise<DnsServerStatus> {
+  if (typeof status?.diagnostics?.enabled !== "boolean") throw new Error("Для переключения диагностики обновите NFQWS2 Strategy");
+  return api<DnsServerStatus>("POST", "/api/dnsserver/shadow/diagnostics", { enabled }, { timeoutMs: 10_000 });
+}
+
+type Props = {
+  status?: DnsShadowStatus;
+  disabled?: boolean;
+  onBusyChange?: (busy: boolean) => boolean;
+  onStatus?: (status: DnsServerStatus) => void;
+  onRefresh?: () => Promise<void> | void;
+};
+
+export function ShadowDnsDiagnostics({ status, disabled = false, onBusyChange, onStatus, onRefresh }: Props) {
   const [notice, setNotice] = useState("");
   const [busy, setBusy] = useState(false);
+  const [pending, setPending] = useState(false);
+  const [error, setError] = useState("");
+  const mounted = useRef(false);
+  const working = useRef(false);
   const trace = status?.diagnostics;
+  const supported = typeof trace?.enabled === "boolean";
+  const enabled = trace?.enabled === true;
   const latest = latestShadowAttempt(status);
   const state = shadowDiagnosticState(status);
-  useEffect(() => {
-    if (status?.error && !expandedForError.current) {
-      setOpen(true); expandedForError.current = true;
-    }
-  }, [status?.error]);
+  useEffect(() => { mounted.current = true; return () => { mounted.current = false; }; }, []);
+  useEffect(() => { if (!enabled) setNotice(""); }, [enabled]);
 
   // Older servers keep the existing status UI; no speculative API requests.
   if (!trace) return null;
 
+  const toggle = async (next: boolean) => {
+    if (!supported || disabled || working.current || next === enabled || onBusyChange?.(true) === false) return;
+    working.current = true; setPending(true); setError(""); setNotice("");
+    try {
+      const value = await setShadowDiagnosticsEnabled(status, next);
+      if (mounted.current) onStatus?.(value);
+    } catch (cause) {
+      if (mounted.current) setError((cause as Error).message);
+    } finally {
+      working.current = false;
+      if (mounted.current) setPending(false);
+      onBusyChange?.(false);
+      if (mounted.current) await onRefresh?.();
+    }
+  };
+
   const exportReport = async (copy: boolean) => {
-    if (!status || busy) return;
+    if (!status || busy || pending || !enabled) return;
     setBusy(true); setNotice("");
     try {
       if (copy) {
@@ -63,9 +95,14 @@ export function ShadowDnsDiagnostics({ status }: { status?: DnsShadowStatus }) {
     }
   };
 
-  return <details open={open} onToggle={(event) => setOpen(event.currentTarget.open)} className="mt-3 rounded-md border border-line text-xs">
-    <summary className="cursor-pointer px-3 py-2 font-medium focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">Диагностика Shadow DNS</summary>
-    <div className="space-y-3 border-t border-line p-3">
+  return <div className="mt-3 rounded-md border border-line text-xs">
+    <div className="space-y-2 p-3">
+      <Switch checked={enabled} disabled={!supported || disabled || pending || busy} onChange={(next) => { void toggle(next); }} label="Диагностика Shadow DNS" />
+      <p className="text-muted">{!supported ? "Для переключения диагностики обновите NFQWS2 Strategy." : enabled ? "Сбор диагностических событий включён до перезапуска NFQWS2 Strategy. Выключение очищает историю." : "Диагностика выключена. События не собираются; после перезапуска NFQWS2 Strategy она также выключена."}</p>
+      {pending && <p role="status" className="text-muted">Применение…</p>}
+      {error && <p role="alert" className="text-bad [overflow-wrap:anywhere]">{error}</p>}
+    </div>
+    {enabled && <div className="space-y-3 border-t border-line p-3">
       <div className="flex flex-wrap items-center gap-2" role="status">
         <Badge kind={state === "failed" || state === "waiting" ? "warn" : state === "success" ? "ok" : "neutral"}>
           {state === "running" ? "Поиск DNS выполняется" : state === "waiting" ? "Ожидание повторной попытки" : state === "failed" ? "Последняя попытка не удалась" : state === "success" ? "DNS обнаружены" : "Попыток ещё нет"}
@@ -79,8 +116,8 @@ export function ShadowDnsDiagnostics({ status }: { status?: DnsShadowStatus }) {
       {state === "empty" && <p className="text-muted">История появится после первого запроса к домену из списка Shadow DNS.</p>}
       <p className="text-muted">Отчёт содержит этапы поиска и сведения об обмене DHCP, включая сетевые адреса. Открытие и копирование отчёта не запускают проверку и не меняют WAN.</p>
       <div className="flex flex-wrap gap-2">
-        <Button mini disabled={busy} onClick={() => { void exportReport(true); }}>Скопировать диагностику</Button>
-        <Button mini disabled={busy} onClick={() => { void exportReport(false); }}>Скачать JSON</Button>
+        <Button mini disabled={busy || pending || disabled} onClick={() => { void exportReport(true); }}>Скопировать диагностику</Button>
+        <Button mini disabled={busy || pending || disabled} onClick={() => { void exportReport(false); }}>Скачать JSON</Button>
       </div>
       {notice && <p role="status" className="text-muted [overflow-wrap:anywhere]">{notice}</p>}
       {latest && <div className="max-h-96 overflow-y-auto rounded-md border border-line p-3"><AttemptTimeline attempt={latest} /></div>}
@@ -90,6 +127,6 @@ export function ShadowDnsDiagnostics({ status }: { status?: DnsShadowStatus }) {
           {trace.attempts.slice(0, -1).reverse().map((attempt) => <div key={attempt.id} className="rounded-md border border-line p-3"><AttemptTimeline attempt={attempt} /></div>)}
         </div>
       </details>}
-    </div>
-  </details>;
+    </div>}
+  </div>;
 }

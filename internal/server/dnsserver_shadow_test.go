@@ -29,3 +29,22 @@ func TestShadowRenewEndpointIsPrivatePostAndRequiresConfirmation(t *testing.T) {
 		}
 	}
 }
+
+func TestShadowDiagnosticsEndpointIsPrivatePostAndRequiresBoolean(t *testing.T) {
+	const path = "/api/dnsserver/shadow/diagnostics"
+	s := New(nil)
+	if publicAPI(path) {
+		t.Fatal("diagnostics exposed without authentication")
+	}
+	_, pattern := s.mux.Handler(httptest.NewRequest(http.MethodPost, path, nil))
+	if pattern != "POST "+path {
+		t.Fatal("POST route missing", pattern)
+	}
+	for _, body := range []string{`{}`, `{"enabled":null}`, `{"enabled":"true"}`, `not JSON`} {
+		w := httptest.NewRecorder()
+		s.dnsServerShadowDiagnostics(w, httptest.NewRequest(http.MethodPost, path, strings.NewReader(body)))
+		if w.Code != http.StatusBadRequest {
+			t.Fatal("invalid toggle reached app", w.Code)
+		}
+	}
+}

@@ -4,13 +4,104 @@ package dnsroute
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"errors"
+	"net"
+	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
+
+func TestShadowWireDisabledAndOldContextDoNotOpenCapture(t *testing.T) {
+	var state shadowDiagnosticState
+	ctx, _ := state.begin(context.Background())
+	// nil NIC deliberately proves the disabled path returns before socket setup.
+	startShadowWireCapture(ctx, nil, shadowInformTestIdentity(), false)()
+	state.setEnabled(true)
+	old, _ := state.begin(context.Background())
+	state.setEnabled(false)
+	state.setEnabled(true)
+	startShadowWireCapture(old, nil, shadowInformTestIdentity(), false)()
+	state.setEnabled(false)
+}
+
+func shadowWireTestSocketFDs(t *testing.T) map[int]bool {
+	t.Helper()
+	entries, err := os.ReadDir("/proc/self/fd")
+	if err != nil {
+		t.Skip("descriptor inspection unavailable", err)
+	}
+	result := map[int]bool{}
+	for _, entry := range entries {
+		target, err := os.Readlink(filepath.Join("/proc/self/fd", entry.Name()))
+		if err == nil && strings.HasPrefix(target, "socket:") {
+			fd, err := strconv.Atoi(entry.Name())
+			if err == nil {
+				result[fd] = true
+			}
+		}
+	}
+	return result
+}
+
+func TestShadowWireKernelSwitchOffClosesCaptureBeforeAttemptFinishes(t *testing.T) {
+	nic, err := net.InterfaceByName("lo")
+	if err != nil {
+		t.Skip("loopback unavailable", err)
+	}
+	var state shadowDiagnosticState
+	state.setEnabled(true)
+	defer state.setEnabled(false)
+	ctx, _ := state.begin(context.Background())
+	before := shadowWireTestSocketFDs(t)
+	stop := startShadowWireCapture(ctx, nic, shadowInformTestIdentity(), false)
+	defer stop()
+	fd := -1
+	for candidate := range shadowWireTestSocketFDs(t) {
+		if !before[candidate] {
+			if fd != -1 {
+				t.Fatal("unexpected extra diagnostic sockets")
+			}
+			fd = candidate
+		}
+	}
+	if fd == -1 {
+		t.Skip("optional AF_PACKET capture unavailable (requires CAP_NET_RAW)")
+	}
+	state.setEnabled(false)
+	deadline := time.Now().Add(time.Second)
+	for {
+		_, err := unix.FcntlInt(uintptr(fd), unix.F_GETFD, 0)
+		if errors.Is(err, unix.EBADF) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("switch-off left optional capture open until INFORM completion")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	// A late finalizer must not close a descriptor that reused the capture fd.
+	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_DGRAM|unix.SOCK_CLOEXEC, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(fds[0])
+	defer unix.Close(fds[1])
+	stop()
+	stop()
+	if err := unix.Send(fds[0], []byte{1}, 0); err != nil {
+		t.Fatal("late capture finalizer closed reused fd", err)
+	}
+	if got := state.snapshot(); got.Enabled || len(got.Attempts) != 0 {
+		t.Fatal("late capture finalizer restored cleared history", got)
+	}
+}
 
 func shadowWireInformFixture() []byte {
 	id := shadowInformTestIdentity()

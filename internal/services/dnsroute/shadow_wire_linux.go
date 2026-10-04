@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"sync"
 	"time"
 
 	"golang.org/x/sys/unix"
@@ -48,12 +49,36 @@ func startShadowWireCapture(ctx context.Context, nic *net.Interface, id shadowIn
 		shadowDiagnosticEvent(ctx, "wire.error", "Не удалось включить захват DHCP: "+err.Error(), 0)
 		return func() {}
 	}
+	// A switch-off closes this optional socket promptly even while the actual
+	// INFORM exchange keeps waiting for its answer. Serialize closure with the
+	// bounded final read so a recycled fd can never be read or closed twice.
+	var mu sync.Mutex
+	closed := false
+	closeCapture := func() {
+		mu.Lock()
+		defer mu.Unlock()
+		if !closed {
+			_ = unix.Close(fd)
+			closed = true
+		}
+	}
+	collector := ctx.Value(shadowDiagnosticContextKey{}).(shadowDiagnosticContext)
+	stopDisable := context.AfterFunc(collector.session.ctx, closeCapture)
 	shadowDiagnosticEvent(ctx, "wire.start", fmt.Sprintf("Захват на %s: IPv4 UDP 67↔68, только время текущей попытки; без promiscuous mode", nic.Name), 0)
 	return func() {
-		defer unix.Close(fd)
+		stopDisable()
+		mu.Lock()
+		defer mu.Unlock()
+		if closed {
+			return
+		}
+		defer func() { _ = unix.Close(fd); closed = true }()
+		if !shadowDiagnosticEnabled(ctx) {
+			return
+		}
 		buffer := make([]byte, 1536)
 		packets, outgoing, incoming, unrelated, shown := 0, 0, 0, 0, 0
-		for packets < shadowWireMaxReads {
+		for packets < shadowWireMaxReads && shadowDiagnosticEnabled(ctx) {
 			n, address, err := unix.Recvfrom(fd, buffer, unix.MSG_DONTWAIT)
 			if err != nil {
 				if !errors.Is(err, unix.EAGAIN) && !errors.Is(err, unix.EWOULDBLOCK) {
