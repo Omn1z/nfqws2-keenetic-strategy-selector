@@ -272,6 +272,7 @@ func (s *Server) routes() {
 	m.HandleFunc("GET /api/arp-block", s.getARPBlock)
 	m.HandleFunc("POST /api/arp-block/isolation", s.setARPBlockIsolation)
 	m.HandleFunc("GET /api/dnsserver", s.dnsServerStatus)
+	m.HandleFunc("POST /api/dnsserver/shadow/renew", s.dnsServerShadowRenew)
 	m.HandleFunc("GET /api/dnsserver/openwrt", s.dnsServerOpenWrt)
 	m.HandleFunc("POST /api/dnsserver/openwrt/apply", s.dnsServerOpenWrtApply)
 	m.HandleFunc("POST /api/dnsserver/openwrt/restore", s.dnsServerOpenWrtRestore)

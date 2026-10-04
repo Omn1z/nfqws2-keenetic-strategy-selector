@@ -535,12 +535,26 @@ func parseKeeneticShadowLeases(output string) []keeneticShadowLease {
 			ip, _, err := net.ParseCIDR(address)
 			obtained = err == nil && ip.Equal(leases[current].clientIP)
 		}
-		if obtained && strings.HasPrefix(message, "ndm: Dns::InterfaceSpecific: name server ") && strings.HasSuffix(message, " is ignored.") {
-			address := strings.TrimSuffix(strings.TrimPrefix(message, "ndm: Dns::InterfaceSpecific: name server "), " is ignored.")
-			if ip := net.ParseIP(address); ip != nil && len(leases[current].servers) < 8 {
+		if obtained {
+			if ip := parseKeeneticIgnoredDNS(message); ip != nil && len(leases[current].servers) < 8 {
 				leases[current].servers = append(leases[current].servers, ip.String())
 			}
 		}
 	}
 	return leases
+}
+
+// Older firmware logs the same ignored peer address under Dhcp::Client.
+// Callers still require the original ACK/address/timestamp association; neither
+// spelling by itself proves that an address belongs to the active WAN lease.
+func parseKeeneticIgnoredDNS(message string) net.IP {
+	for _, prefix := range []string{"ndm: Dns::InterfaceSpecific: name server ", "ndm: Dhcp::Client: name server "} {
+		if address, ok := strings.CutPrefix(message, prefix); ok {
+			if address, ok = strings.CutSuffix(address, " is ignored."); ok {
+				return net.ParseIP(address)
+			}
+			return nil
+		}
+	}
+	return nil
 }

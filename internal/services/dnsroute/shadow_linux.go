@@ -19,7 +19,9 @@ func (a *Adapter) shadowServersOS(ctx context.Context) (result []string, resultE
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	a.shadow.discoveryMu.Lock()
+	if err := lockShadowContext(ctx, &a.shadow.discoveryMu); err != nil {
+		return nil, err
+	}
 	defer a.shadow.discoveryMu.Unlock()
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -36,9 +38,12 @@ func (a *Adapter) shadowServersOS(ctx context.Context) (result []string, resultE
 			}
 		}()
 	}
-	ctx, finish := a.shadow.diagnostics.begin(ctx)
 	var nextRetry time.Time
-	defer func() { finish(result, resultErr, nextRetry) }()
+	if !shadowDiagnosticEnabled(ctx) {
+		var finish func([]string, error, time.Time)
+		ctx, finish = a.shadow.diagnostics.begin(ctx)
+		defer func() { finish(result, resultErr, nextRetry) }()
+	}
 	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
 	a.loadShadowLeases()

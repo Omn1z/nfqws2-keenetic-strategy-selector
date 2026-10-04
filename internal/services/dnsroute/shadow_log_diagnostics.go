@@ -78,17 +78,14 @@ func logShadowNativeLeases(ctx context.Context, output string, leases []keenetic
 				addDetail(fmt.Sprintf("obtained: время=%s; адрес=%s; связь с ACK=%s", shadowNativeLogTime(timestamp), ip, linked))
 			}
 		}
-		if strings.HasPrefix(message, "ndm: Dns::InterfaceSpecific: name server ") && strings.HasSuffix(message, " is ignored.") {
-			address := strings.TrimSuffix(strings.TrimPrefix(message, "ndm: Dns::InterfaceSpecific: name server "), " is ignored.")
-			if ip := net.ParseIP(address); ip != nil {
-				ignoredCount++
-				linked := "нет (нет подходящей пары ACK/obtained в окне парсера)"
-				if obtained && iface != "" {
-					linked = iface
-					associatedCount++
-				}
-				addDetail(fmt.Sprintf("ignored DNS: время=%s; адрес=%s; связь с ACK=%s", shadowNativeLogTime(timestamp), ip, linked))
+		if ip := parseKeeneticIgnoredDNS(message); ip != nil {
+			ignoredCount++
+			linked := "нет (нет подходящей пары ACK/obtained в окне парсера)"
+			if obtained && iface != "" {
+				linked = iface
+				associatedCount++
 			}
+			addDetail(fmt.Sprintf("ignored DNS: время=%s; адрес=%s; связь с ACK=%s", shadowNativeLogTime(timestamp), ip, linked))
 		}
 	}
 	// Join the same wrapped native records as the lease parser, with a strict

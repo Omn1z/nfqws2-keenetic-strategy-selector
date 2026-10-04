@@ -100,7 +100,7 @@ func TestShadowNativeDHCPRenewalLearnsBoundedLease(t *testing.T) {
 	ack := shadowNativeTestPacket(5, 0x12345678)
 	now := shadowNativeTestNow.Add(time.Second)
 	got := tracker.Observe(ack, false, now)
-	if got.Kind != "ack" || got.Err != nil || got.XID != "12345678" || !got.ServerIP.Equal(shadowNativeTestServer) || !reflect.DeepEqual(got.Servers, []string{"77.88.8.7", "192.0.2.53"}) || got.LeaseSeconds != 3600 || !got.LeaseExpires.Equal(now.Add(time.Hour)) {
+	if got.Kind != "ack" || got.Err != nil || got.XID != "12345678" || !got.ServerIP.Equal(shadowNativeTestServer) || !reflect.DeepEqual(got.Servers, []string{"77.88.8.7", "192.0.2.53"}) || got.LeaseSeconds != 3600 || !got.LeaseExpires.Equal(shadowNativeTestNow.Add(time.Hour)) {
 		t.Fatalf("ack: %+v", got)
 	}
 	clear(ack)
@@ -109,9 +109,6 @@ func TestShadowNativeDHCPRenewalLearnsBoundedLease(t *testing.T) {
 	}
 	if got := tracker.Observe(shadowNativeTestPacket(5, 0x12345678), false, now); got.Kind != "" {
 		t.Fatal("accepted duplicate ACK", got)
-	}
-	if got := tracker.Observe(shadowNativeTestPacket(3, 0x12345678), true, now); got.Kind != "" {
-		t.Fatal("reopened completed transaction", got)
 	}
 }
 
@@ -331,12 +328,97 @@ func TestShadowNativeDHCPTransactionsExpireAndStayBounded(t *testing.T) {
 		tracker.Observe(shadowNativeTestPacket(3, xid), true, when)
 		tracker.Observe(shadowNativeTestPacket(5, xid), false, when)
 	}
-	if len(tracker.completed) != shadowNativePendingLimit {
-		t.Fatal("completed transaction tombstones are not bounded", len(tracker.completed))
+	if len(tracker.pending) != 0 {
+		t.Fatal("completed requests remained pending", len(tracker.pending))
 	}
-	tracker.Observe(nil, false, shadowNativeTestNow.Add(3*time.Minute))
-	if len(tracker.completed) != 0 {
-		t.Fatal("completed transaction tombstones did not expire")
+	if got := tracker.Observe(shadowNativeTestPacket(5, 20), false, shadowNativeTestNow.Add(3*time.Minute)); got.Kind != "" {
+		t.Fatal("completed request accepted a replay after pending TTL", got)
+	}
+}
+
+func TestShadowNativeDHCPReusesXIDOnlyAfterFreshValidatedRequest(t *testing.T) {
+	tracker := shadowNativeTestTracker(t)
+	request, ack := shadowNativeTestPacket(3, 1), shadowNativeTestPacket(5, 1)
+	for renewal := 0; renewal < 4; renewal++ {
+		started := shadowNativeTestNow.Add(time.Duration(renewal) * 30 * time.Second)
+		if renewal > 0 {
+			if got := tracker.Observe(ack, false, started); got.Kind != "" {
+				t.Fatal("duplicate ACK reopened completed exchange", got)
+			}
+			bad := append([]byte(nil), request...)
+			bad[15]++ // Wrong outgoing source must not make an old XID pending.
+			if got := tracker.Observe(bad, true, started); got.Kind == "request" {
+				t.Fatal("invalid REQUEST reopened completed XID", got)
+			}
+			if got := tracker.Observe(request, false, started); got.Kind != "" {
+				t.Fatal("incoming forged REQUEST reopened completed XID", got)
+			}
+			tracker.Observe(shadowNativeTestPacket(8, 1), true, started)
+			if got := tracker.Observe(ack, false, started); got.Kind != "" || len(tracker.pending) != 0 {
+				t.Fatal("invalid/non-native request reopened XID", got)
+			}
+		}
+		if got := tracker.Observe(request, true, started); got.Kind != "request" {
+			t.Fatal("new native renewal with reused XID was suppressed", got)
+		}
+		got := tracker.Observe(ack, false, started.Add(time.Second))
+		if got.Kind != "ack" || !got.LeaseExpires.Equal(started.Add(time.Hour)) || len(tracker.pending) != 0 {
+			t.Fatal("renewed lease did not use the fresh request generation", got)
+		}
+	}
+}
+
+func TestShadowNativeDHCPXIDCanRenewAfterNoDNSOrNAK(t *testing.T) {
+	for _, kind := range []string{"ack_no_dns", "nak"} {
+		t.Run(kind, func(t *testing.T) {
+			tracker := shadowNativeTestTracker(t)
+			request := shadowNativeTestSelectingRequest(1, true)
+			tracker.Observe(request, true, shadowNativeTestNow)
+			reply := shadowNativeTestPacket(6, 1)
+			if kind == "ack_no_dns" {
+				reply = shadowNativeTestOptions(shadowNativeTestPacket(5, 1), []byte{53, 1, 5, 54, 4, 1, 1, 1, 2, 51, 4, 0, 0, 0x0e, 0x10, 255})
+			}
+			if got := tracker.Observe(reply, false, shadowNativeTestNow); got.Kind != kind {
+				t.Fatal("fixture did not complete initial exchange", got)
+			}
+			if got := tracker.Observe(reply, false, shadowNativeTestNow.Add(time.Second)); got.Kind != "" {
+				t.Fatal("duplicate negative reply accepted", got)
+			}
+			started := shadowNativeTestNow.Add(2 * time.Second)
+			if got := tracker.Observe(request, true, started); got.Kind != "request" {
+				t.Fatal("native client could not reuse XID after a negative reply", got)
+			}
+			if got := tracker.Observe(shadowNativeTestPacket(5, 1), false, started.Add(time.Second)); got.Kind != "ack" || !got.LeaseExpires.Equal(started.Add(time.Hour)) {
+				t.Fatal("new exchange did not restore fresh DNS evidence", got)
+			}
+		})
+	}
+}
+
+func TestShadowNativeDHCPDelayedACKDoesNotExtendLease(t *testing.T) {
+	for _, delay := range []time.Duration{time.Second, time.Minute, 90 * time.Second} {
+		t.Run(delay.String(), func(t *testing.T) {
+			tracker := shadowNativeTestTracker(t)
+			request := shadowNativeTestPacket(3, 1)
+			tracker.Observe(request, true, shadowNativeTestNow)
+			// Retransmission with the same XID must not move the lease origin.
+			tracker.Observe(request, true, shadowNativeTestNow.Add(delay/2))
+			ack := shadowNativeTestOptions(shadowNativeTestPacket(5, 1), []byte{53, 1, 5, 54, 4, 1, 1, 1, 2, 51, 4, 0, 0, 0, 60, 6, 4, 192, 0, 2, 53, 255})
+			got := tracker.Observe(ack, false, shadowNativeTestNow.Add(delay))
+			if got.Kind != "ack" || got.LeaseSeconds != 60 || !got.LeaseExpires.Equal(shadowNativeTestNow.Add(time.Minute)) {
+				t.Fatal("delayed ACK or retransmit extended DHCP lease", got)
+			}
+			if delay >= time.Minute && shadowNativeTestNow.Add(delay).Before(got.LeaseExpires) {
+				t.Fatal("expired lease appeared live at receipt", got)
+			}
+		})
+	}
+	tracker := shadowNativeTestTracker(t)
+	tracker.Observe(shadowNativeTestPacket(3, 1), true, shadowNativeTestNow)
+	options := []byte{53, 1, 5, 54, 4, 1, 1, 1, 2, 51, 4, 255, 255, 255, 255, 6, 4, 192, 0, 2, 53, 255}
+	got := tracker.Observe(shadowNativeTestOptions(shadowNativeTestPacket(5, 1), options), false, shadowNativeTestNow.Add(time.Minute))
+	if got.Kind != "ack" || !got.LeaseExpires.Equal(shadowNativeTestNow.Add(shadowNativeMaxLease)) {
+		t.Fatal("delayed ACK extended seven-day safety bound", got)
 	}
 }
 

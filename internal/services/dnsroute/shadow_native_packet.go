@@ -18,11 +18,10 @@ const (
 // A tracker belongs to one verified WAN address/MAC and must be replaced when
 // either changes. The owner serializes Observe calls.
 type shadowNativeDHCPTracker struct {
-	client    [4]byte
-	mac       [6]byte
-	pending   map[[4]byte]shadowNativePending
-	completed map[[4]byte]time.Time
-	sequence  uint64
+	client   [4]byte
+	mac      [6]byte
+	pending  map[[4]byte]shadowNativePending
+	sequence uint64
 }
 
 type shadowNativePending struct {
@@ -50,7 +49,7 @@ func newShadowNativeDHCPTracker(client net.IP, mac net.HardwareAddr) (*shadowNat
 	if ip == nil || !shadowNativePeer(ip) || len(mac) != 6 || mac[0]&1 != 0 || bytes.Equal(mac, make([]byte, 6)) {
 		return nil, fmt.Errorf("invalid native DHCP WAN identity")
 	}
-	t := &shadowNativeDHCPTracker{pending: make(map[[4]byte]shadowNativePending), completed: make(map[[4]byte]time.Time)}
+	t := &shadowNativeDHCPTracker{pending: make(map[[4]byte]shadowNativePending)}
 	copy(t.client[:], ip)
 	copy(t.mac[:], mac)
 	return t, nil
@@ -66,31 +65,20 @@ func (t *shadowNativeDHCPTracker) prune(now time.Time) {
 			delete(t.pending, xid)
 		}
 	}
-	for xid, done := range t.completed {
-		if now.Before(done) || !now.Before(done.Add(shadowNativePendingTTL)) {
-			delete(t.completed, xid)
-		}
-	}
 }
 
-func (t *shadowNativeDHCPTracker) complete(xid [4]byte, request shadowNativePending, now time.Time) {
+func (t *shadowNativeDHCPTracker) complete(request shadowNativePending) {
 	// A late ACK for an older transaction must not roll back a newer lease.
+	// Consuming pending requests also rejects duplicate replies until another
+	// validated outgoing REQUEST is seen. Keenetic reuses XID across renewals,
+	// so completed XIDs themselves must not prevent a fresh native exchange.
+	// DHCP carries no generation beyond XID: after reuse, an old matching ACK
+	// cannot be distinguished from the new reply by passive observation alone.
 	for id, pending := range t.pending {
 		if pending.sequence <= request.sequence {
 			delete(t.pending, id)
 		}
 	}
-	if len(t.completed) == shadowNativePendingLimit {
-		var oldest [4]byte
-		var oldestTime time.Time
-		for id, when := range t.completed {
-			if oldestTime.IsZero() || when.Before(oldestTime) {
-				oldest, oldestTime = id, when
-			}
-		}
-		delete(t.completed, oldest)
-	}
-	t.completed[xid] = now
 }
 
 func (t *shadowNativeDHCPTracker) Observe(packet []byte, outgoing bool, now time.Time) shadowNativeDHCPObservation {
@@ -127,9 +115,6 @@ func (t *shadowNativeDHCPTracker) Observe(packet []byte, outgoing bool, now time
 	if outgoing {
 		// In particular, our own DHCPINFORMs never create native lease evidence.
 		if typeOption[0] != 3 {
-			return shadowNativeDHCPObservation{}
-		}
-		if _, done := t.completed[xid]; done {
 			return shadowNativeDHCPObservation{}
 		}
 		if !bytes.Equal(yiaddr, zero) || !bytes.Equal(giaddr, zero) || (!bytes.Equal(packet[16:20], broadcast) && !shadowNativePeer(net.IP(packet[16:20]))) || bytes.Equal(packet[16:20], t.client[:]) {
@@ -203,7 +188,7 @@ func (t *shadowNativeDHCPTracker) Observe(packet []byte, outgoing bool, now time
 		if !bytes.Equal(yiaddr, zero) || !bytes.Equal(ciaddr, zero) {
 			return reject("invalid DHCPNAK address fields")
 		}
-		t.complete(xid, request, now)
+		t.complete(request)
 		observation.Kind = "nak"
 		return observation
 	}
@@ -218,10 +203,13 @@ func (t *shadowNativeDHCPTracker) Observe(packet []byte, outgoing bool, now time
 	}
 	seconds := min(uint64(binary.BigEndian.Uint32(lease)), uint64(shadowNativeMaxLease/time.Second))
 	observation.LeaseSeconds = seconds
-	observation.LeaseExpires = now.Add(time.Duration(seconds) * time.Second)
+	// RFC2131 measures the lease from sending DHCPREQUEST, not receiving ACK.
+	// Keep the first observed transmission time through retries; network delay
+	// must not extend the lease. The owner rejects an already-expired result.
+	observation.LeaseExpires = request.started.Add(time.Duration(seconds) * time.Second)
 	dns, hasDNS := options[6]
 	if !hasDNS {
-		t.complete(xid, request, now)
+		t.complete(request)
 		observation.Kind = "ack_no_dns"
 		return observation
 	}
@@ -240,7 +228,7 @@ func (t *shadowNativeDHCPTracker) Observe(packet []byte, outgoing bool, now time
 			seen[address] = true
 		}
 	}
-	t.complete(xid, request, now)
+	t.complete(request)
 	observation.Kind = "ack"
 	return observation
 }

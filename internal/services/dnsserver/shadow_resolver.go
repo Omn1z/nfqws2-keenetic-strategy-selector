@@ -20,11 +20,12 @@ type shadowBackend interface {
 }
 
 type ShadowDNSStatus struct {
-	Enabled     bool                        `json:"enabled"`
-	Automatic   bool                        `json:"automatic"`
-	Servers     []string                    `json:"servers"`
-	Error       string                      `json:"error"`
-	Diagnostics *dnsroute.ShadowDiagnostics `json:"diagnostics,omitempty"`
+	Enabled          bool                        `json:"enabled"`
+	Automatic        bool                        `json:"automatic"`
+	Servers          []string                    `json:"servers"`
+	Error            string                      `json:"error"`
+	RenewalAvailable bool                        `json:"renewal_available,omitempty"`
+	Diagnostics      *dnsroute.ShadowDiagnostics `json:"diagnostics,omitempty"`
 }
 
 func initialShadowStatus(cfg *ShadowDNSConfig) ShadowDNSStatus {

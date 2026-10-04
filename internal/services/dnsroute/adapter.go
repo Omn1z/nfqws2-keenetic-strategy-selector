@@ -53,6 +53,7 @@ type Adapter struct {
 	conns               map[*routedConn]struct{}
 	done                chan struct{}
 	shadow              shadowState
+	shadowRenewal       shadowRenewalState
 }
 
 type routedConn struct {

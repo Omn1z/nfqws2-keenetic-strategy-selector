@@ -387,7 +387,15 @@ export interface DnsShadowDiagnostics {
   in_progress: boolean;
   attempts: DnsShadowDiagnosticAttempt[];
 }
-export interface DnsShadowStatus { enabled: boolean; automatic: boolean; servers: string[]; error?: string; diagnostics?: DnsShadowDiagnostics }
+export interface DnsShadowStatus { enabled: boolean; automatic: boolean; servers: string[]; error?: string; diagnostics?: DnsShadowDiagnostics; renewal_available?: boolean }
+export interface DnsShadowRenewResult {
+  status: "resolved" | "waiting" | "no_dns" | "nak";
+  interface: string;
+  device: string;
+  servers?: string[];
+  message: string;
+}
+export interface DnsShadowRenewResponse { ok: true; result: DnsShadowRenewResult }
 export interface DnsServerConfig {
   enabled: boolean;
   listen_host: string;

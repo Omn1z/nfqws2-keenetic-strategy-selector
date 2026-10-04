@@ -146,3 +146,68 @@ func TestShadowNativeLogDiagnosticsUnknownClockAndInvalidMetadata(t *testing.T) 
 	// No diagnostics collector means no log scan or attempt creation.
 	logShadowNativeLeases(context.Background(), "", nil, time.Time{})
 }
+
+func TestKeeneticShadowLegacyIgnoredDNSAndDiagnostics(t *testing.T) {
+	// Older Keenetic logs use Dhcp::Client for ignored option 6 addresses;
+	// current firmware uses Dns::InterfaceSpecific for the same event.
+	for _, component := range []string{"Dhcp::Client", "Dns::InterfaceSpecific"} {
+		t.Run(component, func(t *testing.T) {
+			log := "I [Oct  4 03:00:00] ndhcpc: GigabitEthernet1: received ACK for 10.101.48.55 from 1.1.1.2 lease 3600 sec.\n" +
+				"I [Oct  4 03:00:00] ndm: Dhcp::Client: configuring interface ISP.\n" +
+				"I [Oct  4 03:00:00] ndm: Dhcp::Client: obtained IP address 10.101.48.55/23.\n" +
+				"I [Oct  4 03:00:00] ndm: " + component + ": name server 192.0.2.53 is\n                    ignored.\n" +
+				"I [Oct  4 03:00:00] ndm: " + component + ": name server 198.51.100.53 is ignored.\n"
+			leases := parseKeeneticShadowLeases(log)
+			if len(leases) != 1 || leases[0].iface != "GigabitEthernet1" || !leases[0].clientIP.Equal(net.ParseIP("10.101.48.55")) || len(leases[0].servers) != 2 || leases[0].servers[0] != "192.0.2.53" || leases[0].servers[1] != "198.51.100.53" {
+				t.Fatalf("valid ignored peer DNS lost: %+v", leases)
+			}
+			events := nativeLogDiagnosticsForTest(t, log, leases, time.Date(2026, 10, 4, 3, 10, 0, 0, time.UTC))
+			if !strings.Contains(events[0].Message, "ignored DNS=2; связанных ignored DNS=2") || !strings.Contains(events[1].Message, "DNS=2") {
+				t.Fatalf("diagnostic disagrees with legacy parser: %+v", events)
+			}
+			// A bare later renewal still cannot inherit old option 6 evidence
+			// just because the previous block used the legacy spelling.
+			log += "I [Oct  4 03:30:00] ndhcpc: GigabitEthernet1: received ACK for 10.101.48.55 from 1.1.1.2 lease 3600 sec.\n"
+			if fresh := parseKeeneticShadowLeases(log); len(fresh) != 1 || len(fresh[0].servers) != 0 {
+				t.Fatalf("old DNS inherited by a later bare ACK: %+v", fresh)
+			}
+		})
+	}
+}
+
+func TestKeeneticShadowLegacyIgnoredDNSStillRequiresStrictAssociation(t *testing.T) {
+	ack := "I [Oct  4 03:00:00] ndhcpc: GigabitEthernet1: received ACK for 10.101.48.55 from 1.1.1.2 lease 3600 sec.\n"
+	obtained := "I [Oct  4 03:00:00] ndm: Dhcp::Client: obtained IP address 10.101.48.55/23.\n"
+	ignored := "I [Oct  4 03:00:00] ndm: Dhcp::Client: name server 192.0.2.53 is ignored.\n"
+	for name, log := range map[string]string{
+		"orphan":          ignored,
+		"no obtained":     ack + ignored,
+		"wrong timestamp": ack + obtained + strings.Replace(ignored, "03:00:00", "03:00:01", 1),
+		"wrong address":   ack + strings.Replace(obtained, "48.55", "48.56", 1) + ignored,
+		"past window":     ack + obtained + strings.Repeat("I [Oct  4 03:00:00] other: unrelated\n", 15) + ignored,
+		"LAN bridge":      strings.Replace(ack, "GigabitEthernet1", "Bridge0", 1) + obtained + ignored,
+	} {
+		t.Run(name, func(t *testing.T) {
+			leases := parseKeeneticShadowLeases(log)
+			for _, lease := range leases {
+				if len(lease.servers) != 0 {
+					t.Fatalf("unassociated legacy DNS accepted: %+v", leases)
+				}
+			}
+			events := nativeLogDiagnosticsForTest(t, log, leases, time.Date(2026, 10, 4, 3, 10, 0, 0, time.UTC))
+			if !strings.Contains(events[0].Message, "ignored DNS=1; связанных ignored DNS=0") {
+				t.Fatalf("orphan legacy record falsely linked in diagnostics: %+v", events)
+			}
+		})
+	}
+	for _, message := range []string{
+		"ndm: Other::Client: name server 192.0.2.53 is ignored.",
+		"ndm: Dhcp::Client: name server secret.example is ignored.",
+		"ndm: Dhcp::Client: name server 192.0.2.53 is accepted.",
+		"ndm: Dhcp::Client: name server 192.0.2.53 is ignored. secret",
+	} {
+		if ip := parseKeeneticIgnoredDNS(message); ip != nil {
+			t.Fatalf("not an exact ignored DNS record: %q -> %s", message, ip)
+		}
+	}
+}

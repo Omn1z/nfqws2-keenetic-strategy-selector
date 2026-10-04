@@ -213,7 +213,19 @@ export default function DnsServer() {
         }} />
 
       <fieldset disabled={busy || testing} inert={openWrtBusy} className="min-w-0">
-        <ShadowDns value={form.shadow_dns} status={live.shadow_dns} onChange={(value) => set("shadow_dns", value)} />
+        <ShadowDns value={form.shadow_dns} status={live.shadow_dns} onChange={(value) => set("shadow_dns", value)} busy={busy || testing || filterUpdating || importing}
+          onRefresh={refresh} onRenewResult={(result) => {
+            // A successful renewal supersedes the previous cached failure
+            // immediately, even while an older status poll is still finishing.
+            if (result.status === "resolved") setLive((current) => current?.shadow_dns ? { ...current, shadow_dns: { ...current.shadow_dns, servers: result.servers ?? [], error: undefined } } : current);
+          }} onRenewBusyChange={(pending) => {
+            if (pending) {
+              if (acting.current) return false;
+              acting.current = true; mutation.current++;
+            } else acting.current = false;
+            setBusy(pending);
+            return true;
+          }} />
 
         <Card title="Пул DoH по умолчанию" sub="для доменов вне Shadow DNS и специальных групп">
           <p className="mb-3 text-xs text-muted">Серверы пула участвуют в параллельных запросах через доступные маршруты. Первый корректный ответ возвращается устройству.</p>

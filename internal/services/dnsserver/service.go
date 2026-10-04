@@ -138,6 +138,9 @@ func (s *Service) Status() Status {
 		st.FastDNS.Enabled = s.cfg.FastDNS
 	}
 	s.mu.RUnlock()
+	if backend, ok := s.backend.(shadowRenewBackend); ok && st.Running && st.ShadowDNS.Enabled {
+		st.ShadowDNS.RenewalAvailable = backend.ShadowRenewalAvailable()
+	}
 	if backend, ok := s.backend.(interface {
 		ShadowDiagnostics() dnsroute.ShadowDiagnostics
 	}); ok {
