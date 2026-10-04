@@ -284,6 +284,9 @@ type shadowDHCPTarget struct {
 	wanKey             string
 	clientIP, serverIP net.IP
 	stamp              string
+	// A silent unicast peer is retried through the verified WAN broadcast
+	// path on the next discovery pass, without extending that pass's budget.
+	preferBroadcast bool
 }
 
 type shadowInformAnswer struct {
@@ -297,6 +300,9 @@ type shadowInformState struct {
 	answers    map[string]shadowInformAnswer
 	retryAfter map[string]time.Time
 	probe      func(context.Context, string, net.IP, net.IP) ([]string, error)
+	// The orchestrator uses this serial to keep known-peer and broadcast
+	// discovery within a single DHCP exchange per pass, including multi-WAN.
+	unicastAttempts uint64
 	// Initial discovery has no known DHCP peer yet. Keep its bounded retry
 	// separately so a failed broadcast cannot poison a learned unicast target.
 	broadcastKey   string
@@ -317,16 +323,34 @@ func (target shadowDHCPTarget) valid(key string, ips []net.IP) bool {
 }
 
 func (s *shadowInformState) remember(iface string, target shadowDHCPTarget, routerNow time.Time) {
+	if _, exists := s.targets[iface]; !exists {
+		// Firmware logs can use ISP while interface enumeration uses its
+		// GigabitEthernet ID. One verified WAN address must keep one target.
+		var aliases []string
+		for name, previous := range s.targets {
+			if previous.wanKey == target.wanKey && previous.clientIP.Equal(target.clientIP) {
+				aliases = append(aliases, name)
+			}
+		}
+		if len(aliases) > 0 {
+			sort.Strings(aliases)
+			iface = aliases[0]
+		}
+	}
 	if previous, ok := s.targets[iface]; ok {
 		observed := shadowLeaseObservedAt(target.stamp, routerNow)
 		retained := shadowLeaseObservedAt(previous.stamp, routerNow)
 		if !observed.IsZero() && !retained.IsZero() && observed.Before(retained) {
 			return
 		}
-		if previous.wanKey == target.wanKey && previous.clientIP.Equal(target.clientIP) && previous.serverIP.Equal(target.serverIP) && previous.stamp == target.stamp {
+		// A live broadcast may have found a different peer since this log ACK.
+		// Its retained stamp is a watermark: replaying that same old log must
+		// not restore the unreachable peer or discard the fresh DNS answer.
+		if previous.wanKey == target.wanKey && previous.clientIP.Equal(target.clientIP) && previous.stamp == target.stamp && (target.stamp != "" || previous.serverIP.Equal(target.serverIP)) {
 			return
 		}
 		if previous.wanKey == target.wanKey && previous.clientIP.Equal(target.clientIP) && previous.serverIP.Equal(target.serverIP) {
+			target.preferBroadcast = previous.preferBroadcast
 			if answer, exists := s.answers[iface]; exists {
 				answer.refresh = true
 				s.answers[iface] = answer

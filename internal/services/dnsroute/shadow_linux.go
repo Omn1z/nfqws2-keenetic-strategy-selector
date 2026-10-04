@@ -4,6 +4,7 @@ package dnsroute
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"os/exec"
@@ -221,19 +222,38 @@ func discoverShadowServersWithState(ctx context.Context, wan []string, remembere
 				verifyTarget := func(iface string, clientIP net.IP) bool {
 					return verify(iface) && keeneticInterfaceOwnsWAN(statuses[iface], []net.IP{clientIP})
 				}
+				unicastAttempts := inform.unicastAttempts
 				fresh, err := discoverShadowInform(ctx, inform, key, wanIPs, local, wanDevices, verifyTarget)
 				informErr = err
 				if len(fresh) > 0 {
 					candidates = fresh // current option 6 supersedes older leased DNS
 				}
-				if len(filterShadowServers(candidates, local)) == 0 && nativeErr == nil && key != "" && !hasShadowInformTarget(inform, key, wanIPs, wanDevices, verifyTarget) {
+				fallbackTargets := dueShadowInformBroadcastTargets(inform, key, wanIPs, wanDevices, verifyTarget)
+				if inform.unicastAttempts == unicastAttempts && nativeErr == nil && key != "" && (len(fallbackTargets) > 0 || len(filterShadowServers(candidates, local)) == 0 && !hasShadowInformTarget(inform, key, wanIPs, wanDevices, verifyTarget)) {
+					broadcastFresh := false
 					if interfaces, err := readNative("show interface"); err == nil {
 						eligible := parseShadowBroadcastWANs(interfaces, defaultRoutes, wan, wanDevices)
-						fresh, err := discoverShadowBroadcast(ctx, inform, key, eligible, local)
-						informErr = err
-						if len(fresh) > 0 {
-							candidates = fresh
+						if len(fallbackTargets) > 0 {
+							eligible = shadowBroadcastFallbackWANs(inform, key, eligible, fallbackTargets)
 						}
+						if len(eligible) > 0 {
+							fresh, err := discoverShadowBroadcast(ctx, inform, key, eligible, local)
+							informErr = err
+							if len(fresh) > 0 {
+								candidates = fresh
+								broadcastFresh = true
+							}
+						}
+					}
+					if contextErr := shadowDiscoveryContextErr(ctx); contextErr != nil {
+						return nil, contextErr
+					}
+					// Even the native interface read may outlive a cache TTL,
+					// whether discovery subsequently sends a packet or not.
+					if !broadcastFresh {
+						candidates = shadowUnexpiredCandidates(candidates, inform, remembered, key, wanIPs, func(iface string, ip net.IP) bool {
+							return verified[iface] && keeneticInterfaceOwnsWAN(statuses[iface], []net.IP{ip})
+						})
 					}
 				}
 			}
@@ -260,6 +280,33 @@ func discoverShadowServersWithState(ctx context.Context, wan []string, remembere
 	return servers, nil
 }
 
+func shadowUnexpiredCandidates(candidates []string, state *shadowInformState, leases map[string]shadowRememberedLease, key string, wanIPs []net.IP, verified func(string, net.IP) bool) []string {
+	now := time.Now()
+	valid := map[string]bool{}
+	for iface, answer := range state.answers {
+		target := state.targets[iface]
+		if now.Before(answer.expires) && target.valid(key, wanIPs) && verified(iface, target.clientIP) {
+			for _, server := range filterShadowServers(answer.servers, nil) {
+				valid[server] = true
+			}
+		}
+	}
+	for iface, lease := range leases {
+		if lease.valid(key, wanIPs, now) && verified(iface, lease.clientIP) {
+			for _, server := range filterShadowServers(lease.servers, nil) {
+				valid[server] = true
+			}
+		}
+	}
+	var result []string
+	for _, server := range candidates {
+		if valid[server] {
+			result = append(result, server)
+		}
+	}
+	return result
+}
+
 // Inform responses have no lease grant. Cache the verified options for five
 // minutes independently of the original DHCP lease, with a bounded retry rate.
 // Called only while discoveryMu is held; no per-query worker or periodic fork.
@@ -272,6 +319,7 @@ func discoverShadowInform(ctx context.Context, state *shadowInformState, key str
 	}
 	sort.Strings(keys)
 	var lastErr error
+	probed := false
 	for _, iface := range keys {
 		target := state.targets[iface]
 		device := devices[target.clientIP.String()]
@@ -291,10 +339,22 @@ func discoverShadowInform(ctx context.Context, state *shadowInformState, key str
 			lastErr = fmt.Errorf("ожидается повторное получение DNS от DHCP-сервера")
 			continue
 		}
+		if target.preferBroadcast {
+			if now.Before(answer.expires) {
+				return filterShadowServers(answer.servers, local), nil
+			}
+			lastErr = fmt.Errorf("DHCP-сервер не ответил напрямую; ожидается обнаружение через broadcast активного WAN")
+			continue
+		}
+		if probed {
+			continue
+		}
 		probe := state.probe
 		if probe == nil {
 			probe = shadowDHCPInform
 		}
+		probed = true
+		state.unicastAttempts++
 		servers, err := probe(ctx, device, target.clientIP, target.serverIP)
 		now = time.Now()
 		if err := shadowDiscoveryContextErr(ctx); err != nil {
@@ -311,6 +371,12 @@ func discoverShadowInform(ctx context.Context, state *shadowInformState, key str
 			state.retryAfter = map[string]time.Time{}
 		}
 		state.retryAfter[iface] = time.Now().Add(retry)
+		if errors.Is(err, context.DeadlineExceeded) {
+			// The parent discovery context was checked above. Only a local
+			// probe timeout switches transport; cancellation never does.
+			target.preferBroadcast = true
+			state.targets[iface] = target
+		}
 		if err == nil {
 			if state.answers == nil {
 				state.answers = map[string]shadowInformAnswer{}

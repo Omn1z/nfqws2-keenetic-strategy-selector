@@ -85,6 +85,7 @@ func TestShadowInformCacheRetryCancellationAndRenewal(t *testing.T) {
 	// A different verified server cannot inherit the previous peer's answer or cooldown.
 	changed := renewed
 	changed.serverIP = net.ParseIP("192.0.2.2")
+	changed.stamp = "Oct  3 12:00:01"
 	state.remember("ISP", changed, time.Date(2026, 10, 3, 12, 0, 2, 0, time.UTC))
 	if len(state.answers) != 0 || len(state.retryAfter) != 0 {
 		t.Fatal("changed DHCP peer retained old options or failure cooldown")
