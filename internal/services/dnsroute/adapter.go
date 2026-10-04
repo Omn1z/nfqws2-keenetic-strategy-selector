@@ -114,7 +114,9 @@ func (a *Adapter) ObserveAnswer(ctx context.Context, domain string, response []b
 func (a *Adapter) Close() error {
 	a.opMu.Lock()
 	defer a.opMu.Unlock()
-	return a.closeOS()
+	err := a.closeOS()
+	a.closeShadowNative()
+	return err
 }
 
 // ResolveLANHost chooses an owned LAN address, avoiding WAN and VPN devices.

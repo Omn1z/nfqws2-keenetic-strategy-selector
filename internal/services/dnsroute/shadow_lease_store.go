@@ -28,14 +28,15 @@ type shadowBootClock struct {
 }
 
 type shadowLeaseRecord struct {
-	Interface     string    `json:"interface"`
-	WANKey        string    `json:"wan_key"`
-	ClientIP      string    `json:"client_ip"`
-	Servers       []string  `json:"servers"`
-	Expires       time.Time `json:"expires"`
-	ExpiresBootNS int64     `json:"expires_boot_ns"`
-	Stamp         string    `json:"dhcp_stamp"`
-	LeaseSeconds  uint64    `json:"lease_seconds"`
+	Interface     string     `json:"interface"`
+	WANKey        string     `json:"wan_key"`
+	ClientIP      string     `json:"client_ip"`
+	Servers       []string   `json:"servers"`
+	Expires       time.Time  `json:"expires"`
+	ExpiresBootNS int64      `json:"expires_boot_ns"`
+	Stamp         string     `json:"dhcp_stamp"`
+	LeaseSeconds  uint64     `json:"lease_seconds"`
+	ObservedAt    *time.Time `json:"observed_at,omitempty"`
 }
 
 type shadowLeaseDocument struct {
@@ -82,7 +83,7 @@ func shadowStateDigest(leases map[string]shadowRememberedLease, targets map[stri
 }
 
 func sameShadowLease(a, b shadowRememberedLease) bool {
-	return a.wanKey == b.wanKey && a.clientIP.Equal(b.clientIP) && a.stamp == b.stamp && a.leaseSeconds == b.leaseSeconds && slices.Equal(a.servers, b.servers)
+	return a.wanKey == b.wanKey && a.clientIP.Equal(b.clientIP) && a.stamp == b.stamp && a.observedAt.Equal(b.observedAt) && a.leaseSeconds == b.leaseSeconds && slices.Equal(a.servers, b.servers)
 }
 
 func shadowLeaseRecords(leases map[string]shadowRememberedLease) []shadowLeaseRecord {
@@ -94,7 +95,12 @@ func shadowLeaseRecords(leases map[string]shadowRememberedLease) []shadowLeaseRe
 	result := make([]shadowLeaseRecord, 0, len(keys))
 	for _, iface := range keys {
 		lease := leases[iface]
-		result = append(result, shadowLeaseRecord{Interface: iface, WANKey: lease.wanKey, ClientIP: lease.clientIP.String(), Servers: append([]string(nil), lease.servers...), Expires: lease.expires.UTC(), Stamp: lease.stamp, LeaseSeconds: lease.leaseSeconds})
+		record := shadowLeaseRecord{Interface: iface, WANKey: lease.wanKey, ClientIP: lease.clientIP.String(), Servers: append([]string(nil), lease.servers...), Expires: lease.expires.UTC(), Stamp: lease.stamp, LeaseSeconds: lease.leaseSeconds}
+		if !lease.observedAt.IsZero() {
+			at := lease.observedAt.UTC()
+			record.ObservedAt = &at
+		}
+		result = append(result, record)
 	}
 	return result
 }
@@ -216,7 +222,13 @@ func decodeShadowState(data []byte, clock shadowBootClock) (map[string]shadowRem
 		if !validKeeneticInterface(item.Interface) || ip.To4() == nil || !ip.IsGlobalUnicast() || item.WANKey == "" || len(item.WANKey) > 2048 || strings.ContainsAny(item.WANKey, "\r\n\x00") || len(item.Stamp) > 32 || item.LeaseSeconds == 0 || item.LeaseSeconds >= 0xffffffff || len(item.Servers) == 0 || len(item.Servers) > 8 {
 			return nil, nil, fmt.Errorf("invalid saved Shadow lease")
 		}
-		if _, err := time.Parse("Jan _2 15:04:05", item.Stamp); err != nil {
+		observedAt := time.Time{}
+		if item.ObservedAt != nil {
+			observedAt = *item.ObservedAt
+			if observedAt.IsZero() || observedAt.After(doc.SavedAt) || item.Expires.After(observedAt.Add(time.Duration(item.LeaseSeconds)*time.Second)) {
+				return nil, nil, fmt.Errorf("invalid native DHCP observation timestamp")
+			}
+		} else if _, err := time.Parse("Jan _2 15:04:05", item.Stamp); err != nil {
 			return nil, nil, fmt.Errorf("invalid DHCP lease timestamp")
 		}
 		if _, duplicate := result[item.Interface]; duplicate {
@@ -241,7 +253,7 @@ func decodeShadowState(data []byte, clock shadowBootClock) (map[string]shadowRem
 		if remaining <= 0 {
 			continue
 		}
-		result[item.Interface] = shadowRememberedLease{wanKey: item.WANKey, clientIP: ip, servers: append([]string(nil), item.Servers...), expires: clock.now.Add(remaining), stamp: item.Stamp, leaseSeconds: item.LeaseSeconds}
+		result[item.Interface] = shadowRememberedLease{wanKey: item.WANKey, clientIP: ip, servers: append([]string(nil), item.Servers...), expires: clock.now.Add(remaining), stamp: item.Stamp, leaseSeconds: item.LeaseSeconds, observedAt: observedAt}
 	}
 	return result, targets, nil
 }

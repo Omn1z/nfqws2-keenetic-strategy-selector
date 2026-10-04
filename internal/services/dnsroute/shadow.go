@@ -31,6 +31,7 @@ type shadowState struct {
 	leasesLoaded bool
 	leaseDigest  string
 	inform       shadowInformState
+	native       shadowNativeState
 	// Route fields below are protected by Adapter.opMu. Preparing their
 	// kernel tables must never hold the ordinary DNS/cache/status mutex.
 	route   *routeState
@@ -377,6 +378,7 @@ type shadowRememberedLease struct {
 	expires      time.Time
 	stamp        string
 	leaseSeconds uint64
+	observedAt   time.Time // native packet receipt; independent of firmware log timezone
 }
 
 func shadowLeaseRemaining(lease keeneticShadowLease, routerNow time.Time) time.Duration {

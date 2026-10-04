@@ -157,7 +157,12 @@ func shadowWirePacketSummary(packet []byte, id shadowInformIdentity, discover, o
 }
 
 func attachShadowWireFilter(fd int) error {
-	filter := []unix.SockFilter{
+	filter := shadowWireFilterProgram()
+	return unix.SetsockoptSockFprog(fd, unix.SOL_SOCKET, unix.SO_ATTACH_FILTER, &unix.SockFprog{Len: uint16(len(filter)), Filter: &filter[0]})
+}
+
+func shadowWireFilterProgram() []unix.SockFilter {
+	return []unix.SockFilter{
 		{Code: unix.BPF_LD | unix.BPF_B | unix.BPF_ABS, K: 0},
 		{Code: unix.BPF_ALU | unix.BPF_AND | unix.BPF_K, K: 0xf0},
 		{Code: unix.BPF_JMP | unix.BPF_JEQ | unix.BPF_K, K: 0x40, Jf: 17}, // →20 drop
@@ -180,5 +185,26 @@ func attachShadowWireFilter(fd int) error {
 		{Code: unix.BPF_RET | unix.BPF_K, K: 1536},
 		{Code: unix.BPF_RET | unix.BPF_K, K: 0},
 	}
+}
+
+// Native observation stays open while awaiting a normal firmware renewal.
+// Filter other subscribers' DHCP in the kernel as well as ordinary WAN traffic,
+// so broadcast DHCP chatter cannot wake or fill this observer's receive queue.
+func attachShadowNativeFilter(fd int, mac net.HardwareAddr) error {
+	if len(mac) != 6 || mac[0]&1 != 0 || bytes.Equal(mac, make([]byte, 6)) {
+		return fmt.Errorf("invalid native DHCP filter MAC")
+	}
+	filter := shadowWireFilterProgram()
+	// Retain every original reject target (20), and send the original accept
+	// target (19) past it to the MAC check (21). X still holds IPv4 IHL.
+	filter[19] = unix.SockFilter{Code: unix.BPF_JMP | unix.BPF_JA, K: 1}
+	filter = append(filter,
+		unix.SockFilter{Code: unix.BPF_LD | unix.BPF_W | unix.BPF_IND, K: 36},
+		unix.SockFilter{Code: unix.BPF_JMP | unix.BPF_JEQ | unix.BPF_K, K: binary.BigEndian.Uint32(mac[:4]), Jf: 3},
+		unix.SockFilter{Code: unix.BPF_LD | unix.BPF_H | unix.BPF_IND, K: 40},
+		unix.SockFilter{Code: unix.BPF_JMP | unix.BPF_JEQ | unix.BPF_K, K: uint32(binary.BigEndian.Uint16(mac[4:])), Jf: 1},
+		unix.SockFilter{Code: unix.BPF_RET | unix.BPF_K, K: 1536},
+		unix.SockFilter{Code: unix.BPF_RET | unix.BPF_K, K: 0},
+	)
 	return unix.SetsockoptSockFprog(fd, unix.SOL_SOCKET, unix.SO_ATTACH_FILTER, &unix.SockFprog{Len: uint16(len(filter)), Filter: &filter[0]})
 }

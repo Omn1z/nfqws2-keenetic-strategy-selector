@@ -24,8 +24,17 @@ func (a *Adapter) shadowServersOS(ctx context.Context) (result []string, resultE
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if time.Now().Before(a.shadow.discoveryUntil) {
+	if time.Now().Before(a.shadow.discoveryUntil) && !a.shadow.native.changed() {
 		return append([]string(nil), a.shadow.servers...), a.shadow.discoveryErr
+	}
+	nativeReader := a.shadow.native.reader
+	if nativeReader != nil {
+		revision := nativeReader.snapshot().sequence
+		defer func() {
+			if callerCtx.Err() == nil && a.shadow.native.reader == nativeReader && revision > a.shadow.native.applied {
+				a.shadow.native.applied = revision
+			}
+		}()
 	}
 	ctx, finish := a.shadow.diagnostics.begin(ctx)
 	var nextRetry time.Time
@@ -35,10 +44,11 @@ func (a *Adapter) shadowServersOS(ctx context.Context) (result []string, resultE
 	a.loadShadowLeases()
 	shadowDiagnosticEvent(ctx, "state.loaded", fmt.Sprintf("Сохранённые аренды: %d; известные DHCP-серверы: %d", len(a.shadow.leases), len(a.shadow.inform.targets)), 0)
 	discoveryStarted := time.Now()
-	servers, err := discoverShadowServersWithState(ctx, a.cfg.WANIfaces, a.shadow.leases, &a.shadow.inform)
+	servers, err := discoverShadowServersWithObserver(ctx, a.cfg.WANIfaces, a.shadow.leases, &a.shadow.inform, a.observeShadowNative)
 	if err := shadowDiscoveryContextErr(callerCtx); err != nil {
 		return nil, err
 	} // a canceled caller must not poison discovery
+	a.shadow.native.applied = max(a.shadow.native.applied, a.shadow.native.inspected)
 	if contextErr := shadowDiscoveryContextErr(ctx); contextErr != nil && len(servers) == 0 {
 		// The caller is still alive, so this was our discovery budget rather
 		// than caller cancellation. Cache it below like other discovery errors;
@@ -75,6 +85,10 @@ func discoverShadowServersWithLeases(ctx context.Context, wan []string, remember
 }
 
 func discoverShadowServersWithState(ctx context.Context, wan []string, remembered map[string]shadowRememberedLease, inform *shadowInformState) ([]string, error) {
+	return discoverShadowServersWithObserver(ctx, wan, remembered, inform, nil)
+}
+
+func discoverShadowServersWithObserver(ctx context.Context, wan []string, remembered map[string]shadowRememberedLease, inform *shadowInformState, observe func(context.Context, string, []shadowBroadcastWAN, []net.IP, time.Time) bool) ([]string, error) {
 	if err := shadowDiscoveryContextErr(ctx); err != nil {
 		return nil, err
 	}
@@ -116,7 +130,11 @@ func discoverShadowServersWithState(ctx context.Context, wan []string, remembere
 	var candidates []string
 	var informErr, nativeErr error
 	if ndmc, err := exec.LookPath("ndmc"); err == nil {
+		interfaceOutput, interfacesRead := "", false
 		readNative := func(operation string) (string, error) {
+			if operation == "show interface" && interfacesRead {
+				return interfaceOutput, nil
+			}
 			started := time.Now()
 			out, err := command(ctx, ndmc, "-c", operation)
 			if err := shadowNativeCommandError(ctx, operation, out, err); err != nil {
@@ -127,6 +145,9 @@ func discoverShadowServersWithState(ctx context.Context, wan []string, remembere
 				return "", err
 			}
 			shadowDiagnosticEvent(ctx, "native.command", operation+": прочитано", time.Since(started))
+			if operation == "show interface" {
+				interfaceOutput, interfacesRead = out, true
+			}
 			return out, nil
 		}
 		verified := map[string]bool{}
@@ -163,6 +184,9 @@ func discoverShadowServersWithState(ctx context.Context, wan []string, remembere
 		if len(filterShadowServers(candidates, local)) > 0 {
 			// Current authoritative DNS supersedes any older ignored lease.
 			clear(remembered)
+			if observe != nil {
+				observe(ctx, "", nil, local, time.Time{})
+			}
 		} else {
 			key, defaultRoutes := "", ""
 			routeStarted := time.Now()
@@ -187,17 +211,34 @@ func discoverShadowServersWithState(ctx context.Context, wan []string, remembere
 					}
 				}
 			}
+			routerNow := time.Time{}
 			if log, err := readNative("show log"); err == nil {
-				routerNow := time.Time{}
 				if clock, err := command(ctx, "date", "+%Y-%m-%dT%H:%M:%S%z"); err == nil {
 					routerNow, _ = time.Parse("2006-01-02T15:04:05-0700", strings.TrimSpace(clock))
 				}
 				logLeases := parseKeeneticShadowLeases(log)
 				shadowDiagnosticEvent(ctx, "native.leases", fmt.Sprintf("Связанных DHCP ACK в журнале: %d", len(logLeases)), 0)
+				logShadowNativeLeases(ctx, log, logLeases, routerNow)
 				for _, lease := range logLeases {
+					// Native IDs and aliases (ISP/GigabitEthernet1) may differ in
+					// ring logs. Compare fresh packet evidence across the WAN/IP.
+					stale := false
+					observed := shadowLeaseObservedAt(lease.stamp, routerNow)
+					for _, previous := range remembered {
+						if previous.wanKey == key && previous.clientIP.Equal(lease.clientIP) && !previous.observedAt.IsZero() && (observed.IsZero() || observed.Before(previous.observedAt)) {
+							stale = true
+							break
+						}
+					}
+					if stale {
+						continue
+					}
 					if previous, ok := remembered[lease.iface]; ok {
 						observed := shadowLeaseObservedAt(lease.stamp, routerNow)
 						retained := shadowLeaseObservedAt(previous.stamp, routerNow)
+						if !previous.observedAt.IsZero() {
+							retained = previous.observedAt
+						}
 						if !observed.IsZero() && !retained.IsZero() && observed.Before(retained) {
 							continue // an older ring-log ACK cannot replace newer evidence
 						}
@@ -233,14 +274,39 @@ func discoverShadowServersWithState(ctx context.Context, wan []string, remembere
 					}
 				}
 			}
+			// Passive capture observes the native client's ordinary renewal even
+			// when the provider ignores INFORM. It is configured only for the
+			// verified physical active WAN, never for OpenWrt or VPN interfaces.
+			nativeObserved := false
+			if observe != nil && key != "" && nativeErr == nil {
+				if interfaces, err := readNative("show interface"); err == nil {
+					eligible := parseShadowBroadcastWANs(interfaces, defaultRoutes, wan, wanDevices)
+					nativeObserved = observe(ctx, key, eligible, local, routerNow)
+					if nativeObserved {
+						candidates = nil
+					}
+				} else {
+					observe(ctx, "", nil, local, routerNow)
+				}
+			} else if observe != nil {
+				observe(ctx, "", nil, local, routerNow)
+			}
+			hasNativeLease := false
 			if len(filterShadowServers(candidates, local)) == 0 {
 				for iface, lease := range remembered {
-					if lease.valid(key, wanIPs, time.Now()) && verify(iface) && keeneticInterfaceOwnsWAN(statuses[iface], []net.IP{lease.clientIP}) {
+					if verify(iface) && keeneticInterfaceOwnsWAN(statuses[iface], []net.IP{lease.clientIP}) && lease.valid(key, wanIPs, time.Now()) {
 						candidates = append(candidates, lease.servers...)
+						hasNativeLease = hasNativeLease || !lease.observedAt.IsZero()
 					}
 				}
 			}
-			if inform != nil {
+			if hasNativeLease && inform != nil {
+				candidates = shadowUnexpiredCandidates(candidates, inform, remembered, key, wanIPs, func(iface string, ip net.IP) bool {
+					return verified[iface] && keeneticInterfaceOwnsWAN(statuses[iface], []net.IP{ip})
+				})
+				hasNativeLease = len(filterShadowServers(candidates, local)) > 0
+			}
+			if inform != nil && !hasNativeLease {
 				verifyTarget := func(iface string, clientIP net.IP) bool {
 					return verify(iface) && keeneticInterfaceOwnsWAN(statuses[iface], []net.IP{clientIP})
 				}
@@ -282,6 +348,9 @@ func discoverShadowServersWithState(ctx context.Context, wan []string, remembere
 			}
 		}
 	} else if ubus, err := exec.LookPath("ubus"); err == nil {
+		if observe != nil {
+			observe(ctx, "", nil, local, time.Time{})
+		}
 		started := time.Now()
 		out, e := command(ctx, ubus, "call", "network.interface", "dump")
 		if e == nil {
@@ -289,6 +358,9 @@ func discoverShadowServersWithState(ctx context.Context, wan []string, remembere
 		}
 		shadowDiagnosticEvent(ctx, "openwrt.dns", fmt.Sprintf("ubus: прочитан=%t; принято DNS-серверов: %d", e == nil, len(filterShadowServers(candidates, local))), time.Since(started))
 	} else {
+		if observe != nil {
+			observe(ctx, "", nil, local, time.Time{})
+		}
 		shadowDiagnosticEvent(ctx, "discovery.source", "Не найдены ndmc и ubus", 0)
 	}
 	servers := filterShadowServers(candidates, local)
