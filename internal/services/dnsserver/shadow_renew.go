@@ -55,9 +55,17 @@ func (s *Service) RenewShadowDNS(ctx context.Context, confirmed bool) (dnsroute.
 	}
 	run.resolver.mu.Lock()
 	run.resolver.shadowStatus.Servers = append([]string{}, result.Servers...)
-	run.resolver.shadowStatus.Error = ""
 	if result.Status != "resolved" {
 		run.resolver.shadowStatus.Error = result.Message
+	} else if run.resolver.shadowStatus.FallbackActive {
+		// Newly learned addresses deserve a fresh query, but discovery alone
+		// does not prove reachability. Keep fallback until a DNS reply succeeds.
+		run.resolver.shadowFallback.generation++
+		run.resolver.shadowFallback.probing = false
+		run.resolver.shadowFallback.retryAt = run.resolver.now()
+		run.resolver.shadowStatus.NextProbeAt = run.resolver.shadowFallback.retryAt.UTC().Format(time.RFC3339)
+	} else {
+		run.resolver.shadowStatus.Error = ""
 	}
 	run.resolver.mu.Unlock()
 	return result, nil

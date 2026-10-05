@@ -72,6 +72,16 @@ test("Shadow report preserves every bounded attempt and event without settings o
   assert.equal(JSON.stringify(report).includes("private_key"), false);
   assert.equal(JSON.stringify(input), before);
   assert.throws(() => shadowDiagnosticsReport(status({ diagnostics: undefined })), /недоступна/);
+
+  const reserve = { ...input, fallback_active: true, next_probe_at: "2026-10-04T00:00:31.2Z" };
+  const reserveBefore = JSON.stringify(reserve);
+  const reserveReport = JSON.parse(shadowDiagnosticsReport(reserve));
+  assert.deepEqual(reserveReport.shadow_dns, { ...report.shadow_dns, fallback_active: true, next_probe_at: reserve.next_probe_at });
+  assert.equal(JSON.stringify(reserveReport).includes("never-export"), false);
+  assert.equal(JSON.stringify(reserveReport).includes("private_key"), false);
+  assert.equal(JSON.stringify(reserve), reserveBefore);
+  const recovered = JSON.parse(shadowDiagnosticsReport({ ...input, fallback_active: false }));
+  assert.deepEqual(recovered.shadow_dns, { ...report.shadow_dns, fallback_active: false });
 });
 
 function replaceGlobal(t: TestContext, name: string, value: unknown) {

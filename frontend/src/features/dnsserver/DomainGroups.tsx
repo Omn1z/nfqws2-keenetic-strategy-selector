@@ -16,9 +16,9 @@ export function DomainGroups({ value, onChange, disabled }: {
   const totalDomains = value.reduce((total, group) => total + domainCount(group.domains), 0);
 
   return <Card title="Специальные DoH и домены" sub={`Групп: ${value.length} · Доменов: ${totalDomains}`} head={<Button mini disabled={disabled} onClick={() => onChange([...value, newRuleGroup()])}>Добавить группу</Button>}>
-    <p className="mb-3 text-xs text-muted">Сначала выберите DoH или пул серверов, затем добавьте один домен или целый список. Домены группы вне включённого Shadow DNS используют только этот пул; пул по умолчанию к нему не добавляется.</p>
+    <p className="mb-3 text-xs text-muted">Сначала выберите DoH или пул серверов, затем добавьте один домен или целый список. Домены группы используют только этот пул; пул по умолчанию к нему не добавляется. Для доменов из Shadow DNS сначала проверяется провайдер, а при его недоступности используется выбранный здесь пул.</p>
     <div className="space-y-4">
-      {value.length === 0 && <p className="py-3 text-xs text-muted">Специальных групп нет. Домены вне включённого Shadow DNS используют пул DoH по умолчанию.</p>}
+      {value.length === 0 && <p className="py-3 text-xs text-muted">Специальных групп нет. Используется пул DoH по умолчанию; для доменов из Shadow DNS он служит резервом при недоступности провайдера.</p>}
       {value.map((group, index) => <div key={group.id} className="rounded-lg border border-line p-3 sm:p-4">
         <div className="mb-3 flex flex-wrap items-center gap-3">
           <h3 className="mr-auto text-sm font-semibold">Группа {index + 1}</h3>

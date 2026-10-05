@@ -171,3 +171,33 @@ func TestShadowRenewServiceDoesNotUpdateReplacementResolver(t *testing.T) {
 		t.Fatal("result applied to replaced resolver")
 	}
 }
+
+func TestShadowRenewLearnedServersAllowImmediateProbeButDoNotClaimRecovery(t *testing.T) {
+	s, _ := shadowRenewServiceFixture(t)
+	r := s.active.resolver
+	now := time.Now()
+	r.now = func() time.Time { return now }
+	r.finishShadowAttempt(0, nil, errors.New("provider timeout"), false)
+	// Pretend an old recovery attempt is still running while DHCP completes.
+	r.shadowFallback.probing = true
+	oldGeneration := r.shadowFallback.generation
+	if _, err := s.RenewShadowDNS(context.Background(), true); err != nil {
+		t.Fatal(err)
+	}
+	status := r.ShadowStatus()
+	if !status.FallbackActive || status.Error != "provider timeout" || len(status.Servers) != 1 {
+		t.Fatalf("discovery claimed recovery or lost reason: %+v", status)
+	}
+	try, generation, _ := r.beginShadowAttempt()
+	if !try || generation == oldGeneration {
+		t.Fatal("new DNS addresses did not allow a fresh attempt")
+	}
+	r.finishShadowAttempt(oldGeneration, nil, errors.New("late old failure"), false)
+	if r.ShadowStatus().Error != "provider timeout" {
+		t.Fatal("old attempt overwrote renewal state")
+	}
+	r.finishShadowAttempt(generation, status.Servers, nil, false)
+	if status = r.ShadowStatus(); status.FallbackActive || status.Error != "" || status.NextProbeAt != "" {
+		t.Fatalf("successful DNS answer did not restore provider: %+v", status)
+	}
+}

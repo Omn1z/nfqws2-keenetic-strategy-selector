@@ -55,8 +55,8 @@ test("Shadow editor bounds rendered rule controls and distinguishes pending disc
   assert.equal((pending.match(/role="switch"/g) ?? []).length, 1);
   assert.equal(pending.includes("адреса вручную"), false);
   assert.ok(pending.includes("при первом запросе"));
-  assert.ok(pending.includes("приоритет над группами DoH"));
-  assert.ok(pending.includes("автоматического перехода к DoH или VPN нет"));
+  assert.ok(pending.includes("DNS провайдера имеет приоритет"));
+  assert.ok(pending.includes("Если он недоступен, используются обычные DNS-маршруты сервера"));
   const failed = renderToStaticMarkup(createElement(ShadowDns, { value: shadowForm(), status: { enabled: true, automatic: true, servers: [], error: "DNS провайдера не найден" }, onChange: () => {} }));
   assert.ok(failed.includes("DNS провайдера не найден"));
   assert.equal(failed.includes("при первом запросе"), false);

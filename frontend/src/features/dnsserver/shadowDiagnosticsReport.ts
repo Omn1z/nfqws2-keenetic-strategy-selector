@@ -28,7 +28,10 @@ export function shadowDiagnosticsReport(status: DnsShadowStatus): string {
     format: "nfqws2-strategy-shadow-diagnostics",
     version: 1,
     captured_at: trace.captured_at,
-    shadow_dns: { enabled: status.enabled, automatic: status.automatic, servers: status.servers, error: status.error },
+    shadow_dns: {
+      enabled: status.enabled, automatic: status.automatic, servers: status.servers, error: status.error,
+      fallback_active: status.fallback_active, next_probe_at: status.next_probe_at,
+    },
     diagnostics: {
       version: trace.version, enabled: trace.enabled, app_version: trace.app_version, platform: trace.platform,
       captured_at: trace.captured_at, in_progress: trace.in_progress,

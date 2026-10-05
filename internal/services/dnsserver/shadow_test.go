@@ -225,7 +225,7 @@ func TestShadowResolverTruncatedUDPUsesTCPAndServerFailover(t *testing.T) {
 	}
 }
 
-func TestShadowResolverFailureNeverFallsBackToDoH(t *testing.T) {
+func TestShadowResolverReportsProviderAndConfiguredFailures(t *testing.T) {
 	for _, mode := range []string{"unavailable", "discovery", "unsupported"} {
 		t.Run(mode, func(t *testing.T) {
 			cfg := Default()
@@ -241,8 +241,11 @@ func TestShadowResolverFailureNeverFallsBackToDoH(t *testing.T) {
 			r := NewResolver(cfg, backend)
 			defer r.Close()
 			_, out, err := r.Resolve(context.Background(), resolverWire(t, "ozon.ru", 1, mdns.TypeA))
-			if err == nil || !strings.Contains(err.Error(), "Shadow DNS") || out.Route != shadowRoute || len(b.dialCalls()) != 0 || r.CacheStatus().Entries != 0 {
-				t.Fatalf("unexpected fallback: %+v %v", out, err)
+			if err == nil || !strings.Contains(err.Error(), "Shadow DNS") || !strings.Contains(err.Error(), "резерв DNS Server: DNS недоступен") || out.Error != err.Error() || r.CacheStatus().Entries != 0 {
+				t.Fatalf("missing failure details: %+v %v", out, err)
+			}
+			if s := r.ShadowStatus(); !s.FallbackActive || s.Error == "" || s.NextProbeAt == "" {
+				t.Fatalf("missing outage state: %+v", s)
 			}
 		})
 	}

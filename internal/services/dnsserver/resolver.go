@@ -102,6 +102,7 @@ type Resolver struct {
 	blocker         atomic.Pointer[Blocker]
 	shadow          *shadowMatcher
 	shadowStatus    ShadowDNSStatus
+	shadowFallback  shadowFallbackState // guarded by mu
 }
 
 func NewResolver(cfg Config, backend Backend) *Resolver {
@@ -150,8 +151,13 @@ func (r *Resolver) SetCancellationObserver(observer func(CancellationSummary)) {
 func (r *Resolver) SchedulerSnapshot(domain string) SchedulerSnapshot {
 	r.mu.Lock()
 	scheduler := r.scheduler
+	fallback := r.shadowStatus.FallbackActive
 	r.mu.Unlock()
-	return scheduler.Snapshot(r.policyConfig(), r.backend.Routes(), domain)
+	policy := r.policyConfig()
+	if fallback {
+		policy.ShadowDNS = nil
+	}
+	return scheduler.Snapshot(policy, r.backend.Routes(), domain)
 }
 
 func (r *Resolver) Close() {
@@ -268,8 +274,14 @@ func (r *Resolver) Resolve(ctx context.Context, raw []byte) ([]byte, Outcome, er
 // client IDs, question casing, filtering and routing observation stay outside.
 func (r *Resolver) resolveUncached(ctx context.Context, query *mdns.Msg, wire []byte, domain string) (*mdns.Msg, Outcome, error) {
 	if r.shadow.matches(domain) {
-		return r.resolveShadow(ctx, query, domain)
+		return r.resolveShadow(ctx, query, wire, domain)
 	}
+	return r.resolveConfigured(ctx, query, wire, domain)
+}
+
+// Shared by ordinary lookups and Shadow fallback: domain pools, VPN-only and
+// disabled methods must have exactly the same meaning in both paths.
+func (r *Resolver) resolveConfigured(ctx context.Context, query *mdns.Msg, wire []byte, domain string) (*mdns.Msg, Outcome, error) {
 	pool, _ := r.cfg.upstreamsFor(domain)
 	out := Outcome{Domain: domain, Upstream: pool[0].Address}
 	ctx, cancel := context.WithTimeout(ctx, 25*time.Second)

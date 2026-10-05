@@ -388,7 +388,7 @@ export interface DnsShadowDiagnostics {
   in_progress: boolean;
   attempts: DnsShadowDiagnosticAttempt[];
 }
-export interface DnsShadowStatus { enabled: boolean; automatic: boolean; servers: string[]; error?: string; diagnostics?: DnsShadowDiagnostics; renewal_available?: boolean }
+export interface DnsShadowStatus { enabled: boolean; automatic: boolean; servers: string[]; error?: string; diagnostics?: DnsShadowDiagnostics; renewal_available?: boolean; fallback_active?: boolean; next_probe_at?: string }
 export interface DnsShadowRenewResult {
   status: "resolved" | "waiting" | "no_dns" | "nak";
   interface: string;

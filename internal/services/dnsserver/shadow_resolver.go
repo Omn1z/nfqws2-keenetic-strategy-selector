@@ -12,8 +12,8 @@ import (
 	"nfqws2strategy/internal/services/dnsroute"
 )
 
-// Optional so existing backends cannot silently send selected domains over an
-// ordinary dialer/VPN when they do not implement the explicit direct path.
+// Provider DNS always uses the explicit WAN path; the configured DNS Server
+// routes are a separate fallback when this path is unavailable.
 type shadowBackend interface {
 	DialShadowDNS(context.Context, string, string) (net.Conn, error)
 	ShadowDNSServers(context.Context) ([]string, error)
@@ -24,6 +24,8 @@ type ShadowDNSStatus struct {
 	Automatic        bool                        `json:"automatic"`
 	Servers          []string                    `json:"servers"`
 	Error            string                      `json:"error"`
+	FallbackActive   bool                        `json:"fallback_active"`
+	NextProbeAt      string                      `json:"next_probe_at,omitempty"`
 	RenewalAvailable bool                        `json:"renewal_available,omitempty"`
 	Diagnostics      *dnsroute.ShadowDiagnostics `json:"diagnostics,omitempty"`
 }
@@ -44,37 +46,33 @@ func (r *Resolver) ShadowStatus() ShadowDNSStatus {
 	return s
 }
 
-func (r *Resolver) resolveShadow(ctx context.Context, query *mdns.Msg, domain string) (response *mdns.Msg, out Outcome, err error) {
+func (r *Resolver) queryShadow(ctx context.Context, query *mdns.Msg, domain string) (response *mdns.Msg, out Outcome, servers []string, err error) {
 	out = Outcome{Domain: domain, Route: shadowRoute}
 	ctx, cancel := context.WithTimeout(ctx, time.Duration(r.cfg.TimeoutSeconds)*time.Second)
 	defer cancel()
 	stopClose := context.AfterFunc(r.lifetime, cancel)
 	defer stopClose()
-	var servers []string
 	defer func() {
 		if err != nil {
 			out.Error = err.Error()
 		}
-		r.mu.Lock()
-		r.shadowStatus.Servers = append([]string{}, servers...)
-		r.shadowStatus.Error = out.Error
-		r.mu.Unlock()
 	}()
 	backend, ok := r.backend.(shadowBackend)
 	if !ok {
-		return nil, out, fmt.Errorf("Shadow DNS: прямой DNS не поддерживается на этой платформе")
+		return nil, out, servers, fmt.Errorf("Shadow DNS: прямой DNS не поддерживается на этой платформе")
 	}
 	servers, err = backend.ShadowDNSServers(ctx)
 	if err != nil {
-		return nil, out, fmt.Errorf("Shadow DNS: %w", err)
+		return nil, out, servers, fmt.Errorf("Shadow DNS: %w", err)
 	}
 	if len(servers) == 0 || len(servers) > 8 {
-		return nil, out, fmt.Errorf("Shadow DNS: DNS провайдера ещё не получен от WAN")
+		return nil, out, servers, fmt.Errorf("Shadow DNS: DNS провайдера ещё не получен от WAN")
 	}
+	servers = append([]string(nil), servers...)
 	for i, address := range servers {
 		servers[i], err = normalizeShadowServer(address)
 		if err != nil {
-			return nil, out, err
+			return nil, out, servers, err
 		}
 	}
 	// Cached discovery is serialized by the backend. A burst of callers
@@ -83,7 +81,7 @@ func (r *Resolver) resolveShadow(ctx context.Context, query *mdns.Msg, domain st
 	case r.attempts <- struct{}{}:
 		defer func() { <-r.attempts }()
 	case <-ctx.Done():
-		return nil, out, ctx.Err()
+		return nil, out, servers, ctx.Err()
 	}
 	r.mu.Lock()
 	observer := r.observer
@@ -92,7 +90,7 @@ func (r *Resolver) resolveShadow(ctx context.Context, query *mdns.Msg, domain st
 	failures := make([]string, 0, len(servers))
 	for i, address := range servers {
 		if ctx.Err() != nil {
-			return nil, out, ctx.Err()
+			return nil, out, servers, ctx.Err()
 		}
 		deadline, _ := ctx.Deadline()
 		attempt, stop := context.WithTimeout(ctx, time.Until(deadline)/time.Duration(len(servers)-i))
@@ -108,11 +106,11 @@ func (r *Resolver) resolveShadow(ctx context.Context, query *mdns.Msg, domain st
 			observer(event)
 		}
 		if err == nil {
-			return response, out, nil
+			return response, out, servers, nil
 		}
 		failures = append(failures, address+": "+err.Error())
 	}
-	return nil, out, fmt.Errorf("Shadow DNS недоступен: %s", strings.Join(failures, "; "))
+	return nil, out, servers, fmt.Errorf("Shadow DNS недоступен: %s", strings.Join(failures, "; "))
 }
 
 func exchangeShadowDNS(ctx context.Context, backend shadowBackend, address string, query *mdns.Msg) (*mdns.Msg, error) {
