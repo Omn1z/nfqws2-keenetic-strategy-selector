@@ -30,9 +30,9 @@ func TestWorkerForwardsPartialTransportPacketWithoutSplitting(t *testing.T) {
 	clientCrypto := buildContext(prekey, secret, relay)
 	done := make(chan bool, 1)
 	go func() {
-		done <- cfWorker(context.Background(), local, local, func() { _ = local.Close() },
-			relay, 2, false, dcDefaultIPs[2], reenc, stats,
-			fallbackConfig{cfproxyWorkerDomains: []string{"worker.example.com"}, workerPool: pool})
+		done <- attemptFallback(context.Background(), local, local, func() { _ = local.Close() },
+			relay, 2, false, true, reenc, stats,
+			fallbackConfig{cfproxyEnabled: true, cfproxyWorkerDomains: []string{"worker.example.com"}, workerPool: pool, h2Pool: &cfH2Pool{}}, nil, nil, protoIntAbridged)
 	}()
 	serverWS := &rawWebSocket{conn: telegram, r: bufio.NewReader(telegram)}
 	_, gotInit, _, err := serverWS.readFrame()

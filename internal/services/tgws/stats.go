@@ -11,6 +11,11 @@ type Stats struct {
 	connectionsTotal       atomic.Int64
 	connectionsActive      atomic.Int64
 	connectionsWS          atomic.Int64
+	connectionsH2          atomic.Int64
+	h2TCPConnections       atomic.Int64
+	h2Requests             atomic.Int64
+	h2Errors               atomic.Int64
+	h2Replays              atomic.Int64
 	connectionsTCPFallback atomic.Int64
 	connectionsCFProxy     atomic.Int64
 	connectionsFronting    atomic.Int64
@@ -43,6 +48,7 @@ type Snapshot struct {
 		Total       int64 `json:"total"`
 		Active      int64 `json:"active"`
 		WS          int64 `json:"ws"`
+		H2          int64 `json:"h2"`
 		TCPFallback int64 `json:"tcp_fallback"`
 		CFProxy     int64 `json:"cfproxy"`
 		Fronting    int64 `json:"fronting"`
@@ -62,6 +68,12 @@ type Snapshot struct {
 		CFPoolHits   int64 `json:"cf_pool_hits"`
 		CFPoolMisses int64 `json:"cf_pool_misses"`
 	} `json:"ws"`
+	H2 struct {
+		TCPConnections int64 `json:"tcp_connections"`
+		Requests       int64 `json:"requests"`
+		Errors         int64 `json:"errors"`
+		Replays        int64 `json:"replays"`
+	} `json:"h2"`
 	StartedAt int64 `json:"started_at"`
 }
 
@@ -70,6 +82,11 @@ func (s *Stats) snapshot() Snapshot {
 	out.Connections.Total = s.connectionsTotal.Load()
 	out.Connections.Active = s.connectionsActive.Load()
 	out.Connections.WS = s.connectionsWS.Load()
+	out.Connections.H2 = s.connectionsH2.Load()
+	out.H2.TCPConnections = s.h2TCPConnections.Load()
+	out.H2.Requests = s.h2Requests.Load()
+	out.H2.Errors = s.h2Errors.Load()
+	out.H2.Replays = s.h2Replays.Load()
 	out.Connections.TCPFallback = s.connectionsTCPFallback.Load()
 	out.Connections.CFProxy = s.connectionsCFProxy.Load()
 	out.Connections.Fronting = s.connectionsFronting.Load()
@@ -95,9 +112,10 @@ func (s *Stats) summary() string {
 	if pool > 0 {
 		poolS = fmt.Sprintf("%d/%d", s.poolHits.Load(), pool)
 	}
-	return fmt.Sprintf("total=%d active=%d ws=%d tcp_fb=%d cf=%d front=%d bad=%d masked=%d err=%d pool=%s cf_pool=%d/%d up=%s down=%s",
+	return fmt.Sprintf("total=%d active=%d ws=%d tcp_fb=%d cf=%d front=%d bad=%d masked=%d err=%d pool=%s cf_pool=%d/%d up=%s down=%s h2=%d h2_tcp=%d h2_req=%d h2_err=%d h2_replay=%d",
 		s.connectionsTotal.Load(), s.connectionsActive.Load(), s.connectionsWS.Load(),
 		s.connectionsTCPFallback.Load(), s.connectionsCFProxy.Load(), s.connectionsFronting.Load(), s.connectionsBad.Load(),
 		s.connectionsMasked.Load(), s.wsErrors.Load(), poolS, s.cfPoolHits.Load(), s.cfPoolHits.Load()+s.cfPoolMisses.Load(),
-		humanBytes(s.bytesUp.Load()), humanBytes(s.bytesDown.Load()))
+		humanBytes(s.bytesUp.Load()), humanBytes(s.bytesDown.Load()), s.connectionsH2.Load(),
+		s.h2TCPConnections.Load(), s.h2Requests.Load(), s.h2Errors.Load(), s.h2Replays.Load())
 }

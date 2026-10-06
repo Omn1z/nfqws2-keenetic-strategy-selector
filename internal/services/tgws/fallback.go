@@ -12,15 +12,17 @@ type fallbackConfig struct {
 	cfproxyEnabled       bool
 	cfproxyWorkerDomains []string
 	workerPool           *cfWorkerPool
+	tcpBackoff           *tcpFallbackBackoff
 	disableSecure        bool
+	h2Pool               *cfH2Pool
 }
 
-// attemptFallback tries each enabled fallback in order: CF worker, CF proxy
-// pool, then direct TCP to the DC default IP. Returns true if one took over
+// attemptFallback tries each enabled fallback in order: CF Worker, CF media
+// HTTP/2, CF WebSocket, then direct TCP to the DC default IP. Returns true if one took over
 // the connection.
 func attemptFallback(ctx context.Context, client io.Reader, clientWriter io.Writer, closeClient func(),
 	relayInit []byte, dc int, isTest, isMedia bool, reenc *reencryptionContext, stats *Stats,
-	cfg fallbackConfig, bal *domainBalancer, splitter *messageSplitter) bool {
+	cfg fallbackConfig, bal *domainBalancer, splitter *messageSplitter, protocols ...uint32) bool {
 
 	targetIP := fallbackIP(dc, isTest)
 
@@ -30,13 +32,29 @@ func attemptFallback(ctx context.Context, client io.Reader, clientWriter io.Writ
 		}
 	}
 	if cfg.cfproxyEnabled && !isTest {
+		if isMedia && !cfg.disableSecure && cfg.h2Pool != nil && len(protocols) > 0 {
+			channel, err := cfg.h2Pool.open(ctx, dc, "DC"+itoa(dc)+" media")
+			if ctx.Err() != nil {
+				if channel != nil {
+					channel.close()
+				}
+				return false
+			}
+			if err != nil {
+				log.Printf("tgws: DC%d HTTP/2 unavailable: %s", dc, censorDomains(err.Error()))
+			} else if channel != nil {
+				stats.connectionsH2.Add(1)
+				stats.connectionsCFProxy.Add(1)
+				bridgeH2(ctx, client, clientWriter, closeClient, channel, reenc, stats, protocols[0], "DC"+itoa(dc)+" CF H2")
+				return true
+			}
+		}
 		if cfProxy(ctx, client, clientWriter, closeClient, relayInit, dc, reenc, stats, bal, splitter, cfg.disableSecure) {
 			return true
 		}
 	}
 	if targetIP != "" {
-		log.Printf("tgws: DC%d -> TCP fallback %s:443", dc, targetIP)
-		if tcpFallback(ctx, client, clientWriter, closeClient, targetIP, relayInit, reenc, stats) {
+		if tcpFallback(ctx, client, clientWriter, closeClient, targetIP, relayInit, reenc, stats, cfg.tcpBackoff) {
 			return true
 		}
 	}
@@ -131,19 +149,20 @@ func cfProxy(ctx context.Context, client io.Reader, clientWriter io.Writer, clos
 }
 
 func tcpFallback(ctx context.Context, client io.Reader, clientWriter io.Writer, closeClient func(),
-	dst string, relayInit []byte, reenc *reencryptionContext, stats *Stats) bool {
+	dst string, relayInit []byte, reenc *reencryptionContext, stats *Stats, backoffs ...*tcpFallbackBackoff) bool {
 
-	dialer := &net.Dialer{Timeout: 10 * time.Second}
-	remote, err := dialer.DialContext(ctx, "tcp", net.JoinHostPort(dst, "443"))
+	var backoff *tcpFallbackBackoff
+	if len(backoffs) > 0 {
+		backoff = backoffs[0]
+	}
+	remote, err := prepareTCPFallback(ctx, net.JoinHostPort(dst, "443"), relayInit, backoff)
 	if err != nil {
-		log.Printf("tgws: TCP fallback %s:443 failed: %s", dst, censorDomains(err.Error()))
 		return false
 	}
+	defer remote.Close()
+	stopClose := context.AfterFunc(ctx, func() { _ = remote.Close() })
+	defer stopClose()
 	stats.connectionsTCPFallback.Add(1)
-	if _, err := remote.Write(relayInit); err != nil {
-		_ = remote.Close()
-		return false
-	}
 	bridgeTCP(client, clientWriter, remote, closeClient, reenc, stats)
 	return true
 }

@@ -143,6 +143,16 @@ func connectWSWithTLSConfig(ctx context.Context, host, domain string, timeout ti
 	}
 	stopClose := context.AfterFunc(ctx, func() { _ = raw.Close() })
 	defer stopClose()
+	adopted := false
+	defer func() {
+		if !adopted {
+			_ = raw.Close()
+		}
+	}()
+	deadline, _ := ctx.Deadline()
+	if err := raw.SetDeadline(deadline); err != nil {
+		return nil, err
+	}
 	applyConnOptions(raw, bufferSize)
 
 	var conn net.Conn = raw
@@ -157,8 +167,6 @@ func connectWSWithTLSConfig(ctx context.Context, host, domain string, timeout ti
 		}
 		tlsConfig.ServerName, tlsConfig.InsecureSkipVerify = sni, sni != domain
 		tconn := tls.Client(raw, tlsConfig)
-		deadline, _ := ctx.Deadline()
-		_ = tconn.SetDeadline(deadline)
 		if err := tconn.HandshakeContext(ctx); err != nil {
 			_ = raw.Close()
 			return nil, err
@@ -176,8 +184,11 @@ func connectWSWithTLSConfig(ctx context.Context, host, domain string, timeout ti
 		"Sec-WebSocket-Key: " + wsKey + "\r\n" +
 		"Sec-WebSocket-Version: 13\r\n" +
 		"Sec-WebSocket-Protocol: binary\r\n\r\n"
-	if _, err := conn.Write([]byte(req)); err != nil {
+	if n, err := conn.Write([]byte(req)); err != nil || n != len(req) {
 		_ = conn.Close()
+		if err == nil {
+			err = io.ErrShortWrite
+		}
 		return nil, err
 	}
 
@@ -188,9 +199,18 @@ func connectWSWithTLSConfig(ctx context.Context, host, domain string, timeout ti
 		return nil, err
 	}
 	if statusCode == 101 {
-		if useTLS {
-			_ = conn.SetDeadline(time.Time{}) // clear the handshake deadline
+		// Cancelled setup must not transfer a socket whose cancellation
+		// callback is already closing it to a bridge or the warm pool.
+		if !stopClose() {
+			return nil, ctx.Err()
 		}
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if err := conn.SetDeadline(time.Time{}); err != nil {
+			return nil, err
+		}
+		adopted = true
 		return &rawWebSocket{conn: conn, r: br, domain: domain, sni: sni, idleTimeout: wsIdleTimeout}, nil
 	}
 	_ = conn.Close()

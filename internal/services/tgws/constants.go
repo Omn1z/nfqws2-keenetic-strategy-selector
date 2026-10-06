@@ -13,8 +13,8 @@ package tgws
 // UpstreamVersion and UpstreamCommit identify the network implementation
 // synchronized into this Go/Keenetic port.
 const (
-	UpstreamVersion = "1.10.4"
-	UpstreamCommit  = "70b982da2ca75637b61f281170e4ed57df763db8"
+	UpstreamVersion = "1.11.1"
+	UpstreamCommit  = "18175fb4fe567cf6aef61f9d883eff010c9e66a8"
 )
 
 // --- MTProto obfuscation handshake ---------------------------------------

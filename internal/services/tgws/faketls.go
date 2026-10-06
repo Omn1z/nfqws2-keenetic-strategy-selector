@@ -210,8 +210,16 @@ func (s *fakeTLSStream) readRecordChunk() ([]byte, error) {
 }
 
 func (s *fakeTLSStream) Write(p []byte) (int, error) {
-	if _, err := s.w.Write(wrapTLSRecords(p)); err != nil {
-		return 0, err
+	framed := wrapTLSRecords(p)
+	for len(framed) > 0 {
+		n, err := s.w.Write(framed)
+		if err != nil {
+			return 0, err
+		}
+		if n <= 0 || n > len(framed) {
+			return 0, io.ErrShortWrite
+		}
+		framed = framed[n:]
 	}
 	return len(p), nil
 }

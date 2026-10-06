@@ -25,6 +25,7 @@ type Manager struct {
 	cancel     context.CancelFunc
 	pool       *wsPool
 	workerPool *cfWorkerPool
+	h2Pool     *cfH2Pool
 	conns      *connSet
 	wg         sync.WaitGroup
 
@@ -130,6 +131,10 @@ func (m *Manager) start() error {
 	pool := newWSPool(ctx, cfg.PoolSize, cfg.BufferSize, m.stats, cfg.SNIFronting)
 	secure := !cfg.DisableSecure
 	workerPool := newCFWorkerPool(ctx, cfg.PoolSize, cfg.BufferSize, m.stats, secure)
+	var h2Pool *cfH2Pool
+	if cfg.h2Enabled() {
+		h2Pool = newCFH2Pool(ctx, bal, m.stats)
+	}
 	settings := handlerSettings{
 		secret:        secret,
 		dcRedirects:   copyDC(cfg.DCRedirects),
@@ -137,7 +142,7 @@ func (m *Manager) start() error {
 		fakeTLSDomain: cfg.FakeTLSDomain,
 		proxyProtocol: cfg.ProxyProtocol,
 		forceTestDC:   cfg.ForceTestDC,
-		fallback:      fallbackConfig{cfproxyEnabled: cfg.CFProxy, cfproxyWorkerDomains: append([]string{}, cfg.CFProxyWorkerDomains...), workerPool: workerPool, disableSecure: cfg.DisableSecure},
+		fallback:      fallbackConfig{cfproxyEnabled: cfg.CFProxy, cfproxyWorkerDomains: append([]string{}, cfg.CFProxyWorkerDomains...), workerPool: workerPool, disableSecure: cfg.DisableSecure, h2Pool: h2Pool, tcpBackoff: newTCPFallbackBackoff()},
 		awgAvailable:  m.awgAvailable,
 	}
 	conns := newConnSet()
@@ -148,6 +153,9 @@ func (m *Manager) start() error {
 		cancel()
 		pool.reset()
 		workerPool.reset()
+		if h2Pool != nil {
+			h2Pool.close()
+		}
 		return fmt.Errorf("не удалось открыть порт %d: %w", cfg.Port, err)
 	}
 
@@ -156,14 +164,15 @@ func (m *Manager) start() error {
 	m.cancel = cancel
 	m.pool = pool
 	m.workerPool = workerPool
+	m.h2Pool = h2Pool
 	m.conns = conns
 	m.running = true
 	m.stats.startedAt.Store(time.Now().Unix())
 
 	m.wg.Add(1)
 	go m.acceptLoop(ln, handler, conns)
+	pool.warmup(settings.dcRedirects, cfg.ForceTestDC)
 	if !cfg.ForceTestDC {
-		pool.warmup(settings.dcRedirects)
 		cfTargets := make(map[int]string)
 		for dc, ip := range dcDefaultIPs {
 			if settings.dcRedirects[dc] == "" {
@@ -180,6 +189,9 @@ func (m *Manager) start() error {
 	log.Printf("tgws: upstream %s listening on :%d (fake-tls=%q, pool=%d)", UpstreamVersion, cfg.Port, censorDomains(cfg.FakeTLSDomain), cfg.PoolSize)
 	if cfg.DisableSecure {
 		log.Printf("tgws: CF proxy/Worker fallback uses plain WebSocket on port 80")
+	}
+	if h2Pool != nil {
+		log.Printf("tgws: HTTP/2 multiplexing enabled for CF media")
 	}
 	return nil
 }
@@ -247,7 +259,9 @@ func (m *Manager) stop() {
 	m.running = false
 	cancel, ln, pool, conns := m.cancel, m.ln, m.pool, m.conns
 	workerPool := m.workerPool
+	h2Pool := m.h2Pool
 	m.workerPool = nil
+	m.h2Pool = nil
 	m.cancel, m.ln, m.pool, m.conns = nil, nil, nil, nil
 	m.mu.Unlock()
 
@@ -265,6 +279,9 @@ func (m *Manager) stop() {
 	}
 	if workerPool != nil {
 		workerPool.reset()
+	}
+	if h2Pool != nil {
+		h2Pool.close()
 	}
 	m.wg.Wait()
 	log.Printf("tgws: stopped. stats: %s", m.stats.summary())

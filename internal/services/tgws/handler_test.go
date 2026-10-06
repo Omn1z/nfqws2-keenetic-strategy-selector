@@ -5,92 +5,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
-	"errors"
-	"fmt"
 	"io"
 	"net"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
-
-func TestDirectTimeoutSkipsOtherSNIAndCoolsSharedIP(t *testing.T) {
-	h := newClientHandler(context.Background(), handlerSettings{}, nil, &Stats{}, nil)
-	calls := 0
-	h.connect = func(_ context.Context, host, domain string, timeout time.Duration, path string, buffer int) (*rawWebSocket, error) {
-		calls++
-		return nil, fmt.Errorf("TLS handshake: %w", context.DeadlineExceeded)
-	}
-	if ws := h.connectDirect("2", "192.0.2.1", wsDomainsFor(2, false), wsPath, wsDefaultTimeout, "test"); ws != nil {
-		t.Fatal("timeout returned a connection")
-	}
-	if calls != 1 {
-		t.Fatalf("same timed-out IP dialed %d times; want one", calls)
-	}
-	if !h.cooldown.ipCoolingDown("192.0.2.1") || h.cooldown.ipCoolingDown("192.0.2.2") {
-		t.Fatal("IP cooldown must affect exactly the failed destination")
-	}
-	if h.cooldown.isBlacklisted("2") || h.cooldown.remainingCooldown("2") <= 0 {
-		t.Fatal("a timeout needs a temporary DC cooldown, not a redirect blacklist")
-	}
-}
-
-func TestDirectRedirectBlacklistRequiresEveryAlternativeToRedirect(t *testing.T) {
-	for _, tc := range []struct {
-		name        string
-		last        error
-		blacklisted bool
-	}{
-		{"all redirects", &wsHandshakeError{statusCode: 302}, true},
-		{"one network failure", errors.New("connection reset"), false},
-		{"redirect then timeout", context.DeadlineExceeded, false},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			h := newClientHandler(context.Background(), handlerSettings{}, nil, &Stats{}, nil)
-			calls := 0
-			h.connect = func(context.Context, string, string, time.Duration, string, int) (*rawWebSocket, error) {
-				calls++
-				if calls == 1 {
-					return nil, &wsHandshakeError{statusCode: 302}
-				}
-				return nil, tc.last
-			}
-			h.connectDirect("2tm", "192.0.2.1", wsDomainsFor(2, true), wsTestPath, wsDefaultTimeout, "test")
-			if calls != 2 || h.cooldown.isBlacklisted("2tm") != tc.blacklisted {
-				t.Fatalf("calls=%d blacklist=%t; want calls=2 blacklist=%t", calls, h.cooldown.isBlacklisted("2tm"), tc.blacklisted)
-			}
-			if h.cooldown.isBlacklisted("2") || h.cooldown.isBlacklisted("2m") {
-				t.Fatal("test/media DC state leaked into other DC variants")
-			}
-		})
-	}
-}
-
-func TestCanceledDialDoesNotPoisonCooldown(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	h := newClientHandler(ctx, handlerSettings{}, nil, &Stats{}, nil)
-	h.connect = func(context.Context, string, string, time.Duration, string, int) (*rawWebSocket, error) {
-		cancel()
-		return nil, context.Canceled
-	}
-	h.connectDirect("2", "192.0.2.1", wsDomainsFor(2, false), wsPath, wsDefaultTimeout, "test")
-	if h.cooldown.isBlacklisted("2") || h.cooldown.ipCoolingDown("192.0.2.1") || h.cooldown.remainingCooldown("2") > 0 {
-		t.Fatal("shutdown cancellation must not be remembered as upstream failure")
-	}
-}
-
-func TestSuccessfulPoolDestinationCanClearIPCooldown(t *testing.T) {
-	c := newCooldownTracker()
-	c.cooldownIP("192.0.2.1")
-	c.clearIP("192.0.2.1")
-	if c.ipCoolingDown("192.0.2.1") {
-		t.Fatal("a successful WS connection must clear the shared IP cooldown")
-	}
-	c.ipFailUntil["192.0.2.1"] = time.Now().Add(-time.Second)
-	if c.ipCoolingDown("192.0.2.1") {
-		t.Fatal("expired IP cooldown must allow retries")
-	}
-}
 
 func TestTestDCRoutingUsesSeparateEnvironment(t *testing.T) {
 	for _, tc := range []struct {
@@ -112,7 +33,7 @@ func TestTestDCRoutingUsesSeparateEnvironment(t *testing.T) {
 		}
 	}
 	if connectionDCKey(2, true, true) != "2tm" || connectionDCKey(2, false, true) != "2m" {
-		t.Fatal("production/test/media cooldown keys must be distinct")
+		t.Fatal("production/test/media connection keys must be distinct")
 	}
 }
 
@@ -124,14 +45,25 @@ func TestAuthenticatedTestDCUsesTestWebSocketPathAndNormalizedRelay(t *testing.T
 	defer remote.Close()
 	defer telegram.Close()
 	_ = telegram.SetDeadline(time.Now().Add(2 * time.Second))
-	h := newClientHandler(context.Background(), handlerSettings{
-		secret: bytes.Repeat([]byte{1}, 16), dcRedirects: map[int]string{2: "192.0.2.1"},
-	}, nil, &Stats{}, newDomainBalancer())
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	stats := &Stats{}
+	pool := newWSPool(ctx, 1, 4096, stats)
 	var gotPath, gotDomain string
-	h.connect = func(_ context.Context, _, domain string, _ time.Duration, path string, _ int) (*rawWebSocket, error) {
+	pool.dial = func(_ context.Context, _, domain string, _ time.Duration, path string, _ int, sni string) (*rawWebSocket, error) {
 		gotPath, gotDomain = path, domain
-		return &rawWebSocket{conn: remote, r: bufio.NewReader(remote)}, nil
+		return &rawWebSocket{conn: remote, r: bufio.NewReader(remote), domain: domain, sni: sni}, nil
 	}
+	key := poolKey{dc: 2, media: true, test: true, targetIP: "192.0.2.1"}
+	pool.scheduleRefill(key, key.targetIP, wsDomainsFor(2, true))
+	waitForPool(t, pool)
+	// Keep the fixture's single upstream socket dedicated to this client.
+	pool.mu.Lock()
+	pool.refillAfter[key] = time.Now().Add(time.Hour)
+	pool.mu.Unlock()
+	h := newClientHandler(ctx, handlerSettings{
+		secret: bytes.Repeat([]byte{1}, 16), dcRedirects: map[int]string{2: "192.0.2.1"},
+	}, pool, stats, newDomainBalancer())
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
@@ -159,6 +91,58 @@ func TestAuthenticatedTestDCUsesTestWebSocketPathAndNormalizedRelay(t *testing.T
 	}
 	if gotPath != wsTestPath || gotDomain != "kws2-1.web.telegram.org" {
 		t.Fatalf("test media target=%s%s", gotDomain, gotPath)
+	}
+	if stats.poolHits.Load() != 1 || stats.connectionsWS.Load() != 1 || stats.poolMisses.Load() != 0 {
+		t.Fatalf("test client did not use its warmed test/media bucket: %s", stats.summary())
+	}
+}
+
+func TestAuthenticatedPoolMissDoesNotWaitForForegroundDial(t *testing.T) {
+	for _, size := range []int{0, 1} {
+		t.Run(itoa(size), func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			stats := &Stats{}
+			pool := newWSPool(ctx, size, 4096, stats)
+			started := make(chan struct{}, 1)
+			var dials atomic.Int32
+			pool.dial = func(ctx context.Context, _, _ string, _ time.Duration, _ string, _ int, _ string) (*rawWebSocket, error) {
+				dials.Add(1)
+				started <- struct{}{}
+				<-ctx.Done()
+				return nil, ctx.Err()
+			}
+			// DC99 has no fallback endpoint, keeping this full handler test
+			// independent of real Telegram/public network availability.
+			secret := bytes.Repeat([]byte{1}, 16)
+			h := newClientHandler(ctx, handlerSettings{secret: secret, dcRedirects: map[int]string{99: "192.0.2.1"}}, pool, stats, newDomainBalancer())
+			client, local := net.Pipe()
+			defer client.Close()
+			defer local.Close()
+			_ = client.SetDeadline(time.Now().Add(time.Second))
+			done := make(chan struct{})
+			go func() { defer close(done); h.handle(local) }()
+			if _, err := client.Write(makeClientInit(secret, protoTagIntermediate, 99)); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case <-done:
+			case <-time.After(300 * time.Millisecond):
+				t.Fatal("handler waited for a foreground direct WS dial on pool miss")
+			}
+			if size > 0 {
+				select {
+				case <-started:
+				case <-time.After(time.Second):
+					t.Fatal("pool miss did not schedule a background refill")
+				}
+			}
+			cancel()
+			waitForPool(t, pool)
+			if dials.Load() != int32(size) || stats.connectionsWS.Load() != 0 || stats.connectionsActive.Load() != 0 {
+				t.Fatalf("size=%d dials=%d stats=%s", size, dials.Load(), stats.summary())
+			}
+		})
 	}
 }
 

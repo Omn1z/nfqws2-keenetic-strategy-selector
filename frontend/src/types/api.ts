@@ -261,9 +261,10 @@ export interface ARPSpoofView {
 }
 
 export interface TgwsSnapshot {
-  connections: { total: number; active: number; ws: number; tcp_fallback: number; cfproxy: number; fronting: number; bad: number; masked: number };
+  connections: { total: number; active: number; ws: number; h2?: number; tcp_fallback: number; cfproxy: number; fronting: number; bad: number; masked: number };
   traffic: { bytes_up: number; bytes_down: number; human_up: string; human_down: string };
   ws: { errors: number; pool_hits: number; pool_misses: number; cf_pool_hits: number; cf_pool_misses: number };
+  h2?: { tcp_connections: number; requests: number; errors: number; replays: number };
   started_at: number;
 }
 
@@ -279,6 +280,7 @@ export interface TgwsConfig {
   sni_fronting: boolean;
   disable_secure: boolean;
   cfproxy: boolean;
+  cfproxy_h2_media?: boolean;
   cfproxy_user_domain: string;
   cfproxy_worker_domain: string;
   cfproxy_user_domains: string[];

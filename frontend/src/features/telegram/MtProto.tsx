@@ -23,6 +23,7 @@ interface Form {
   pool_size: string;
   buffer_size: string;
   cfproxy: boolean;
+  cfproxy_h2_media: boolean;
   proxy_protocol: boolean;
   force_test_dc: boolean;
   sni_fronting: boolean;
@@ -46,17 +47,19 @@ const parseDC = (text: string): Record<string, string> => {
   }
   return out;
 };
-const toForm = (c: TgwsConfig): Form => ({
+export const toForm = (c: TgwsConfig): Form => ({
   port: String(c.port || 1433), secret: c.secret || "", dc: dcText(c.dc_redirects), fake_tls_domain: c.fake_tls_domain || "",
   link_host: c.link_host || "", pool_size: String(c.pool_size ?? 4), buffer_size: String(c.buffer_size || 262144),
   cfproxy: !!c.cfproxy, proxy_protocol: !!c.proxy_protocol, force_test_dc: !!c.force_test_dc, sni_fronting: !!c.sni_fronting, disable_secure: !!c.disable_secure,
+  cfproxy_h2_media: c.cfproxy_h2_media ?? true,
   cfproxy_user_domain: c.cfproxy_user_domains?.join("\n") ?? c.cfproxy_user_domain ?? "",
   cfproxy_worker_domain: c.cfproxy_worker_domains?.join("\n") ?? c.cfproxy_worker_domain ?? "",
 });
-const collect = (f: Form) => ({
+export const collect = (f: Form) => ({
   port: parseInt(f.port, 10) || 1433, secret: f.secret.trim(), dc_redirects: parseDC(f.dc), fake_tls_domain: f.fake_tls_domain.trim(),
   link_host: f.link_host.trim(), pool_size: parseInt(f.pool_size, 10) || 0, buffer_size: parseInt(f.buffer_size, 10) || 262144,
   cfproxy: f.cfproxy, proxy_protocol: f.proxy_protocol, force_test_dc: f.force_test_dc, sni_fronting: f.sni_fronting, disable_secure: f.disable_secure,
+  cfproxy_h2_media: f.cfproxy_h2_media,
   cfproxy_user_domains: f.cfproxy_user_domain.split(/[\s,;]+/).filter(Boolean),
   cfproxy_worker_domains: f.cfproxy_worker_domain.split(/[\s,;]+/).filter(Boolean),
 });
@@ -93,7 +96,7 @@ export default function MtProto() {
 
   return (
     <>
-      <Card title="Telegram MTProto → WebSocket прокси" sub={live.upstream_version ? `TG WS Proxy ${live.upstream_version}` : undefined} head={<Badge kind={live.running ? "ok" : "bad"}>{live.running ? "работает" : "остановлен"}</Badge>}>
+      <Card title="Telegram MTProto прокси" sub={live.upstream_version ? `TG WS Proxy ${live.upstream_version}` : undefined} head={<Badge kind={live.running ? "ok" : "bad"}>{live.running ? "работает" : "остановлен"}</Badge>}>
         <p className="mb-3 text-xs text-muted">Прокси для Telegram прямо на роутере: клиенты в LAN ходят через <code>&lt;роутер&gt;:порт</code>, трафик идёт к Telegram по WSS с запасными путями.</p>
         <div className="flex flex-wrap items-center gap-4">
           <ToggleField label="Прокси включён" checked={live.config.enabled} onChange={toggle} />
@@ -119,17 +122,19 @@ export default function MtProto() {
           <Field label="Хост для ссылки" hint="пусто = авто" className="min-w-[200px] flex-1"><Input value={form.link_host} placeholder="192.168.1.1" onChange={(e) => set("link_host", e.target.value)} /></Field>
         </div>
         <div className="flex flex-wrap gap-4">
-          <Field label="Размер пула WS" className="w-32 shrink-0"><Input type="number" min={0} max={16} value={form.pool_size} onChange={(e) => set("pool_size", e.target.value)} /></Field>
+          <Field label="Размер пула WS" hint="0 — без прямого WS, только резервные маршруты" className="w-40 shrink-0"><Input type="number" min={0} max={16} value={form.pool_size} onChange={(e) => set("pool_size", e.target.value)} /></Field>
           <Field label="Буфер сокета (байт)" className="w-40 shrink-0"><Input type="number" min={4096} step={4096} value={form.buffer_size} onChange={(e) => set("buffer_size", e.target.value)} /></Field>
         </div>
         <div className="flex flex-wrap items-end gap-6">
           <ToggleField label="CF fallback" checked={form.cfproxy} onChange={(v) => set("cfproxy", v)} />
+          <ToggleField label="HTTP/2 для медиа через CF" checked={form.cfproxy_h2_media} onChange={(v) => set("cfproxy_h2_media", v)} />
           <ToggleField label="PROXY protocol" checked={form.proxy_protocol} onChange={(v) => set("proxy_protocol", v)} />
           <ToggleField label="Резервный SNI" checked={form.sni_fronting} onChange={(v) => set("sni_fronting", v)} />
           <ToggleField label="CF без TLS (порт 80)" checked={form.disable_secure} onChange={(v) => set("disable_secure", v)} />
           <ToggleField label="Тестовые DC Telegram" checked={form.force_test_dc} onChange={(v) => set("force_test_dc", v)} />
         </div>
         <p className="text-xs text-muted">Тестовые DC нужны для тестовой среды Telegram. Для обычного аккаунта оставьте этот переключатель выключенным.</p>
+        <p className="text-xs text-muted">HTTP/2 передаёт несколько загрузок медиа через общее соединение CF Proxy. Используется при отсутствии готового прямого WS и после CF Worker. Требует включённого CF fallback и TLS; для тестовых DC не применяется.</p>
         <p className="text-xs text-muted">Резервный SNI помогает при блокировке обычного TLS к Telegram. Включайте его при необходимости: некоторые фронты принимают подключение, но не передают трафик.</p>
         <div className="flex flex-wrap gap-4">
           <Field label="Свои CF-домены" hint="По одному на строку или через запятую. Пусто — встроенный пул с автоматическим обновлением." className="min-w-[200px] flex-1"><Textarea rows={3} value={form.cfproxy_user_domain} onChange={(e) => set("cfproxy_user_domain", e.target.value)} /></Field>
@@ -144,6 +149,8 @@ export default function MtProto() {
             <StatRow l="Соединения" v={cc.total} />
             <StatRow l="Активные" v={cc.active} />
             <StatRow l="WS / TCP-fallback / CF" v={`${cc.ws} / ${cc.tcp_fallback} / ${cc.cfproxy}`} />
+            <StatRow l="Медиа через HTTP/2 · TCP-соединения" v={`${cc.h2 ?? 0} · ${live.stats.h2?.tcp_connections ?? 0}`} />
+            <StatRow l="HTTP/2 запросы / повторы / ошибки" v={`${live.stats.h2?.requests ?? 0} / ${live.stats.h2?.replays ?? 0} / ${live.stats.h2?.errors ?? 0}`} />
             <StatRow l="Отклонено (плохой секрет) / маскировка" v={`${cc.bad} / ${cc.masked}`} />
             <StatRow l="Трафик ↑ / ↓" v={`${t.human_up || "0.0B"} / ${t.human_down || "0.0B"}`} />
             <StatRow l="Пул (попаданий/всего) · ошибки WS" v={`${w.pool_hits}/${w.pool_hits + w.pool_misses} · ${w.errors}`} />

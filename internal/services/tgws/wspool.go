@@ -2,14 +2,11 @@ package tgws
 
 import (
 	"context"
-	"errors"
 	"log"
 	"math/rand"
-	"net"
 	"net/url"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 )
 
@@ -24,12 +21,13 @@ func wsDomainsFor(dc int, isMedia bool) []string {
 	if isMedia {
 		return []string{a, b}
 	}
-	return []string{b, a}
+	return []string{b}
 }
 
 type poolKey struct {
 	dc       int
 	media    bool
+	test     bool
 	targetIP string
 }
 
@@ -39,7 +37,7 @@ type pooledWS struct {
 }
 
 // wsPool is an idle-keep-alive pool of warm WS connections with background
-// refill, keyed by (DC, is_media).
+// refill, keyed by DC, media/test mode and destination.
 type wsPool struct {
 	ctx    context.Context
 	target int
@@ -48,6 +46,8 @@ type wsPool struct {
 
 	mu               sync.Mutex
 	idle             map[poolKey][]pooledWS
+	checking         map[*rawWebSocket]chan struct{}
+	wake             chan struct{}
 	refilling        map[poolKey]uint64
 	domains          map[poolKey][]string
 	failures         map[poolKey]int
@@ -83,6 +83,8 @@ func newWSPool(ctx context.Context, target, buffer int, stats *Stats, fronting .
 		buffer:      buffer,
 		stats:       stats,
 		idle:        map[poolKey][]pooledWS{},
+		checking:    map[*rawWebSocket]chan struct{}{},
+		wake:        make(chan struct{}, 1),
 		refilling:   map[poolKey]uint64{},
 		domains:     map[poolKey][]string{},
 		failures:    map[poolKey]int{},
@@ -101,43 +103,66 @@ func newWSPool(ctx context.Context, target, buffer int, stats *Stats, fronting .
 	return p
 }
 
-// acquire returns a warm connection if one is available, else nil (the caller
-// should connect fresh). Either way it kicks off a background refill.
-func (p *wsPool) acquire(dc int, isMedia bool, targetIP string, domains []string) *rawWebSocket {
-	key := poolKey{dc, isMedia, targetIP}
-	now := time.Now()
-
-	p.mu.Lock()
-	bucket := p.idle[key]
-	for len(bucket) > 0 {
-		head := bucket[0]
-		bucket = bucket[1:]
-		if now.Sub(head.created) >= poolMaxAge || !head.ws.idleHealthy() {
-			go func(ws *rawWebSocket) { _ = ws.close() }(head.ws)
-			continue
-		}
-		p.idle[key] = bucket
-		p.mu.Unlock()
-		p.stats.poolHits.Add(1)
-		p.reportSuccess(dc, isMedia)
-		p.scheduleRefill(key, targetIP, domains)
-		return head.ws
+// acquire never performs a foreground dial. A miss starts a background refill
+// while the caller proceeds to its other transports.
+func (p *wsPool) acquire(dc int, isMedia bool, targetIP string, domains []string, isTest ...bool) *rawWebSocket {
+	if p.target == 0 || targetIP == "" || p.ctx.Err() != nil {
+		return nil
 	}
-	p.idle[key] = bucket
-	p.mu.Unlock()
-
-	p.stats.poolMisses.Add(1)
-	p.scheduleRefill(key, targetIP, domains)
-	return nil
+	key := poolKey{dc: dc, media: isMedia, test: len(isTest) > 0 && isTest[0], targetIP: targetIP}
+	for {
+		now := time.Now()
+		p.mu.Lock()
+		bucket := p.idle[key]
+		var kept []pooledWS
+		var waiting chan struct{}
+		for len(bucket) > 0 {
+			head := bucket[0]
+			bucket = bucket[1:]
+			if done := p.checking[head.ws]; done != nil {
+				kept = append(kept, head)
+				waiting = done
+				continue
+			}
+			if now.Sub(head.created) >= poolMaxAge || !head.ws.idleHealthy() {
+				go func(ws *rawWebSocket) { _ = ws.close() }(head.ws)
+				continue
+			}
+			if len(kept) == 0 {
+				p.idle[key] = bucket
+			} else {
+				p.idle[key] = append(kept, bucket...)
+			}
+			p.mu.Unlock()
+			p.stats.poolHits.Add(1)
+			p.scheduleRefill(key, targetIP, domains)
+			return head.ws
+		}
+		p.idle[key] = kept
+		p.mu.Unlock()
+		if waiting != nil {
+			// A background probe owns this idle socket for at most its short
+			// read deadline. Do not hand it to a bridge while that read runs.
+			select {
+			case <-waiting:
+				continue
+			case <-p.ctx.Done():
+				return nil
+			}
+		}
+		p.stats.poolMisses.Add(1)
+		p.scheduleRefill(key, targetIP, domains)
+		return nil
+	}
 }
 
-func (p *wsPool) warmup(dcToIP map[int]string) {
+func (p *wsPool) warmup(dcToIP map[int]string, isTest ...bool) {
 	for dc, ip := range dcToIP {
 		if ip == "" {
 			continue
 		}
 		for _, media := range []bool{false, true} {
-			p.scheduleRefill(poolKey{dc, media, ip}, ip, wsDomainsFor(dc, media))
+			p.scheduleRefill(poolKey{dc: dc, media: media, test: len(isTest) > 0 && isTest[0], targetIP: ip}, ip, wsDomainsFor(dc, media))
 		}
 	}
 }
@@ -151,23 +176,16 @@ func (p *wsPool) reset() {
 		}
 	}
 	p.idle = map[poolKey][]pooledWS{}
+	for _, done := range p.checking {
+		close(done)
+	}
+	p.checking = map[*rawWebSocket]chan struct{}{}
 	p.generation++
 	p.refilling = map[poolKey]uint64{}
 	p.domains = map[poolKey][]string{}
 	p.failures = map[poolKey]int{}
 	p.refillAfter = map[poolKey]time.Time{}
 	p.tryFrontingFirst.Store(false)
-}
-
-func (p *wsPool) reportSuccess(dc int, isMedia bool) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	for key := range p.failures {
-		if key.dc == dc && key.media == isMedia {
-			delete(p.failures, key)
-			delete(p.refillAfter, key)
-		}
-	}
 }
 
 func (p *wsPool) scheduleRefill(key poolKey, targetIP string, domains []string) {
@@ -195,6 +213,7 @@ func (p *wsPool) refill(key poolKey, targetIP string, domains []string, generati
 			delete(p.refilling, key)
 		}
 		p.mu.Unlock()
+		p.wakeMaintenance()
 	}()
 	if p.ctx.Err() != nil {
 		return
@@ -210,46 +229,52 @@ func (p *wsPool) refill(key poolKey, targetIP string, domains []string, generati
 		return
 	}
 
-	var wg sync.WaitGroup
-	results := make([]*rawWebSocket, needed)
-	failures := make([]error, needed)
-	for i := 0; i < needed; i++ {
-		wg.Add(1)
-		go func(idx int) {
-			defer wg.Done()
-			results[idx], failures[idx] = p.connectOneResult(targetIP, domains)
-		}(i)
+	path := wsPath
+	if key.test {
+		path = wsTestPath
 	}
-	wg.Wait()
-
+	type result struct {
+		ws  *rawWebSocket
+		err error
+	}
+	results := make(chan result, needed)
+	for i := 0; i < needed; i++ {
+		go func() {
+			ws, err := p.connectOneResult(targetIP, domains, path)
+			results <- result{ws, err}
+		}()
+	}
+	connected := 0
+	queueOnly := true
+	for i := 0; i < needed; i++ {
+		item := <-results
+		if !isWSHandshakeQueueError(item.err) {
+			queueOnly = false
+		}
+		if item.ws == nil {
+			continue
+		}
+		p.mu.Lock()
+		valid := p.ctx.Err() == nil && p.generation == generation
+		if valid {
+			// A slow sibling dial must not withhold an already warm socket.
+			p.idle[key] = append(p.idle[key], pooledWS{ws: item.ws, created: time.Now()})
+			connected++
+		}
+		p.mu.Unlock()
+		if !valid {
+			_ = item.ws.close()
+		}
+	}
 	p.mu.Lock()
 	if p.ctx.Err() != nil || p.generation != generation {
 		p.mu.Unlock()
-		for _, ws := range results {
-			if ws != nil {
-				_ = ws.close()
-			}
-		}
 		return
-	}
-	connected := 0
-	for _, ws := range results {
-		if ws != nil {
-			p.idle[key] = append(p.idle[key], pooledWS{ws: ws, created: time.Now()})
-			connected++
-		}
 	}
 	if connected > 0 {
 		delete(p.failures, key)
 		delete(p.refillAfter, key)
 	} else {
-		queueOnly := true
-		for _, err := range failures {
-			if !isWSHandshakeQueueError(err) {
-				queueOnly = false
-				break
-			}
-		}
 		delay := time.Second
 		if !queueOnly {
 			p.failures[key]++
@@ -283,42 +308,112 @@ func poolRefillBackoff(failures int) time.Duration {
 // Keep ready sockets fresh even when no clients consume them. Failed and
 // partially successful refills are retried with a bounded backoff.
 func (p *wsPool) maintain() {
-	ticker := time.NewTicker(poolCheckInterval)
-	defer ticker.Stop()
+	timer := time.NewTimer(poolCheckInterval)
+	defer timer.Stop()
 	for {
 		select {
 		case <-p.ctx.Done():
 			p.reset()
 			return
-		case now := <-ticker.C:
+		case now := <-timer.C:
 			p.rotate(now)
+		case <-p.wake:
+		}
+		timer.Reset(p.maintenanceDelay(time.Now()))
+	}
+}
+
+func (p *wsPool) wakeMaintenance() {
+	select {
+	case p.wake <- struct{}{}:
+	default:
+	}
+}
+
+func (p *wsPool) maintenanceDelay(now time.Time) time.Duration {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	delay := poolCheckInterval
+	for key := range p.domains {
+		for _, item := range p.idle[key] {
+			delay = min(delay, max(time.Millisecond, item.created.Add(poolMaxAge).Sub(now)))
+		}
+		if _, running := p.refilling[key]; !running && len(p.idle[key]) < p.target {
+			if after := p.refillAfter[key]; !after.IsZero() {
+				delay = min(delay, max(time.Millisecond, after.Sub(now)))
+			}
 		}
 	}
+	return delay
 }
 
 func (p *wsPool) rotate(now time.Time) {
 	p.mu.Lock()
-	targets := make(map[poolKey][]string, len(p.domains))
-	var expired []*rawWebSocket
-	for key, domains := range p.domains {
-		bucket := p.idle[key]
-		ready := bucket[:0]
-		for _, item := range bucket {
-			if now.Sub(item.created) >= poolMaxAge || item.ws.isClosed() {
-				expired = append(expired, item.ws)
-			} else {
-				ready = append(ready, item)
+	generation := p.generation
+	type candidate struct {
+		key  poolKey
+		item pooledWS
+	}
+	var candidates []candidate
+	for key := range p.domains {
+		for _, item := range p.idle[key] {
+			candidates = append(candidates, candidate{key, item})
+		}
+	}
+	p.mu.Unlock()
+	for _, candidate := range candidates {
+		p.mu.Lock()
+		if p.generation != generation || p.ctx.Err() != nil {
+			p.mu.Unlock()
+			return
+		}
+		present := false
+		for _, item := range p.idle[candidate.key] {
+			if item.ws == candidate.item.ws {
+				present = true
+				break
 			}
 		}
-		p.idle[key] = ready
-		if len(ready) < p.target {
+		if !present || p.checking[candidate.item.ws] != nil {
+			p.mu.Unlock()
+			continue
+		}
+		done := make(chan struct{})
+		p.checking[candidate.item.ws] = done
+		p.mu.Unlock()
+
+		// Probe one socket at a time outside the pool mutex. acquire either
+		// borrows another ready socket or waits only for this short probe.
+		healthy := now.Sub(candidate.item.created) < poolMaxAge && candidate.item.ws.idleHealthy()
+		p.mu.Lock()
+		if p.checking[candidate.item.ws] == done {
+			delete(p.checking, candidate.item.ws)
+			if !healthy {
+				bucket := p.idle[candidate.key]
+				for i, item := range bucket {
+					if item.ws == candidate.item.ws {
+						copy(bucket[i:], bucket[i+1:])
+						bucket[len(bucket)-1] = pooledWS{}
+						p.idle[candidate.key] = bucket[:len(bucket)-1]
+						break
+					}
+				}
+			}
+			close(done)
+		}
+		p.mu.Unlock()
+		if !healthy {
+			go candidate.item.ws.close()
+		}
+	}
+	p.mu.Lock()
+	targets := make(map[poolKey][]string, len(p.domains))
+	for key, domains := range p.domains {
+		if len(p.idle[key]) < p.target {
 			targets[key] = append([]string(nil), domains...)
 		}
 	}
 	p.mu.Unlock()
-	for _, ws := range expired {
-		go ws.close()
-	}
 	for key, domains := range targets {
 		p.scheduleRefill(key, key.targetIP, domains)
 	}
@@ -329,10 +424,10 @@ func (p *wsPool) connectOne(targetIP string, domains []string) *rawWebSocket {
 	return ws
 }
 
-func (p *wsPool) connectOneResult(targetIP string, domains []string) (*rawWebSocket, error) {
+func (p *wsPool) connectOneResult(targetIP string, domains []string, paths ...string) (*rawWebSocket, error) {
 	// Warm all configured DC/media buckets without starting their entire TLS
 	// burst at once on a router. A slot covers both ordinary and fronted
-	// attempts; foreground client dials do not enter this background queue.
+	// attempts; ordinary client sessions only consume ready sockets.
 	if p.ctx.Err() != nil {
 		return nil, p.ctx.Err()
 	}
@@ -347,11 +442,30 @@ func (p *wsPool) connectOneResult(targetIP string, domains []string) (*rawWebSoc
 		return nil, p.ctx.Err()
 	}
 	var lastFailure error
+	path := wsPath
+	if len(paths) > 0 {
+		path = paths[0]
+	}
 	for index, domain := range domains {
-		frontedFirst := p.frontingEnabled && p.tryFrontingFirst.Load()
-		if frontedFirst {
-			ws, err := p.connectFrontedResult(targetIP, domain)
-			if ws != nil {
+		modes := []bool{false}
+		if p.frontingEnabled {
+			frontedFirst := p.tryFrontingFirst.Load()
+			modes = []bool{frontedFirst, !frontedFirst}
+		}
+		for _, fronted := range modes {
+			if err := p.ctx.Err(); err != nil {
+				return nil, err
+			}
+			sni, timeout := domain, 8*time.Second
+			if fronted {
+				sni, timeout = frontingSNI, 7*time.Second
+			}
+			ws, err := p.dial(p.ctx, targetIP, domain, timeout, path, p.buffer, sni)
+			if err == nil && ws != nil {
+				p.tryFrontingFirst.Store(fronted)
+				if fronted {
+					p.stats.connectionsFronting.Add(1)
+				}
 				logAlternatePooledDomain(ws, index, targetIP, domains)
 				return ws, nil
 			}
@@ -361,35 +475,12 @@ func (p *wsPool) connectOneResult(targetIP string, domains []string) (*rawWebSoc
 				}
 				return nil, err
 			}
+			if p.ctx.Err() != nil {
+				return nil, p.ctx.Err()
+			}
+			p.stats.wsErrors.Add(1)
 			lastFailure = err
 		}
-		ws, err := p.dial(p.ctx, targetIP, domain, 8*time.Second, "/apiws", p.buffer, domain)
-		if err == nil {
-			p.tryFrontingFirst.Store(false)
-			logAlternatePooledDomain(ws, index, targetIP, domains)
-			return ws, nil
-		}
-		if isWSHandshakeQueueError(err) {
-			if lastFailure != nil {
-				return nil, lastFailure
-			}
-			return nil, err
-		}
-		lastFailure = err
-		if hs, ok := err.(*wsHandshakeError); ok && hs.isRedirect() {
-			continue
-		}
-		if p.frontingEnabled && !frontedFirst && shouldTryFronting(err) {
-			ws, _ := p.connectFrontedResult(targetIP, domain)
-			logAlternatePooledDomain(ws, index, targetIP, domains)
-			if ws != nil {
-				return ws, nil
-			}
-			// The ordinary attempt already failed over the network. Preserve
-			// that cause even if its fronted retry waits for local capacity.
-			return nil, err
-		}
-		return nil, err
 	}
 	return nil, lastFailure
 }
@@ -399,17 +490,6 @@ func logAlternatePooledDomain(ws *rawWebSocket, index int, targetIP string, doma
 		log.Printf("tgws: WS pool accepted alternate domain %s (preferred=%s, target=%s, sni=%s)",
 			domains[index], domains[0], targetIP, censorDomains(ws.sni))
 	}
-}
-
-func shouldTryFronting(err error) bool {
-	if isWSHandshakeQueueError(err) {
-		return false
-	}
-	var ne net.Error
-	// Match upstream's timeout/reset-only fallback. An EOF from the ordinary
-	// endpoint must not populate the pool with a fronted HTTP 101 connection
-	// that cannot actually carry this DC's MTProto stream.
-	return (errors.As(err, &ne) && ne.Timeout()) || errors.Is(err, syscall.ECONNRESET)
 }
 
 func (p *wsPool) connectFronted(targetIP, domain string) *rawWebSocket {

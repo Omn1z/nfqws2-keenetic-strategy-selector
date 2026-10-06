@@ -4,22 +4,17 @@ import (
 	"bufio"
 	"context"
 	"encoding/binary"
-	"errors"
 	"fmt"
 	"io"
 	"log"
 	"net"
 	"strings"
-	"sync"
 	"time"
 
 	"nfqws2strategy/internal/tools/tgfronts"
 )
 
 const (
-	ipFailCooldown     = time.Hour
-	dcFailCooldown     = 60 * time.Second
-	wsFastFailTimeout  = 2 * time.Second
 	wsDefaultTimeout   = 5 * time.Second
 	handshakeReadLimit = 10 * time.Second
 )
@@ -53,85 +48,16 @@ func (b *bufConn) Read(p []byte) (int, error)  { return b.r.Read(p) }
 func (b *bufConn) Write(p []byte) (int, error) { return b.c.Write(p) }
 func (b *bufConn) Close() error                { return b.c.Close() }
 
-type cooldownTracker struct {
-	mu          sync.Mutex
-	blacklist   map[string]bool
-	failUntil   map[string]time.Time
-	ipFailUntil map[string]time.Time
-}
-
-func newCooldownTracker() *cooldownTracker {
-	return &cooldownTracker{blacklist: map[string]bool{}, failUntil: map[string]time.Time{}, ipFailUntil: map[string]time.Time{}}
-}
-
-func (c *cooldownTracker) isBlacklisted(key string) bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.blacklist[key]
-}
-func (c *cooldownTracker) addBlacklist(key string) {
-	c.mu.Lock()
-	c.blacklist[key] = true
-	c.mu.Unlock()
-}
-func (c *cooldownTracker) remainingCooldown(key string) time.Duration {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if t, ok := c.failUntil[key]; ok {
-		if d := time.Until(t); d > 0 {
-			return d
-		}
-	}
-	return 0
-}
-func (c *cooldownTracker) cooldown(key string) {
-	c.mu.Lock()
-	c.failUntil[key] = time.Now().Add(dcFailCooldown)
-	c.mu.Unlock()
-}
-func (c *cooldownTracker) clear(key string) {
-	c.mu.Lock()
-	delete(c.failUntil, key)
-	c.mu.Unlock()
-}
-
-func (c *cooldownTracker) ipCoolingDown(ip string) bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	until := c.ipFailUntil[ip]
-	if time.Now().Before(until) {
-		return true
-	}
-	delete(c.ipFailUntil, ip)
-	return false
-}
-
-func (c *cooldownTracker) cooldownIP(ip string) {
-	c.mu.Lock()
-	c.ipFailUntil[ip] = time.Now().Add(ipFailCooldown)
-	c.mu.Unlock()
-}
-
-func (c *cooldownTracker) clearIP(ip string) {
-	c.mu.Lock()
-	delete(c.ipFailUntil, ip)
-	c.mu.Unlock()
-}
-
 type clientHandler struct {
 	ctx      context.Context
 	settings handlerSettings
 	pool     *wsPool
 	stats    *Stats
 	bal      *domainBalancer
-	cooldown *cooldownTracker
-	connect  func(context.Context, string, string, time.Duration, string, int) (*rawWebSocket, error)
 }
 
 func newClientHandler(ctx context.Context, s handlerSettings, pool *wsPool, stats *Stats, bal *domainBalancer) *clientHandler {
-	return &clientHandler{ctx: ctx, settings: s, pool: pool, stats: stats, bal: bal, cooldown: newCooldownTracker(), connect: func(ctx context.Context, host, domain string, timeout time.Duration, path string, bufferSize int) (*rawWebSocket, error) {
-		return connectWS(ctx, host, domain, timeout, path, bufferSize, true)
-	}}
+	return &clientHandler{ctx: ctx, settings: s, pool: pool, stats: stats, bal: bal}
 }
 
 func (h *clientHandler) handle(conn net.Conn) {
@@ -253,7 +179,7 @@ func (h *clientHandler) serveAuthenticated(parsed *clientHandshake, stream rwStr
 	reenc := buildContext(parsed.prekeyIV, h.settings.secret, relayInit)
 	fallback := func() {
 		splitter := newMessageSplitter(relayInit, protoInt)
-		if !attemptFallback(h.ctx, stream, stream, closeClient, relayInit, dc, isTest, isMedia, reenc, h.stats, h.settings.fallback, h.bal, splitter) {
+		if !attemptFallback(h.ctx, stream, stream, closeClient, relayInit, dc, isTest, isMedia, reenc, h.stats, h.settings.fallback, h.bal, splitter, protoInt) {
 			log.Printf("tgws: [%s] DC%d%s no fallback available", label, dc, mediaTag)
 		}
 	}
@@ -268,55 +194,25 @@ func (h *clientHandler) serveAuthenticated(parsed *clientHandshake, stream rwStr
 			log.Printf("tgws: [%s] DC%d%s -> AWG front %s", label, dc, mediaTag, front)
 		}
 	}
-	if !hasRoute || h.cooldown.isBlacklisted(dcKey) {
-		reason := "no DC route"
-		if hasRoute {
-			reason = "DC blacklisted"
-		}
-		log.Printf("tgws: [%s] DC%d%s %s -> fallback", label, dc, mediaTag, reason)
+	if !hasRoute {
+		log.Printf("tgws: [%s] DC%d%s no DC route -> fallback", label, dc, mediaTag)
 		fallback()
 		return
 	}
 
 	domains := wsDomainsFor(dc, isMedia)
-	path := wsPath
-	if isTest {
-		path = wsTestPath
-	}
 	var ws *rawWebSocket
-	if !isTest && h.pool != nil {
-		ws = h.pool.acquire(dc, isMedia, targetIP, domains)
+	if h.pool != nil {
+		ws = h.pool.acquire(dc, isMedia, targetIP, domains, isTest)
 	}
-	// A timeout means both SNI alternatives share an unreachable IP. Skip
-	// repeated foreground dials for an hour when CF can serve the connection,
-	// but let a successfully refilled pool override that negative cache.
-	hasCFFallback := (!isTest && h.settings.fallback.cfproxyEnabled) || len(h.settings.fallback.cfproxyWorkerDomains) > 0
-	if ws == nil && hasCFFallback && h.cooldown.ipCoolingDown(targetIP) {
-		log.Printf("tgws: [%s] DC%d%s IP %s on cooldown -> fallback", label, dc, mediaTag, targetIP)
-		fallback()
-		return
-	}
-	timeout := wsDefaultTimeout
-	if h.cooldown.remainingCooldown(dcKey) > 0 {
-		timeout = wsFastFailTimeout
-	}
-
-	if ws != nil {
-		log.Printf("tgws: [%s] DC%d%s -> pool hit via %s (host=%s, sni=%s)", label, dc, mediaTag, targetIP, censorDomains(ws.domain), censorDomains(ws.sni))
-	} else {
-		ws = h.connectDirect(dcKey, targetIP, domains, path, timeout, label)
-	}
-
 	if ws == nil {
+		// Only the bounded background pool establishes direct WS connections.
+		// A client must not wait for another foreground retry of an unavailable DC.
+		log.Printf("tgws: [%s] DC%d%s WS pool unavailable -> fallback", label, dc, mediaTag)
 		fallback()
 		return
 	}
-
-	h.cooldown.clear(dcKey)
-	h.cooldown.clearIP(targetIP)
-	if !isTest && h.pool != nil {
-		h.pool.reportSuccess(dc, isMedia)
-	}
+	log.Printf("tgws: [%s] DC%d%s -> pool hit via %s (host=%s, sni=%s)", label, dc, mediaTag, targetIP, censorDomains(ws.domain), censorDomains(ws.sni))
 	h.stats.connectionsWS.Add(1)
 	splitter := newMessageSplitter(relayInit, protoInt)
 	if err := ws.send(relayInit); err != nil {
@@ -342,53 +238,6 @@ func connectionDCKey(dc int, isTest, isMedia bool) string {
 		key += "m"
 	}
 	return key
-}
-
-func (h *clientHandler) connectDirect(dcKey, targetIP string, domains []string, path string, timeout time.Duration, label string) *rawWebSocket {
-	allRedirects := len(domains) > 0
-	for _, domain := range domains {
-		if h.ctx.Err() != nil {
-			return nil
-		}
-		log.Printf("tgws: [%s] DC%s -> wss://%s%s via %s", label, dcKey, domain, path, targetIP)
-		ws, err := h.connect(h.ctx, targetIP, domain, timeout, path, h.settings.bufferSize)
-		if err == nil {
-			return ws
-		}
-		if isWSHandshakeQueueError(err) {
-			// A busy local setup budget must not blacklist a healthy DC/IP or
-			// record it as an upstream WS failure. The next client can retry.
-			if !allRedirects {
-				// Preserve a real failure from an earlier SNI in this attempt.
-				h.cooldown.cooldown(dcKey)
-			}
-			return nil
-		}
-		h.stats.wsErrors.Add(1)
-		if h.ctx.Err() != nil {
-			return nil
-		}
-		var hs *wsHandshakeError
-		if errors.As(err, &hs) && hs.isRedirect() {
-			log.Printf("tgws: [%s] DC%s %d from %s -> %s", label, dcKey, hs.statusCode, domain, censorDomains(hs.location))
-			continue
-		}
-		allRedirects = false
-		var netErr net.Error
-		if errors.Is(err, context.DeadlineExceeded) || (errors.As(err, &netErr) && netErr.Timeout()) {
-			h.cooldown.cooldownIP(targetIP)
-			log.Printf("tgws: [%s] DC%s IP %s timed out; cooldown for %ds", label, dcKey, targetIP, int(ipFailCooldown.Seconds()))
-			break
-		}
-		log.Printf("tgws: [%s] DC%s WS connect failed: %s", label, dcKey, censorDomains(err.Error()))
-	}
-	if allRedirects {
-		h.cooldown.addBlacklist(dcKey)
-		log.Printf("tgws: [%s] DC%s blacklisted for WS (all redirects)", label, dcKey)
-	} else {
-		h.cooldown.cooldown(dcKey)
-	}
-	return nil
 }
 
 func consumeProxyProtocol(br *bufio.Reader) error {

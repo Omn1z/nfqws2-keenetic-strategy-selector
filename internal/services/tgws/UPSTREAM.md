@@ -1,8 +1,8 @@
 # TG WS Proxy upstream
 
 The in-process Go MTProto proxy is synchronized with
-[Flowseal/tg-ws-proxy v1.10.4](https://github.com/Flowseal/tg-ws-proxy/tree/v1.10.4),
-commit `70b982da2ca75637b61f281170e4ed57df763db8` (2026-09-21).
+[Flowseal/tg-ws-proxy v1.11.1](https://github.com/Flowseal/tg-ws-proxy/tree/v1.11.1),
+commit `18175fb4fe567cf6aef61f9d883eff010c9e66a8` (2026-10-06).
 
 The upstream network implementation is ported into Go, rather than launched as
 a separate Python process. Its MIT license is included in `LICENSE.upstream`.
@@ -13,7 +13,18 @@ Synchronized behavior:
 - WebSocket fragmentation, frame/message limits, batched writes and ping/pong.
 - Expiring connection pools, bounded retry backoff, SNI fronting and a separate
   CF Worker pool with domain failover.
-- Per-IP timeout cooldown, per-DC retry cooldown and redirect fallback.
+- Native WebSocket routing uses ready pooled sockets only. Empty pools refill
+  in the background while the current client uses fallback routes. Pool size
+  zero disables native WS; test and production DC pools remain separate.
+- TCP fallback has per-endpoint exponential backoff from 30 seconds to one hour
+  and one concurrent recovery probe. Successful setup resets the delay; caller
+  cancellation does not classify the endpoint as unavailable.
+- CF HTTP/2 media multiplexing after the Worker route and before CF WebSocket.
+  Ordinary sessions, test DCs, plain-WS mode and SOCKS5 retain their WS/TCP paths.
+  MTProto packet framing, bounded replay and independent response delivery let
+  multiple media streams share a TLS connection without waiting for each other.
+- HTTP 404 and other MTProto transport errors reach the affected native client
+  without disabling the CF origin or unrelated channels.
 - Multiple CF proxy/Worker domains, updated bundled domains and hourly refresh
   of the upstream domain list. Invalid responses preserve the current pool.
 - Verified TLS for ordinary CF/Telegram endpoints and an opt-in plain HTTP
@@ -26,9 +37,14 @@ Keenetic adaptations retained: LAN listener and port defaults, disabled service
 on first install, existing secrets/links, JSON persistence and web controls,
 shared AWG fallback routes, and the SOCKS5 frontend using the shared WS transport.
 The host starts the proxies after route/firewall initialization. All native,
-CF and Worker WebSocket setups share a limit of four simultaneous attempts;
+CF and Worker WebSocket setups and HTTP/2 TLS handshakes share a limit of four simultaneous attempts;
 established streams release their slot. Waiting is bounded and does not mark an
 endpoint as unreachable. Pool capacity remains configurable independently.
+CF HTTP/2 uses the Go HTTP/2 transport without a separate runtime dependency.
+Request, response and replay buffers are bounded per channel and origin, and
+replay pauses when native writes are backpressured. The `cfproxy_h2_media`
+switch defaults to true, including saved configurations predating the field;
+explicitly disabling it preserves the previous CF WebSocket path.
 Bounded TLS session caches reduce repeated key exchanges during pool rotation;
 verified and opt-in domain-fronted connections use separate caches. Native trust
 is supplemented with Entware's CA files once, preserving explicit SSL_CERT_FILE

@@ -3,6 +3,7 @@ package tgws
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"net"
 	"strings"
@@ -29,6 +30,7 @@ type Config struct {
 	DisableSecure bool `json:"disable_secure"`
 
 	CFProxy              bool     `json:"cfproxy"`
+	CFProxyH2Media       bool     `json:"cfproxy_h2_media"`
 	CFProxyUserDomain    string   `json:"cfproxy_user_domain"`
 	CFProxyWorkerDomain  string   `json:"cfproxy_worker_domain"`
 	CFProxyUserDomains   []string `json:"cfproxy_user_domains"`
@@ -45,13 +47,31 @@ type Config struct {
 // so installing an update never opens a new listening port unexpectedly.
 func Default() *Config {
 	return &Config{
-		Enabled:     false,
-		Port:        1433,
-		DCRedirects: map[int]string{2: "149.154.167.220", 4: "149.154.167.220"},
-		BufferSize:  256 * 1024,
-		PoolSize:    4,
-		CFProxy:     true,
+		Enabled:        false,
+		Port:           1433,
+		DCRedirects:    map[int]string{2: "149.154.167.220", 4: "149.154.167.220"},
+		BufferSize:     256 * 1024,
+		PoolSize:       4,
+		CFProxy:        true,
+		CFProxyH2Media: true,
 	}
+}
+
+// Missing fields in existing installations adopt upstream's enabled default;
+// an explicitly saved false remains false, including through API round trips.
+func (c *Config) UnmarshalJSON(data []byte) error {
+	type plain Config
+	value := plain(*c)
+	value.CFProxyH2Media = true
+	if err := json.Unmarshal(data, &value); err != nil {
+		return err
+	}
+	*c = Config(value)
+	return nil
+}
+
+func (c *Config) h2Enabled() bool {
+	return c.CFProxyH2Media && c.CFProxy && !c.DisableSecure && !c.ForceTestDC
 }
 
 // EnsureSecret generates a random 16-byte (32 hex) secret if none is set.

@@ -14,6 +14,32 @@ import (
 	"time"
 )
 
+type shortTLSWriter struct {
+	net.Conn
+	data  bytes.Buffer
+	limit int
+}
+
+func (w *shortTLSWriter) Write(p []byte) (int, error) {
+	return w.data.Write(p[:min(len(p), w.limit)])
+}
+
+func TestFakeTLSWriteCompletesShortWritesAndRejectsZeroProgress(t *testing.T) {
+	payload := bytes.Repeat([]byte{0x42}, tlsAppDataMax+123)
+	writer := &shortTLSWriter{limit: 7}
+	stream := &fakeTLSStream{w: writer}
+	if n, err := stream.Write(payload); err != nil || n != len(payload) {
+		t.Fatalf("write=%d, %v", n, err)
+	}
+	if !bytes.Equal(writer.data.Bytes(), wrapTLSRecords(payload)) {
+		t.Fatal("short write truncated Fake TLS records")
+	}
+	writer.limit = 0
+	if _, err := stream.Write(payload); err != io.ErrShortWrite {
+		t.Fatalf("zero write did not terminate: %v", err)
+	}
+}
+
 func TestFakeTLSRejectsUnauthenticatedHellos(t *testing.T) {
 	secret := []byte("0123456789abcdef")
 	now := uint32(time.Now().Unix())

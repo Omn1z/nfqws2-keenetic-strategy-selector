@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"context"
 	"errors"
-	"fmt"
 	"io"
 	"net"
 	"net/url"
@@ -51,7 +50,7 @@ func TestWSPoolRotationRefillsPartialAndExpiresOldConnections(t *testing.T) {
 		return ws, nil
 	}
 	key := poolKey{dc: 2, targetIP: "149.154.167.220"}
-	ready, _ := newMemoryWS(nil)
+	ready, _ := newMemoryWS(serverFrame(wsOpPing, nil, true))
 	old, oldConn := newMemoryWS(nil)
 	p.mu.Lock()
 	p.idle[key] = []pooledWS{{ws: ready, created: time.Now()}, {ws: old, created: time.Now().Add(-poolMaxAge)}}
@@ -163,6 +162,7 @@ func TestWSPoolCancellationStopsQueuedDials(t *testing.T) {
 
 func TestWSPoolBackoffAndSuccessfulFreshConnectionReset(t *testing.T) {
 	p := testWSPool(t, 1)
+	p.frontingEnabled = false
 	var calls atomic.Int32
 	p.tryFrontingFirst.Store(false)
 	p.dial = func(context.Context, string, string, time.Duration, string, int, string) (*rawWebSocket, error) {
@@ -182,17 +182,25 @@ func TestWSPoolBackoffAndSuccessfulFreshConnectionReset(t *testing.T) {
 	if calls.Load() != 1 {
 		t.Fatal("refill ignored backoff")
 	}
-	p.reportSuccess(2, false)
 	p.mu.Lock()
-	_, blocked := p.refillAfter[key]
+	p.refillAfter[key] = time.Now().Add(-time.Second)
 	p.mu.Unlock()
-	if blocked {
-		t.Fatal("successful connection did not clear refill cooldown")
+	p.dial = func(context.Context, string, string, time.Duration, string, int, string) (*rawWebSocket, error) {
+		calls.Add(1)
+		ws, _ := newMemoryWS(nil)
+		return ws, nil
 	}
 	p.scheduleRefill(key, key.targetIP, []string{"example.com"})
 	waitForPool(t, p)
 	if calls.Load() != 2 {
-		t.Fatal("pool did not retry after success")
+		t.Fatal("pool did not retry after cooldown")
+	}
+	p.mu.Lock()
+	_, blocked := p.refillAfter[key]
+	failures = p.failures[key]
+	p.mu.Unlock()
+	if blocked || failures != 0 {
+		t.Fatal("successful refill did not clear backoff")
 	}
 	if poolRefillBackoff(1) != time.Second || poolRefillBackoff(2) != 2*time.Second || poolRefillBackoff(1000) != time.Hour {
 		t.Fatal("incorrect capped exponential backoff")
@@ -278,29 +286,7 @@ func TestWSPoolTriesFrontingAfterDirectTimeout(t *testing.T) {
 	_ = ws.close()
 }
 
-func TestWSFrontingErrorClassificationMatchesUpstream(t *testing.T) {
-	for _, tc := range []struct {
-		name string
-		err  error
-		want bool
-	}{
-		{"EOF", io.EOF, false},
-		{"wrapped EOF", fmt.Errorf("TLS handshake: %w", io.EOF), false},
-		{"unexpected EOF", io.ErrUnexpectedEOF, false},
-		{"timeout", context.DeadlineExceeded, true},
-		{"connection reset", syscall.ECONNRESET, true},
-		{"wrapped reset", fmt.Errorf("read: %w", syscall.ECONNRESET), true},
-		{"HTTP redirect", &wsHandshakeError{statusCode: 302}, false},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := shouldTryFronting(tc.err); got != tc.want {
-				t.Fatalf("shouldTryFronting(%v)=%t, want %t", tc.err, got, tc.want)
-			}
-		})
-	}
-}
-
-func TestWSPoolDoesNotAcceptFrontedUpgradeAfterDirectEOF(t *testing.T) {
+func TestWSPoolRetriesFrontedUpgradeAfterDirectEOFWhenOptedIn(t *testing.T) {
 	p := testWSPool(t, 0)
 	calls := 0
 	p.dial = func(_ context.Context, _, domain string, _ time.Duration, _ string, _ int, sni string) (*rawWebSocket, error) {
@@ -311,11 +297,12 @@ func TestWSPoolDoesNotAcceptFrontedUpgradeAfterDirectEOF(t *testing.T) {
 		ws, _ := newMemoryWS(nil)
 		return ws, nil
 	}
-	if ws := p.connectOne("192.0.2.1", []string{"kws2.web.telegram.org"}); ws != nil {
-		_ = ws.close()
-		t.Fatal("accepted fronted upgrade after EOF from the original endpoint")
+	ws := p.connectOne("192.0.2.1", []string{"kws2.web.telegram.org"})
+	if ws == nil {
+		t.Fatal("opted-in fronting was not retried after EOF")
 	}
-	if calls != 1 || p.stats.connectionsFronting.Load() != 0 {
+	_ = ws.close()
+	if calls != 2 || p.stats.connectionsFronting.Load() != 1 {
 		t.Fatalf("dial calls=%d fronting=%d", calls, p.stats.connectionsFronting.Load())
 	}
 }
@@ -398,7 +385,11 @@ func TestBothWSPoolsDiscardClosedIdleSocketsBeforeCountingHits(t *testing.T) {
 				t.Error("worker closed socket counted as a hit")
 			}
 		} else {
-			p := newWSPool(context.Background(), 0, 4096, stats)
+			p := testWSPool(t, 1)
+			p.stats = stats
+			p.dial = func(context.Context, string, string, time.Duration, string, int, string) (*rawWebSocket, error) {
+				return nil, io.EOF
+			}
 			p.idle[poolKey{dc: 2, targetIP: "192.0.2.2"}] = []pooledWS{{ws: ws, created: time.Now()}}
 			if got := p.acquire(2, false, "192.0.2.2", []string{"kws2.web.telegram.org"}); got != nil {
 				t.Error("native pool returned closed socket")

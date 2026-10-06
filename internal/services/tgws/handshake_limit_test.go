@@ -196,22 +196,19 @@ func TestWSHandshakeLimiterReleaseIsIdempotent(t *testing.T) {
 	}
 }
 
-func TestWSHandshakeQueueErrorsPreserveCauseWithoutFrontingRetry(t *testing.T) {
+func TestWSHandshakeQueueErrorsPreserveCauseAndClassification(t *testing.T) {
 	for _, cause := range []error{context.Canceled, context.DeadlineExceeded} {
 		err := fmt.Errorf("WS setup: %w", &wsHandshakeQueueError{cause: cause})
 		if !errors.Is(err, cause) || !isWSHandshakeQueueError(err) {
 			t.Fatalf("queue error lost its classification or cause: %v", err)
 		}
-		if shouldTryFronting(err) {
-			t.Fatalf("local queue failure triggered SNI fronting: %v", err)
-		}
 	}
-	if isWSHandshakeQueueError(context.DeadlineExceeded) || !shouldTryFronting(context.DeadlineExceeded) {
+	if isWSHandshakeQueueError(context.DeadlineExceeded) {
 		t.Fatal("ordinary network timeout lost its classification")
 	}
 }
 
-func TestQueuedWSSetupDoesNotPoisonDirectEndpoint(t *testing.T) {
+func TestQueuedWSSetupDoesNotDialAndAllowsRetry(t *testing.T) {
 	for _, mode := range []string{"cancel", "deadline"} {
 		t.Run(mode, func(t *testing.T) {
 			var hits atomic.Int32
@@ -239,25 +236,13 @@ func TestQueuedWSSetupDoesNotPoisonDirectEndpoint(t *testing.T) {
 				held = append(held, release)
 				defer release()
 			}
-			stats := &Stats{}
-			h := newClientHandler(context.Background(), handlerSettings{}, nil, stats, nil)
-			queued := true
-			calls := 0
-			var gotError error
-			h.connect = func(ctx context.Context, host, domain string, timeout time.Duration, path string, buffer int) (*rawWebSocket, error) {
-				calls++
-				if queued && mode == "cancel" {
-					child, cancel := context.WithCancel(ctx)
-					stop := time.AfterFunc(10*time.Millisecond, cancel)
-					defer stop.Stop()
-					defer cancel()
-					ctx = child
-				}
-				ws, err := connectWSWithTLSConfig(ctx, host, domain, timeout, path, buffer, domain, false, nil)
-				gotError = err
-				return ws, err
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			if mode == "cancel" {
+				stop := time.AfterFunc(10*time.Millisecond, cancel)
+				defer stop.Stop()
 			}
-			ws := h.connectDirect("2", target, wsDomainsFor(2, false), wsPath, 20*time.Millisecond, "queued test")
+			ws, gotError := connectWSWithTLSConfig(ctx, target, "kws2.web.telegram.org", 20*time.Millisecond, wsPath, 4096, "kws2.web.telegram.org", false, nil)
 			if ws != nil {
 				_ = ws.close()
 				t.Fatal("setup passed a fully occupied handshake budget")
@@ -269,17 +254,13 @@ func TestQueuedWSSetupDoesNotPoisonDirectEndpoint(t *testing.T) {
 			if !isWSHandshakeQueueError(gotError) || !errors.Is(gotError, cause) {
 				t.Fatalf("wrong queued failure: %v", gotError)
 			}
-			if calls != 1 || hits.Load() != 0 || stats.wsErrors.Load() != 0 {
-				t.Fatalf("local queue failure caused retries/network/error stats: calls=%d hits=%d errors=%d", calls, hits.Load(), stats.wsErrors.Load())
-			}
-			if len(h.cooldown.ipFailUntil) != 0 || len(h.cooldown.failUntil) != 0 || len(h.cooldown.blacklist) != 0 {
-				t.Fatal("local queue failure poisoned IP/DC cooldown or blacklist")
+			if hits.Load() != 0 {
+				t.Fatalf("local queue failure reached the network: hits=%d", hits.Load())
 			}
 			for _, release := range held {
 				release()
 			}
-			queued = false
-			ws = h.connectDirect("2", target, wsDomainsFor(2, false), wsPath, time.Second, "retry test")
+			ws, gotError = connectWSWithTLSConfig(context.Background(), target, "kws2.web.telegram.org", time.Second, wsPath, 4096, "kws2.web.telegram.org", false, nil)
 			if ws == nil {
 				t.Fatalf("healthy endpoint unavailable after releasing budget: %v", gotError)
 			}
@@ -379,40 +360,6 @@ func TestCFWorkerPoolQueueFailureStopsDomainRetries(t *testing.T) {
 	}
 }
 
-func TestDirectFailureBeforeQueueKeepsOnlyGenuineDCCooldown(t *testing.T) {
-	for _, tc := range []struct {
-		name     string
-		first    error
-		cooldown bool
-	}{
-		{"network failure", errors.New("TLS handshake failed"), true},
-		{"redirect", &wsHandshakeError{statusCode: 302}, false},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			stats := &Stats{}
-			h := newClientHandler(context.Background(), handlerSettings{}, nil, stats, nil)
-			calls := 0
-			h.connect = func(context.Context, string, string, time.Duration, string, int) (*rawWebSocket, error) {
-				calls++
-				if calls == 1 {
-					return nil, tc.first
-				}
-				return nil, &wsHandshakeQueueError{cause: context.DeadlineExceeded}
-			}
-			h.connectDirect("2", "192.0.2.2", wsDomainsFor(2, false), wsPath, time.Second, "mixed queue test")
-			if (h.cooldown.remainingCooldown("2") > 0) != tc.cooldown {
-				t.Fatalf("DC cooldown=%s, want enabled=%t", h.cooldown.remainingCooldown("2"), tc.cooldown)
-			}
-			if len(h.cooldown.ipFailUntil) != 0 || len(h.cooldown.blacklist) != 0 {
-				t.Fatal("queued attempt poisoned IP cooldown or blacklist")
-			}
-			if calls != 2 || stats.wsErrors.Load() != 1 {
-				t.Fatalf("queue counted as another network failure: calls=%d errors=%d", calls, stats.wsErrors.Load())
-			}
-		})
-	}
-}
-
 func TestWSQueueWaitDoesNotConsumeNetworkUpgradeTimeout(t *testing.T) {
 	const timeout = 200 * time.Millisecond
 	const queueWait = 150 * time.Millisecond
@@ -452,14 +399,7 @@ func TestWSQueueWaitDoesNotConsumeNetworkUpgradeTimeout(t *testing.T) {
 	})
 	defer releaseTimer.Stop()
 	target := strings.TrimPrefix(server.URL, "http://")
-	h := newClientHandler(context.Background(), handlerSettings{}, nil, &Stats{}, nil)
-	var gotError error
-	h.connect = func(ctx context.Context, host, domain string, timeout time.Duration, path string, buffer int) (*rawWebSocket, error) {
-		ws, err := connectWSWithTLSConfig(ctx, host, domain, timeout, path, buffer, domain, false, nil)
-		gotError = err
-		return ws, err
-	}
-	ws := h.connectDirect("2", target, wsDomainsFor(2, false), wsPath, timeout, "delayed upgrade test")
+	ws, gotError := connectWSWithTLSConfig(context.Background(), target, "kws2.web.telegram.org", timeout, wsPath, 4096, "kws2.web.telegram.org", false, nil)
 	if ws == nil {
 		t.Fatalf("local queue exhausted a healthy endpoint's network timeout: %v", gotError)
 	}
@@ -469,8 +409,5 @@ func TestWSQueueWaitDoesNotConsumeNetworkUpgradeTimeout(t *testing.T) {
 	}
 	if hits.Load() != 1 || len(wsHandshakes.slots) != 0 {
 		t.Fatalf("hits=%d occupied slots=%d", hits.Load(), len(wsHandshakes.slots))
-	}
-	if len(h.cooldown.ipFailUntil) != 0 || len(h.cooldown.failUntil) != 0 || len(h.cooldown.blacklist) != 0 || h.stats.wsErrors.Load() != 0 {
-		t.Fatal("local queue followed by a successful upgrade poisoned endpoint state")
 	}
 }
