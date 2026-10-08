@@ -62,12 +62,7 @@ func Default() *Config {
 	return c
 }
 
-// Anchored at line start (multiline) so commented-out example lines like
-// `# ... ISP_INTERFACE="eth3 nwg1"` are not matched instead of the real value.
-var (
-	reBase  = regexp.MustCompile(`(?m)^[ \t]*NFQWS_BASE_ARGS="([^"]*)"`)
-	reIface = regexp.MustCompile(`(?m)^[ \t]*ISP_INTERFACE="([^"]*)"`)
-)
+var reBase = regexp.MustCompile(`(?m)^[ \t]*NFQWS_BASE_ARGS="([^"]*)"`)
 
 // LoadFromNfqws2Conf reads ISP_INTERFACE and NFQWS_BASE_ARGS from the installed
 // nfqws2.conf to keep the tester aligned with the live setup. Missing file is a
@@ -78,10 +73,12 @@ func (c *Config) LoadFromNfqws2Conf() error {
 		return err
 	}
 	s := string(b)
-	if m := reIface.FindStringSubmatch(s); m != nil {
-		if f := strings.Fields(m[1]); len(f) > 0 {
-			c.WANIfaces = f
-		}
+	ifaces, err := WANInterfacesFromConf(s)
+	if err != nil {
+		return err
+	}
+	if len(ifaces) > 0 {
+		c.WANIfaces = ifaces
 	}
 	if m := reBase.FindStringSubmatch(s); m != nil {
 		c.BaseArgs = splitArgs(m[1])

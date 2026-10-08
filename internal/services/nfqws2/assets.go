@@ -18,6 +18,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"nfqws2strategy/internal/tools/config"
 	routerpath "nfqws2strategy/internal/tools/path"
 )
 
@@ -66,6 +67,13 @@ func prepareAssetData(kind, name string, data []byte) ([]byte, bool, error) {
 	original := data
 	data = bytes.TrimPrefix(data, []byte{0xef, 0xbb, 0xbf})
 	data = bytes.ReplaceAll(data, []byte("\r\n"), []byte("\n"))
+	if kind == "conf" {
+		normalized, err := config.NormalizeWANInterfaces(string(data))
+		if err != nil {
+			return nil, false, err
+		}
+		data = []byte(normalized)
+	}
 	return data, !bytes.Equal(data, original), nil
 }
 

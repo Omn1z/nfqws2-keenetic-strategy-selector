@@ -392,6 +392,11 @@ func (a *App) ApplyStrategyToConfig(argLine string, restart bool) error {
 	}
 	replacement := "${1}" + escapeRepl(argLine) + "${2}"
 	out := reArgsBlock.ReplaceAll(b, []byte(replacement))
+	normalized, err := config.NormalizeWANInterfaces(string(out))
+	if err != nil {
+		return err
+	}
+	out = []byte(normalized)
 	if err := os.WriteFile(conf, out, 0o644); err != nil {
 		return err
 	}

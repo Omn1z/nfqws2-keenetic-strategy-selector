@@ -93,7 +93,7 @@ export function ConfigPane({ restart }: { restart: () => Promise<void> }) {
     </div></Card>}
     <Card title="Настройки запуска" sub="форма и полный файл редактируют один черновик">
       <div className="grid grid-cols-1 gap-x-4 gap-y-3 sm:grid-cols-2 lg:grid-cols-3">
-        <Field label="WAN-интерфейсы" hint="через пробел"><Input disabled={readonly} value={val("ISP_INTERFACE")} onChange={(e) => patch("ISP_INTERFACE", e.target.value)} /></Field>
+        <Field label="WAN-интерфейсы" hint="Через пробел или запятую: eth4, eth3, eth2.4"><Input disabled={readonly} value={val("ISP_INTERFACE")} onChange={(e) => patch("ISP_INTERFACE", e.target.value)} /></Field>
         <fieldset className="min-w-0">
           <legend className="mb-1.5 text-sm font-medium leading-5">Режим работы{mode === "custom" && <span className="ml-2 rounded-sm border border-line px-1.5 py-0.5 text-[10px] font-normal text-muted">Пользовательский</span>}</legend>
           <RadioGroup disabled={readonly} value={mode === "custom" ? null : mode} aria-label="Режим работы" aria-describedby={modeHintId} className="grid min-h-8 grid-cols-3 gap-0.5 rounded-md bg-rhea-input/50 p-0.5" onValueChange={(next) => {

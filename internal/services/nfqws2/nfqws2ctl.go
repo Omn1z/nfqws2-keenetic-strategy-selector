@@ -332,6 +332,12 @@ func (m *Manager) Save(kind, name, content string) error {
 		return err
 	}
 	data := []byte(normalize(content))
+	if kind == "conf" {
+		data, _, err = prepareAssetData(kind, base, data)
+		if err != nil {
+			return err
+		}
+	}
 	var owner *assetOwner
 	if _, statErr := os.Lstat(basePath); os.IsNotExist(statErr) && kind == "list" {
 		owner, err = m.currentAutolistOwner("lists/" + base)
@@ -475,6 +481,9 @@ func (m *Manager) ApplyBypass() error {
 }
 
 func (m *Manager) applyBypass() error {
+	if _, err := m.PrepareWANInterfaces(); err != nil {
+		return fmt.Errorf("prepare NFQUEUE bypass interfaces: %w", err)
+	}
 	confDir := stdpath.Dir(m.cfg.Nfqws2Conf)
 	bypassScript := stdpath.Join(confDir, "nfqws-strategy-bypass.sh")
 	initScript := m.cfg.Nfqws2Init
@@ -521,6 +530,10 @@ func nfqws2BypassApplyCommand(initScript, bypassScript string) string {
 // the full apply. This lets upgrades from the vendor helper become effective
 // without asking the user to revisit the Bypass tab.
 func (m *Manager) RestoreBypass() error {
+	interfacesChanged, err := m.PrepareWANInterfaces()
+	if err != nil {
+		return fmt.Errorf("prepare NFQUEUE bypass interfaces: %w", err)
+	}
 	confDir := stdpath.Dir(m.cfg.Nfqws2Conf)
 	listDir := stdpath.Join(confDir, "lists")
 	domains := stdpath.Join(listDir, "nfqueue_bypass_domains.list")
@@ -564,6 +577,12 @@ func (m *Manager) RestoreBypass() error {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	cmd := shell.Quote(bypassScript) + " iptables && " + shell.Quote(bypassScript) + " ip6tables"
+	if interfacesChanged {
+		// Upstream may already have attempted to rebuild its parent chains with
+		// the old comma-separated value before the panel started. Repair those
+		// too, while reusing the valid resolved-IP cache.
+		cmd = nfqws2BypassApplyCommand(m.cfg.Nfqws2Init, bypassScript)
+	}
 	out, err := exec.CommandContext(ctx, "sh", "-c", cmd).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("NFQUEUE bypass restore failed: %v: %s", err, strings.TrimSpace(string(out)))
@@ -696,6 +715,9 @@ func (m *Manager) CheckUpdate() VersionInfo {
 // package, never a router reboot). It briefly bounces nfqws2. Returns trimmed
 // command output.
 func (m *Manager) Update() (string, error) {
+	if _, err := m.PrepareWANInterfaces(); err != nil {
+		return "", err
+	}
 	pm, apk := packageManager()
 	if pm == "" {
 		return "", fmt.Errorf("package manager not found (apk/opkg)")

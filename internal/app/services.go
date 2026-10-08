@@ -51,6 +51,9 @@ func (a *App) RestartServices(names []string) []ServiceResult {
 // other stale nfqws2): stop (drops the firewall), `killall nfqws2` (exact process-name
 // match — never this binary), then start fresh.
 func (a *App) restartNfqws2() ServiceResult {
+	if _, err := a.nfqws2.PrepareWANInterfaces(); err != nil {
+		return ServiceResult{Name: "nfqws2", OK: false, Detail: err.Error()}
+	}
 	init := a.Cfg.Nfqws2Init
 	script := init + " stop 2>&1 || true\n" +
 		"killall nfqws2 2>/dev/null\n" +
@@ -90,6 +93,9 @@ func (a *App) restartSocks5() ServiceResult {
 // queue) then starts. Nfqws2Stop stops and reaps. These back the dashboard
 // NFQWS2 Start/Stop controls; the router is never rebooted.
 func (a *App) Nfqws2Start() ServiceResult {
+	if _, err := a.nfqws2.PrepareWANInterfaces(); err != nil {
+		return ServiceResult{Name: "nfqws2", OK: false, Detail: err.Error()}
+	}
 	init := a.Cfg.Nfqws2Init
 	script := "for n in nfqws2 nfqws2.real nfqws2-keenetic; do killall \"$n\" 2>/dev/null; done\nsleep 1\n" + init + " start 2>&1"
 	return a.nfqws2Ctl("start", script)
