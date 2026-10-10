@@ -3,6 +3,7 @@ import { api } from "@/lib/api";
 import { cn } from "@/lib/cn";
 import { kb } from "@/lib/format";
 import { usePoll } from "@/lib/hooks";
+import { summarizeTargetChecks } from "@/lib/targetChecks";
 import { useStore } from "@/providers/StoreProvider";
 import { toast } from "@/components/ui/Toast";
 import { Card } from "@/components/ui/Card";
@@ -28,8 +29,10 @@ export default function BlockCheck() {
       setBc(r);
       if (r.status !== "running") {
         setRunning(false);
-        const blocked = r.targets.filter((t) => t.blocked).length;
-        toast(r.status === "cancelled" ? "Проверка отменена" : `Проверка завершена: заблокировано ${blocked} из ${r.total}`, "ok");
+        const { blocked, localErrors } = summarizeTargetChecks(r.targets ?? []);
+        if (r.status === "error") toast(r.error || "Проверка не завершена из-за локальной ошибки", "err");
+        else if (r.status === "cancelled") toast("Проверка отменена", "warn");
+        else toast(`Проверка завершена: заблокировано ${blocked} из ${r.total}${localErrors ? `; не определено из-за локальной ошибки: ${localErrors}` : ""}`, localErrors ? "warn" : "ok");
       }
     } catch (e) { setRunning(false); toast((e as Error).message, "err"); }
   }, 1000, running);
@@ -59,6 +62,7 @@ export default function BlockCheck() {
           {running && <Button variant="danger" onClick={cancel}>■ Отменить</Button>}
           {bc && <span className="text-xs text-muted">{bc.status}</span>}
         </div>
+        {bc?.error && <p role="alert" className="mt-2 text-xs text-bad">{bc.error}</p>}
         {running && bc && (
           <div className="mt-2">
             <div className="h-2 overflow-hidden rounded-full bg-line"><div className="h-full rounded-full bg-accent transition-[width]" style={{ width: `${pct}%` }} /></div>

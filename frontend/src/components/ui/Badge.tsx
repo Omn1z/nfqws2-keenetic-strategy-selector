@@ -28,6 +28,7 @@ const VERDICT: Record<string, [string, BadgeKind]> = {
   refused: ["отказ", "warn"],
   dns: ["DNS", "warn"],
   error: ["ошибка", "bad"],
+  local_error: ["локальная ошибка", "warn"],
 };
 
 export function VerdictBadge({ v }: { v: string }) {

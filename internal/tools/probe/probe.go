@@ -16,16 +16,17 @@ import (
 
 // Result is the outcome of a single probe.
 type Result struct {
-	Host      string `json:"host"`
-	Code      int    `json:"code"`
-	RemoteIP  string `json:"remote_ip"`
-	Size      int64  `json:"size"`
-	TTFBms    int64  `json:"ttfb_ms"`
-	TotalMs   int64  `json:"total_ms"`
-	SpeedBps  int64  `json:"speed_bps"`
-	OK        bool   `json:"ok"`
-	Truncated bool   `json:"truncated"`
-	Err       string `json:"err,omitempty"`
+	Host       string `json:"host"`
+	Code       int    `json:"code"`
+	RemoteIP   string `json:"remote_ip"`
+	Size       int64  `json:"size"`
+	TTFBms     int64  `json:"ttfb_ms"`
+	TotalMs    int64  `json:"total_ms"`
+	SpeedBps   int64  `json:"speed_bps"`
+	OK         bool   `json:"ok"`
+	Truncated  bool   `json:"truncated"`
+	LocalError bool   `json:"local_error,omitempty"` // local socket allocation failed; not evidence of a remote block
+	Err        string `json:"err,omitempty"`
 }
 
 // Prober runs probes bound to a worker's source-port range.
@@ -76,13 +77,6 @@ func (p *Prober) ProbeURL(ctx context.Context, host, url string) Result {
 	ctx, cancel := context.WithTimeout(ctx, p.MaxTime)
 	defer cancel()
 
-	dialer := &net.Dialer{
-		Timeout:   p.ConnectTimeout,
-		LocalAddr: &net.TCPAddr{Port: p.pickPort()},
-		Control: func(network, address string, c syscall.RawConn) error {
-			return c.Control(setReuse)
-		},
-	}
 	tr := &http.Transport{
 		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 			// Resolve the host through the chosen DNS server (if any) and dial the
@@ -95,6 +89,16 @@ func (p *Prober) ProbeURL(ctx context.Context, host, url string) Result {
 					}
 					addr = net.JoinHostPort(ip, port)
 				}
+			}
+			// Redirects and transport retries can dial the same endpoint again.
+			// Reusing the previous source port would collide with its TCP tuple
+			// in TIME_WAIT, even with SO_REUSEADDR on Linux.
+			dialer := &net.Dialer{
+				Timeout:   p.ConnectTimeout,
+				LocalAddr: &net.TCPAddr{Port: p.pickPort()},
+				Control: func(network, address string, c syscall.RawConn) error {
+					return c.Control(setReuse)
+				},
 			}
 			return dialer.DialContext(ctx, "tcp4", addr) // force IPv4 to match our v4 rules
 		},
@@ -125,6 +129,7 @@ func (p *Prober) ProbeURL(ctx context.Context, host, url string) Result {
 	resp, err := client.Do(req)
 	if err != nil {
 		r.Err = err.Error()
+		r.LocalError = isLocalBindError(err)
 		r.TotalMs = time.Since(start).Milliseconds()
 		return r
 	}

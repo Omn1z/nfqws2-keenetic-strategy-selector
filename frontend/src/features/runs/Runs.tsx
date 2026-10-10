@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { exportStrategy } from "@/lib/api";
 import { cn } from "@/lib/cn";
 import { kb } from "@/lib/format";
+import { baselineCheckMessage, summarizeTargetChecks } from "@/lib/targetChecks";
 import { applyStrategyToConfig } from "@/lib/actions";
 import { useStore } from "@/providers/StoreProvider";
 import { toast } from "@/components/ui/Toast";
@@ -110,6 +111,7 @@ export default function Runs() {
   const errored = results.filter((x) => x.error).length;
   const pct = run?.total ? Math.round((run.done * 100) / run.total) : 0;
   const base = (run?.auto && run.baseline) || [];
+  const baseSummary = summarizeTargetChecks(base);
 
   return (
     <>
@@ -169,8 +171,8 @@ export default function Runs() {
       >
         {base.length > 0 && (
           <div className="mb-3 rounded-[10px] border border-line bg-line-soft p-3 text-[12.5px] text-ink-soft">
-            <b className="text-ink">Базовый замер без обхода:</b> заблокировано {base.filter((b) => b.blocked).length} из {base.length}.{" "}
-            {base.filter((b) => b.blocked).length === 0 ? "Обходить нечего — всё доступно." : "Автоподбор тестируется только на заблокированных целях."}
+            <b className="text-ink">Базовый замер без обхода:</b> заблокировано {baseSummary.blocked} из {base.length}.{" "}
+            {baselineCheckMessage(base)}
             <div className="mt-1.5 flex flex-wrap gap-2">{base.map((b, i) => <span key={i}>{b.host} <VerdictBadge v={b.verdict} /></span>)}</div>
           </div>
         )}

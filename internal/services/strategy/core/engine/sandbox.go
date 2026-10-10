@@ -6,6 +6,7 @@ package engine
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"os/exec"
 	"strconv"
@@ -20,7 +21,7 @@ import (
 
 const (
 	procMark = "0x40000000/0x40000000" // nfqws marks its own generated packets
-	exclMark = "0x20000000/0x20000000" // main nfqws chains RETURN on this connmark
+	exclMark = "0x20000000/0x20000000" // our temporary guards exclude test connections
 	noExit   = -2                      // s.lastExit sentinel: process has not exited yet
 )
 
@@ -32,6 +33,15 @@ type Sandbox struct {
 	PortLo int
 	PortHi int
 	wrDir  string
+
+	// ruleExec permits a command-level firewall fake in tests. Production uses
+	// iptables directly; no shell or process-wide mutable command hook is used.
+	ruleExec      func(...string) ([]byte, error)
+	expectedRules [][]string
+	guardChains   []string
+	queueRead     func() ([]byte, error)
+	localAddrs    func() ([]net.Addr, error)
+	localIPs      []string
 
 	mu       sync.Mutex
 	cmd      *exec.Cmd
@@ -55,17 +65,102 @@ func NewSandbox(cfg *config.Config, worker int) *Sandbox {
 
 func (s *Sandbox) postChain() string { return fmt.Sprintf("STRAT_POST_%d", s.Worker) }
 func (s *Sandbox) preChain() string  { return fmt.Sprintf("STRAT_PRE_%d", s.Worker) }
+func (s *Sandbox) outChain() string  { return fmt.Sprintf("STRAT_OUT_%d", s.Worker) }
 
-func ipt(args ...string) error {
-	out, err := exec.Command("iptables", append([]string{"-w"}, args...)...).CombinedOutput()
+func (s *Sandbox) iptOutput(args ...string) ([]byte, error) {
+	if s.ruleExec != nil {
+		return s.ruleExec(args...)
+	}
+	return exec.Command("iptables", append([]string{"-w"}, args...)...).CombinedOutput()
+}
+
+func (s *Sandbox) ipt(args ...string) error {
+	out, err := s.iptOutput(args...)
 	if err != nil {
 		return fmt.Errorf("iptables %s: %v: %s", strings.Join(args, " "), err, strings.TrimSpace(string(out)))
 	}
 	return nil
 }
 
-func iptQuiet(args ...string) {
-	_ = exec.Command("iptables", append([]string{"-w"}, args...)...).Run()
+func (s *Sandbox) iptQuiet(args ...string) {
+	_, _ = s.iptOutput(args...)
+}
+
+// addRule records the exact rule for later validation. Position is only used
+// when installing a jump/guard; iptables -C checks its match and target.
+func (s *Sandbox) addRule(chain string, first bool, args ...string) error {
+	op := []string{"-t", "mangle", "-A", chain}
+	if first {
+		op = []string{"-t", "mangle", "-I", chain, "1"}
+	}
+	if err := s.ipt(append(op, args...)...); err != nil {
+		return err
+	}
+	s.expectedRules = append(s.expectedRules, append([]string{"-t", "mangle", "-C", chain}, args...))
+	return nil
+}
+
+func (s *Sandbox) mainGuard(chain, originalSource string) []string {
+	sport := fmt.Sprintf("%d:%d", s.PortLo, s.PortHi)
+	args := []string{"-p", "tcp"}
+	if chain == "nfqws_post" {
+		args = append(args, "--sport", sport, "--dport", "443")
+	} else {
+		args = append(args, "--sport", "443", "--dport", sport)
+	}
+	args = append(args, "-m", "connmark", "--mark", exclMark)
+	if originalSource != "" {
+		args = append(args, "-m", "conntrack", "--ctorigsrc", originalSource)
+	}
+	return append(args, "-j", "RETURN")
+}
+
+// Main service chains can be absent when it is stopped. Inspect the whole
+// table, so a permission/extension/iptables error is never mistaken for absence.
+func (s *Sandbox) mainChains() ([]string, error) {
+	out, err := s.iptOutput("-t", "mangle", "-S")
+	if err != nil {
+		return nil, fmt.Errorf("inspect main NFQWS2 firewall: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	var chains []string
+	for _, name := range []string{"nfqws_post", "nfqws_pre"} {
+		for _, line := range strings.Split(string(out), "\n") {
+			if strings.TrimSpace(line) == "-N "+name {
+				chains = append(chains, name)
+				break
+			}
+		}
+	}
+	return chains, nil
+}
+
+// CheckRules detects an external firewall/service restart during a run. A
+// result obtained after losing the sandbox or its main-service guards must not
+// be accepted as a successful isolated probe. Call before and after probing.
+func (s *Sandbox) CheckRules() error {
+	if len(s.expectedRules) == 0 {
+		return fmt.Errorf("sandbox firewall is not installed")
+	}
+	localIPs, err := s.localIPv4()
+	if err != nil {
+		return err
+	}
+	if strings.Join(localIPs, ",") != strings.Join(s.localIPs, ",") {
+		return fmt.Errorf("local IPv4 addresses changed during the test; repeat the test")
+	}
+	chains, err := s.mainChains()
+	if err != nil {
+		return err
+	}
+	if strings.Join(chains, ",") != strings.Join(s.guardChains, ",") {
+		return fmt.Errorf("main NFQWS2 firewall changed during the test; repeat the test")
+	}
+	for _, rule := range s.expectedRules {
+		if err := s.ipt(rule...); err != nil {
+			return fmt.Errorf("sandbox isolation was lost; repeat the test: %w", err)
+		}
+	}
+	return nil
 }
 
 // RulesUp installs the sandbox's iptables chains and jumps so the test
@@ -79,53 +174,91 @@ func (s *Sandbox) RulesUp() error { return s.rulesUp(true) }
 // blocked with no bypass?") even while the main nfqws service is running.
 func (s *Sandbox) RulesUpExcludeOnly() error { return s.rulesUp(false) }
 
-func (s *Sandbox) rulesUp(queue bool) error {
-	pc, prc := s.postChain(), s.preChain()
+func (s *Sandbox) rulesUp(queue bool) (setupErr error) {
+	pc, prc, oc := s.postChain(), s.preChain(), s.outChain()
 	sport := fmt.Sprintf("%d:%d", s.PortLo, s.PortHi)
 	q := strconv.Itoa(s.QNum)
 
 	s.RulesDown() // clean any leftovers
-
-	iptQuiet("-t", "mangle", "-N", pc)
-	if err := ipt("-t", "mangle", "-F", pc); err != nil {
+	defer func() {
+		if setupErr != nil {
+			s.RulesDown()
+		}
+	}()
+	if len(s.cfg.WANIfaces) == 0 || s.PortLo < 1 || s.PortHi > 65535 || s.PortHi < s.PortLo {
+		return fmt.Errorf("invalid sandbox WAN interfaces or source-port range")
+	}
+	localIPs, err := s.localIPv4()
+	if err != nil {
 		return err
 	}
-	iptQuiet("-t", "mangle", "-N", prc)
-	if err := ipt("-t", "mangle", "-F", prc); err != nil {
-		return err
+	s.localIPs = localIPs
+
+	for _, chain := range []string{pc, prc, oc} {
+		s.iptQuiet("-t", "mangle", "-N", chain)
+		if err := s.ipt("-t", "mangle", "-F", chain); err != nil {
+			return err
+		}
 	}
 
 	// Skip nfqws-generated packets so we never re-queue our own fakes.
-	if err := ipt("-t", "mangle", "-A", pc, "-m", "mark", "--mark", procMark, "-j", "RETURN"); err != nil {
+	for _, chain := range []string{oc, pc} {
+		if err := s.addRule(chain, false, "-m", "mark", "--mark", procMark, "-j", "RETURN"); err != nil {
+			return err
+		}
+	}
+	// Only router-local test sockets are marked. Doing this in POSTROUTING also
+	// captured forwarded LAN clients that happened to use the same source port.
+	if err := s.addRule(oc, false, "-p", "tcp", "--dport", "443", "--sport", sport,
+		"-j", "CONNMARK", "--set-xmark", exclMark); err != nil {
 		return err
 	}
 	for _, ifc := range s.cfg.WANIfaces {
-		// Mark test connections excluded from the main nfqws service.
-		if err := ipt("-t", "mangle", "-A", pc, "-o", ifc, "-p", "tcp", "--dport", "443", "--sport", sport,
-			"-j", "CONNMARK", "--set-xmark", exclMark); err != nil {
-			return err
-		}
 		if !queue {
 			continue
 		}
-		// Queue first outgoing packets of the test connection to our nfqws.
-		if err := ipt("-t", "mangle", "-A", pc, "-o", ifc, "-p", "tcp", "--dport", "443", "--sport", sport,
-			"-m", "connbytes", "--connbytes", "1:16", "--connbytes-mode", "packets", "--connbytes-dir", "original",
-			"-j", "NFQUEUE", "--queue-num", q, "--queue-bypass"); err != nil {
-			return err
+		for _, source := range localIPs {
+			// MARK_EXCLUDE is shared with vendor policy rules. The original
+			// conntrack source must also be a router address, even on replies
+			// that are still addressed to its WAN IP before reverse NAT.
+			if err := s.addRule(pc, false, "-o", ifc, "-p", "tcp", "--dport", "443", "--sport", sport,
+				"-m", "connmark", "--mark", exclMark, "-m", "conntrack", "--ctorigsrc", source,
+				"-m", "connbytes", "--connbytes", "1:16", "--connbytes-mode", "packets", "--connbytes-dir", "original",
+				"-j", "NFQUEUE", "--queue-num", q, "--queue-bypass"); err != nil {
+				return err
+			}
+			if err := s.addRule(prc, false, "-i", ifc, "-p", "tcp", "--sport", "443", "--dport", sport,
+				"-m", "connmark", "--mark", exclMark, "-m", "conntrack", "--ctorigsrc", source,
+				"-m", "connbytes", "--connbytes", "1:16", "--connbytes-mode", "packets", "--connbytes-dir", "reply",
+				"-j", "NFQUEUE", "--queue-num", q, "--queue-bypass"); err != nil {
+				return err
+			}
 		}
-		// Queue first reply packets.
-		if err := ipt("-t", "mangle", "-A", prc, "-i", ifc, "-p", "tcp", "--sport", "443", "--dport", sport,
-			"-m", "connbytes", "--connbytes", "1:16", "--connbytes-mode", "packets", "--connbytes-dir", "reply",
-			"-j", "NFQUEUE", "--queue-num", q, "--queue-bypass"); err != nil {
-			return err
+	}
+	// A connmark alone does not exclude anything: the vendor's chains do not
+	// necessarily test MARK_EXCLUDE. Return only from those chains, preserving
+	// unrelated mangle/routing rules after their jumps in the built-in chains.
+	chains, err := s.mainChains()
+	if err != nil {
+		return err
+	}
+	s.guardChains = chains
+	for _, chain := range chains {
+		for _, source := range localIPs {
+			if err := s.addRule(chain, true, s.mainGuard(chain, source)...); err != nil {
+				return err
+			}
 		}
 	}
 	// Jump in at the top so we run before the main nfqws chains.
-	if err := ipt("-t", "mangle", "-I", "POSTROUTING", "1", "-j", pc); err != nil {
+	if err := s.addRule("POSTROUTING", true, "-j", pc); err != nil {
 		return err
 	}
-	if err := ipt("-t", "mangle", "-I", "PREROUTING", "1", "-j", prc); err != nil {
+	if err := s.addRule("PREROUTING", true, "-j", prc); err != nil {
+		return err
+	}
+	// Install marking last, after every exclusion/queue path is ready.
+	if err := s.addRule("OUTPUT", true, "-j", oc); err != nil {
 		return err
 	}
 	return nil
@@ -133,13 +266,18 @@ func (s *Sandbox) rulesUp(queue bool) error {
 
 // RulesDown removes the sandbox's chains and jumps. Safe to call repeatedly.
 func (s *Sandbox) RulesDown() {
-	pc, prc := s.postChain(), s.preChain()
-	iptQuiet("-t", "mangle", "-D", "POSTROUTING", "-j", pc)
-	iptQuiet("-t", "mangle", "-D", "PREROUTING", "-j", prc)
-	iptQuiet("-t", "mangle", "-F", pc)
-	iptQuiet("-t", "mangle", "-X", pc)
-	iptQuiet("-t", "mangle", "-F", prc)
-	iptQuiet("-t", "mangle", "-X", prc)
+	pc, prc, oc := s.postChain(), s.preChain(), s.outChain()
+	s.iptQuiet("-t", "mangle", "-D", "OUTPUT", "-j", oc)
+	s.iptQuiet("-t", "mangle", "-D", "POSTROUTING", "-j", pc)
+	s.iptQuiet("-t", "mangle", "-D", "PREROUTING", "-j", prc)
+	s.removeMainGuards()
+	for _, chain := range []string{pc, prc, oc} {
+		s.iptQuiet("-t", "mangle", "-F", chain)
+		s.iptQuiet("-t", "mangle", "-X", chain)
+	}
+	s.expectedRules = nil
+	s.guardChains = nil
+	s.localIPs = nil
 }
 
 // StartNfqws launches a dedicated nfqws2 child bound to this sandbox's queue,
@@ -155,6 +293,9 @@ func (s *Sandbox) RulesDown() {
 // still captured for diagnostics, and an early exit (e.g. bad args) is reported
 // immediately instead of waiting out the full timeout.
 func (s *Sandbox) StartNfqws(extraArgs, strategyArgs []string) error {
+	if err := s.CheckRules(); err != nil {
+		return err
+	}
 	s.StopNfqws()
 	if err := os.MkdirAll(s.wrDir, 0o755); err != nil {
 		return err
@@ -263,17 +404,8 @@ func (s *Sandbox) exitCode() int {
 // queueBound reports whether this sandbox's NFQUEUE number is currently bound by
 // a listener in the kernel (i.e. the child nfqws2 has created and configured it).
 func (s *Sandbox) queueBound() bool {
-	b, err := os.ReadFile("/proc/net/netfilter/nfnetlink_queue")
-	if err != nil {
-		return false
-	}
-	want := strconv.Itoa(s.QNum)
-	for _, line := range strings.Split(string(b), "\n") {
-		if f := strings.Fields(line); len(f) > 0 && f[0] == want {
-			return true
-		}
-	}
-	return false
+	_, err := s.QueuePackets()
+	return err == nil
 }
 
 // StopNfqws terminates the sandbox's nfqws2 child.

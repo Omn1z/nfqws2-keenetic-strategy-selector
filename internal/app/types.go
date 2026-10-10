@@ -67,7 +67,7 @@ type BlockCheck struct {
 type TargetCheck struct {
 	Host     string `json:"host"`
 	Blocked  bool   `json:"blocked"`
-	Verdict  string `json:"verdict"` // ok | timeout | reset | refused | cap16k | dns | error
+	Verdict  string `json:"verdict"` // ok | timeout | reset | refused | cap16k | dns | error | local_error
 	Code     int    `json:"code"`
 	Size     int64  `json:"size"`
 	TTFBms   int64  `json:"ttfb_ms"`

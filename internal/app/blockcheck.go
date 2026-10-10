@@ -149,6 +149,17 @@ func (a *App) executeBlockCheck(ctx context.Context, bc *BlockCheck, targets []s
 wait:
 	close(jobs)
 	wg.Wait()
+	for _, sb := range sandboxes {
+		if err := sb.CheckRules(); err != nil {
+			a.mu.Lock()
+			bc.Status = "error"
+			bc.Error = fmt.Sprintf("block-check isolation: %v", err)
+			bc.Targets = nil
+			bc.Done = 0
+			a.mu.Unlock()
+			return
+		}
+	}
 
 	a.mu.Lock()
 	if ctx.Err() != nil {

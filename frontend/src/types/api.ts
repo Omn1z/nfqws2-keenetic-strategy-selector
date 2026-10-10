@@ -1,7 +1,7 @@
 // TypeScript mirrors of the Go JSON API (field names match the `json:"..."` tags).
 
 export type RunStatus = "running" | "done" | "cancelled" | "error";
-export type Verdict = "ok" | "timeout" | "reset" | "refused" | "cap16k" | "dns" | "error";
+export type Verdict = "ok" | "timeout" | "reset" | "refused" | "cap16k" | "dns" | "error" | "local_error";
 export type DnsType = "doh" | "dot";
 
 export interface AuthStatus {

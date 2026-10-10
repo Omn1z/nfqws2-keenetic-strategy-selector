@@ -20,23 +20,23 @@ type Strategy struct {
 // Args splits the ArgLine into argv tokens.
 func (s Strategy) Args() []string { return strings.Fields(s.ArgLine) }
 
-// Builtin returns the seed catalog of known-good TCP/TLS strategies (and a few
-// HTTP/QUIC). These are derived from the shipped nfqws2-keenetic config and
-// common zapret2 combinations. Users can add custom strategies on top.
+// Builtin returns the seed catalog of TCP/TLS and HTTP strategies to test.
+// These are derived from the shipped nfqws2-keenetic config and common zapret2
+// combinations; reachability still depends on the network and target.
 func Builtin() []Strategy {
 	return []Strategy{
 		{
 			ID: "tls-fake-multisplit-google", L7: "tls", Source: "builtin",
-			Name: "fake(tls google)+multisplit midsld seqovl",
+			Name: "fake(tls google,seq-10000)+multisplit midsld seqovl",
 			ArgLine: "--filter-tcp=443 --filter-l7=tls --payload=tls_client_hello " +
-				"--lua-desync=fake:blob=tls_clienthello:tls_mod=rnd,dupsid,sni=www.google.com:tcp_seq=10000 " +
+				"--lua-desync=fake:blob=tls_clienthello:tls_mod=rnd,dupsid,sni=www.google.com:tcp_seq=-10000 " +
 				"--lua-desync=multisplit:pos=1,midsld:seqovl=1:seqovl_pattern=tls_clienthello",
 		},
 		{
 			ID: "tls-fake-ack-multisplit", L7: "tls", Source: "builtin",
-			Name: "fake(0x0,ack-66000)+multisplit",
+			Name: "fake(0x0,seq-10000,ack-66000)+multisplit",
 			ArgLine: "--filter-tcp=443 --filter-l7=tls --payload=tls_client_hello " +
-				"--lua-desync=fake:blob=0x00000000:tcp_ack=-66000:tls_mod=rnd,dupsid,sni=www.google.com:repeats=2 " +
+				"--lua-desync=fake:blob=0x00000000:tcp_seq=-10000:tcp_ack=-66000:tls_mod=rnd,dupsid,sni=www.google.com:repeats=2 " +
 				"--lua-desync=multisplit:pos=1,midsld",
 		},
 		{
@@ -60,9 +60,9 @@ func Builtin() []Strategy {
 		},
 		{
 			ID: "tls-fakedsplit-midsld", L7: "tls", Source: "builtin",
-			Name: "fakedsplit midsld seqovl",
+			Name: "fakedsplit midsld seqovl fake seq-10000",
 			ArgLine: "--filter-tcp=443 --filter-l7=tls --payload=tls_client_hello " +
-				"--lua-desync=fakedsplit:pos=midsld:seqovl=1:seqovl_pattern=tls_clienthello",
+				"--lua-desync=fakedsplit:pos=midsld:seqovl=1:seqovl_pattern=tls_clienthello:tcp_seq=-10000",
 		},
 		{
 			ID: "tls-fake-md5-multisplit", L7: "tls", Source: "builtin",
@@ -86,11 +86,14 @@ const (
 )
 
 // AutoCandidates returns the broad search space used by automatic strategy
-// selection. These cover the proven zapret2/winws2 desync combinations (split
+// selection. These cover common zapret2/winws2 desync combinations (split
 // positions, overlap, fakes with badseq/badsum/md5/ttl fooling, disorder) over
-// TLS:443 and HTTP:80. They are tested in order; survivors are ranked by speed.
-// A candidate that the engine rejects is reported as an error and skipped, so an
-// over-broad entry never aborts the run.
+// TLS:443 and HTTP:80. Each still needs a network test; survivors are ranked by speed.
+// Every TCP fake needs its own fooling: tls_mod, seqovl and tcp_ts_up do not
+// make a fake unreceivable. Timestamp-only fooling is unsuitable for a router
+// serving clients that may not negotiate TCP timestamps. For fake splitters,
+// upstream applies tcp_seq to fake parts only, preserving real payloads.
+// A candidate that the engine rejects is reported as an error and skipped.
 func AutoCandidates() []Strategy {
 	tls := func(id, name, desync string) Strategy {
 		return Strategy{ID: "auto-" + id, Name: name, L7: "tls", Source: "auto", ArgLine: tlsFilter + desync}
@@ -116,50 +119,48 @@ func AutoCandidates() []Strategy {
 		tls("md-ovl1", "multidisorder midsld seqovl1", "--lua-desync=multidisorder:pos=1,midsld:seqovl=1:seqovl_pattern=tls_clienthello"),
 		tls("md-multi", "multidisorder midsld+sniext", "--lua-desync=multidisorder:pos=1,midsld,sniext+1"),
 		// --- fakedsplit / fakeddisorder ---
-		tls("fds-midsld", "fakedsplit midsld seqovl1", "--lua-desync=fakedsplit:pos=midsld:seqovl=1:seqovl_pattern=tls_clienthello"),
-		tls("fdd-midsld", "fakeddisorder midsld seqovl1", "--lua-desync=fakeddisorder:pos=midsld:seqovl=1:seqovl_pattern=tls_clienthello"),
+		tls("fds-midsld", "fakedsplit midsld seqovl1 fake seq-10000", "--lua-desync=fakedsplit:pos=midsld:seqovl=1:seqovl_pattern=tls_clienthello:tcp_seq=-10000"),
+		tls("fdd-midsld", "fakeddisorder midsld seqovl1 fake seq-10000", "--lua-desync=fakeddisorder:pos=midsld:seqovl=1:seqovl_pattern=tls_clienthello:tcp_seq=-10000"),
 		// --- fake + split combos ---
-		tls("fake-google-ms", "fake(google sni)+multisplit", "--lua-desync=fake:blob=tls_clienthello:tls_mod=rnd,dupsid,sni=www.google.com --lua-desync=multisplit:pos=1,midsld"),
-		tls("fake-ack-ms", "fake(0x0,ack-66000)+multisplit", "--lua-desync=fake:blob=0x00000000:tcp_ack=-66000:repeats=2 --lua-desync=multisplit:pos=1,midsld"),
+		tls("fake-google-ms", "fake(google sni,seq-10000)+multisplit", "--lua-desync=fake:blob=tls_clienthello:tls_mod=rnd,dupsid,sni=www.google.com:tcp_seq=-10000 --lua-desync=multisplit:pos=1,midsld"),
+		tls("fake-ack-ms", "fake(0x0,seq-10000,ack-66000)+multisplit", "--lua-desync=fake:blob=0x00000000:tcp_seq=-10000:tcp_ack=-66000:repeats=2 --lua-desync=multisplit:pos=1,midsld"),
 		tls("fake-badsum-ms", "fake(badsum)+multisplit ovl", "--lua-desync=fake:blob=tls_clienthello:badsum --lua-desync=multisplit:pos=1,midsld:seqovl=1:seqovl_pattern=tls_clienthello"),
 		tls("fake-md5-ms", "fake(tcp_md5)+multisplit", "--lua-desync=fake:blob=tls_clienthello:tcp_md5 --lua-desync=multisplit:pos=1,midsld"),
-		tls("fake-rep-md", "fake(rep6,ack)+multidisorder", "--lua-desync=fake:blob=tls_clienthello:repeats=6:tcp_ack=-66000 --lua-desync=multidisorder:pos=1,midsld:tcp_ack=-66000"),
+		tls("fake-rep-md", "fake(rep6,seq-10000,ack)+multidisorder", "--lua-desync=fake:blob=tls_clienthello:repeats=6:tcp_seq=-10000:tcp_ack=-66000 --lua-desync=multidisorder:pos=1,midsld"),
 		tls("fake-ttl-ms", "fake(ip_ttl=4)+multisplit", "--lua-desync=fake:blob=tls_clienthello:ip_ttl=4:ip6_ttl=4 --lua-desync=multisplit:pos=1,midsld"),
-		tls("fake-autottl-ms", "fake(autottl)+multisplit", "--lua-desync=fake:blob=tls_clienthello:ip_autottl=0,3-20 --lua-desync=multisplit:pos=1,midsld"),
-		tls("fake-rep-fds", "fake(rep2)+fakedsplit", "--lua-desync=fake:blob=tls_clienthello:repeats=2 --lua-desync=fakedsplit:pos=midsld"),
-		tls("fake-padencap-ms", "fake(padencap)+multisplit sniext", "--lua-desync=fake:blob=tls_clienthello:tls_mod=rnd,padencap --lua-desync=multisplit:pos=1,sniext+1"),
-		tls("fake-google", "fake(google sni) only", "--lua-desync=fake:blob=tls_clienthello:tls_mod=rnd,dupsid,sni=www.google.com:tcp_seq=10000"),
+		tls("fake-autottl-ms", "fake(autottl,seq-10000)+multisplit", "--lua-desync=fake:blob=tls_clienthello:ip_autottl=0,3-20:tcp_seq=-10000 --lua-desync=multisplit:pos=1,midsld"),
+		tls("fake-rep-fds", "fake(rep2,seq-10000)+fakedsplit(seq-10000)", "--lua-desync=fake:blob=tls_clienthello:repeats=2:tcp_seq=-10000 --lua-desync=fakedsplit:pos=midsld:tcp_seq=-10000"),
+		tls("fake-padencap-ms", "fake(padencap,seq-10000)+multisplit sniext", "--lua-desync=fake:blob=tls_clienthello:tls_mod=rnd,padencap:tcp_seq=-10000 --lua-desync=multisplit:pos=1,sniext+1"),
+		tls("fake-google", "fake(google sni,seq-10000) only", "--lua-desync=fake:blob=tls_clienthello:tls_mod=rnd,dupsid,sni=www.google.com:tcp_seq=-10000"),
 		// --- richer split/disorder positions & fooling ---
 		tls("ms-sld2", "multisplit sld+2", "--lua-desync=multisplit:pos=sld+2"),
 		tls("ms-multi3", "multisplit 1,sniext+1,host+1,midsld", "--lua-desync=multisplit:pos=1,sniext+1,host+1,midsld"),
 		tls("ms-tsup", "multisplit midsld tcp_ts_up", "--lua-desync=multisplit:pos=1,midsld:tcp_ts_up"),
-		tls("ms-md5", "multisplit midsld tcp_md5", "--lua-desync=multisplit:pos=1,midsld:tcp_md5"),
 		tls("ms-ovl-tsup", "multisplit midsld seqovl tcp_ts_up", "--lua-desync=multisplit:pos=1,midsld:seqovl=1:seqovl_pattern=tls_clienthello:tcp_ts_up"),
 		tls("md-host", "multidisorder host+1", "--lua-desync=multidisorder:pos=1,host+1"),
 		tls("md-tsup", "multidisorder midsld tcp_ts_up", "--lua-desync=multidisorder:pos=1,midsld:tcp_ts_up"),
-		tls("md-badsum", "multidisorder midsld badsum", "--lua-desync=multidisorder:pos=1,midsld:badsum"),
 		// --- fake (varied SNI / fooling) + reorder, incl. multi-line strategies ---
-		tls("fake-fonts-ms", "fake(fonts.google sni,ts)+multisplit", "--lua-desync=fake:blob=tls_clienthello:tls_mod=rnd,dupsid,sni=fonts.google.com:tcp_seq=10000 --lua-desync=multisplit:pos=1,midsld:seqovl=1:seqovl_pattern=tls_clienthello:tcp_ts_up"),
-		tls("fake-ack-sni-ms", "fake(0x0,ack,sni)+multisplit", "--lua-desync=fake:blob=0x00000000:tcp_ack=-66000:tls_mod=rnd,dupsid,sni=www.google.com:repeats=2 --lua-desync=multisplit:pos=1,midsld"),
-		tls("fake-sni-ts-ms", "fake(google sni,ts)+multisplit ovl", "--lua-desync=fake:blob=tls_clienthello:tls_mod=rnd,dupsid,sni=www.google.com:tcp_ts_up --lua-desync=multisplit:pos=1,midsld:seqovl=1:seqovl_pattern=tls_clienthello"),
-		tls("fake-msft-md", "fake(microsoft sni)+multidisorder", "--lua-desync=fake:blob=tls_clienthello:tls_mod=rnd,dupsid,sni=www.microsoft.com --lua-desync=multidisorder:pos=1,midsld"),
+		tls("fake-fonts-ms", "fake(fonts.google sni,seq-10000,ts)+multisplit", "--lua-desync=fake:blob=tls_clienthello:tls_mod=rnd,dupsid,sni=fonts.google.com:tcp_seq=-10000 --lua-desync=multisplit:pos=1,midsld:seqovl=1:seqovl_pattern=tls_clienthello:tcp_ts_up"),
+		tls("fake-ack-sni-ms", "fake(0x0,seq-10000,ack,sni)+multisplit", "--lua-desync=fake:blob=0x00000000:tcp_seq=-10000:tcp_ack=-66000:tls_mod=rnd,dupsid,sni=www.google.com:repeats=2 --lua-desync=multisplit:pos=1,midsld"),
+		tls("fake-sni-ts-ms", "fake(google sni,seq-10000,ts)+multisplit ovl", "--lua-desync=fake:blob=tls_clienthello:tls_mod=rnd,dupsid,sni=www.google.com:tcp_seq=-10000:tcp_ts_up --lua-desync=multisplit:pos=1,midsld:seqovl=1:seqovl_pattern=tls_clienthello"),
+		tls("fake-msft-md", "fake(microsoft sni,seq-10000)+multidisorder", "--lua-desync=fake:blob=tls_clienthello:tls_mod=rnd,dupsid,sni=www.microsoft.com:tcp_seq=-10000 --lua-desync=multidisorder:pos=1,midsld"),
 		tls("fake-md5-ts-ms", "fake(md5,ts)+multisplit", "--lua-desync=fake:blob=tls_clienthello:tcp_md5:tcp_ts_up --lua-desync=multisplit:pos=1,midsld"),
 		tls("fake-ttl2-md", "fake(ttl2)+multidisorder", "--lua-desync=fake:blob=tls_clienthello:ip_ttl=2:ip6_ttl=2 --lua-desync=multidisorder:pos=1,midsld"),
-		tls("fake-2x-ms", "fake x2 (rep+ack)+multisplit", "--lua-desync=fake:blob=tls_clienthello:repeats=2 --lua-desync=fake:blob=tls_clienthello:tcp_ack=-66000 --lua-desync=multisplit:pos=1,midsld"),
+		tls("fake-2x-ms", "fake x2 (rep+ack,seq-10000)+multisplit", "--lua-desync=fake:blob=tls_clienthello:repeats=2:tcp_seq=-10000 --lua-desync=fake:blob=tls_clienthello:tcp_ack=-66000:tcp_seq=-10000 --lua-desync=multisplit:pos=1,midsld"),
 		// --- fakedsplit / fakeddisorder variants ---
-		tls("fds-ts", "fakedsplit midsld seqovl tcp_ts_up", "--lua-desync=fakedsplit:pos=midsld:seqovl=1:seqovl_pattern=tls_clienthello:tcp_ts_up"),
-		tls("fdd-sniext", "fakeddisorder sniext+1 seqovl", "--lua-desync=fakeddisorder:pos=sniext+1:seqovl=1:seqovl_pattern=tls_clienthello"),
+		tls("fds-ts", "fakedsplit midsld seqovl tcp_ts_up fake seq-10000", "--lua-desync=fakedsplit:pos=midsld:seqovl=1:seqovl_pattern=tls_clienthello:tcp_ts_up:tcp_seq=-10000"),
+		tls("fdd-sniext", "fakeddisorder sniext+1 seqovl fake seq-10000", "--lua-desync=fakeddisorder:pos=sniext+1:seqovl=1:seqovl_pattern=tls_clienthello:tcp_seq=-10000"),
 		tls("fdd-badsum-md5", "fakeddisorder midsld badsum md5", "--lua-desync=fakeddisorder:pos=midsld:badsum:tcp_md5"),
 		// --- hostfakesplit (fake host injection, multi-line) ---
 		tls("hfs-sniext", "hostfakesplit midhost seqovl(sniext)", "--lua-desync=hostfakesplit:midhost=host-2:seqovl=sniext+3:seqovl_pattern=tls_clienthello:badsum:tcp_md5:tcp_ts_up --lua-desync=hostfakesplit:tcp_md5:tcp_ts_up"),
-		tls("hfs-google", "hostfakesplit host=google seqovl", "--lua-desync=hostfakesplit:host=www.google.com:seqovl=sniext+3:seqovl_pattern=tls_clienthello:badsum --lua-desync=hostfakesplit:tcp_ts_up"),
+		tls("hfs-google", "hostfakesplit host=google badsum + fake seq-10000", "--lua-desync=hostfakesplit:host=www.google.com:seqovl=sniext+3:seqovl_pattern=tls_clienthello:badsum --lua-desync=hostfakesplit:tcp_ts_up:tcp_seq=-10000"),
 		// --- HTTP:80 ---
 		http("methodeol", "http_methodeol badsum", "--lua-desync=http_methodeol:badsum"),
 		http("ms-method", "multisplit method+2", "--lua-desync=multisplit:pos=method+2"),
-		http("fake-ms", "fake(http_req)+multisplit", "--lua-desync=fake:blob=http_req --lua-desync=multisplit:pos=method+2"),
+		http("fake-ms", "fake(http_req,seq-10000)+multisplit", "--lua-desync=fake:blob=http_req:tcp_seq=-10000 --lua-desync=multisplit:pos=method+2"),
 		http("md-method", "multidisorder method+2,host+1", "--lua-desync=multidisorder:pos=method+2,host+1"),
 		http("ms-method-host", "multisplit method+2,host+1", "--lua-desync=multisplit:pos=method+2,host+1"),
-		http("fake-md-method", "fake(http)+multidisorder method", "--lua-desync=fake:blob=http_req --lua-desync=multidisorder:pos=method+2"),
+		http("fake-md-method", "fake(http,seq-10000)+multidisorder method", "--lua-desync=fake:blob=http_req:tcp_seq=-10000 --lua-desync=multidisorder:pos=method+2"),
 	}
 }
 

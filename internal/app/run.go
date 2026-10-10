@@ -288,18 +288,22 @@ func (a *App) executeRun(ctx context.Context, run *Run, list *List, plan []runJo
 			return
 		}
 		base := baselineCheck(ctx, probe.New(bsb.PortLo, bsb.PortHi), targets)
+		isolationErr := bsb.CheckRules()
 		bsb.RulesDown()
+		if isolationErr != nil {
+			a.failRun(run, fmt.Sprintf("baseline isolation: %v", isolationErr))
+			return
+		}
 		a.mu.Lock()
 		run.Baseline = base
 		a.mu.Unlock()
 		if ctx.Err() != nil {
 			return
 		}
-		var blocked []string
-		for _, tc := range base {
-			if tc.Blocked {
-				blocked = append(blocked, tc.Host)
-			}
+		blocked, err := blockedBaselineTargets(base)
+		if err != nil {
+			a.failRun(run, err.Error())
+			return
 		}
 		if len(blocked) == 0 {
 			a.mu.Lock()
@@ -318,6 +322,7 @@ func (a *App) executeRun(ctx context.Context, run *Run, list *List, plan []runJo
 	var smu sync.Mutex
 	var sandboxes []*engine.Sandbox
 	started := 0
+	var workerStartErr error
 	feeding := true
 
 	defer func() {
@@ -350,22 +355,21 @@ func (a *App) executeRun(ctx context.Context, run *Run, list *List, plan []runJo
 	// the cap. wg.Add happens under smu, before feeding is cleared, so Wait is safe.
 	startWorker := func() bool {
 		smu.Lock()
+		defer smu.Unlock()
 		if !feeding || started >= maxThreads {
-			smu.Unlock()
 			return false
 		}
 		w := started
-		started++
-		wg.Add(1)
-		smu.Unlock()
 		sb := engine.NewSandbox(a.Cfg, w)
 		if err := sb.RulesUp(); err != nil {
-			wg.Done()
+			workerStartErr = err
 			return false
 		}
-		smu.Lock()
+		// Count only a ready worker; otherwise an all-failed setup leaves the
+		// job feeder waiting forever for workers that were never started.
+		started++
+		wg.Add(1)
 		sandboxes = append(sandboxes, sb)
-		smu.Unlock()
 		go worker(sb)
 		return true
 	}
@@ -377,7 +381,7 @@ func (a *App) executeRun(ctx context.Context, run *Run, list *List, plan []runJo
 	live := started
 	smu.Unlock()
 	if live == 0 {
-		a.failRun(run, "could not start any worker")
+		a.failRun(run, fmt.Sprintf("could not start any worker: %v", workerStartErr))
 		return
 	}
 	a.mu.Lock()
@@ -472,6 +476,8 @@ func baselineCheck(ctx context.Context, pr *probe.Prober, targets []string) []Ta
 func classifyProbe(host string, r probe.Result) TargetCheck {
 	tc := TargetCheck{Host: host, Code: r.Code, Size: r.Size, TTFBms: r.TTFBms, SpeedBps: r.SpeedBps, Err: r.Err}
 	switch {
+	case r.LocalError:
+		tc.Verdict, tc.Blocked = "local_error", false
 	case r.Truncated:
 		tc.Verdict, tc.Blocked = "cap16k", true
 	case r.Code != 0:
@@ -493,6 +499,47 @@ func classifyProbe(host string, r probe.Result) TargetCheck {
 		tc.Blocked = true
 	}
 	return tc
+}
+
+// A local socket failure says nothing about DPI. Do not select a strategy from
+// an incomplete baseline, even if other targets were successfully measured.
+func blockedBaselineTargets(base []TargetCheck) ([]string, error) {
+	var blocked []string
+	for _, tc := range base {
+		if tc.Verdict == "local_error" {
+			return nil, fmt.Errorf("baseline: локальная ошибка проверки %s (не признак блокировки): %s", tc.Host, tc.Err)
+		}
+		if tc.Blocked {
+			blocked = append(blocked, tc.Host)
+		}
+	}
+	return blocked, nil
+}
+
+// A reachable target may have bypassed the candidate queue via VPN routing.
+// Never credit that success to NFQWS. Measure one target at a time per worker,
+// so traffic from parallel targets cannot mask an entirely unused queue.
+func probeQueuedTarget(ctx context.Context, host string, fetch func(context.Context, string) probe.Result, counter func() (uint32, error)) probe.Result {
+	before, err := counter()
+	if err != nil {
+		return probe.Result{Host: host, Err: fmt.Sprintf("проверка NFQUEUE до запроса: %v", err)}
+	}
+	r := fetch(ctx, host)
+	after, err := counter()
+	if err == nil && after != before {
+		return r // inequality also handles the kernel uint32 counter wrapping
+	}
+	r.OK = false
+	detail := "тестовая NFQUEUE не получила пакетов; проверьте VPN-маршрут и WAN-интерфейсы"
+	if err != nil {
+		detail = fmt.Sprintf("проверка NFQUEUE после запроса: %v", err)
+	}
+	if r.Err == "" {
+		r.Err = detail
+	} else {
+		r.Err += "; " + detail
+	}
+	return r
 }
 
 func (a *App) testStrategy(ctx context.Context, sb *engine.Sandbox, pr *probe.Prober, job runJob, targets []string, resolver *dns.Resolver) StrategyResult {
@@ -527,26 +574,22 @@ func (a *App) testStrategy(ctx context.Context, sb *engine.Sandbox, pr *probe.Pr
 	}
 	defer sb.StopNfqws()
 
-	// Probe targets concurrently within this worker (distinct source ports), so a
-	// failing strategy doesn't accumulate per-target timeouts.
-	perTarget := make([]probe.Result, len(targets))
-	sem := make(chan struct{}, 8)
-	var wg sync.WaitGroup
-	for i, t := range targets {
+	// Workers still run in parallel, but targets sharing a queue are measured
+	// sequentially to detect successful requests that went entirely through VPN.
+	perTarget := make([]probe.Result, 0, len(targets))
+	for _, t := range targets {
 		if ctx.Err() != nil {
 			break
 		}
-		wg.Add(1)
-		go func(i int, t string) {
-			defer wg.Done()
-			sem <- struct{}{}
-			defer func() { <-sem }()
-			perTarget[i] = pr.Probe(ctx, t)
-		}(i, t)
+		perTarget = append(perTarget, probeQueuedTarget(ctx, t, pr.Probe, sb.QueuePackets))
 	}
-	wg.Wait()
 
 	var sumTTFB, sumSpeed int64
+	if err := sb.CheckRules(); err != nil {
+		res.Error = fmt.Sprintf("probe isolation: %v", err)
+		res.PerTarget = perTarget
+		return res
+	}
 	for _, pres := range perTarget {
 		if pres.Host == "" {
 			continue // not probed (cancelled)
@@ -584,7 +627,7 @@ func (a *App) mergeSuccessful(list *List, run *Run, results []StrategyResult) {
 			continue
 		}
 		prev, ok := byID[r.StrategyID]
-		if !ok || r.Coefficient > prev.Coefficient {
+		if !ok || r.ArgLine != prev.ArgLine || r.Coefficient > prev.Coefficient {
 			byID[r.StrategyID] = SavedStrategy{
 				StrategyID: r.StrategyID, Name: r.Name, ArgLine: r.ArgLine,
 				DNS: r.DNS, DNSID: r.DNSID,
