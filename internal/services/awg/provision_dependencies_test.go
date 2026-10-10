@@ -13,9 +13,9 @@ import (
 func TestUserspaceProvisionCarriesReviewedDependencyLock(t *testing.T) {
 	script := userspaceInstallScript()
 	for _, want := range []string{
-		"go1.26.8.linux-$arch.tar.gz",
-		"d0f743b33e8d8945e6b1f432edd15785c70507121d6e2a723b21285eddf8b57b",
-		"211ffced9dcb9633a55eac6364816ec0ddd951389a740e88fa8b3337971bdda0",
+		"go1.26.9.linux-$arch.tar.gz",
+		"42d158b4d8f7b61ac0a830567c940a86098fb7aac52e467a5ebec03ef5cc2f8d",
+		"4a97373d49fcacdcf3694fea368a500b00ee3e963974f3e7514132717632f052",
 		`-modfile="$work/engine-deps.mod" -mod=readonly`,
 		`GOTOOLCHAIN=local CGO_ENABLED=0`,
 		`engine_current "$work/amneziawg-go"`,
@@ -68,10 +68,10 @@ func TestUserspaceProvisionRebuildsEngineWithOldDependencies(t *testing.T) {
 		accepted bool
 	}{
 		{"current verified build", current, true},
-		{"same source old compiler", strings.ReplaceAll(current, "go1.26.8", "go1.25.7"), false},
-		{"same source unpatched next compiler", strings.ReplaceAll(current, "go1.26.8", "go1.27.0"), false},
+		{"same source old compiler", strings.ReplaceAll(current, "go1.26.9", "go1.26.8"), false},
+		{"same source unpatched next compiler", strings.ReplaceAll(current, "go1.26.9", "go1.27.1"), false},
 		{"same source old crypto", strings.ReplaceAll(current, "\tv0.57.0\t", "\tv0.42.0\t"), false},
-		{"same source old net", strings.ReplaceAll(current, "\tv0.59.0\t", "\tv0.44.0\t"), false},
+		{"same source old net", strings.ReplaceAll(current, "\tv0.60.0\t", "\tv0.59.0\t"), false},
 		{"same source old sys", strings.ReplaceAll(current, "\tv0.48.0\t", "\tv0.36.0\t"), false},
 		{"old replacement", strings.ReplaceAll(current, "\tv0.57.0\th1:checksum", "\tv0.57.0\n\t=>\tgolang.org/x/crypto\tv0.42.0\th1:checksum"), false},
 		{"local replacement", strings.ReplaceAll(current, "\tv0.57.0\th1:checksum", "\tv0.57.0\n\t=>\t../crypto\t(devel)"), false},

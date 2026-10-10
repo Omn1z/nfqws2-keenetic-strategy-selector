@@ -2,7 +2,7 @@ module nfqws2strategy
 
 go 1.26.4
 
-toolchain go1.26.8
+toolchain go1.26.9
 
 require (
 	github.com/AdguardTeam/urlfilter v0.23.4
@@ -10,7 +10,7 @@ require (
 	github.com/miekg/dns v1.1.73
 	golang.org/x/crypto v0.57.0
 	golang.org/x/mod v0.41.0
-	golang.org/x/net v0.59.0
+	golang.org/x/net v0.60.0
 	golang.org/x/sys v0.48.0
 )
 

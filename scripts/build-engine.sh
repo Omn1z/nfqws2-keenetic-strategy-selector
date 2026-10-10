@@ -6,7 +6,7 @@
 # like our own binary.
 #
 # Output: dist/awg-engine-linux-<arch>.tar.gz (+ .sha256), each containing
-# `amneziawg-go`. Runs on a Linux CI host. Needs: go >= 1.26.8, git, tar.
+# `amneziawg-go`. Runs on a Linux CI host. Needs: go >= 1.26.9, git, tar.
 # Set GOVULNCHECK to the scanner executable to check an audit build per target.
 # Audit builds retain symbols and stay in .engine-build, outside release assets.
 set -e
