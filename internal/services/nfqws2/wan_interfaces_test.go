@@ -25,8 +25,40 @@ NFQWS_ARGS="
 "
 `
 
+// Upstream creates this snapshot at startup and sources it after nfqws2.conf
+// on every subsequent init invocation, including firewall_iptables/ip6tables.
+const keeneticUltraWANRuntimeConfig = `ISP_INTERFACE="eth4,eth3,eth2.4"
+IPV6_ENABLED=1
+TCP_PORTS=80,443
+UDP_PORTS=443,50000:50100
+POLICY_NAME="active policy"
+POLICY_EXCLUDE=1
+POLICY_MARK="0x42/0x0fffffff"
+NFQUEUE_NUM=301
+`
+
 func normalizedKeeneticUltraWANConfig() string {
 	return strings.Replace(keeneticUltraWANConfig, "eth4,eth3,eth2.4", "eth4 eth3 eth2.4", 1)
+}
+
+func normalizedKeeneticUltraWANRuntimeConfig() string {
+	return strings.Replace(keeneticUltraWANRuntimeConfig, "eth4,eth3,eth2.4", "eth4 eth3 eth2.4", 1)
+}
+
+func writeWANRuntimeConfig(t *testing.T, m *Manager, content string) {
+	t.Helper()
+	if err := os.WriteFile(m.cfg.Nfqws2Conf+".run", []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func readWANRuntimeConfig(t *testing.T, m *Manager) string {
+	t.Helper()
+	data, err := os.ReadFile(m.cfg.Nfqws2Conf + ".run")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(data)
 }
 
 func writeWANConfig(t *testing.T, m *Manager, content string) {
@@ -77,6 +109,106 @@ func TestPrepareWANInterfacesPreservesConfigAndPermissions(t *testing.T) {
 	if !after.ModTime().Equal(stamp) {
 		t.Fatal("already normalized config was rewritten")
 	}
+	if _, err := os.Stat(m.cfg.Nfqws2Conf + ".run"); !os.IsNotExist(err) {
+		t.Fatalf("preparation created an absent runtime snapshot: %v", err)
+	}
+}
+
+func TestPrepareWANInterfacesPreservesRuntimeSnapshot(t *testing.T) {
+	for _, runtimeOnly := range []bool{false, true} {
+		name := "both configs need normalization"
+		if runtimeOnly {
+			name = "only runtime snapshot needs normalization"
+		}
+		t.Run(name, func(t *testing.T) {
+			m := archiveTestManager(t)
+			content := keeneticUltraWANConfig
+			if runtimeOnly {
+				content = normalizedKeeneticUltraWANConfig()
+			}
+			writeWANConfig(t, m, content)
+			writeWANRuntimeConfig(t, m, keeneticUltraWANRuntimeConfig)
+			runtimePath := m.cfg.Nfqws2Conf + ".run"
+			before, err := os.Stat(runtimePath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			changed, err := m.PrepareWANInterfaces()
+			if err != nil || !changed {
+				t.Fatalf("prepare runtime snapshot: changed=%v, err=%v", changed, err)
+			}
+			if got := string(readTestAsset(t, m, "nfqws2.conf")); got != normalizedKeeneticUltraWANConfig() {
+				t.Fatalf("main config = %q", got)
+			}
+			if got := readWANRuntimeConfig(t, m); got != normalizedKeeneticUltraWANRuntimeConfig() {
+				t.Fatalf("runtime snapshot was not normalized or active policy/ports/queue changed: %q", got)
+			}
+			after, err := os.Stat(runtimePath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if after.Mode().Perm() != before.Mode().Perm() {
+				t.Fatalf("runtime permissions changed: %o -> %o", before.Mode().Perm(), after.Mode().Perm())
+			}
+			stamp := time.Unix(1234567890, 0)
+			if err := os.Chtimes(runtimePath, stamp, stamp); err != nil {
+				t.Fatal(err)
+			}
+			if changed, err := m.PrepareWANInterfaces(); err != nil || changed {
+				t.Fatalf("repeat runtime preparation: changed=%v, err=%v", changed, err)
+			}
+			after, err = os.Stat(runtimePath)
+			if err != nil || !after.ModTime().Equal(stamp) {
+				t.Fatalf("normalized runtime snapshot was rewritten: %v", err)
+			}
+		})
+	}
+}
+
+func TestPrepareWANInterfacesKeepsDistinctConfiguredAndRunningLists(t *testing.T) {
+	m := archiveTestManager(t)
+	// The user can save their next WAN settings before restarting the engine.
+	// Normalization must not apply those pending settings to the live snapshot.
+	mainConfig := strings.Replace(keeneticUltraWANConfig, "eth4,eth3,eth2.4", "eth9,nwg1", 1)
+	writeWANConfig(t, m, mainConfig)
+	writeWANRuntimeConfig(t, m, keeneticUltraWANRuntimeConfig)
+	if changed, err := m.PrepareWANInterfaces(); err != nil || !changed {
+		t.Fatalf("prepare distinct WAN lists: changed=%v, err=%v", changed, err)
+	}
+	if got := string(readTestAsset(t, m, "nfqws2.conf")); got != strings.Replace(mainConfig, "eth9,nwg1", "eth9 nwg1", 1) {
+		t.Fatalf("configured WAN list was replaced with running settings: %q", got)
+	}
+	if got := readWANRuntimeConfig(t, m); got != normalizedKeeneticUltraWANRuntimeConfig() {
+		t.Fatalf("running settings were replaced with pending config: %q", got)
+	}
+}
+
+func TestPrepareWANInterfacesRejectsInvalidRuntimeBeforeWritingEitherFile(t *testing.T) {
+	m := archiveTestManager(t)
+	writeWANConfig(t, m, keeneticUltraWANConfig)
+	invalid := strings.Replace(keeneticUltraWANRuntimeConfig, "eth4,eth3,eth2.4", "eth4,"+strings.Repeat("x", 16), 1)
+	writeWANRuntimeConfig(t, m, invalid)
+	stamp := time.Unix(1234567890, 0)
+	for _, path := range []string{m.cfg.Nfqws2Conf, m.cfg.Nfqws2Conf + ".run"} {
+		if err := os.Chtimes(path, stamp, stamp); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if changed, err := m.PrepareWANInterfaces(); err == nil || changed {
+		t.Fatalf("invalid runtime snapshot accepted: changed=%v, err=%v", changed, err)
+	}
+	if got := string(readTestAsset(t, m, "nfqws2.conf")); got != keeneticUltraWANConfig {
+		t.Fatalf("main config was partially normalized despite invalid runtime snapshot: %q", got)
+	}
+	if got := readWANRuntimeConfig(t, m); got != invalid {
+		t.Fatalf("invalid runtime snapshot was replaced: %q", got)
+	}
+	for _, path := range []string{m.cfg.Nfqws2Conf, m.cfg.Nfqws2Conf + ".run"} {
+		info, err := os.Stat(path)
+		if err != nil || !info.ModTime().Equal(stamp) {
+			t.Fatalf("%s was rewritten despite invalid runtime snapshot: %v", path, err)
+		}
+	}
 }
 
 func TestPrepareWANInterfacesMissingConfigIsNoop(t *testing.T) {
@@ -87,6 +219,9 @@ func TestPrepareWANInterfacesMissingConfigIsNoop(t *testing.T) {
 	}
 	if _, err := os.Stat(m.cfg.Nfqws2Conf); !os.IsNotExist(err) {
 		t.Fatalf("preparation created missing config: %v", err)
+	}
+	if _, err := os.Stat(m.cfg.Nfqws2Conf + ".run"); !os.IsNotExist(err) {
+		t.Fatalf("preparation created missing runtime snapshot: %v", err)
 	}
 }
 
@@ -171,7 +306,10 @@ func TestWANInterfacesNormalizedOnConfigWrites(t *testing.T) {
 
 func TestPreparedWANInterfacesApplyBypassForBothFamilies(t *testing.T) {
 	m := archiveTestManager(t)
-	writeWANConfig(t, m, keeneticUltraWANConfig)
+	// Reproduce the upgrade case: the main config was already repaired, but
+	// the running engine's older snapshot still overrides it with commas.
+	writeWANConfig(t, m, normalizedKeeneticUltraWANConfig())
+	writeWANRuntimeConfig(t, m, keeneticUltraWANRuntimeConfig)
 	dir := filepath.Dir(m.cfg.Nfqws2Conf)
 	initPath := filepath.Join(dir, "mock-init.sh")
 	bypassPath := filepath.Join(dir, "mock-bypass.sh")
@@ -180,6 +318,7 @@ func TestPreparedWANInterfacesApplyBypassForBothFamilies(t *testing.T) {
 	initScript := `#!/bin/sh
 set -eu
 . "$WAN_TEST_CONFIG"
+if [ -f "$WAN_TEST_CONFIG.run" ]; then . "$WAN_TEST_CONFIG.run"; fi
 for iface in $ISP_INTERFACE; do
   case "$iface" in *,*) printf 'invalid interface: %s\n' "$iface" >&2; exit 2 ;; esac
   [ "${#iface}" -lt 16 ] || exit 2
@@ -219,8 +358,23 @@ func TestRestoreBypassRepairsWANInterfacesBeforeReusingFreshCache(t *testing.T) 
 	if runtime.GOOS == "windows" {
 		t.Skip("requires a POSIX executable shell shim")
 	}
+	t.Run("main config changed", func(t *testing.T) {
+		testRestoreBypassRepairsWANInterfaces(t, false)
+	})
+	t.Run("only runtime snapshot changed", func(t *testing.T) {
+		testRestoreBypassRepairsWANInterfaces(t, true)
+	})
+}
+
+func testRestoreBypassRepairsWANInterfaces(t *testing.T, runtimeOnly bool) {
+	t.Helper()
 	m := archiveTestManager(t)
-	writeWANConfig(t, m, keeneticUltraWANConfig)
+	if runtimeOnly {
+		writeWANConfig(t, m, normalizedKeeneticUltraWANConfig())
+		writeWANRuntimeConfig(t, m, keeneticUltraWANRuntimeConfig)
+	} else {
+		writeWANConfig(t, m, keeneticUltraWANConfig)
+	}
 	dir := filepath.Dir(m.cfg.Nfqws2Conf)
 	binDir := filepath.Join(dir, "bin")
 	listDir := filepath.Join(dir, "lists")
@@ -242,6 +396,7 @@ start_service() {
 }
 case "$1" in firewall_iptables|firewall_ip6tables) ;; *) exit 97 ;; esac
 . "$WAN_TEST_CONFIG"
+if [ -f "$WAN_TEST_CONFIG.run" ]; then . "$WAN_TEST_CONFIG.run"; fi
 for iface in $ISP_INTERFACE; do
   case "$iface" in *,*) exit 2 ;; esac
   printf '%s %s\n' "$1" "$iface" >> "$WAN_TEST_CALLS"
@@ -317,6 +472,13 @@ exec /bin/sh "$@"
 		}
 		if got := string(readTestAsset(t, m, "nfqws2.conf")); got != normalizedKeeneticUltraWANConfig() {
 			t.Fatalf("restore %d left invalid WAN interfaces: %q", attempt+1, got)
+		}
+		if runtimeOnly {
+			if got := readWANRuntimeConfig(t, m); got != normalizedKeeneticUltraWANRuntimeConfig() {
+				t.Fatalf("restore %d left invalid runtime WAN interfaces or changed active settings: %q", attempt+1, got)
+			}
+		} else if _, err := os.Stat(m.cfg.Nfqws2Conf + ".run"); !os.IsNotExist(err) {
+			t.Fatalf("restore %d created an absent runtime snapshot: %v", attempt+1, err)
 		}
 		info, err := os.Stat(cache)
 		if err != nil || !info.ModTime().Equal(stamp) {
