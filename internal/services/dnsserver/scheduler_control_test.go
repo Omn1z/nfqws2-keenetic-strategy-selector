@@ -202,6 +202,13 @@ func TestResolverSchedulerDisabledKeepsParallelRaceWithoutMeasurements(t *testin
 		if query == nil {
 			return
 		}
+		if query.Question[0].Name == "warmup.example." {
+			if req.ProtoMajor != 2 {
+				t.Errorf("fixture did not negotiate HTTP/2: %s", req.Proto)
+			}
+			maintenanceReply(t, w, query)
+			return
+		}
 		entered <- struct{}{}
 		select {
 		case <-release:
@@ -212,6 +219,28 @@ func TestResolverSchedulerDisabledKeepsParallelRaceWithoutMeasurements(t *testin
 	backend.routes = backend.routes[:2]
 	r.cfg.SchedulerEnabled, r.cfg.CacheSize, r.cfg.FastDNS = false, 0, false
 	r.fastDNS = nil
+	// Both upstream paths share a host and can multiplex on the same HTTP/2
+	// connection. Warm each route to make that reuse deterministic.
+	warm := new(mdns.Msg)
+	warm.SetQuestion("warmup.example.", mdns.TypeA)
+	wire, err := warm.Pack()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, route := range backend.routes {
+		if _, err := r.exchangeEndpoint(context.Background(), route.ID, r.cfg.DefaultUpstream, wire, warm); err != nil {
+			t.Fatal(err)
+		}
+	}
+	backend.setFailures()
+	attempts := make(chan AttemptEvent, 8)
+	r.SetAttemptObserver(func(event AttemptEvent) { attempts <- event })
+	want := make(map[string]bool)
+	for _, route := range backend.routes {
+		for _, upstream := range []Upstream{r.cfg.DefaultUpstream, r.cfg.DefaultPool[0]} {
+			want[route.ID+"|"+upstream.Address] = true
+		}
+	}
 	var once sync.Once
 	unblock := func() { once.Do(func() { close(release) }) }
 	defer unblock()
@@ -227,15 +256,28 @@ func TestResolverSchedulerDisabledKeepsParallelRaceWithoutMeasurements(t *testin
 	if reply := resolverFlightTestReceive(t, done); reply.err != nil {
 		t.Fatal(reply.err)
 	}
-	if len(r.scheduler.entries) != 0 || r.scheduler.races != 0 || len(backend.dialCalls()) != 4 {
-		t.Fatal("disabled resolver created adaptive history or changed the parallel race")
+	for i := 0; i < 4; i++ {
+		select {
+		case event := <-attempts:
+			key := event.Route + "|" + event.Upstream
+			if !want[key] {
+				t.Fatalf("unexpected or duplicate foreground attempt: %+v", event)
+			}
+			delete(want, key)
+		case <-time.After(2 * time.Second):
+			t.Fatalf("foreground attempts did not finish: missing=%v", want)
+		}
 	}
+	if len(r.scheduler.entries) != 0 || r.scheduler.races != 0 {
+		t.Fatalf("disabled resolver created adaptive history: entries=%d races=%d", len(r.scheduler.entries), r.scheduler.races)
+	}
+	dials := len(backend.dialCalls())
 	r.StartMaintenance()
 	for i := 0; i < 12; i++ {
 		r.runSchedulerProbe()
 	}
-	if len(backend.dialCalls()) != 4 || r.scheduler.probeToken != 0 {
-		t.Fatal("disabled maintenance sent extra DNS traffic")
+	if len(backend.dialCalls()) != dials || len(entered) != 0 || len(attempts) != 0 || r.scheduler.probeToken != 0 {
+		t.Fatalf("disabled maintenance sent extra DNS traffic: dials=%d->%d requests=%d attempts=%d probe=%d", dials, len(backend.dialCalls()), len(entered), len(attempts), r.scheduler.probeToken)
 	}
 }
 
