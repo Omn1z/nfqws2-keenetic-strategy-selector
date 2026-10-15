@@ -4,13 +4,290 @@ import (
 	"archive/zip"
 	"bytes"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
+	"reflect"
+	"slices"
 	"strings"
 	"testing"
 
 	"nfqws2strategy/internal/tools/config"
 )
+
+func saveArchiveTestServices(t *testing.T, m *Manager, services []ServiceStrategy) ServiceStrategiesState {
+	t.Helper()
+	state, err := m.ServiceStrategies()
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, err = m.SaveServiceStrategies(services, state.Revision)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return state
+}
+
+func archiveZIPFiles(t *testing.T, data []byte) map[string][]byte {
+	t.Helper()
+	zr, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := map[string][]byte{}
+	for _, file := range zr.File {
+		r, err := file.Open()
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, err := io.ReadAll(r)
+		r.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		out[file.Name] = body
+	}
+	return out
+}
+
+func TestStrategyArchiveCarriesServicesAcrossRoutersAndRestartPreparation(t *testing.T) {
+	source := serviceManagerFixture(t)
+	want := saveArchiveTestServices(t, source, testService()).Services
+	data, err := source.StrategyExport()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := archiveZIPFiles(t, data)[serviceStrategiesArchiveName]; !exists {
+		t.Fatal("export omitted editable service definitions")
+	}
+	for _, existing := range []bool{false, true} {
+		t.Run(map[bool]string{false: "freshRouter", true: "existingServices"}[existing], func(t *testing.T) {
+			target := archiveTestManager(t)
+			if existing {
+				putTestAsset(t, target, "nfqws2.conf", []byte(serviceTestConf))
+				other := testService()
+				other[0].Name = "Different service"
+				other[0].Groups[0].Entries = []string{"different.example"}
+				saveArchiveTestServices(t, target, other)
+			}
+			preview, err := target.StrategyPreview(data, "")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := target.StrategyImport(data, "", ArchiveImportOptions{Digest: preview.Digest, Overwrite: true}); err != nil {
+				t.Fatal(err)
+			}
+			state, err := target.ServiceStrategies()
+			if err != nil || !reflect.DeepEqual(state.Services, want) || !state.RestartRequired {
+				t.Fatalf("wrong restored services: %+v, %v", state, err)
+			}
+			before := readTestAsset(t, target, "nfqws2.conf")
+			if bytes.Contains(before, []byte(filepath.ToSlash(filepath.Dir(source.cfg.Nfqws2Conf)))) || !bytes.Contains(before, []byte(filepath.ToSlash(filepath.Dir(target.cfg.Nfqws2Conf)))) {
+				t.Fatal("import did not regenerate service paths for the destination router")
+			}
+			if err := target.PrepareServiceStrategies(); err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(before, readTestAsset(t, target, "nfqws2.conf")) {
+				t.Fatal("restart preparation overwrote imported profiles from stale definitions")
+			}
+			state, _ = target.ServiceStrategies()
+			if !reflect.DeepEqual(state.Services, want) {
+				t.Fatal("restart preparation resurrected the old services")
+			}
+		})
+	}
+}
+
+func TestStrategySnapshotRestoresServiceDefinitionsAndKeepsLiveImmutableLists(t *testing.T) {
+	m := serviceManagerFixture(t)
+	want := saveArchiveTestServices(t, m, testService()).Services
+	snapshot, err := m.StrategySnapshotCreate("Original services")
+	if err != nil {
+		t.Fatal(err)
+	}
+	changed := testService()
+	changed[0].Groups[0].Entries = []string{"new.example"}
+	saveArchiveTestServices(t, m, changed)
+	lists, err := filepath.Glob(filepath.Join(filepath.Dir(m.cfg.Nfqws2Conf), "lists", "n2s_service_*.list"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	live := map[string][]byte{}
+	for _, name := range lists {
+		live[name], err = os.ReadFile(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	preview, err := m.StrategyPreview(nil, snapshot.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range preview.Removed {
+		if managedServiceArchiveList(name) {
+			t.Fatal("restore proposed deleting an immutable list still used by the live engine")
+		}
+	}
+	result, err := m.StrategyImport(nil, snapshot.ID, ArchiveImportOptions{Digest: preview.Digest, Overwrite: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	state, err := m.ServiceStrategies()
+	if err != nil || !reflect.DeepEqual(state.Services, want) {
+		t.Fatalf("snapshot failed to restore service definitions: %+v, %v", state, err)
+	}
+	for name, before := range live {
+		after, err := os.ReadFile(name)
+		if err != nil || !bytes.Equal(before, after) || !slices.Contains(result.Kept, "lists/"+filepath.Base(name)) {
+			t.Fatalf("live list was changed or lost: %s, %v", name, err)
+		}
+	}
+	before := readTestAsset(t, m, "nfqws2.conf")
+	if err := m.PrepareServiceStrategies(); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, readTestAsset(t, m, "nfqws2.conf")) {
+		t.Fatal("restart undid the restored snapshot")
+	}
+}
+
+func TestLegacyStrategyArchiveClearsNewerServiceDefinitions(t *testing.T) {
+	m := serviceManagerFixture(t)
+	saveArchiveTestServices(t, m, testService())
+	data := testZIP(t, map[string][]byte{"nfqws2.conf": []byte(serviceTestConf)})
+	preview, err := m.StrategyPreview(data, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(strings.Join(preview.Warnings, "\n"), "текущие сервисные стратегии будут очищены") {
+		t.Fatal("legacy import did not explain clearing services")
+	}
+	if _, err := m.StrategyImport(data, "", ArchiveImportOptions{Digest: preview.Digest, Overwrite: true}); err != nil {
+		t.Fatal(err)
+	}
+	state, err := m.ServiceStrategies()
+	if err != nil || len(state.Services) != 0 || state.Profiles != 0 {
+		t.Fatalf("legacy archive retained newer service definitions: %+v, %v", state, err)
+	}
+	if err := m.PrepareServiceStrategies(); err != nil {
+		t.Fatal(err)
+	}
+	want, err := config.NormalizeWANInterfaces(serviceTestConf)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := readTestAsset(t, m, "nfqws2.conf"); string(got) != want {
+		t.Fatal("legacy global configuration was overwritten during restart preparation")
+	}
+}
+
+func TestStrategyArchiveRejectsIncompleteOrInvalidServicesBeforeWrites(t *testing.T) {
+	m := serviceManagerFixture(t)
+	saveArchiveTestServices(t, m, testService())
+	good, err := m.StrategyExport()
+	if err != nil {
+		t.Fatal(err)
+	}
+	confBefore := readTestAsset(t, m, "nfqws2.conf")
+	docBefore, _, err := readAssetLocation(m.serviceStrategiesLocation())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, kind := range []string{"missingDocument", "invalidJSON", "unknownField", "invalidStrategy", "inconsistentList"} {
+		t.Run(kind, func(t *testing.T) {
+			files := archiveZIPFiles(t, good)
+			switch kind {
+			case "missingDocument":
+				delete(files, serviceStrategiesArchiveName)
+			case "invalidJSON":
+				files[serviceStrategiesArchiveName] = []byte("{")
+			case "unknownField":
+				files[serviceStrategiesArchiveName] = []byte(`{"services":[],"unknown":true}`)
+			case "invalidStrategy":
+				files[serviceStrategiesArchiveName] = bytes.Replace(files[serviceStrategiesArchiveName], []byte("--filter-tcp=8443"), []byte("--filter-tcp=8443; echo injected"), 1)
+			case "inconsistentList":
+				for name := range files {
+					if managedServiceArchiveList(name) {
+						files[name] = []byte("changed.example\n")
+						break
+					}
+				}
+			}
+			data := testZIP(t, files)
+			if _, err := m.StrategyPreview(data, ""); err == nil {
+				t.Fatal("invalid services accepted by preview")
+			}
+			if _, err := m.StrategyImport(data, "", ArchiveImportOptions{Overwrite: true}); err == nil {
+				t.Fatal("invalid services accepted by import")
+			}
+			docAfter, _, _ := readAssetLocation(m.serviceStrategiesLocation())
+			snapshots, _ := m.StrategySnapshots()
+			if !bytes.Equal(confBefore, readTestAsset(t, m, "nfqws2.conf")) || !bytes.Equal(docBefore, docAfter) || len(snapshots) != 0 {
+				t.Fatal("invalid archive changed live files or wrote a snapshot")
+			}
+		})
+	}
+}
+
+func TestStrategyArchiveCannotOverwriteExistingImmutableServiceList(t *testing.T) {
+	m := serviceManagerFixture(t)
+	saveArchiveTestServices(t, m, testService())
+	compiled, err := CompileServiceStrategies(testService(), filepath.ToSlash(filepath.Join(filepath.Dir(m.cfg.Nfqws2Conf), "lists")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, content := range compiled.Lists {
+		data := testZIP(t, map[string][]byte{"nfqws2.conf": []byte(serviceTestConf), "lists/" + name: []byte("different.example\n")})
+		if _, err := m.StrategyPreview(data, ""); err == nil {
+			t.Fatal("preview accepted an altered immutable service list")
+		}
+		if got := readTestAsset(t, m, "lists/"+name); string(got) != content {
+			t.Fatal("immutable service list changed")
+		}
+	}
+}
+
+func TestStrategyArchiveServiceDocumentParticipatesInRevisionAndRollback(t *testing.T) {
+	m := serviceManagerFixture(t)
+	saveArchiveTestServices(t, m, testService())
+	data, err := m.StrategyExport()
+	if err != nil {
+		t.Fatal(err)
+	}
+	preview, err := m.StrategyPreview(data, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	other := testService()
+	other[0].Name = "Renamed while preview was open"
+	saveArchiveTestServices(t, m, other)
+	if _, err := m.StrategyImport(data, "", ArchiveImportOptions{Digest: preview.Digest, Overwrite: true}); !errors.Is(err, ErrArchiveChanged) {
+		t.Fatalf("service-only edit escaped the revision guard: %v", err)
+	}
+	confBefore := readTestAsset(t, m, "nfqws2.conf")
+	docBefore, _, _ := readAssetLocation(m.serviceStrategiesLocation())
+	// A directory in the flat script namespace fails after the document write,
+	// while the main config is still waiting to be written last.
+	if err := os.Mkdir(filepath.Join(filepath.Dir(m.cfg.Nfqws2Conf), "zblocked.sh"), 0755); err != nil {
+		t.Fatal(err)
+	}
+	files := archiveZIPFiles(t, data)
+	files["scripts/zblocked.sh"] = []byte("#!/bin/sh\n")
+	data = testZIP(t, files)
+	preview, err = m.StrategyPreview(data, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := m.StrategyImport(data, "", ArchiveImportOptions{Digest: preview.Digest, Overwrite: true})
+	if err == nil || !strings.Contains(err.Error(), "исходные файлы восстановлены") || !validSnapshotID(result.Snapshot.ID) {
+		t.Fatalf("failed transaction did not roll back: %+v, %v", result, err)
+	}
+	docAfter, _, _ := readAssetLocation(m.serviceStrategiesLocation())
+	if !bytes.Equal(confBefore, readTestAsset(t, m, "nfqws2.conf")) || !bytes.Equal(docBefore, docAfter) {
+		t.Fatal("failed archive transaction did not restore the previous service document and config")
+	}
+}
 
 func archiveTestManager(t *testing.T) *Manager {
 	t.Helper()

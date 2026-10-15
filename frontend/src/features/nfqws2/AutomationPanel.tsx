@@ -3,6 +3,7 @@ import { api } from "@/lib/api";
 import { Card } from "@/components/ui/Card";
 import { Button } from "@/components/ui/Button";
 import { Badge } from "@/components/ui/Badge";
+import { Switch } from "@/components/ui/Switch";
 import { toast } from "@/components/ui/Toast";
 import { cn } from "@/lib/cn";
 import type { AutomationStatus } from "@/types/api";
@@ -60,7 +61,7 @@ export function AutomationPanel() {
   };
 
   const pickNow = async () => {
-    if (busy || st.pick_in_progress) return;
+    if (busy || st.pick_in_progress || st.nfqws2_manual_off) return;
     setBusy(true);
     try {
       const next = await api<AutomationStatus>("POST", "/api/nfqws2/automation/pick-now", {});
@@ -104,6 +105,7 @@ export function AutomationPanel() {
       }
     >
       <div className="space-y-3">
+        {st.nfqws2_manual_off && <p className="text-xs text-muted" role="status">Служба NFQWS2 выключена вручную. Watchdog и авто-подбор приостановлены до включения службы основным переключателем.</p>}
         <div>
           <div className="mb-1 text-[12px] uppercase tracking-wide text-muted">Режим NFQWS2</div>
           <div className="inline-flex overflow-hidden rounded-lg border border-line">
@@ -118,37 +120,37 @@ export function AutomationPanel() {
 
         <div className="border-t border-line-soft pt-3">
           <div className="mb-1 text-[12px] uppercase tracking-wide text-muted">Авто-пик стратегии</div>
-          <label className="flex items-center gap-2 text-[13px]">
-            <input
-              type="checkbox"
-              checked={st.auto_pick}
-              onChange={e => patch({ auto_pick: e.target.checked })}
-              disabled={busy}
-            />
-            <span>При первом старте если конфиг пуст — сам запустить скан и применить лучшую стратегию</span>
-          </label>
+          <Switch
+            checked={st.auto_pick}
+            onChange={auto_pick => patch({ auto_pick })}
+            disabled={busy}
+            label="Автоматически подбирать и применять стратегию"
+          />
+          <p className="mt-1 text-[11.5px] text-muted">
+            Подбирать стратегию для пустого конфига и повторять по расписанию, если оно включено. По умолчанию выключено.
+          </p>
 
-          <label className="mt-2 flex items-center gap-2 text-[13px]">
-            <input
-              type="checkbox"
-              checked={st.periodic_scan}
-              onChange={e => patch({ periodic_scan: e.target.checked })}
-              disabled={busy}
+          <div className="mt-2 flex flex-wrap items-center gap-2 text-[13px]">
+            <Switch
+              checked={st.auto_pick && st.periodic_scan}
+              onChange={periodic_scan => patch({ periodic_scan })}
+              disabled={busy || !st.auto_pick}
+              label="Повторять каждые"
             />
-            <span>Периодически пере-сканировать раз в</span>
             <input
               type="number"
+              aria-label="Интервал авто-пика в часах"
               min={1}
               max={720}
               value={st.interval_h}
               onChange={e => patch({ interval_h: Math.max(1, parseInt(e.target.value || "24", 10)) })}
-              disabled={busy || !st.periodic_scan}
+              disabled={busy || !st.auto_pick || !st.periodic_scan}
               className="w-16 rounded border border-line bg-panel px-1.5 py-0.5 text-right tabular-nums outline-none focus:border-accent"
             />
             <span>ч</span>
-          </label>
+          </div>
           <p className="mt-1 text-[11.5px] text-muted">
-            Скан реально дёргает заблокированные сайты с тестовыми стратегиями, занимает 1–3 мин. По умолчанию выключено.
+            Когда авто-пик выключен, фоновый подбор и расписание не запускаются. «Пик сейчас» запускает подбор вручную.
           </p>
         </div>
 
@@ -169,10 +171,12 @@ export function AutomationPanel() {
         )}
 
         <div className="flex items-center gap-2 border-t border-line-soft pt-3">
-          <Button mini onClick={pickNow} disabled={busy || st.pick_in_progress}>
+          <Button mini onClick={pickNow} disabled={busy || st.pick_in_progress || st.nfqws2_manual_off}>
             {st.pick_in_progress ? "сканирую…" : "Пик сейчас"}
           </Button>
-          <span className="text-[11.5px] text-muted">Скан + применить, занимает 1–3 мин</span>
+          <span className="text-[11.5px] text-muted">
+            Скан + применить, занимает 1–3 мин
+          </span>
         </div>
       </div>
     </Card>

@@ -17,12 +17,17 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"nfqws2strategy/internal/tools/config"
 )
 
+const serviceStrategiesArchiveName = "nfqws2-service-strategies.json"
+
 type archiveEntry struct {
-	data       []byte
-	mode       fs.FileMode
-	normalized bool
+	data           []byte
+	mode           fs.FileMode
+	normalized     bool
+	legacyServices bool
 }
 type archiveFiles map[string]archiveEntry
 
@@ -108,6 +113,102 @@ func sortedArchiveNames(files archiveFiles) []string {
 	return names
 }
 
+// Service definitions live outside the engine directory. Reserve one exact ZIP
+// entry without exposing the selector's data directory through the file editor.
+func (m *Manager) strategyArchiveLocation(name string) (assetLocation, error) {
+	if name == serviceStrategiesArchiveName {
+		loc := m.serviceStrategiesLocation()
+		loc.kind = "service"
+		return loc, nil
+	}
+	return m.assetLocation(name)
+}
+
+func managedServiceArchiveList(name string) bool {
+	return strings.HasPrefix(name, "lists/") && managedServiceList(name)
+}
+
+func validateStrategyArchiveLimits(files archiveFiles) error {
+	if len(files) > ArchiveMaxFiles {
+		return fmt.Errorf("слишком много файлов в ZIP")
+	}
+	total := 0
+	for _, entry := range files {
+		if len(entry.data) > AssetMaxBytes {
+			return fmt.Errorf("файл превышает предел 16 МиБ")
+		}
+		total += len(entry.data)
+		if total > ArchiveExpandedMaxBytes {
+			return fmt.Errorf("ZIP после распаковки превышает 64 МиБ")
+		}
+	}
+	return nil
+}
+
+// Rebuild derived paths and lists for this router before any live file changes.
+// The document is authoritative; importing a generated block alone cannot
+// recover editable groups and would be silently undone by the next restart.
+func (m *Manager) prepareStrategyArchiveServices(files archiveFiles) error {
+	entry, hasDocument := files[serviceStrategiesArchiveName]
+	if !hasDocument {
+		_, _, managed, err := config.ManagedServiceConfigRange(string(files["nfqws2.conf"].data))
+		if err != nil {
+			return err
+		}
+		if managed {
+			return fmt.Errorf("архив содержит сервисные профили без %s; экспортируйте стратегию вместе с настройками сервисов", serviceStrategiesArchiveName)
+		}
+		return nil
+	}
+	var doc serviceStrategiesDocument
+	decoder := json.NewDecoder(bytes.NewReader(entry.data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&doc); err != nil {
+		return fmt.Errorf("%s: %w", serviceStrategiesArchiveName, err)
+	}
+	if err := decoder.Decode(new(any)); err != io.EOF {
+		return fmt.Errorf("%s: ожидается один JSON-документ", serviceStrategiesArchiveName)
+	}
+	listsDir := filepath.ToSlash(filepath.Join(filepath.Dir(m.cfg.Nfqws2Conf), "lists"))
+	compiled, conf, _, _, err := compileServiceConfig(string(files["nfqws2.conf"].data), doc.Services, listsDir)
+	if err != nil {
+		return fmt.Errorf("сервисы из архива: %w", err)
+	}
+	doc.Services, doc.RestartRequired = compiled.Services, true
+	data, err := json.MarshalIndent(doc, "", "  ")
+	if err != nil {
+		return err
+	}
+	files[serviceStrategiesArchiveName] = archiveEntry{data: append(data, '\n'), mode: 0600, legacyServices: entry.legacyServices}
+	confEntry := files["nfqws2.conf"]
+	confEntry.data = []byte(conf)
+	files["nfqws2.conf"] = confEntry
+	for name, content := range compiled.Lists {
+		name = "lists/" + name
+		if supplied, exists := files[name]; exists && string(supplied.data) != content {
+			return fmt.Errorf("управляемый список %s не соответствует настройкам сервисов", name)
+		}
+		files[name] = archiveEntry{data: []byte(content), mode: 0644}
+	}
+	return validateStrategyArchiveLimits(files)
+}
+
+func prepareStrategyArchiveAgainstCurrent(files, current archiveFiles) error {
+	if _, incoming := files[serviceStrategiesArchiveName]; !incoming {
+		if _, exists := current[serviceStrategiesArchiveName]; exists {
+			// A pre-services snapshot represents a global-only strategy. Clear
+			// newer definitions transactionally rather than resurrecting them.
+			files[serviceStrategiesArchiveName] = archiveEntry{data: []byte("{\"services\":[],\"restart_required\":true}\n"), mode: 0600, legacyServices: true}
+		}
+	}
+	for name, entry := range files {
+		if previous, exists := current[name]; exists && managedServiceArchiveList(name) && !bytes.Equal(previous.data, entry.data) {
+			return fmt.Errorf("управляемый список %s уже существует с другим содержимым; работающая стратегия должна сохранить свой неизменяемый список", name)
+		}
+	}
+	return validateStrategyArchiveLimits(files)
+}
+
 func (m *Manager) collectArchiveLocked() (archiveFiles, error) {
 	assets, err := m.listAssetsLocked()
 	if err != nil {
@@ -129,6 +230,16 @@ func (m *Manager) collectArchiveLocked() (archiveFiles, error) {
 			return nil, fmt.Errorf("размер стратегии превышает 64 МиБ")
 		}
 		out[item.Path] = archiveEntry{data: data, mode: mode}
+	}
+	data, mode, err := readAssetLocation(m.serviceStrategiesLocation())
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
+	if err == nil {
+		out[serviceStrategiesArchiveName] = archiveEntry{data: data, mode: mode}
+	}
+	if err := validateStrategyArchiveLimits(out); err != nil {
+		return nil, err
 	}
 	return out, nil
 }
@@ -197,7 +308,7 @@ func (m *Manager) decodeStrategyArchive(data []byte) (archiveFiles, error) {
 		if !strings.Contains(name, "/") && (strings.HasSuffix(name, ".lua") || strings.HasSuffix(name, ".lua.gz")) {
 			name = "lua/" + name
 		}
-		loc, err := m.assetLocation(name)
+		loc, err := m.strategyArchiveLocation(name)
 		if err != nil {
 			return nil, err
 		}
@@ -240,10 +351,16 @@ func (m *Manager) decodeStrategyArchive(data []byte) (archiveFiles, error) {
 		if loc.kind == "script" {
 			mode = 0755
 		}
+		if loc.kind == "service" {
+			mode = 0600
+		}
 		out[name] = archiveEntry{data: body, mode: mode, normalized: normalized}
 	}
 	if _, exists := out["nfqws2.conf"]; !exists {
 		return nil, fmt.Errorf("в архиве отсутствует nfqws2.conf")
+	}
+	if err := m.prepareStrategyArchiveServices(out); err != nil {
+		return nil, err
 	}
 	return out, nil
 }
@@ -299,11 +416,27 @@ func archivePreview(files, current archiveFiles, restore bool) ArchivePreview {
 	if restore {
 		for _, name := range sortedArchiveNames(current) {
 			if _, exists := files[name]; !exists {
+				if managedServiceArchiveList(name) {
+					continue
+				}
 				out.Removed = append(out.Removed, name)
 			}
 		}
 		if len(out.Removed) > 0 {
 			out.Warnings = append(out.Warnings, "При восстановлении будут удалены файлы, добавленные после этого снимка. Личные списки сохранятся при выборе «Оставить свои».")
+		}
+	}
+	if entry, exists := files[serviceStrategiesArchiveName]; exists {
+		if entry.legacyServices {
+			out.Warnings = append(out.Warnings, "В старом архиве нет настроек сервисов: текущие сервисные стратегии будут очищены, останется глобальная конфигурация из архива.")
+		} else {
+			out.Warnings = append(out.Warnings, "Настройки сервисов будут восстановлены из архива; пути и списки подготовлены для этого роутера.")
+		}
+	}
+	for name := range current {
+		if managedServiceArchiveList(name) {
+			out.Warnings = append(out.Warnings, "Существующие управляемые списки сервисов сохраняются: работающий движок может использовать их до перезапуска.")
+			break
 		}
 	}
 	out.Warnings = append(out.Warnings, "Импорт сохраняет файлы. Для запуска стратегии примените конфиг отдельно.")
@@ -319,6 +452,9 @@ func (m *Manager) StrategyExport() ([]byte, error) {
 	}
 	if _, exists := files["nfqws2.conf"]; !exists {
 		return nil, fmt.Errorf("активный nfqws2.conf не найден")
+	}
+	if err := m.prepareStrategyArchiveServices(files); err != nil {
+		return nil, err
 	}
 	return encodeStrategyArchive(files)
 }
@@ -341,6 +477,9 @@ func (m *Manager) StrategyPreview(data []byte, snapshot string) (ArchivePreview,
 	if err != nil {
 		return ArchivePreview{}, err
 	}
+	if err := prepareStrategyArchiveAgainstCurrent(files, current); err != nil {
+		return ArchivePreview{}, err
+	}
 	return archivePreview(files, current, snapshot != ""), nil
 }
 
@@ -361,6 +500,9 @@ func (m *Manager) StrategyImport(data []byte, snapshot string, opts ArchiveImpor
 	}
 	current, err := m.collectArchiveLocked()
 	if err != nil {
+		return out, err
+	}
+	if err := prepareStrategyArchiveAgainstCurrent(files, current); err != nil {
 		return out, err
 	}
 	preview := archivePreview(files, current, snapshot != "")
@@ -407,7 +549,7 @@ func (m *Manager) StrategyImport(data []byte, snapshot string, opts ArchiveImpor
 		var failures []error
 		for i := len(changed) - 1; i >= 0; i-- {
 			name := changed[i]
-			loc, e := m.assetLocation(name)
+			loc, e := m.strategyArchiveLocation(name)
 			if e == nil {
 				if old, exists := current[name]; exists {
 					e = writeAssetLocation(loc, old.data, old.mode)
@@ -435,8 +577,12 @@ func (m *Manager) StrategyImport(data []byte, snapshot string, opts ArchiveImpor
 			out.Kept = append(out.Kept, name)
 			continue
 		}
+		if previous, exists := current[name]; exists && managedServiceArchiveList(name) && bytes.Equal(previous.data, files[name].data) {
+			out.Kept = append(out.Kept, name)
+			continue
+		}
 		entry := files[name]
-		loc, _ := m.assetLocation(name)
+		loc, _ := m.strategyArchiveLocation(name)
 		var owner *assetOwner
 		if automaticStrategyList(name) {
 			owner = newListOwner
@@ -447,12 +593,19 @@ func (m *Manager) StrategyImport(data []byte, snapshot string, opts ArchiveImpor
 		changed = append(changed, name)
 		out.Imported = append(out.Imported, name)
 	}
+	if snapshot != "" {
+		for _, name := range sortedArchiveNames(current) {
+			if _, incoming := files[name]; !incoming && managedServiceArchiveList(name) {
+				out.Kept = append(out.Kept, name)
+			}
+		}
+	}
 	for _, name := range preview.Removed {
 		if protectedStrategyList(name) && opts.Lists != "replace" {
 			out.Kept = append(out.Kept, name)
 			continue
 		}
-		loc, _ := m.assetLocation(name)
+		loc, _ := m.strategyArchiveLocation(name)
 		if err = removeAssetLocation(loc); err != nil {
 			return rollback(fmt.Errorf("%s: %w", name, err))
 		}
@@ -598,6 +751,9 @@ func (m *Manager) StrategySnapshotCreate(name string) (Snapshot, error) {
 	}
 	if _, exists := files["nfqws2.conf"]; !exists {
 		return Snapshot{}, fmt.Errorf("nfqws2.conf не найден")
+	}
+	if err := m.prepareStrategyArchiveServices(files); err != nil {
+		return Snapshot{}, err
 	}
 	return m.createSnapshotLocked(name, false, files)
 }

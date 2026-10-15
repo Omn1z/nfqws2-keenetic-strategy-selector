@@ -373,6 +373,7 @@ func (s *Server) routes() {
 	m.HandleFunc("POST /api/awg2/routing/commit", s.awg2RoutingCommit)
 	m.HandleFunc("POST /api/awg2/routing/teardown", s.awg2RoutingTeardown)
 	m.HandleFunc("POST /api/awg2/routing/rules", s.awg2RoutingRules)
+	m.HandleFunc("GET /api/awg2/routing/discovered", s.awg2DiscoveredRoutes)
 	m.HandleFunc("GET /api/awg2/routing/rules/export", s.awg2RulesExport)
 	m.HandleFunc("POST /api/awg2/routing/rules/export", s.awg2RulesExport)
 	m.HandleFunc("POST /api/awg2/routing/rules/import/preview", s.awg2RulesImportPreview)
@@ -407,6 +408,7 @@ func (s *Server) routes() {
 
 	// NFQWS2 engine: file management (conf/list/lua) + version/update/reload.
 	m.HandleFunc("GET /api/nfqws2/version", s.nfqws2Version)
+	m.HandleFunc("GET /api/nfqws2/status", s.nfqws2ServiceStatus)
 	m.HandleFunc("GET /api/nfqws2/update/check", s.nfqws2CheckUpdate)
 	m.HandleFunc("POST /api/nfqws2/update", s.nfqws2Update)
 	m.HandleFunc("POST /api/nfqws2/reload", s.nfqws2Reload)
@@ -422,6 +424,7 @@ func (s *Server) routes() {
 	m.HandleFunc("DELETE /api/nfqws2/file", s.nfqws2DeleteFile)
 	m.HandleFunc("GET /api/nfqws2/file/download", s.nfqws2DownloadFile)
 	s.nfqws2AssetRoutes(m)
+	s.serviceStrategiesRoutes(m)
 
 	// Automation: NFQWS2 fallback watchdog + auto-pick (NFQWS2 tab panel).
 	m.HandleFunc("GET /api/nfqws2/automation", s.getAutomation)
@@ -1854,6 +1857,11 @@ func (s *Server) awg2SpeedTest(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) nfqws2StartSvc(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, s.app.Nfqws2Start())
+}
+
+func (s *Server) nfqws2ServiceStatus(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, 200, s.app.Nfqws2ServiceStatus())
 }
 
 func (s *Server) nfqws2StopSvc(w http.ResponseWriter, r *http.Request) {

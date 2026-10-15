@@ -10,9 +10,9 @@ import { Skeleton } from "@/components/ui/Skeleton";
 import { Button } from "@/components/ui/Button";
 import { Modal } from "@/components/ui/Modal";
 import { toast } from "@/components/ui/Toast";
-import { confirmDialog } from "@/components/ui/Confirm";
 import { Sparkline } from "@/components/ui/Chart";
 import { DnsStatistics } from "@/features/dnsserver/DnsStatistics";
+import { Nfqws2ServiceControls, useNfqws2ServiceControl } from "@/features/nfqws2/Nfqws2ServiceControl";
 import type { Dashboard as DashboardData } from "@/types/api";
 
 const Row = ({ l, children }: { l: string; children: ReactNode }) => (
@@ -119,32 +119,20 @@ function RestartButton() {
   );
 }
 
-// NFQWS2 service controls: status + Start / Stop / Reload / Restart. Stop and
-// Restart interrupt DPI bypass, so they confirm first; Reload is a SIGHUP (safe).
+// NFQWS2 service controls share one full restart for every configuration change.
 function Nfqws2Card({ running, queue }: { running: boolean; queue: number }) {
-  const [busy, setBusy] = useState("");
-  const run = async (key: string, fn: () => Promise<void>, confirm?: { title: string; body?: string; danger?: boolean }) => {
-    if (confirm && !(await confirmDialog({ title: confirm.title, body: confirm.body, confirmLabel: "Да", danger: confirm.danger }))) return;
-    setBusy(key);
-    try { await fn(); } catch (e) { toast((e as Error).message, "err"); } finally { setBusy(""); }
-  };
-  const start = () => run("start", async () => svcToast(await api<ServiceResult>("POST", "/api/nfqws2/start", {})));
-  const stop = () => run("stop", async () => svcToast(await api<ServiceResult>("POST", "/api/nfqws2/stop", {})), { title: "Остановить NFQWS2?", body: "Обход DPI перестанет работать до следующего запуска.", danger: true });
-  const reload = () => run("reload", async () => { await api("POST", "/api/nfqws2/reload", {}); toast("nfqws2: конфиг перечитан (reload)", "ok"); });
-  const restart = () => run("restart", async () => { const d = await api<{ results: ServiceResult[] }>("POST", "/api/services/restart", { services: ["nfqws2"] }); if (d.results?.[0]) svcToast(d.results[0]); }, { title: "Перезапустить NFQWS2?", body: "Обход DPI прервётся на ~2 секунды." });
-  const B = ({ k, label, variant, onClick }: { k: string; label: string; variant?: "primary" | "danger"; onClick: () => void }) => (
-    <Button mini variant={variant} disabled={!!busy} onClick={onClick}>{busy === k ? "…" : label}</Button>
-  );
+  const service = useNfqws2ServiceControl();
+  const liveRunning = service.status?.running ?? running;
   return (
-    <Card title="NFQWS2" sub="движок DPI" head={<Badge kind={running ? "ok" : "bad"}>{running ? "работает" : "остановлен"}</Badge>} className={CARD}>
-      <p className="mb-2.5 text-[13px] text-ink-soft">Очередь {queue}: <b>{running ? "активна" : "не активна"}</b></p>
-      <div className="flex flex-wrap gap-2">
-        <B k="start" label="Старт" variant="primary" onClick={start} />
-        <B k="stop" label="Стоп" variant="danger" onClick={stop} />
-        <B k="reload" label="Reload" onClick={reload} />
-        <B k="restart" label="Перезапуск" onClick={restart} />
+    <Card title="NFQWS2" sub="движок DPI" className={CARD}>
+      <p className="mb-2.5 text-[13px] text-ink-soft">Очередь {queue}: <b>{liveRunning ? "активна" : "не активна"}</b></p>
+      <div className="flex flex-wrap items-center gap-2">
+        <Nfqws2ServiceControls status={service.status} error={service.error} pending={service.pending}
+          onToggle={enabled => { void service.run(enabled ? "start" : "stop"); }}
+          onRestart={() => { void service.run("restart"); }} />
       </div>
-      <p className="mt-2 text-xs text-muted">Reload перечитывает списки без обрыва очереди; Стоп/Перезапуск прерывают обход.</p>
+      {service.error && <p className="mt-2 text-xs text-bad" role="status">{service.error}</p>}
+      <p className="mt-2 text-xs text-muted">Перезапуск применяет конфиг, стратегии и списки. Обход DPI ненадолго прерывается.</p>
     </Card>
   );
 }
@@ -276,16 +264,14 @@ export default function Dashboard() {
   //  Row 1 (HERO 2-up): VPN tunnel + the routing card you actually look at.
   //  Row 2 (METRICS 3-up): connections, WAN, DPI packets — drop the dead-card
   //                         path so an empty queue doesn't waste a column.
-  //  Row 3 (SERVICES 3-up): TG WS / SOCKS5 / NFQWS2 — show ONLY if they are
-  //                          actually running or have any activity. The "0/0
-  //                          остановлен" placeholder strip from the old layout
-  //                          carried zero information and ate vertical space.
+  //  Row 3 (SERVICES 3-up): keep NFQWS2 controls available while stopped;
+  //                         optional Telegram proxies show while active.
   //  Charts: render only after we have at least one delta sample.
   const awgConns = d.awg ?? [];
   const awgConnected = awgConns.filter((c) => c.state === "connected").length;
   const showTgws    = d.tgws.running    || cc.total > 0 || tr.bytes_up > 0 || tr.bytes_down > 0;
   const showSocks5  = d.socks5.running  || sc.total > 0 || str.bytes_up > 0 || str.bytes_down > 0;
-  const showNfqws2  = d.nfqws2_running  || !!q;
+  const showNfqws2  = true; // Keep the switch available when the engine is stopped.
   const services    = [
     showTgws    && "tgws",
     showSocks5  && "socks5",

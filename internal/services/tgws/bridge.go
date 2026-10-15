@@ -16,6 +16,7 @@ import (
 // itself is what gets framed.
 type messageSplitter struct {
 	decryptor cipher.Stream
+	relayInit []byte // Used only by the legacy ciphertext-only splitter.
 	proto     uint32
 	cipherBuf []byte
 	plainBuf  []byte
@@ -24,7 +25,7 @@ type messageSplitter struct {
 
 func newMessageSplitter(relayHandshake []byte, proto uint32) *messageSplitter {
 	return &messageSplitter{
-		decryptor: upstreamPacketDecryptor(relayHandshake),
+		relayInit: append([]byte(nil), relayHandshake...),
 		proto:     proto,
 	}
 }
@@ -35,6 +36,12 @@ func (m *messageSplitter) split(chunk []byte) [][]byte {
 	}
 	if m.off {
 		return [][]byte{chunk}
+	}
+	// The live bridge supplies plaintext to splitPlain. Avoid expanding a
+	// third AES key/keystream unless a legacy ciphertext-only caller needs it.
+	if m.decryptor == nil {
+		m.decryptor = upstreamPacketDecryptor(m.relayInit)
+		m.relayInit = nil
 	}
 	plain := make([]byte, len(chunk))
 	m.decryptor.XORKeyStream(plain, chunk)

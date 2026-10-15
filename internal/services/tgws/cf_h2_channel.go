@@ -3,11 +3,13 @@ package tgws
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/http/httptrace"
 	"strings"
@@ -21,6 +23,7 @@ type cfH2Request struct {
 	sent                       time.Time
 	receiving, replay, rotated bool
 	packet                     *cfH2Replay
+	conn                       net.Conn
 }
 
 type cfH2Channel struct {
@@ -97,7 +100,11 @@ func (c *cfH2Channel) send(ctx context.Context, body []byte, quick bool) error {
 }
 
 func (c *cfH2Channel) startLocked(body []byte, entry *cfH2Replay, replay bool) {
-	ctx, cancel := context.WithTimeout(c.ctx, cfH2RequestTimeout)
+	timeout := c.lane.requestTimeout
+	if timeout <= 0 {
+		timeout = cfH2RequestTimeout
+	}
+	ctx, cancel := context.WithTimeout(c.ctx, timeout)
 	r := &cfH2Request{body: body, cancel: cancel, packet: entry, replay: replay}
 	c.pending[r] = struct{}{}
 	c.pendingBytes += len(body)
@@ -138,6 +145,9 @@ func (c *cfH2Channel) run(ctx context.Context, r *cfH2Request) {
 			r.packet.pending = nil
 		}
 	}
+	if err != nil && !r.rotated && c.ctx.Err() == nil {
+		l.retireTimedOutIdleConnLocked(r, err)
+	}
 	if err != nil && c.err == nil && c.ctx.Err() == nil && !r.rotated {
 		l.stats.h2Errors.Add(1)
 		log.Printf("tgws: [%s] H2 %s request failed: %s", censorDomains(c.label), censorDomains(l.host), censorDomains(err.Error()))
@@ -146,6 +156,13 @@ func (c *cfH2Channel) run(ctx context.Context, r *cfH2Request) {
 	if err == nil && c.err == nil && c.ctx.Err() == nil {
 		c.lastProgress = time.Now()
 		if len(reply) > 0 {
+			if r.packet != nil {
+				identity := reply[:min(len(reply), 24)]
+				if !bytes.Equal(identity, r.packet.replyID) {
+					r.packet.replyID = bytes.Clone(identity)
+					r.packet.attempts = 0
+				}
+			}
 			// post already reserved reply memory, including all queued responses.
 			if len(c.replies) >= 16 {
 				c.releaseReplyLocked(len(reply))
@@ -158,6 +175,32 @@ func (c *cfH2Channel) run(ctx context.Context, r *cfH2Request) {
 		c.releaseReplyLocked(len(reply))
 	}
 	l.signalLocked()
+}
+
+// A request timeout alone must not destroy other active HTTP/2 streams. Once
+// the last request on a silent connection times out, discard that connection
+// so the next request can reconnect instead of reusing the same half-open path.
+// Buffered replies belong to their channels and survive this TCP retirement.
+func (l *cfH2Lane) retireTimedOutIdleConnLocked(request *cfH2Request, err error) {
+	var networkError net.Error
+	if request.conn == nil || (!errors.Is(err, context.DeadlineExceeded) && !(errors.As(err, &networkError) && networkError.Timeout())) {
+		return
+	}
+	for channel := range l.channels {
+		for pending := range channel.pending {
+			if pending != request && (pending.conn == nil || pending.conn == request.conn) {
+				return
+			}
+		}
+	}
+	// Closing the underlying socket avoids a TLS close-notify write waiting
+	// on the path which just stopped responding. Holding the lane lock keeps
+	// GotConn from assigning an unrelated stream during this retirement.
+	if conn, ok := request.conn.(*tls.Conn); ok {
+		_ = conn.NetConn().Close()
+	} else {
+		_ = request.conn.Close()
+	}
 }
 
 var errCFH2ReplyBuffer = errors.New("H2 response buffers exceeded bound")
@@ -178,6 +221,11 @@ func (c *cfH2Channel) post(ctx context.Context, r *cfH2Request) (reply []byte, r
 		}
 	}()
 	trace := &httptrace.ClientTrace{
+		GotConn: func(info httptrace.GotConnInfo) {
+			l.mu.Lock()
+			r.conn = info.Conn
+			l.mu.Unlock()
+		},
 		WroteRequest: func(info httptrace.WroteRequestInfo) {
 			if info.Err == nil {
 				l.mu.Lock()

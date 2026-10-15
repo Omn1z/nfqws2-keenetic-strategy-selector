@@ -6,7 +6,6 @@ package app
 import (
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"sort"
@@ -170,6 +169,7 @@ func (a *App) Shutdown() {
 	a.arpspoof.Stop()
 	a.awgroute.StopAWG()
 	a.awgroute.TeardownRouting()
+	a.awgroute.CloseRoutingDiscoveries()
 	a.stopGeoAutoLoop()
 	a.stopAutomation()
 }
@@ -401,9 +401,8 @@ func (a *App) ApplyStrategyToConfig(argLine string, restart bool) error {
 		return err
 	}
 	if restart {
-		c := exec.Command(a.Cfg.Nfqws2Init, "restart")
-		if o, err := c.CombinedOutput(); err != nil {
-			return fmt.Errorf("restart failed: %v: %s", err, strings.TrimSpace(string(o)))
+		if result := a.restartNfqws2(); !result.OK {
+			return fmt.Errorf("стратегия сохранена; перезапуск NFQWS2: %s", result.Detail)
 		}
 	}
 	return nil

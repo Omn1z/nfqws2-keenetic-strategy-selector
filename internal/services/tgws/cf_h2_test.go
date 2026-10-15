@@ -370,3 +370,103 @@ func TestCFH2RequiresVerifiedTLSAndHTTP2(t *testing.T) {
 		})
 	}
 }
+
+func TestCFH2LastRequestTimeoutReconnectsAndPreservesBufferedReply(t *testing.T) {
+	lane, _ := cfH2Fixture(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead {
+			return
+		}
+		body, _ := io.ReadAll(r.Body)
+		if body[16] == 1 {
+			<-r.Context().Done()
+			return
+		}
+		w.Write([]byte{body[16], 0, 0, 0})
+	})
+	buffered := cfH2TestChannel(t, lane)
+	if err := buffered.send(context.Background(), cfH2Packet(2), false); err != nil {
+		t.Fatal(err)
+	}
+	cfH2WaitForNoRequests(t, buffered)
+	lane.mu.Lock()
+	lane.requestTimeout = 40 * time.Millisecond
+	lane.mu.Unlock()
+	stalled := cfH2TestChannel(t, lane)
+	if err := stalled.send(context.Background(), cfH2Packet(1), false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cfH2TestReceive(t, stalled); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("stalled request error=%v", err)
+	}
+	if reply, err := cfH2TestReceive(t, buffered); err != nil || !bytes.Equal(reply, []byte{2, 0, 0, 0}) {
+		t.Fatalf("timeout discarded buffered response: %x %v", reply, err)
+	}
+	buffered.delivered()
+	lane.mu.Lock()
+	lane.requestTimeout = time.Second
+	lane.mu.Unlock()
+	recovered := cfH2TestChannel(t, lane)
+	if err := recovered.send(context.Background(), cfH2Packet(3), false); err != nil {
+		t.Fatal(err)
+	}
+	if reply, err := cfH2TestReceive(t, recovered); err != nil || !bytes.Equal(reply, []byte{3, 0, 0, 0}) {
+		t.Fatalf("next request failed to reconnect: %x %v", reply, err)
+	}
+	recovered.delivered()
+	if count := lane.stats.h2TCPConnections.Load(); count != 2 {
+		t.Fatalf("silent connection was reused: %d TLS connections", count)
+	}
+}
+
+func TestCFH2RequestTimeoutKeepsUnrelatedActiveStream(t *testing.T) {
+	healthyStarted, release := make(chan struct{}), make(chan struct{})
+	defer close(release)
+	lane, _ := cfH2Fixture(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead {
+			return
+		}
+		body, _ := io.ReadAll(r.Body)
+		if body[16] == 1 {
+			<-r.Context().Done()
+			return
+		}
+		close(healthyStarted)
+		select {
+		case <-release:
+		case <-r.Context().Done():
+			return
+		}
+		w.Write([]byte{2, 0, 0, 0})
+	})
+	lane.mu.Lock()
+	lane.requestTimeout = 100 * time.Millisecond
+	lane.mu.Unlock()
+	stalled := cfH2TestChannel(t, lane)
+	if err := stalled.send(context.Background(), cfH2Packet(1), false); err != nil {
+		t.Fatal(err)
+	}
+	lane.mu.Lock()
+	lane.requestTimeout = time.Second
+	lane.mu.Unlock()
+	healthy := cfH2TestChannel(t, lane)
+	if err := healthy.send(context.Background(), cfH2Packet(2), false); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-healthyStarted:
+	case <-time.After(3 * time.Second):
+		t.Fatal("unrelated stream did not start")
+	}
+	if _, err := cfH2TestReceive(t, stalled); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("stalled request error=%v", err)
+	}
+	// Release this request without closing the channel or touching the socket.
+	release <- struct{}{}
+	if reply, err := cfH2TestReceive(t, healthy); err != nil || !bytes.Equal(reply, []byte{2, 0, 0, 0}) {
+		t.Fatalf("timeout broke another HTTP2 stream: %x %v", reply, err)
+	}
+	healthy.delivered()
+	if count := lane.stats.h2TCPConnections.Load(); count != 1 {
+		t.Fatalf("active HTTP2 connection unnecessarily replaced: %d", count)
+	}
+}

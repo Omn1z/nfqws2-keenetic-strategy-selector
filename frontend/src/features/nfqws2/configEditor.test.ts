@@ -101,3 +101,66 @@ test("path fixes honor UTF-16 offsets and reject stale or invalid spans", () => 
   assert.equal(applyPathFix(source + " changed", { ...d, from: 4 }), source + " changed");
   assert.equal(validPathDiagnostics(source, [d, { ...d, from: -1 }, { ...d, to: Infinity }, { ...d, path: "/wrong" }]).length, 1);
 });
+
+const managedServices = '# BEGIN N2S SERVICE STRATEGIES\n' +
+  'NFQWS_ARGS_CUSTOM="--filter-tcp=8443 --hostlist-domains=facepunch.com --lua-desync=multisplit${NFQWS_ARGS_CUSTOM:+ --new }${NFQWS_ARGS_CUSTOM}"\n' +
+  "TCP_PORTS='80,443,8443'\n" +
+  '# END N2S SERVICE STRATEGIES\n';
+
+test("structured edits use base assignments and preserve service overrides verbatim", () => {
+  const base = 'NFQWS_ARGS_CUSTOM="--filter-tcp=443 --lua-desync=fake"\nTCP_PORTS=80,443\n';
+  const source = base + managedServices;
+  const parsed = parseConfigAssignments(source);
+  assert.equal(parsed.canAppend, true);
+  assert.equal(parsed.assignments.get("TCP_PORTS")?.value, "80,443");
+  assert.equal(parsed.assignments.get("NFQWS_ARGS_CUSTOM")?.value, "--filter-tcp=443 --lua-desync=fake");
+  assert.equal(patchConfigValue(source, "TCP_PORTS", "443"), base.replace("TCP_PORTS=80,443", "TCP_PORTS=443") + managedServices);
+  assert.equal(patchConfigValue(source, "UDP_PORTS", "443"), base + 'UDP_PORTS="443"\n' + managedServices);
+  assert.equal(patchConfigValue(managedServices, "NFQWS_ARGS_CUSTOM", "--filter-tcp=80"), 'NFQWS_ARGS_CUSTOM="--filter-tcp=80"\n' + managedServices);
+  const crlf = source.replaceAll("\n", "\r\n");
+  assert.equal(patchConfigValue(crlf, "UDP_PORTS", "443"), base.replaceAll("\n", "\r\n") + 'UDP_PORTS="443"\r\n' + managedServices.replaceAll("\n", "\r\n"));
+  assert.equal(parseConfigAssignments(source.trimEnd()).canAppend, true);
+});
+
+test("service marker text inside multiline quotes is ordinary strategy content", () => {
+  for (const quote of ["'", '"']) {
+    const source = `NFQWS_ARGS=${quote}--filter-tcp=443\n# BEGIN N2S SERVICE STRATEGIES\n# END N2S SERVICE STRATEGIES\n${quote}\nTCP_PORTS=443\n`;
+    const parsed = parseConfigAssignments(source);
+    assert.equal(parsed.canAppend, true);
+    assert.ok(parsed.assignments.get("NFQWS_ARGS")?.value.includes("# BEGIN N2S"));
+    assert.equal(patchConfigValue(source, "TCP_PORTS", "80"), source.replace("TCP_PORTS=443", "TCP_PORTS=80"));
+  }
+});
+
+test("managed service literals accept only safely generated double quote escapes", () => {
+  const literal = '--filter-tcp=8443 --lua-desync=fake:arg=C:\\data:quote="literal":dollar=$:tick=`';
+  const encoded = literal.replace(/[\\"$`]/g, '\\$&');
+  const block = managedServices.replace('--filter-tcp=8443', encoded);
+  const source = 'TCP_PORTS=443\n' + block;
+  assert.equal(parseConfigAssignments(source).canAppend, true);
+  assert.equal(parseConfigAssignments(source).assignments.get('TCP_PORTS')?.value, '443');
+  assert.equal(patchConfigValue(source, 'TCP_PORTS', '80'), 'TCP_PORTS=80\n' + block);
+  for (const invalid of ['$VALUE', '$(printf unsafe)', '`printf unsafe`', '"unescaped"', '\\q', '\\', '\\\\$VALUE', '\\\\`printf unsafe`']) {
+    const source = 'TCP_PORTS=443\n' + managedServices.replace('--filter-tcp=8443', invalid);
+    assert.equal(parseConfigAssignments(source).canAppend, false, invalid);
+    assert.throws(() => patchConfigValue(source, 'TCP_PORTS', '80'), invalid);
+  }
+});
+
+test("malformed, duplicate or modified service blocks keep structured editing disabled", () => {
+  for (const block of [
+    managedServices + managedServices,
+    managedServices.replace('# END N2S SERVICE STRATEGIES\n', ''),
+    '# END N2S SERVICE STRATEGIES\n',
+    managedServices.replace('# BEGIN', ' # BEGIN'),
+    managedServices.replace("TCP_PORTS='80,443,8443'", 'ISP_INTERFACE=eth8'),
+    managedServices.replace("TCP_PORTS='80,443,8443'", "TCP_PORTS=80\nTCP_PORTS=443"),
+    managedServices.replace("TCP_PORTS='80,443,8443'", 'printf unsafe'),
+    managedServices.replace('--filter-tcp=8443', '$(printf unsafe)'),
+    managedServices + 'TCP_PORTS=999\n',
+  ]) {
+    const source = 'TCP_PORTS=443\n' + block;
+    assert.equal(parseConfigAssignments(source).canAppend, false, block);
+    assert.throws(() => patchConfigValue(source, 'TCP_PORTS', '80'), block);
+  }
+});

@@ -23,6 +23,7 @@ type cfH2Replay struct {
 	originals           map[*cfH2Request]struct{}
 	pending             *cfH2Request
 	retired             bool
+	replyID             []byte
 }
 
 func (c *cfH2Channel) rememberLocked(body []byte, now time.Time) *cfH2Replay {
@@ -96,7 +97,8 @@ func (c *cfH2Channel) replayDueLocked(entry *cfH2Replay, now time.Time) bool {
 	if entry.pending != nil && entry.pending.receiving {
 		return false
 	}
-	if entry.attempts > 0 && now.Sub(entry.lastAttempt) < cfH2ReplayRetry {
+	replayed := entry.attempts > 0 || !entry.lastAttempt.IsZero()
+	if replayed && now.Sub(entry.lastAttempt) < cfH2ReplayRetry {
 		return false
 	}
 	if c.overdueLocked(entry, now) {
@@ -110,7 +112,7 @@ func (c *cfH2Channel) replayDueLocked(entry *cfH2Replay, now time.Time) bool {
 			return false
 		}
 	}
-	return entry.attempts == 0 || now.Sub(c.lastProgress) >= time.Second
+	return !replayed || now.Sub(c.lastProgress) >= time.Second
 }
 
 func (c *cfH2Channel) rotateLocked(r *cfH2Request, retire bool) {

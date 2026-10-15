@@ -1,8 +1,8 @@
 # TG WS Proxy upstream
 
 The in-process Go MTProto proxy is synchronized with
-[Flowseal/tg-ws-proxy v1.11.1](https://github.com/Flowseal/tg-ws-proxy/tree/v1.11.1),
-commit `18175fb4fe567cf6aef61f9d883eff010c9e66a8` (2026-10-06).
+[Flowseal/tg-ws-proxy v1.11.2](https://github.com/Flowseal/tg-ws-proxy/tree/v1.11.2),
+commit `307a384ab7f522e34bb1a045884d0bd90f40bee5` (2026-10-11).
 
 The upstream network implementation is ported into Go, rather than launched as
 a separate Python process. Its MIT license is included in `LICENSE.upstream`.
@@ -25,6 +25,14 @@ Synchronized behavior:
   multiple media streams share a TLS connection without waiting for each other.
 - HTTP 404 and other MTProto transport errors reach the affected native client
   without disabling the CF origin or unrelated channels.
+- The last timed-out request retires a silent HTTP/2 TCP connection so future
+  channels can reconnect. Other active streams and already buffered replies
+  remain intact. New response identities replenish the bounded replay budget
+  without discarding the retry delay or allowing duplicate replies to loop.
+- Padded intermediate HTTP/2 requests accept up to 256 bytes of padding for
+  unencrypted MTProto messages, while encrypted messages retain the 15-byte limit.
+- CF Worker shutdown cancels and joins pending refills before returning, including
+  sockets that complete concurrently with a reset or stop.
 - Multiple CF proxy/Worker domains, updated bundled domains and hourly refresh
   of the upstream domain list. Invalid responses preserve the current pool.
 - Verified TLS for ordinary CF/Telegram endpoints and an opt-in plain HTTP
@@ -32,6 +40,8 @@ Synchronized behavior:
 - Automatic test-DC detection and optional forced test mode, including separate
   test endpoints and the `/apiws_test` path.
 - Listener recovery, session diagnostics and masking of fallback domains in logs.
+- Relay handshakes exclude the HTTP `OPTI` marker as well as existing reserved
+  protocol prefixes.
 
 Keenetic adaptations retained: LAN listener and port defaults, disabled service
 on first install, existing secrets/links, JSON persistence and web controls,
@@ -51,6 +61,10 @@ is supplemented with Entware's CA files once, preserving explicit SSL_CERT_FILE
 and SSL_CERT_DIR overrides and ordinary certificate/hostname verification.
 The upload splitter reads plaintext already produced by the bridge, avoiding a
 third AES pass while preserving MTProto frame boundaries and ciphertext.
+The legacy ciphertext-only splitter constructs its decryptor lazily; live
+connections do not expand that unused AES key. Go's WebSocket masking and HTTP/2
+transport supply the native equivalents of Python's masking tables and batched
+flow-control writes.
 SNI fronting is opt-in (`sni_fronting`, off by default): live tests on Keenetic
 showed that a fronted HTTP 101 can succeed while MTProto receives no response.
 The upstream mechanism remains available in the UI for networks that need it.
@@ -60,8 +74,9 @@ notification, which a synchronous Go TLS connection does not provide by itself.
 Legacy singular CF-domain fields remain readable; explicit new empty arrays
 clear them. Existing DC redirects are preserved during upgrades.
 
-Upstream desktop tray, desktop autostart, application updater, Windows packaging,
-macOS UI and Python AES dependency selection are not part of the router service.
+Upstream desktop tray, desktop autostart, application updater (including Linux
+auto-update and manual checks), Windows packaging, macOS UI, the Python Windows
+event-loop workaround and Python AES dependency selection are not part of the router service.
 Their equivalents are managed by the panel, Entware init service and Go runtime.
 
 For another sync, compare `proxy/` and its upstream tests at the new tag, port

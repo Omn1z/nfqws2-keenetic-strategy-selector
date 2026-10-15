@@ -236,3 +236,127 @@ func TestCFH2PendingReplayDoesNotStarveAnotherOverduePacket(t *testing.T) {
 		t.Fatal("receiving first replay starved second overdue packet")
 	}
 }
+
+func TestCFH2NewReplyIdentityRefreshesReplayBudgetWithoutNativeUpload(t *testing.T) {
+	const freshReplies = 6
+	var requests atomic.Int64
+	lane, _ := cfH2Fixture(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead {
+			return
+		}
+		count := requests.Add(1)
+		if count <= freshReplies {
+			w.Write(bytes.Repeat([]byte{byte(count)}, 40))
+		}
+	})
+	c := cfH2TestChannel(t, lane)
+	if err := c.send(context.Background(), cfH2EncryptedPacket(1), false); err != nil {
+		t.Fatal(err)
+	}
+	for index := 1; index <= freshReplies; index++ {
+		reply, err := cfH2TestReceive(t, c)
+		if err != nil || !bytes.Equal(reply, bytes.Repeat([]byte{byte(index)}, 40)) {
+			t.Fatalf("reply %d: %x %v", index, reply, err)
+		}
+		c.delivered()
+		lane.mu.Lock()
+		entry := c.history[0]
+		if entry.attempts != 0 {
+			t.Errorf("fresh response did not refresh budget: %d", entry.attempts)
+		}
+		if index > 1 && c.replayDueLocked(entry, time.Now()) {
+			t.Error("fresh response erased replay retry/progress backoff")
+		}
+		lane.mu.Unlock()
+		if index < freshReplies {
+			cfH2RecoverTestPoll(t, c)
+		}
+	}
+	for range cfH2ReplayMaxAttempts {
+		cfH2RecoverTestPoll(t, c)
+		cfH2WaitForNoRequests(t, c)
+	}
+	lane.mu.Lock()
+	entry := c.history[0]
+	entry.lastAttempt = time.Now().Add(-3 * time.Second)
+	c.lastProgress = time.Now().Add(-2 * time.Second)
+	c.recoverLocked(time.Now())
+	remaining := len(c.pending)
+	attempts := entry.attempts
+	lane.mu.Unlock()
+	if remaining != 0 || attempts != cfH2ReplayMaxAttempts || requests.Load() != freshReplies+cfH2ReplayMaxAttempts {
+		t.Fatalf("empty responses extended retry budget: requests=%d pending=%d attempts=%d", requests.Load(), remaining, attempts)
+	}
+}
+
+func TestCFH2DuplicateReplyIdentityDoesNotRefreshReplayBudget(t *testing.T) {
+	var requests atomic.Int64
+	lane, _ := cfH2Fixture(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodHead {
+			return
+		}
+		count := requests.Add(1)
+		// A different tail is not a new MTProto reply identifier. Only the
+		// first24 bytes refresh the bounded receiver polling budget upstream.
+		reply := bytes.Repeat([]byte{0x5a}, 40)
+		reply[len(reply)-1] = byte(count)
+		w.Write(reply)
+	})
+	c := cfH2TestChannel(t, lane)
+	if err := c.send(context.Background(), cfH2EncryptedPacket(1), false); err != nil {
+		t.Fatal(err)
+	}
+	for index := 0; index <= cfH2ReplayMaxAttempts; index++ {
+		if index > 0 {
+			cfH2RecoverTestPoll(t, c)
+		}
+		reply, err := cfH2TestReceive(t, c)
+		if err != nil || len(reply) != 40 {
+			t.Fatalf("reply %d: %x %v", index, reply, err)
+		}
+		c.delivered()
+	}
+	lane.mu.Lock()
+	entry := c.history[0]
+	entry.lastAttempt = time.Now().Add(-3 * time.Second)
+	c.lastProgress = time.Now().Add(-2 * time.Second)
+	c.recoverLocked(time.Now())
+	remaining := len(c.pending)
+	lane.mu.Unlock()
+	if remaining != 0 || requests.Load() != 1+cfH2ReplayMaxAttempts {
+		t.Fatalf("duplicate identifier refreshed retry budget: requests=%d pending=%d", requests.Load(), remaining)
+	}
+}
+
+func cfH2RecoverTestPoll(t *testing.T, c *cfH2Channel) {
+	t.Helper()
+	c.lane.mu.Lock()
+	entry := c.history[0]
+	if !entry.lastAttempt.IsZero() {
+		entry.lastAttempt = time.Now().Add(-3 * time.Second)
+	}
+	c.lastProgress = time.Now().Add(-2 * time.Second)
+	c.recoverLocked(time.Now())
+	pending := len(c.pending)
+	c.lane.mu.Unlock()
+	if pending == 0 {
+		t.Fatal("eligible receiver poll was not started")
+	}
+}
+
+func cfH2WaitForNoRequests(t *testing.T, c *cfH2Channel) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		c.lane.mu.Lock()
+		pending := len(c.pending)
+		c.lane.mu.Unlock()
+		if pending == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("HTTP request did not finish")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}

@@ -38,7 +38,13 @@ type Service struct {
 	connectionRefs map[string]AWG2ConnectionRef
 	// routingDNSGate prevents replies from crossing a partially replaced policy.
 	// Its lifecycle is owned by the OS routing apply and the DNS observer.
-	routingDNSGate routingDNSGate
+	routingDNSGate        routingDNSGate
+	discovered            routingLearnedHistory
+	discoveryPersistMu    sync.Mutex
+	discoveryPersistTimer *time.Timer
+	discoveryClosed       bool
+	discoveryScopeMu      sync.Mutex
+	discoveryScopes       map[string]routingDiscoveryScope
 
 	// awg is the currently selected server manager. Low-level client/routing code
 	// still operates on one local awg0 tunnel, so it always reads this active one.
@@ -148,6 +154,7 @@ type managedServer struct {
 // NEVER auto-deploys the remote VPS (that is always an explicit user action).
 func New(cfg *config.Config, st *store.Store) *Service {
 	svc := &Service{cfg: cfg, store: st}
+	svc.loadRoutingDiscoveries()
 	svc.initAWG()
 	go svc.awgRouteCacheSweeper()
 	return svc

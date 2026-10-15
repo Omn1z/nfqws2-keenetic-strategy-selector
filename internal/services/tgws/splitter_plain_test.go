@@ -143,9 +143,12 @@ func TestBridgeWSUsesExistingPlaintextForEveryTransport(t *testing.T) {
 			clientSend.XORKeyStream(make([]byte, 64), zero64)
 			telegramRecv := upstreamPacketDecryptor(relay)
 			var packets [][]byte
-			for i, size := range []int{4, 512, 40} {
+			for i, size := range []int{4, 512, 70000, 40} {
 				packets = append(packets, transportPacket(tc.proto, bytes.Repeat([]byte{byte(i + 1)}, size), i != 0))
 			}
+			// EOF must flush an incomplete final frame after a packet larger
+			// than the bridge's read buffer, preserving every encrypted byte.
+			packets = append(packets, transportPacket(tc.proto, bytes.Repeat([]byte{42}, 32), false)[:7])
 			stats := &Stats{}
 			stopped := make(chan struct{})
 			go func() {
@@ -177,10 +180,10 @@ func TestBridgeWSUsesExistingPlaintextForEveryTransport(t *testing.T) {
 					t.Fatal(err)
 				}
 			}
+			_ = client.Close()
 			if err := <-peerDone; err != nil {
 				t.Fatal(err)
 			}
-			_ = client.Close()
 			select {
 			case <-stopped:
 			case <-time.After(3 * time.Second):

@@ -32,7 +32,14 @@ func (a *App) BackupBuild(w io.Writer) (string, int, error) {
 // one of the allowed roots (same set Build captured). The caller is expected
 // to trigger a selector restart after success so the new files take effect.
 func (a *App) BackupRestore(r io.Reader) (int, error) {
-	n, err := backup.Restore(a.backupRoots(), r)
+	restore := func() (int, error) { return backup.Restore(a.backupRoots(), r) }
+	var n int
+	var err error
+	if a.awgroute != nil {
+		n, err = a.awgroute.RestoreRoutingDiscoveries(restore)
+	} else {
+		n, err = restore()
+	}
 	if err != nil {
 		return n, err
 	}

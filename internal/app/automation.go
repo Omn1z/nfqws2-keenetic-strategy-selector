@@ -7,14 +7,11 @@ package app
 //     through VPN). When enabled, it can still start NFQWS2 if AWG dies, but it
 //     never stops NFQWS2 just because AWG looks healthy.
 //
-//   - AUTO-PICK. Picking a working DPI strategy is normally a manual scan +
-//     pick + apply dance. On first boot (or when the configured strategy
-//     becomes dead) we run that ourselves: scan AutoCandidates, take the top
-//     coefficient, write to nfqws2.conf. The user can disable via auto_pick=false.
+//   - AUTO-PICK. Disabled by default; the user can enable the UI switch to
+//     scan and apply a strategy on first boot when the config is empty.
 //
-//   - PERIODIC RE-SCAN. Censors rotate filters; what works today may not
-//     tomorrow. If the user opts in, every interval_h hours we re-scan and
-//     re-pick. Default OFF (user opt-in only) since each scan is real traffic.
+//   - PERIODIC RE-SCAN. Optional scheduled picks require both auto_pick and
+//     periodic_scan. Explicit "pick now" remains a separate manual action.
 //
 // AWG health = (handshake age < 180s) AND (rx_bytes increasing OR no traffic
 // expected). 30s tick, 2 confirmations before starting fallback in auto mode.
@@ -54,8 +51,8 @@ var defaultAutoPickTargets = []string{
 // AutomationConfig is the user-tunable part.
 type AutomationConfig struct {
 	Mode         string `json:"mode"`          // "off" | "on" | "auto" (default: "off"; off = no service control)
-	AutoPick     bool   `json:"auto_pick"`     // run a scan-and-apply if conf is empty/dead at boot (default true)
-	PeriodicScan bool   `json:"periodic_scan"` // re-pick every IntervalH hours (default false — opt-in)
+	AutoPick     bool   `json:"auto_pick"`     // allow background scan-and-apply (default false)
+	PeriodicScan bool   `json:"periodic_scan"` // scheduled picks while AutoPick is enabled (default false)
 	IntervalH    int    `json:"interval_h"`    // re-scan period when PeriodicScan is on (default 24)
 }
 
@@ -63,10 +60,11 @@ type AutomationConfig struct {
 // the timestamps tell the user "yes, I did pick a strategy 12 minutes ago".
 type AutomationState struct {
 	AutomationConfig
-	LastPickAt    int64  `json:"last_pick_at,omitempty"`
-	LastPickArgs  string `json:"last_pick_args,omitempty"`
-	LastPickName  string `json:"last_pick_name,omitempty"`
-	LastPickError string `json:"last_pick_error,omitempty"`
+	LastPickAt      int64  `json:"last_pick_at,omitempty"`
+	LastPickArgs    string `json:"last_pick_args,omitempty"`
+	LastPickName    string `json:"last_pick_name,omitempty"`
+	LastPickError   string `json:"last_pick_error,omitempty"`
+	Nfqws2ManualOff bool   `json:"nfqws2_manual_off"`
 }
 
 // AutomationStatus is the live view shown to the UI.
@@ -80,9 +78,12 @@ type AutomationStatus struct {
 }
 
 type automationRuntime struct {
-	mu     sync.Mutex
-	state  AutomationState
-	stopCh chan struct{}
+	mu               sync.Mutex
+	serviceMu        sync.Mutex               // serialize explicit controls, watchdog and automatic applies
+	serviceOps       *nfqws2ServiceOperations // optional pure operations for lifecycle tests
+	serviceNeedsStop bool                     // retry failed process/firewall cleanup while manual OFF is retained
+	state            AutomationState
+	stopCh           chan struct{}
 
 	healthyStreak   int
 	unhealthyStreak int
@@ -97,32 +98,44 @@ func defaultAutomation() AutomationState {
 	return AutomationState{
 		AutomationConfig: AutomationConfig{
 			Mode:         "off",
-			AutoPick:     true,
+			AutoPick:     false,
 			PeriodicScan: false,
 			IntervalH:    24,
 		},
 	}
 }
 
-// initAutomation loads persisted state (or seeds defaults), starts the watchdog
-// loop, and — when AutoPick is enabled — kicks an opportunistic first-boot pick
-// if we've never picked or the configured strategy looks dead.
-func (a *App) initAutomation() {
+// loadAutomationState seeds disabled defaults while preserving the user's
+// saved switches and history. It does not start background work.
+func (a *App) loadAutomationState() AutomationState {
 	var st AutomationState
+	changed := false
 	if err := a.store.Load(automationFile, &st); err != nil || st.Mode == "" {
 		st = defaultAutomation()
-		_ = a.store.Save(automationFile, &st)
+		changed = true
 	}
 	if st.Mode == "auto" {
 		// v1.3.8 defaulted to "auto" and stopped NFQWS2 whenever AWG looked
 		// healthy. Migrate that surprising default back to the historical behavior:
 		// keep NFQWS2 running unless the user explicitly switches modes again.
 		st.Mode = "on"
-		_ = a.store.Save(automationFile, &st)
+		changed = true
 	}
 	if st.IntervalH <= 0 {
 		st.IntervalH = 24
+		changed = true
 	}
+	if changed {
+		if err := a.store.Save(automationFile, &st); err != nil {
+			logbuf.Append("automation", "error", "сохранение настроек автоматики: "+err.Error())
+		}
+	}
+	return st
+}
+
+// initAutomation loads settings and starts the independent service watchdog.
+func (a *App) initAutomation() {
+	st := a.loadAutomationState()
 	a.automation = &automationRuntime{state: st, stopCh: make(chan struct{})}
 	go a.automationLoop()
 }
@@ -136,6 +149,11 @@ func (a *App) stopAutomation() {
 
 func (a *App) automationLoop() {
 	rt := a.automation
+	// The vendor S51 init can start before this panel on boot. Restore an
+	// explicit OFF before sampling tunnels or considering background work.
+	if a.nfqws2ManuallyOff() {
+		a.restoreNfqws2ManualOff()
+	}
 	// Settle the initial sample so the first hysteresis tick isn't a phantom
 	// "unhealthy" with zero rx_bytes.
 	a.refreshAWGSample()
@@ -167,23 +185,12 @@ func (a *App) automationStep() {
 		rt.unhealthyStreak++
 		rt.healthyStreak = 0
 	}
+	unhealthy := rt.unhealthyStreak >= confirmTicks
 	rt.mu.Unlock()
+	a.enforceNfqws2Automation(mode, unhealthy, hAge)
 
-	switch mode {
-	case "off":
-		// Watchdog disabled: leave NFQWS2 exactly as the user/service manager set it.
-	case "on":
-		if !a.nfqws2Running() {
-			a.silentNfqws2Start("mode=on")
-		}
-	default: // "auto"
-		if rt.unhealthyStreak >= confirmTicks && !a.nfqws2Running() {
-			a.silentNfqws2Start(fmt.Sprintf("AWG down %ds → fallback", hAge))
-		}
-	}
-
-	// Periodic re-pick. Only run when AWG is healthy (so the scan rides the
-	// VPN, not the censored ISP path) and no scan is currently in flight.
+	// Periodic re-pick requires the master switch, a healthy AWG connection,
+	// and no scan currently in flight.
 	if a.shouldPeriodicPick(healthy) {
 		go a.runAutoPick("periodic")
 	}
@@ -255,17 +262,20 @@ func (a *App) nfqws2Running() bool {
 
 func (a *App) silentNfqws2Start(why string) {
 	logbuf.Append("automation", "info", "start nfqws2: "+why)
-	a.Nfqws2Start()
+	a.startNfqws2Automatically()
 }
 
 func (a *App) silentNfqws2Stop(why string) {
 	logbuf.Append("automation", "info", "stop nfqws2: "+why)
-	a.Nfqws2Stop()
+	a.enforceNfqws2Automation("off", false, 0)
 }
 
 func (a *App) shouldPeriodicPick(healthy bool) bool {
+	if a.nfqws2ManuallyOff() {
+		return false
+	}
 	st := a.AutomationConfig()
-	if !st.PeriodicScan {
+	if !st.AutoPick || !st.PeriodicScan {
 		return false
 	}
 	if !healthy {
@@ -290,6 +300,9 @@ func (a *App) shouldPeriodicPick(healthy bool) bool {
 }
 
 func (a *App) maybeRunFirstBootPick() {
+	if a.nfqws2ManuallyOff() {
+		return
+	}
 	st := a.AutomationConfig()
 	if !st.AutoPick {
 		return
@@ -341,9 +354,31 @@ func readConfArgs(path string) (string, error) {
 	return full[open+1 : close_], nil
 }
 
+// autoPickAllowed keeps the saved switch authoritative for background work,
+// including work queued just before the user disabled it.
+func (a *App) autoPickAllowed(reason string) bool {
+	if a.nfqws2ManuallyOff() {
+		return false
+	}
+	st := a.AutomationConfig()
+	switch reason {
+	case "manual":
+		return true
+	case "first-boot":
+		return st.AutoPick
+	case "periodic":
+		return st.AutoPick && st.PeriodicScan
+	default:
+		return false
+	}
+}
+
 // runAutoPick performs scan → pick top coefficient → apply. Blocks the caller
 // until done (caller is responsible for running it in a goroutine).
 func (a *App) runAutoPick(reason string) {
+	if !a.autoPickAllowed(reason) {
+		return
+	}
 	rt := a.automation
 	rt.mu.Lock()
 	if rt.pickRunning {
@@ -380,7 +415,11 @@ func (a *App) runAutoPick(reason string) {
 		logbuf.Append("automation", "error", "auto-pick: "+err.Error())
 		return
 	}
-	if err := a.applyAutoPickStrategy(*winner, true); err != nil {
+	if !a.autoPickAllowed(reason) {
+		logbuf.Append("automation", "info", "авто-пик выключен: результат фонового сканирования не применён")
+		return
+	}
+	if err := a.applyAutoPickStrategyForReason(*winner, true, reason); err != nil {
 		a.recordPickError(fmt.Errorf("apply: %w", err))
 		logbuf.Append("automation", "error", "auto-pick apply: "+err.Error())
 		return
@@ -451,10 +490,33 @@ func autoPickWinner(results []StrategyResult) (*StrategyResult, error) {
 // Guard automatic writes independently of result selection. Manual config/apply
 // actions remain able to install HTTP strategies when the user requests them.
 func (a *App) applyAutoPickStrategy(result StrategyResult, restart bool) error {
+	return a.applyAutoPickStrategyForReason(result, restart, "")
+}
+
+func (a *App) applyAutoPickStrategyForReason(result StrategyResult, restart bool, reason string) error {
 	if _, err := autoPickWinner([]StrategyResult{result}); err != nil {
 		return err
 	}
-	return a.ApplyStrategyToConfig(result.ArgLine, restart)
+	if a.automation == nil {
+		return a.ApplyStrategyToConfig(result.ArgLine, restart)
+	}
+	a.automation.serviceMu.Lock()
+	defer a.automation.serviceMu.Unlock()
+	if a.nfqws2ManuallyOff() {
+		return errors.New("NFQWS2 выключен вручную; автоматическая стратегия не применена")
+	}
+	if reason != "" && !a.autoPickAllowed(reason) {
+		return errors.New("авто-пик выключен; результат фонового сканирования не применён")
+	}
+	if err := a.ApplyStrategyToConfig(result.ArgLine, false); err != nil {
+		return err
+	}
+	if restart {
+		if result := a.runNfqws2ServiceOperation("restart"); !result.OK {
+			return errors.New(result.Detail)
+		}
+	}
+	return nil
 }
 
 func (a *App) cancelActiveRunIfMatches(runID string) {
@@ -502,28 +564,35 @@ func (a *App) SetAutomationConfig(in AutomationConfig) (AutomationStatus, error)
 		return AutomationStatus{}, fmt.Errorf("bad mode %q", in.Mode)
 	}
 	a.automation.mu.Lock()
+	next := a.automation.state
 	if in.Mode != "" {
-		a.automation.state.Mode = in.Mode
+		next.Mode = in.Mode
 	}
-	a.automation.state.AutoPick = in.AutoPick
-	a.automation.state.PeriodicScan = in.PeriodicScan
+	next.AutoPick = in.AutoPick
+	next.PeriodicScan = in.PeriodicScan
 	if in.IntervalH > 0 {
-		a.automation.state.IntervalH = in.IntervalH
+		next.IntervalH = in.IntervalH
 	}
-	_ = a.store.Save(automationFile, &a.automation.state)
-	a.automation.mu.Unlock()
+	if err := a.store.Save(automationFile, &next); err != nil {
+		a.automation.mu.Unlock()
+		return AutomationStatus{}, fmt.Errorf("сохранение настроек автоматики: %w", err)
+	}
+	a.automation.state = next
 	// Reset hysteresis on mode change so the next tick decides fresh.
-	a.automation.mu.Lock()
 	a.automation.healthyStreak = 0
 	a.automation.unhealthyStreak = 0
 	a.automation.mu.Unlock()
 	return a.AutomationStatus(), nil
 }
 
-// TriggerAutoPickNow runs a scan-and-apply on demand (UI "пик сейчас" button).
+// TriggerAutoPickNow runs a scan-and-apply on demand (UI "пик сейчас" button),
+// independently of the background automation switch.
 func (a *App) TriggerAutoPickNow() error {
 	if a.automation == nil {
 		return errors.New("automation not initialized")
+	}
+	if a.nfqws2ManuallyOff() {
+		return errors.New("NFQWS2 выключен вручную; сначала включите сервис")
 	}
 	a.automation.mu.Lock()
 	running := a.automation.pickRunning

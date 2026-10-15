@@ -139,6 +139,9 @@ func isProtected(kind, base string) bool {
 	case "conf":
 		return base == "nfqws2.conf"
 	case "list":
+		if managedServiceList(base) {
+			return true
+		}
 		switch base {
 		case "user.list", "auto.list", "exclude.list", "ipset.list", "ipset_exclude.list":
 			return true
@@ -331,6 +334,9 @@ func (m *Manager) Save(kind, name, content string) error {
 	if err != nil {
 		return err
 	}
+	if kind == "list" && managedServiceList(base) {
+		return errManagedServiceList
+	}
 	data := []byte(normalize(content))
 	if kind == "conf" {
 		data, _, err = prepareAssetData(kind, base, data)
@@ -359,6 +365,9 @@ func (m *Manager) Create(kind, name string) error {
 	basePath, base, err := m.resolve(kind, name)
 	if err != nil {
 		return err
+	}
+	if kind == "list" && managedServiceList(base) {
+		return errManagedServiceList
 	}
 	if _, e := os.Stat(basePath); e == nil {
 		return fmt.Errorf("файл уже существует: %s", base)

@@ -5,8 +5,11 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
+	"nfqws2strategy/internal/services/awgroute"
 	"nfqws2strategy/internal/tools/config"
+	"nfqws2strategy/internal/tools/store"
 )
 
 func successfulAutoResult(args string, coefficient float64) StrategyResult {
@@ -78,5 +81,99 @@ func TestAutoPickApplyRejectsHTTPBeforeBackupOrWrite(t *testing.T) {
 	got, err = os.ReadFile(conf)
 	if want := strings.Replace(original, regressionTLSArgs, regressionHTTPArgs, 1); err != nil || string(got) != want {
 		t.Fatalf("explicit manual HTTP apply was changed: %q, %v", got, err)
+	}
+}
+
+func TestAutomationSwitchDefaultsOffAndPersistsUserChoice(t *testing.T) {
+	st, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := &App{Cfg: config.Default(), store: st, awgroute: &awgroute.Service{}}
+	initial := a.loadAutomationState()
+	if initial.AutoPick || initial.PeriodicScan || initial.Mode != "off" || initial.IntervalH != 24 {
+		t.Fatalf("unexpected first-install settings: %+v", initial)
+	}
+	var persisted AutomationState
+	if err := st.Load(automationFile, &persisted); err != nil || persisted != initial {
+		t.Fatalf("default settings were not saved: %+v, %v", persisted, err)
+	}
+	initial.LastPickAt = 1234567890
+	initial.LastPickName = "previous strategy"
+	initial.LastPickArgs = regressionTLSArgs
+	initial.LastPickError = "previous diagnostic"
+	a.automation = &automationRuntime{state: initial}
+	for _, enabled := range []bool{true, false, true} {
+		// The master switch must retain the periodic preference while off, so
+		// enabling it again resumes the schedule chosen by the user.
+		requested := AutomationConfig{Mode: "on", AutoPick: enabled, PeriodicScan: true, IntervalH: 7}
+		status, err := a.SetAutomationConfig(requested)
+		if err != nil {
+			t.Fatalf("set auto_pick=%t: %v", enabled, err)
+		}
+		want := initial
+		want.AutomationConfig = requested
+		if status.AutomationState != want || a.AutomationConfig() != requested {
+			t.Fatalf("switch changed unrelated history or ignored requested settings: %+v", status)
+		}
+		if got := a.loadAutomationState(); got != want {
+			t.Fatalf("auto_pick=%t did not survive reload: got %+v, want %+v", enabled, got, want)
+		}
+		if err := st.Load(automationFile, &persisted); err != nil || persisted != want {
+			t.Fatalf("auto_pick=%t did not persist: %+v, %v", enabled, persisted, err)
+		}
+	}
+}
+
+func TestAutoPickSwitchControlsBackgroundSources(t *testing.T) {
+	for _, enabled := range []bool{false, true} {
+		for _, periodic := range []bool{false, true} {
+			state := AutomationState{
+				AutomationConfig: AutomationConfig{Mode: "off", AutoPick: enabled, PeriodicScan: periodic, IntervalH: 1},
+				LastPickAt:       time.Now().Add(-48 * time.Hour).Unix(),
+			}
+			a := &App{automation: &automationRuntime{state: state}}
+			for reason, want := range map[string]bool{
+				"first-boot": enabled,
+				"periodic":   enabled && periodic,
+				"manual":     true,
+				"unknown":    false,
+			} {
+				if got := a.autoPickAllowed(reason); got != want {
+					t.Fatalf("auto_pick=%t periodic_scan=%t reason=%s: got %t, want %t", enabled, periodic, reason, got, want)
+				}
+			}
+			if got := a.shouldPeriodicPick(true); got != (enabled && periodic) {
+				t.Fatalf("overdue scheduled pick: auto_pick=%t periodic_scan=%t got %t", enabled, periodic, got)
+			}
+			if a.shouldPeriodicPick(false) {
+				t.Fatal("unhealthy tunnel allowed a scheduled pick")
+			}
+			// Re-evaluating the permission after a scan must see a newly disabled
+			// switch before applying its result; manual requests stay independent.
+			a.automation.state.AutoPick = false
+			if a.autoPickAllowed("first-boot") || a.autoPickAllowed("periodic") || !a.autoPickAllowed("manual") {
+				t.Fatal("permission check ignored the latest switch value")
+			}
+		}
+	}
+}
+
+func TestAutomationSwitchSaveFailureKeepsPreviousState(t *testing.T) {
+	st, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A directory at the target path makes the atomic rename fail on all OSes.
+	if err := os.Mkdir(st.Path(automationFile), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	original := defaultAutomation()
+	a := &App{Cfg: config.Default(), store: st, awgroute: &awgroute.Service{}, automation: &automationRuntime{state: original}}
+	if _, err := a.SetAutomationConfig(AutomationConfig{Mode: "on", AutoPick: true}); err == nil {
+		t.Fatal("failed switch save was reported as successful")
+	}
+	if a.automation.state != original {
+		t.Fatalf("failed switch save changed runtime settings: %+v", a.automation.state)
 	}
 }

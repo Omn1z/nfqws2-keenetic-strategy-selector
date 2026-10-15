@@ -255,7 +255,8 @@ type cfH2Lane struct {
 	endpoint                          string
 	stats                             *Stats
 	transport                         *http.Transport
-	mu                                sync.Mutex // Also guards all mutable channel/request/replay state.
+	requestTimeout                    time.Duration // Immutable after lane setup; tests use short local deadlines.
+	mu                                sync.Mutex    // Also guards all mutable channel/request/replay state.
 	closeOnce                         sync.Once
 	changed                           chan struct{}
 	closed                            bool
@@ -266,7 +267,7 @@ type cfH2Lane struct {
 
 func newCFH2Lane(parent context.Context, host string, stats *Stats, tlsTemplate *tls.Config) *cfH2Lane {
 	ctx, cancel := context.WithCancel(parent)
-	l := &cfH2Lane{ctx: ctx, cancel: cancel, host: host, endpoint: "https://" + host + "/api", stats: stats, changed: make(chan struct{}), channels: make(map[*cfH2Channel]struct{})}
+	l := &cfH2Lane{ctx: ctx, cancel: cancel, host: host, endpoint: "https://" + host + "/api", stats: stats, requestTimeout: cfH2RequestTimeout, changed: make(chan struct{}), channels: make(map[*cfH2Channel]struct{})}
 	if tlsTemplate == nil {
 		tlsTemplate = &tls.Config{RootCAs: tlsroots.Pool(), ClientSessionCache: wsTLSSessions}
 	}

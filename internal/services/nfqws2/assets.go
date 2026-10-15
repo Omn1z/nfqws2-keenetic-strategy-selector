@@ -359,7 +359,8 @@ func (m *Manager) listAssetsLocked() (Assets, error) {
 				return nil
 			}
 			editable := loc.kind != "blob" && !strings.HasSuffix(name, ".gz") && st.Size() <= readCap
-			out.Files = append(out.Files, Asset{Path: archiveName, Kind: loc.kind, Size: st.Size(), Editable: editable, Protected: archiveName == "nfqws2.conf", ModifiedAt: st.ModTime().UTC()})
+			managed := loc.kind == "list" && managedServiceList(name)
+			out.Files = append(out.Files, Asset{Path: archiveName, Kind: loc.kind, Size: st.Size(), Editable: editable && !managed, Protected: archiveName == "nfqws2.conf" || managed, ModifiedAt: st.ModTime().UTC()})
 			if len(out.Files) > ArchiveMaxFiles {
 				return fmt.Errorf("слишком много файлов (максимум %d)", ArchiveMaxFiles)
 			}
@@ -414,6 +415,9 @@ func (m *Manager) SaveAsset(name string, data []byte, overwrite bool) error {
 	if err != nil {
 		return err
 	}
+	if loc.kind == "list" && managedServiceList(name) {
+		return errManagedServiceList
+	}
 	data, _, err = prepareAssetData(loc.kind, name, data)
 	if err != nil {
 		return err
@@ -450,6 +454,9 @@ func (m *Manager) DeleteAsset(name string) error {
 	loc, err := m.assetLocation(name)
 	if err != nil {
 		return err
+	}
+	if loc.kind == "list" && managedServiceList(name) {
+		return errManagedServiceList
 	}
 	return removeAssetLocation(loc)
 }

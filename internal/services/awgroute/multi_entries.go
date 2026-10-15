@@ -10,6 +10,10 @@ import (
 )
 
 func (svc *Service) awgMultiRuleEntriesWithLookup(z awg.Zone, lookup func(string) []string) ([]string, bool, bool) {
+	return svc.awgMultiRuleEntriesWithLookupAndSeeds(z, lookup, svc.routingDiscoveryWarmupCandidates())
+}
+
+func (svc *Service) awgMultiRuleEntriesWithLookupAndSeeds(z awg.Zone, lookup func(string) []string, candidates []string) ([]string, bool, bool) {
 	seen := map[string]bool{}
 	out := []string{}
 	add := func(raw string) {
@@ -21,6 +25,10 @@ func (svc *Service) awgMultiRuleEntriesWithLookup(z awg.Zone, lookup func(string
 	catchAll := z.IsCatchAll()
 	staticOK := len(z.Domains) == 0 && len(z.IPs) == 0
 	expDomains, expIPs := svc.expandZoneEntries(z)
+	// Previously observed names are bounded warmup candidates, never additions
+	// to the user's list. The supplied lookup determines whether this is a live
+	// explicit apply or a cache-only maintenance pass.
+	resolveDomains := append(append([]string{}, expDomains...), svc.routingDiscoverySeedNamesFrom(z, expDomains, candidates)...)
 	for _, ip := range append(append([]string{}, z.IPs...), expIPs...) {
 		if awgIsCatchAll(ip) {
 			catchAll = true
@@ -36,9 +44,9 @@ func (svc *Service) awgMultiRuleEntriesWithLookup(z awg.Zone, lookup func(string
 	// A geosite/list can expand into thousands of names. Resolve them with the
 	// same bounded concurrency as the legacy ipset builder, then consume the
 	// answers in rule order so matching and cache behavior remain deterministic.
-	answers := make([][]string, len(expDomains))
-	queries := make([]int, 0, len(expDomains))
-	for i, raw := range expDomains {
+	answers := make([][]string, len(resolveDomains))
+	queries := make([]int, 0, len(resolveDomains))
+	for i, raw := range resolveDomains {
 		d := strings.TrimSpace(raw)
 		if d != "" && !awgIsCatchAll(d) && !isMaskEntry(d) {
 			queries = append(queries, i)
@@ -46,7 +54,7 @@ func (svc *Service) awgMultiRuleEntriesWithLookup(z awg.Zone, lookup func(string
 	}
 	if len(queries) < 8 {
 		for _, i := range queries {
-			answers[i] = lookup(routingResolveName(expDomains[i]))
+			answers[i] = lookup(routingResolveName(resolveDomains[i]))
 		}
 	} else {
 		workers := len(queries)
@@ -60,7 +68,7 @@ func (svc *Service) awgMultiRuleEntriesWithLookup(z awg.Zone, lookup func(string
 			go func() {
 				defer wg.Done()
 				for i := range jobs {
-					answers[i] = lookup(routingResolveName(expDomains[i]))
+					answers[i] = lookup(routingResolveName(resolveDomains[i]))
 				}
 			}()
 		}
@@ -70,7 +78,7 @@ func (svc *Service) awgMultiRuleEntriesWithLookup(z awg.Zone, lookup func(string
 		close(jobs)
 		wg.Wait()
 	}
-	for i, d := range expDomains {
+	for i, d := range resolveDomains {
 		d = strings.TrimSpace(d)
 		if d == "" {
 			continue

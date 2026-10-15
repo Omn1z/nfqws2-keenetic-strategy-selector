@@ -170,3 +170,105 @@ func TestLoadFromNfqws2ConfUsesWANInterfaceParser(t *testing.T) {
 		t.Fatal("invalid interface length was accepted")
 	}
 }
+
+const managedServiceFixture = "# BEGIN N2S SERVICE STRATEGIES\n" +
+	"NFQWS_ARGS_CUSTOM=\"--filter-tcp=8443 --hostlist-domains=facepunch.com --lua-desync=multisplit${NFQWS_ARGS_CUSTOM:+ --new }${NFQWS_ARGS_CUSTOM}\"\n" +
+	"TCP_PORTS='80,443,8443'\n" +
+	"# END N2S SERVICE STRATEGIES\n"
+
+func TestWANInterfacesAndLiteralValuesIgnoreManagedServiceOverrides(t *testing.T) {
+	base := "ISP_INTERFACE='eth4,eth3'\nTCP_PORTS='80,443'\nNFQWS_ARGS_CUSTOM=\"--filter-tcp=443 --lua-desync=fake\"\n"
+	source := base + managedServiceFixture
+	got, err := NormalizeWANInterfaces(source)
+	if err != nil || got != strings.Replace(base, "eth4,eth3", "eth4 eth3", 1)+managedServiceFixture {
+		t.Fatalf("base WAN edit changed managed block: %q, %v", got, err)
+	}
+	if value, present, err := LiteralShellConfigValue(source, "TCP_PORTS"); err != nil || !present || value != "80,443" {
+		t.Fatalf("read override instead of base: %q, %v, %v", value, present, err)
+	}
+	if value, present, err := LiteralShellConfigValue(source, "UDP_PORTS"); err != nil || present || value != "" {
+		t.Fatalf("missing base value: %q, %v, %v", value, present, err)
+	}
+	from, to, present, err := ManagedServiceConfigRange(source)
+	if err != nil || !present || from != len(base) || to != len(source) {
+		t.Fatalf("range = %d:%d, %v, %v", from, to, present, err)
+	}
+	for _, source := range []string{strings.ReplaceAll(source, "\n", "\r\n"), strings.TrimSuffix(source, "\n")} {
+		if _, _, present, err := ManagedServiceConfigRange(source); err != nil || !present {
+			t.Fatalf("line ending rejected: %v, %v", present, err)
+		}
+	}
+}
+
+func TestManagedServiceMarkersInsideQuotedValuesRemainData(t *testing.T) {
+	for _, quote := range []string{"'", `"`} {
+		source := "NFQWS_ARGS=" + quote + "--filter-tcp=443\n# BEGIN N2S SERVICE STRATEGIES\n# END N2S SERVICE STRATEGIES\n" + quote + "\nISP_INTERFACE=eth4,eth3\n"
+		if _, _, present, err := ManagedServiceConfigRange(source); err != nil || present {
+			t.Fatalf("quoted marker selected: %v, %v", present, err)
+		}
+		if normalized, err := NormalizeWANInterfaces(source); err != nil || normalized != strings.Replace(source, "ISP_INTERFACE=eth4,eth3", `ISP_INTERFACE="eth4 eth3"`, 1) {
+			t.Fatalf("quoted markers broke WAN normalization: %q, %v", normalized, err)
+		}
+	}
+}
+
+func TestManagedServiceConfigAcceptsOnlyGeneratedDoubleQuoteEscapes(t *testing.T) {
+	literal := "--filter-tcp=8443 --lua-desync=fake:arg=C:\\data:quote=\"literal\":dollar=$:tick=`"
+	encoded := strings.NewReplacer("\\", "\\\\", "\"", "\\\"", "$", "\\$", "`", "\\`").Replace(literal)
+	block := strings.Replace(managedServiceFixture, "--filter-tcp=8443", encoded, 1)
+	source := "ISP_INTERFACE=eth4,eth3\nTCP_PORTS=443\n" + block
+	if _, _, present, err := ManagedServiceConfigRange(source); err != nil || !present {
+		t.Fatalf("generated escaped literal rejected: %v, %v", present, err)
+	}
+	if normalized, err := NormalizeWANInterfaces(source); err != nil || normalized != strings.Replace(source, "ISP_INTERFACE=eth4,eth3", `ISP_INTERFACE="eth4 eth3"`, 1) {
+		t.Fatalf("escaped block changed: %q, %v", normalized, err)
+	}
+	if value, present, err := LiteralShellConfigValue(source, "TCP_PORTS"); err != nil || !present || value != "443" {
+		t.Fatalf("escaped block affected base: %q, %v, %v", value, present, err)
+	}
+	for _, invalid := range []string{"$VALUE", "$(printf unsafe)", "`printf unsafe`", `"unescaped"`, `\q`, `\`, "\\\\$VALUE", "\\\\`printf unsafe`"} {
+		block := strings.Replace(managedServiceFixture, "--filter-tcp=8443", invalid, 1)
+		if _, _, _, err := ManagedServiceConfigRange(block); err == nil {
+			t.Errorf("accepted invalid generated literal %q", invalid)
+		}
+	}
+}
+
+func TestManagedServiceConfigRejectsMalformedOrUnownedBlocks(t *testing.T) {
+	for _, block := range []string{
+		managedServiceFixture + managedServiceFixture,
+		strings.Replace(managedServiceFixture, "# END N2S SERVICE STRATEGIES\n", "", 1),
+		"# END N2S SERVICE STRATEGIES\n",
+		strings.Replace(managedServiceFixture, "# BEGIN", " # BEGIN", 1),
+		strings.Replace(managedServiceFixture, "TCP_PORTS='80,443,8443'", "ISP_INTERFACE=eth8,eth9", 1),
+		strings.Replace(managedServiceFixture, "TCP_PORTS='80,443,8443'", "TCP_PORTS='80'\nTCP_PORTS='443'", 1),
+		strings.Replace(managedServiceFixture, "TCP_PORTS='80,443,8443'", "printf bad", 1),
+		strings.Replace(managedServiceFixture, "--filter-tcp=8443", "$(printf unsafe)", 1),
+		managedServiceFixture + "TCP_PORTS=999\n",
+	} {
+		source := "ISP_INTERFACE=eth4,eth3\n" + block
+		if _, _, _, err := ManagedServiceConfigRange(source); err == nil {
+			t.Fatalf("accepted malformed block: %q", block)
+		}
+		if normalized, err := NormalizeWANInterfaces(source); err == nil || normalized != source {
+			t.Fatalf("modified malformed block: %q, %v", normalized, err)
+		}
+		if _, _, err := LiteralShellConfigValue(source, "TCP_PORTS"); err == nil {
+			t.Fatal("literal read quietly skipped malformed block")
+		}
+	}
+}
+
+func TestLiteralShellConfigValueUsesLastBaseAssignmentAndRejectsEvaluation(t *testing.T) {
+	if value, present, err := LiteralShellConfigValue("TCP_PORTS=80\nTCP_PORTS=443\n", "TCP_PORTS"); err != nil || !present || value != "443" {
+		t.Fatalf("last assignment: %q, %v, %v", value, present, err)
+	}
+	for _, source := range []string{"TCP_PORTS=\"$PORTS\"\n", "TCP_PORTS=\"$(printf 443)\"\n", "TCP_PORTS=443\nprintf unsafe\n"} {
+		if _, _, err := LiteralShellConfigValue(source, "TCP_PORTS"); err == nil {
+			t.Fatalf("accepted evaluation: %q", source)
+		}
+	}
+	if value, present, err := LiteralShellConfigValue("UDP_PORTS=\"$PORTS\"\nTCP_PORTS=443\n", "TCP_PORTS"); err != nil || !present || value != "443" {
+		t.Fatalf("unrelated dynamic transport rejected: %q, %v, %v", value, present, err)
+	}
+}

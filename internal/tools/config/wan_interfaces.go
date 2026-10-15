@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 	"unicode"
 )
@@ -10,13 +11,19 @@ import (
 // shell loops. Only assignment-only configuration files are edited: arbitrary
 // shell programs and dynamic ISP_INTERFACE values are preserved verbatim.
 func NormalizeWANInterfaces(source string) (string, error) {
-	assignments, safe := wanAssignments(source)
+	assignments, safe, err := shellConfigAssignments(source)
+	if err != nil {
+		return source, err
+	}
 	if !safe {
 		return source, nil
 	}
 	var out strings.Builder
 	start := 0
 	for _, assignment := range assignments {
+		if assignment.key != "ISP_INTERFACE" {
+			continue
+		}
 		if !assignment.literal {
 			continue
 		}
@@ -49,12 +56,18 @@ func NormalizeWANInterfaces(source string) (string, error) {
 // without evaluating shell. Missing/dynamic values and shell programs return
 // nil, allowing callers to retain their existing defaults.
 func WANInterfacesFromConf(source string) ([]string, error) {
-	assignments, safe := wanAssignments(source)
+	assignments, safe, err := shellConfigAssignments(source)
+	if err != nil {
+		return nil, err
+	}
 	if !safe {
 		return nil, nil
 	}
 	var ifaces []string
 	for _, assignment := range assignments {
+		if assignment.key != "ISP_INTERFACE" {
+			continue
+		}
 		ifaces = nil
 		if !assignment.literal {
 			continue
@@ -69,6 +82,7 @@ func WANInterfacesFromConf(source string) ([]string, error) {
 }
 
 type wanAssignment struct {
+	key      string
 	from, to int
 	value    string
 	quote    byte
@@ -104,12 +118,20 @@ func splitWANInterfaces(value string) ([]string, error) {
 // A conservative statement scanner deliberately refuses command substitutions,
 // compound shell statements and heredocs. It understands quoting/continuations
 // so an assignment-looking line inside a multiline strategy is never edited.
-func wanAssignments(source string) ([]wanAssignment, bool) {
+func shellConfigAssignments(source string) ([]wanAssignment, bool, error) {
+	from, to, managed, err := ManagedServiceConfigRange(source)
+	if err != nil {
+		return nil, false, err
+	}
 	var assignments []wanAssignment
 	for start := 0; start < len(source); {
+		if managed && start == from {
+			start = to
+			continue
+		}
 		end, safe := wanStatementEnd(source, start)
 		if !safe {
-			return nil, false
+			return nil, false, nil
 		}
 		pos := start
 		for pos < end && wanHorizontalSpace(source[pos]) {
@@ -130,20 +152,149 @@ func wanAssignments(source string) ([]wanAssignment, bool) {
 			pos++
 		}
 		if pos == keyStart || pos == end || source[pos] != '=' {
-			return nil, false
+			return nil, false, nil
 		}
 		key := source[keyStart:pos]
 		pos++
 		assignment, safe := wanAssignmentValue(source, pos, end)
 		if !safe {
-			return nil, false
+			return nil, false, nil
 		}
-		if key == "ISP_INTERFACE" {
-			assignments = append(assignments, assignment)
+		assignment.key = key
+		assignments = append(assignments, assignment)
+		start = end + 1
+	}
+	return assignments, true, nil
+}
+
+// LiteralShellConfigValue reads the last base assignment without evaluating
+// shell. Managed service overrides are excluded so edits retain global values.
+func LiteralShellConfigValue(source, key string) (value string, present bool, err error) {
+	assignments, safe, err := shellConfigAssignments(source)
+	if err != nil {
+		return "", false, err
+	}
+	if !safe {
+		return "", false, fmt.Errorf("%s: конфиг содержит shell-команды или сложные выражения", key)
+	}
+	var selected *wanAssignment
+	for i := range assignments {
+		if assignments[i].key == key {
+			selected = &assignments[i]
+		}
+	}
+	if selected == nil {
+		return "", false, nil
+	}
+	if !selected.literal {
+		return "", true, fmt.Errorf("%s: для автоматического объединения портов укажите буквальное значение", key)
+	}
+	return selected.value, true, nil
+}
+
+const serviceConfigBegin = "# BEGIN N2S SERVICE STRATEGIES"
+const serviceConfigEnd = "# END N2S SERVICE STRATEGIES"
+
+var servicePortAssignment = regexp.MustCompile(`^(TCP_PORTS|UDP_PORTS)=(?:'[0-9,:]*'|"[0-9,:]*"|[0-9,:]*)$`)
+
+// ManagedServiceConfigRange finds one final, generated service block. Markers
+// inside quoted multiline values are data, never block delimiters. Only the
+// narrowly generated assignments are hidden from base config editing.
+func ManagedServiceConfigRange(source string) (from, to int, present bool, err error) {
+	inside := false
+	seen := map[string]bool{}
+	invalid := func() (int, int, bool, error) {
+		return 0, 0, false, fmt.Errorf("некорректный управляемый блок сервисных стратегий: используйте полный редактор конфига")
+	}
+	for start := 0; start < len(source); {
+		end := serviceStatementEnd(source, start)
+		statement := strings.TrimSuffix(source[start:end], "\r")
+		trimmed := strings.TrimSpace(statement)
+		switch trimmed {
+		case serviceConfigBegin:
+			if statement != serviceConfigBegin || inside || present {
+				return invalid()
+			}
+			from, inside = start, true
+		case serviceConfigEnd:
+			if statement != serviceConfigEnd || !inside || !seen["NFQWS_ARGS_CUSTOM"] {
+				return invalid()
+			}
+			to, present, inside = end, true, false
+			if to < len(source) && source[to] == '\n' {
+				to++
+			}
+		default:
+			if inside && trimmed != "" && !strings.HasPrefix(trimmed, "#") {
+				key := ""
+				if match := servicePortAssignment.FindStringSubmatch(statement); match != nil {
+					key = match[1]
+				} else if strings.HasPrefix(statement, `NFQWS_ARGS_CUSTOM="`) && strings.HasSuffix(statement, `${NFQWS_ARGS_CUSTOM:+ --new }${NFQWS_ARGS_CUSTOM}"`) {
+					literal := strings.TrimSuffix(strings.TrimPrefix(statement, `NFQWS_ARGS_CUSTOM="`), `${NFQWS_ARGS_CUSTOM:+ --new }${NFQWS_ARGS_CUSTOM}"`)
+					if validServiceConfigLiteral(literal) {
+						key = "NFQWS_ARGS_CUSTOM"
+					}
+				}
+				if key == "" || seen[key] {
+					return invalid()
+				}
+				seen[key] = true
+			} else if present && trimmed != "" && !strings.HasPrefix(trimmed, "#") {
+				return invalid() // The generated overrides must remain final.
+			}
 		}
 		start = end + 1
 	}
-	return assignments, true
+	if inside {
+		return invalid()
+	}
+	return from, to, present, nil
+}
+
+// The generator escapes these four characters inside its double-quoted
+// assignment. Accept that encoding without permitting shell expansion, closing
+// the quote, or preserving an unknown backslash escape unexpectedly.
+func validServiceConfigLiteral(literal string) bool {
+	for i := 0; i < len(literal); i++ {
+		switch literal[i] {
+		case '\\':
+			i++
+			if i == len(literal) || !strings.ContainsRune("\\\"$`", rune(literal[i])) {
+				return false
+			}
+		case '$', '`', '"', '\r', '\n':
+			return false
+		}
+	}
+	return true
+}
+
+func serviceStatementEnd(source string, from int) int {
+	var quote byte
+	for i := from; i < len(source); i++ {
+		ch := source[i]
+		if ch == '\\' && quote != '\'' {
+			i++
+			continue
+		}
+		if quote != 0 {
+			if ch == quote {
+				quote = 0
+			}
+			continue
+		}
+		if ch == '\'' || ch == '"' || ch == '`' {
+			quote = ch
+		} else if ch == '#' && (i == from || wanHorizontalSpace(source[i-1])) {
+			if next := strings.IndexByte(source[i:], '\n'); next >= 0 {
+				return i + next
+			}
+			return len(source)
+		} else if ch == '\n' {
+			return i
+		}
+	}
+	return len(source)
 }
 
 func wanHorizontalSpace(ch byte) bool { return ch == ' ' || ch == '\t' || ch == '\r' }

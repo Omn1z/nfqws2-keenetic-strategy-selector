@@ -13,10 +13,31 @@ import (
 	"nfqws2strategy/internal/tools/logbuf"
 )
 
-func (svc *Service) awgSetLegacyDNSLearner(p *awg.DNSProxy) {
+func (svc *Service) awgSetLegacyDNSLearner(p *awg.DNSProxy, configs ...*awg.ServerConfig) {
 	generation := svc.routingDNSGate.version()
+	var snapshot []routingDiscoveryRule
+	if len(configs) > 0 && configs[0] != nil {
+		rules := cloneAWGZones(configs[0].Routing.Zones)
+		owner := svc.activeServerID()
+		for i := range rules {
+			rules[i].TunnelID = strings.TrimSpace(rules[i].TunnelID)
+			if rules[i].TunnelID == "" && !rules[i].WaitingForConnection {
+				rules[i].TunnelID = owner
+			}
+			if rules[i].RouteValue() == "tunnel" {
+				candidates := fallbackCandidates(rules[i].TunnelID, rules[i].FallbackTunnelIDs)
+				rules[i].FallbackTunnelIDs = nil
+				if len(candidates) > 1 {
+					rules[i].FallbackTunnelIDs = candidates[1:]
+				}
+			} else {
+				rules[i].FallbackTunnelIDs = nil
+			}
+		}
+		snapshot = svc.legacyRoutingDiscoverySnapshot(rules)
+	}
 	p.SetBeforeReply(func(ctx context.Context, srcIP, name string, ips []string) error {
-		return svc.awgLearnLegacyDNSAnswer(ctx, name, srcIP, ips, generation)
+		return svc.awgLearnLegacyDNSAnswerWithSnapshot(ctx, name, srcIP, ips, generation, snapshot, svc.awgIPSetLearnSync)
 	})
 	p.SetReplayMatch(func(name string, ips []string) {
 		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
@@ -32,12 +53,17 @@ func (svc *Service) awgLearnLegacyDNSAnswer(ctx context.Context, name, srcIP str
 }
 
 func (svc *Service) awgLearnLegacyDNSAnswerWith(ctx context.Context, name, srcIP string, ips []string, generation uint64, learn func(context.Context, []ipsetAddReq) error) error {
+	return svc.awgLearnLegacyDNSAnswerWithSnapshot(ctx, name, srcIP, ips, generation, nil, learn)
+}
+
+func (svc *Service) awgLearnLegacyDNSAnswerWithSnapshot(ctx context.Context, name, srcIP string, ips []string, generation uint64, snapshot []routingDiscoveryRule, learn func(context.Context, []ipsetAddReq) error) error {
 	release, err := svc.routingDNSGate.acquire(ctx, generation, true)
 	if err != nil {
 		return err
 	}
 	defer release()
 	dec := svc.routeFor(name, "")
+	observedDecision := svc.routeFor(name, srcIP)
 	tbl := svc.route.routeTable.Load()
 	var requests []ipsetAddReq
 	for _, ip := range ips {
@@ -68,10 +94,31 @@ func (svc *Service) awgLearnLegacyDNSAnswerWith(ctx context.Context, name, srcIP
 			requests = append(requests, ipsetAddReq{set: awgSetInc + v6Suffix, ip: ip})
 		}
 	}
-	if err := learn(ctx, requests); err != nil {
-		return err
-	}
-	return svc.routingDNSGate.verify(generation)
+	return svc.confirmRoutingDNSLearning(ctx, generation, func() error {
+		return learn(ctx, requests)
+	}, func() {
+		z, matched := svc.legacyRoutingDiscoveryRule(snapshot, observedDecision, name, srcIP)
+		if !matched {
+			return
+		}
+		winnerSet := observedDecision.SourceSet
+		if !observedDecision.SourceBound {
+			if observedDecision.Route == RouteTunnel {
+				winnerSet = awgSetInc
+			} else if observedDecision.Route == RouteDirect {
+				winnerSet = awgSetExc
+			}
+		}
+		installed := []string{}
+		for _, request := range requests {
+			if request.set == winnerSet || request.set == winnerSet+"_6" {
+				installed = append(installed, request.ip)
+			}
+		}
+		if len(installed) > 0 {
+			svc.recordRoutingDiscovery(z, name, srcIP, installed, "dns", generation)
+		}
+	})
 }
 
 // A single bounded restore covers the complete reply. Returning an error is

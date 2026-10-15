@@ -12,6 +12,7 @@ export interface ConfigAssignment {
 export interface ParsedConfig {
   assignments: Map<string, ConfigAssignment>;
   canAppend: boolean;
+  appendAt?: number;
   warning?: string;
 }
 
@@ -61,10 +62,56 @@ function assignmentValue(source: string, from: number, end: number): Omit<Config
     reason: editable ? undefined : "Составное или незавершённое shell-выражение: измените его в полном файле." };
 }
 
+const serviceConfigBegin = "# BEGIN N2S SERVICE STRATEGIES";
+const serviceConfigEnd = "# END N2S SERVICE STRATEGIES";
+function validServiceConfigLiteral(literal: string): boolean {
+  for (let i = 0; i < literal.length; i++) {
+    const ch = literal[i];
+    if (ch === "\\") {
+      const next = literal[++i];
+      if (next === undefined || !'\\"$`'.includes(next)) return false;
+    } else if ('$`"\r\n'.includes(ch)) return false;
+  }
+  return true;
+}
+function managedServiceRange(source: string): { from?: number; to?: number; warning?: string } {
+  let from: number | undefined, to: number | undefined;
+  let inside = false;
+  const seen = new Set<string>();
+  const invalid = () => ({ warning: "Некорректный управляемый блок сервисных стратегий. Используйте полный редактор конфига." });
+  for (let start = 0; start < source.length;) {
+    const end = statementEnd(source, start);
+    const statement = source.slice(start, end).replace(/\r$/, "");
+    const trimmed = statement.trim();
+    if (trimmed === serviceConfigBegin) {
+      if (statement !== serviceConfigBegin || inside || to !== undefined) return invalid();
+      from = start; inside = true;
+    } else if (trimmed === serviceConfigEnd) {
+      if (statement !== serviceConfigEnd || !inside || !seen.has("NFQWS_ARGS_CUSTOM")) return invalid();
+      to = end < source.length ? end + 1 : end; inside = false;
+    } else if (inside && trimmed && !trimmed.startsWith("#")) {
+      let key: string | undefined;
+      const port = /^(TCP_PORTS|UDP_PORTS)=(?:'[0-9,:]*'|"[0-9,:]*"|[0-9,:]*)$/.exec(statement);
+      if (port) key = port[1];
+      else {
+        const prefix = 'NFQWS_ARGS_CUSTOM="';
+        const suffix = '${NFQWS_ARGS_CUSTOM:+ --new }${NFQWS_ARGS_CUSTOM}"';
+        if (statement.startsWith(prefix) && statement.endsWith(suffix) && validServiceConfigLiteral(statement.slice(prefix.length, -suffix.length))) key = "NFQWS_ARGS_CUSTOM";
+      }
+      if (!key || seen.has(key)) return invalid();
+      seen.add(key);
+    } else if (to !== undefined && trimmed && !trimmed.startsWith("#")) return invalid();
+    start = end + 1;
+  }
+  return inside ? invalid() : { from, to };
+}
+
 export function parseConfigAssignments(source: string): ParsedConfig {
   const assignments = new Map<string, ConfigAssignment>();
-  let plain = true;
+  const managed = managedServiceRange(source);
+  let plain = !managed.warning;
   for (let start = 0; start < source.length;) {
+    if (managed.from !== undefined && managed.to !== undefined && start === managed.from) { start = managed.to; continue; }
     const end = statementEnd(source, start);
     const statement = source.slice(start, end);
     const trimmed = statement.trim();
@@ -86,7 +133,7 @@ export function parseConfigAssignments(source: string): ParsedConfig {
       item.reason = "Файл содержит shell-команды или сложные выражения. Для сохранения их порядка используйте полный файл.";
     }
   }
-  return { assignments, canAppend: plain, warning: plain ? undefined : "Структурированное редактирование отключено: файл содержит shell-команды, составные или незавершённые выражения. Полный редактор доступен." };
+  return { assignments, canAppend: plain, appendAt: managed.from, warning: plain ? undefined : managed.warning ?? "Структурированное редактирование отключено: файл содержит shell-команды, составные или незавершённые выражения. Полный редактор доступен." };
 }
 
 function doubleQuoted(value: string): string {
@@ -116,7 +163,9 @@ export function patchConfigValue(source: string, key: string, value: string, for
   else encoded = doubleQuoted(value);
   if (item) return source.slice(0, item.from) + encoded + source.slice(item.to);
   const newline = source.includes("\r\n") ? "\r\n" : "\n";
-  return source + (source && !source.endsWith("\n") ? newline : "") + key + "=" + encoded + newline;
+  const at = parsed.appendAt ?? source.length;
+  const before = source.slice(0, at);
+  return before + (before && !before.endsWith("\n") ? newline : "") + key + "=" + encoded + newline + source.slice(at);
 }
 
 export type ConfigMode = "list" | "auto" | "all" | "custom";

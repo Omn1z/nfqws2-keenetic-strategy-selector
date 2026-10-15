@@ -658,6 +658,32 @@ export interface AwgRoutingState {
   ready: boolean;
   error?: string;
 }
+/** Runtime observations are read-only and never become editable rule entries. */
+export interface AwgRoutingLearnedEntry {
+  domain: string;
+  ips: string[];
+  source_ips: string[];
+  source: "dns" | "sni";
+  first_seen: number;
+  last_seen: number;
+  additional: boolean;
+  confirmed: boolean;
+}
+export interface AwgRoutingDiscoveredRule {
+  rule_index: number;
+  rule_key: string;
+  rule: AwgZone;
+  entries: AwgRoutingLearnedEntry[];
+}
+export interface AwgRoutingDiscoveries {
+  revision: number;
+  active: boolean;
+  ready: boolean;
+  domain_source: string;
+  error?: string;
+  rules: AwgRoutingDiscoveredRule[];
+  limit: number;
+}
 export interface AwgConnectionReference {
   ref: string;
   label: string;
@@ -838,6 +864,7 @@ export interface AutomationStatus {
   handshake_age_sec: number;
   nfqws2_running: boolean;
   pick_in_progress: boolean;
+  nfqws2_manual_off?: boolean;
   note?: string;
 }
 
@@ -1038,6 +1065,11 @@ export interface Nfqws2Version {
   available: boolean;
   url: string;
   error?: string;
+}
+
+export interface Nfqws2ServiceStatus {
+  running: boolean;
+  manual_off: boolean;
 }
 
 export interface OpenWrtDnsState {

@@ -37,7 +37,7 @@ func (svc *Service) awgEnsureMultiDNSProxy(rules []awgMultiRule) bool {
 		// cached global-domain answers without blocking the apply path.
 		ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 		defer cancel()
-		if err := svc.awgMultiLearnDNSAnswer(ctx, rules, name, "", ips, generation); err != nil {
+		if err := svc.awgMultiLearnDNSAnswerWithDiscovery(ctx, rules, name, "", ips, generation, false, svc.awgIPSetLearnSync); err != nil {
 			logbuf.Append("awg2", "warn", "multi-routing DNS replay: "+err.Error())
 		}
 	})
@@ -115,6 +115,10 @@ func (svc *Service) awgMultiLearnDNSAnswer(ctx context.Context, rules []awgMulti
 }
 
 func (svc *Service) awgMultiLearnDNSAnswerWith(ctx context.Context, rules []awgMultiRule, name, srcIP string, ips []string, generation uint64, learn func(context.Context, []ipsetAddReq) error) error {
+	return svc.awgMultiLearnDNSAnswerWithDiscovery(ctx, rules, name, srcIP, ips, generation, true, learn)
+}
+
+func (svc *Service) awgMultiLearnDNSAnswerWithDiscovery(ctx context.Context, rules []awgMultiRule, name, srcIP string, ips []string, generation uint64, observed bool, learn func(context.Context, []ipsetAddReq) error) error {
 	release, err := svc.routingDNSGate.acquire(ctx, generation, true)
 	if err != nil {
 		return err
@@ -134,10 +138,15 @@ func (svc *Service) awgMultiLearnDNSAnswerWith(ctx context.Context, rules []awgM
 	for _, ip := range v4 {
 		requests = append(requests, ipsetAddReq{set: r.SetName, ip: ip})
 	}
-	if err := learn(ctx, requests); err != nil {
-		return err
-	}
-	return svc.routingDNSGate.verify(generation)
+	return svc.confirmRoutingDNSLearning(ctx, generation, func() error {
+		return learn(ctx, requests)
+	}, func() {
+		// Catch-all and IP-only rules can route these addresses without
+		// matching the queried name. Replays do not represent a new visit.
+		if observed && !r.CatchAll && r.Matchers != nil && r.Matchers.MatchAny(name) {
+			svc.recordRoutingDiscovery(r.Zone, name, srcIP, v4, "dns", generation)
+		}
+	})
 }
 
 func (svc *Service) awgFilterMultiDNSLearnIPs(rule *awgMultiRule, ips []string) []string {

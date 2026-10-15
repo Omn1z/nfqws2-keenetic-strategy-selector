@@ -1,4 +1,4 @@
-import { useState, useEffect, useMemo, useRef, useId } from "react";
+import { Fragment, useState, useEffect, useMemo, useRef, useId } from "react";
 import { api } from "@/lib/api";
 import { cn } from "@/lib/cn";
 import { Badge } from "@/components/ui/Badge";
@@ -11,6 +11,8 @@ import { confirmDialog } from "@/components/ui/Confirm";
 import type { Awg2ServerSummary, Awg2Status, AwgZone, AwgRoutingConfig, AwgRulesDocument, AwgConnectionReference, Device } from "@/types/api";
 import RulesTransferModal, { type ImportRoutingRules, type RoutingReadTask } from "./RulesTransferModal";
 import { prepareRuleConnection, ruleWaiting } from "./routingRules";
+import { RoutingDiscoveries, useRoutingDiscoveries } from "./RoutingDiscoveries";
+import { routingDiscoveryIdentity } from "./routingDiscoveriesModel";
 
 /** RulesTable replaces the old zone-form layout with a pi-hole-style table:
  *  each rule is one row with its priority (= array index), name, match preview,
@@ -64,6 +66,7 @@ export default function RulesTable({ r, saveRouting, saving, visible, st, reload
   const [copyOpen, setCopyOpen] = useState(false);
   const [transferOpen, setTransferOpen] = useState(false);
   const [exportWarnings, setExportWarnings] = useState<string[]>([]);
+  const discoveries = useRoutingDiscoveries(visible && !saving);
 
   const zones = r.zones || [];
   const tunnels = useMemo(() => (st.servers || []).filter((s) => s.imported || s.deployed || s.endpoint), [st.servers]);
@@ -151,6 +154,10 @@ export default function RulesTable({ r, saveRouting, saving, visible, st, reload
       </div>
       {hasDraft && <p className="mb-2 text-[11px] text-warn">Экспорт включает текущие несохранённые правки на этой вкладке.</p>}
       {exportWarnings.map((warning, i) => <p key={i} className="mb-2 text-[11px] text-muted">{warning}</p>)}
+      <p className="mb-2 text-[11px] text-muted">Обнаруженные маршруты доступны у каждого правила только для чтения. Снимок обновляется каждые 5 секунд, пока вкладка открыта.</p>
+      {discoveries.error && <p className="mb-2 text-[11px] text-warn" role="status">Не удалось обновить наблюдения: {discoveries.error}{discoveries.snapshot ? ". Показан последний полученный снимок." : ""}</p>}
+      {discoveries.snapshot?.error && <p className="mb-2 text-[11px] text-warn" role="status">Состояние маршрутизации: {discoveries.snapshot.error}</p>}
+      {discoveries.snapshot && (!discoveries.snapshot.active || !discoveries.snapshot.ready) && <p className="mb-2 text-[11px] text-muted">{discoveries.snapshot.active ? "Маршруты ещё применяются; записи показаны как история." : "Маршрутизация не активна; показана история наблюдений."}</p>}
 
       <div className="overflow-x-auto rounded border border-line">
         <table className="w-full text-[11px] md:text-[12px]">
@@ -179,7 +186,8 @@ export default function RulesTable({ r, saveRouting, saving, visible, st, reload
               const matches = cleanArr(zoneLines(z));
               const srcs = cleanArr(z.source_ips || []);
               return (
-                <tr key={i} className={cn("border-t border-line", i % 2 ? "bg-panel-soft/40" : "")}>
+                <Fragment key={`${i}:${routingDiscoveryIdentity(z)}`}>
+                <tr className={cn("border-t border-line", i % 2 ? "bg-panel-soft/40" : "")}>
                   <td className="px-2 py-1.5 text-center font-mono tabular-nums text-muted">{i + 1}</td>
                   <td className="px-2 py-1.5">
                     <button type="button" className="text-left font-medium text-ink hover:underline disabled:opacity-50" onClick={() => setEditIdx(i)} disabled={saving}>{z.name || "(без имени)"}</button>
@@ -229,6 +237,12 @@ export default function RulesTable({ r, saveRouting, saving, visible, st, reload
                     </div>
                   </td>
                 </tr>
+                <tr className={i % 2 ? "bg-panel-soft/40" : ""}>
+                  <td colSpan={8} className="px-2 pb-2">
+                    <RoutingDiscoveries rule={z} index={i} snapshot={discoveries.snapshot} loading={discoveries.loading} />
+                  </td>
+                </tr>
+                </Fragment>
               );
             })}
           </tbody>

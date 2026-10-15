@@ -101,6 +101,7 @@ func (svc *Service) awgBuildMultiPolicyCached() ([]awgMultiRule, []awgMultiTunne
 
 func (svc *Service) awgBuildMultiPolicyWithResolve(resolve bool) ([]awgMultiRule, []awgMultiTunnel) {
 	lookup := svc.policyDNSLookup(false, nil)
+	discoverySeeds := svc.routingDiscoveryWarmupCandidates()
 	if resolve {
 		var cancel context.CancelFunc
 		lookup, cancel = svc.policyDNSWarmupLookup(resolveDomainAllContext)
@@ -236,7 +237,7 @@ func (svc *Service) awgBuildMultiPolicyWithResolve(resolve bool) ([]awgMultiRule
 			Sources:   awgCleanMultiSources(z.SourceIPs),
 			RuleIndex: i,
 		}
-		r.Entries, r.CatchAll, r.StaticOK = svc.awgMultiRuleEntriesWithLookup(z, lookup)
+		r.Entries, r.CatchAll, r.StaticOK = svc.awgMultiRuleEntriesWithLookupAndSeeds(z, lookup, discoverySeeds)
 		r.DomainEntries = svc.awgMultiRuleDomainEntries(z)
 		if len(r.DomainEntries) > 0 {
 			ms, _ := awg.CompileMatcherSet(r.DomainEntries)
@@ -650,8 +651,9 @@ func (svc *Service) awgStartMultiPolicyRefresh(rules []awgMultiRule, tunnels []a
 					// resolve unused domains or alter the applied rule bindings.
 					refreshRules = awgCloneMultiRules(rules)
 					lookup := svc.policyDNSLookup(false, nil)
+					discoverySeeds := svc.routingDiscoveryWarmupCandidates()
 					for i := range refreshRules {
-						refreshRules[i].Entries, _, _ = svc.awgMultiRuleEntriesWithLookup(refreshRules[i].Zone, lookup)
+						refreshRules[i].Entries, _, _ = svc.awgMultiRuleEntriesWithLookupAndSeeds(refreshRules[i].Zone, lookup, discoverySeeds)
 					}
 				}
 				err := svc.awgMaintainMultiPolicy(hookErr != nil, ticks, func() bool { return healthy }, func() error {

@@ -152,7 +152,7 @@ func (m *Manager) start() error {
 	if err != nil {
 		cancel()
 		pool.reset()
-		workerPool.reset()
+		workerPool.close()
 		if h2Pool != nil {
 			h2Pool.close()
 		}
@@ -278,7 +278,7 @@ func (m *Manager) stop() {
 		pool.reset()
 	}
 	if workerPool != nil {
-		workerPool.reset()
+		workerPool.close()
 	}
 	if h2Pool != nil {
 		h2Pool.close()

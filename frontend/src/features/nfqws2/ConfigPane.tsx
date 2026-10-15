@@ -29,7 +29,7 @@ const strategies = [
 ] as const;
 
 /** Raw file is the sole source of truth; each form edits one assignment span. */
-export function ConfigPane({ restart }: { restart: () => Promise<void> }) {
+export function ConfigPane({ restart, canRestart = true }: { restart: () => Promise<void>; canRestart?: boolean }) {
   const modeHintId = useId();
   const [content, setContent] = useState<string | null>(null);
   const [saved, setSaved] = useState("");
@@ -73,7 +73,7 @@ export function ConfigPane({ restart }: { restart: () => Promise<void> }) {
       setSaved(content); setRemoteChanged(false);
       window.dispatchEvent(new CustomEvent("nfqws2-files-changed", { detail: { source: "config" } }));
       toast("nfqws2.conf сохранён", "ok");
-      if (await confirmDialog({ title: "Применить настройки?", body: "Перезапустить nfqws2 (~2 с обхода DPI прервётся). Роутер не перезагружается.", confirmLabel: "Перезапустить", cancelLabel: "Позже" })) await restart();
+      if (canRestart && await confirmDialog({ title: "Перезапустить службу NFQWS2?", body: "Применить сохранённые настройки полным перезапуском службы. Обход DPI ненадолго прервётся; роутер не перезагружается.", confirmLabel: "Перезапуск службы", cancelLabel: "Позже" })) await restart();
     } catch (e) { toast((e as Error).message, "err"); }
     finally { setBusy(false); }
   };
@@ -123,6 +123,7 @@ export function ConfigPane({ restart }: { restart: () => Promise<void> }) {
     <Card title={<span className="font-mono text-sm">nfqws2.conf{dirty && <span className="ml-1.5 text-warn">●</span>}</span>} sub="полный файл с подсветкой, поиском и проверкой путей">
       <CodeEditor value={content} onChange={(text) => { setContent(text); setEditorError(""); }} kind="conf" label="Полный файл nfqws2.conf" readOnly={busy} onSave={() => void save()} />
       <div className="mt-3 flex flex-wrap items-center gap-2"><Button variant="primary" onClick={save} disabled={busy || !dirty}>{busy ? "Сохранение…" : "Сохранить"}</Button><Button variant="ghost" onClick={reset} disabled={busy}>Загрузить с роутера</Button><span className="text-xs text-muted">{dirty ? "Есть несохранённые изменения" : "сохранено"}</span></div>
+      {!canRestart && <p className="mt-2 text-xs text-muted">Для применения сохранённых правок включите службу NFQWS2 и дождитесь подтверждения её состояния.</p>}
     </Card>
   </>;
 }

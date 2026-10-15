@@ -523,12 +523,17 @@ type pooledWorkerWS struct {
 // Limit warm sockets to one per DC so a router does not exhaust worker quotas.
 type cfWorkerPool struct {
 	ctx            context.Context
+	cancel         context.CancelFunc
 	target, buffer int
 	stats          *Stats
+	lifecycleMu    sync.Mutex // serialize reset cleanup and complete shutdown
 	mu             sync.Mutex
 	idle           map[cfPoolKey][]pooledWorkerWS
 	refilling      map[cfPoolKey]uint64
+	refillCancels  map[cfPoolKey]context.CancelFunc
 	generation     uint64
+	closed         bool
+	wg             sync.WaitGroup
 	dial           wsDialFunc
 }
 
@@ -546,8 +551,9 @@ func newCFWorkerPool(ctx context.Context, target, buffer int, stats *Stats, secu
 	if len(secureOpt) > 0 {
 		secure = secureOpt[0]
 	}
-	p := &cfWorkerPool{ctx: ctx, target: target, buffer: buffer, stats: stats,
-		idle: map[cfPoolKey][]pooledWorkerWS{}, refilling: map[cfPoolKey]uint64{}}
+	ctx, cancel := context.WithCancel(ctx)
+	p := &cfWorkerPool{ctx: ctx, cancel: cancel, target: target, buffer: buffer, stats: stats,
+		idle: map[cfPoolKey][]pooledWorkerWS{}, refilling: map[cfPoolKey]uint64{}, refillCancels: map[cfPoolKey]context.CancelFunc{}}
 	p.dial = func(ctx context.Context, host, domain string, timeout time.Duration, path string, bufferSize int, sni string) (*rawWebSocket, error) {
 		return connectWSWithSNI(ctx, host, domain, timeout, path, bufferSize, sni, secure)
 	}
@@ -558,6 +564,10 @@ func (p *cfWorkerPool) acquire(dc int, targetIP string, domains []string) (*rawW
 	key := cfPoolKey{dc, targetIP}
 	now := time.Now()
 	p.mu.Lock()
+	if p.closed || p.ctx.Err() != nil {
+		p.mu.Unlock()
+		return nil, ""
+	}
 	bucket := p.idle[key]
 	for len(bucket) > 0 {
 		head := bucket[0]
@@ -570,7 +580,11 @@ func (p *cfWorkerPool) acquire(dc int, targetIP string, domains []string) (*rawW
 			}
 		}
 		if !allowed || now.Sub(head.created) >= 100*time.Second || !head.ws.idleHealthy() {
-			go head.ws.close()
+			p.wg.Add(1)
+			go func() {
+				defer p.wg.Done()
+				_ = head.ws.close()
+			}()
 			continue
 		}
 		p.idle[key] = bucket
@@ -596,42 +610,60 @@ func (p *cfWorkerPool) warmup(dcToIP map[int]string, domains []string) {
 func (p *cfWorkerPool) scheduleRefill(key cfPoolKey, domains []string) {
 	p.mu.Lock()
 	_, running := p.refilling[key]
-	if p.target == 0 || running || p.ctx.Err() != nil {
+	if p.target == 0 || running || p.closed || p.ctx.Err() != nil {
 		p.mu.Unlock()
 		return
 	}
 	generation := p.generation
+	ctx, cancel := context.WithCancel(p.ctx)
 	p.refilling[key] = generation
+	p.refillCancels[key] = cancel
+	// close marks the pool closed under this same mutex before waiting, so
+	// no Add can race a zero-counter Wait during shutdown.
+	p.wg.Add(1)
 	p.mu.Unlock()
-	go p.refill(key, append([]string(nil), domains...), generation)
+	domains = append([]string(nil), domains...)
+	go func() {
+		defer p.wg.Done()
+		defer cancel()
+		p.refillContext(ctx, key, domains, generation)
+	}()
 }
 
 func (p *cfWorkerPool) refill(key cfPoolKey, domains []string, generation uint64) {
+	p.refillContext(p.ctx, key, domains, generation)
+}
+
+func (p *cfWorkerPool) refillContext(ctx context.Context, key cfPoolKey, domains []string, generation uint64) {
 	defer func() {
 		p.mu.Lock()
 		if current, ok := p.refilling[key]; ok && current == generation {
 			delete(p.refilling, key)
+			delete(p.refillCancels, key)
 		}
 		p.mu.Unlock()
 	}()
 	p.mu.Lock()
 	needed := p.target - len(p.idle[key])
-	valid := generation == p.generation && p.ctx.Err() == nil
+	valid := !p.closed && generation == p.generation && ctx.Err() == nil
 	p.mu.Unlock()
 	if needed <= 0 || !valid {
 		return
 	}
 	for _, domain := range p.availableDomains(domains) {
-		ws, err := p.dial(p.ctx, domain, domain, 8*time.Second, cfWorkerPath(key.dc, key.targetIP), p.buffer, domain)
+		if ctx.Err() != nil {
+			return
+		}
+		ws, err := p.dial(ctx, domain, domain, 8*time.Second, cfWorkerPath(key.dc, key.targetIP), p.buffer, domain)
 		if err != nil {
-			if isWSHandshakeQueueError(err) {
+			if ctx.Err() != nil || isWSHandshakeQueueError(err) {
 				return
 			}
 			p.reportFailure(domain, err)
 			continue
 		}
 		p.mu.Lock()
-		if p.ctx.Err() != nil || p.generation != generation {
+		if p.closed || ctx.Err() != nil || p.generation != generation {
 			p.mu.Unlock()
 			_ = ws.close()
 			return
@@ -664,16 +696,48 @@ func (p *cfWorkerPool) availableDomains(domains []string) []string {
 func (p *cfWorkerPool) reportFailure(_ string, _ error) {}
 
 func (p *cfWorkerPool) reset() {
+	p.lifecycleMu.Lock()
+	defer p.lifecycleMu.Unlock()
+	p.clear()
+}
+
+// clear cancels pending refills and closes every unclaimed idle connection.
+// A canceled dial that still returns a socket is closed by its generation check.
+// lifecycleMu serializes cleanup so close cannot finish ahead of another reset.
+func (p *cfWorkerPool) clear() {
 	p.mu.Lock()
-	defer p.mu.Unlock()
-	for _, bucket := range p.idle {
-		for _, item := range bucket {
-			go item.ws.close()
-		}
-	}
+	idle := p.idle
+	cancels := p.refillCancels
 	p.generation++
 	p.idle = map[cfPoolKey][]pooledWorkerWS{}
 	p.refilling = map[cfPoolKey]uint64{}
+	p.refillCancels = map[cfPoolKey]context.CancelFunc{}
+	p.mu.Unlock()
+	for _, cancel := range cancels {
+		cancel()
+	}
+	for _, bucket := range idle {
+		for _, item := range bucket {
+			_ = item.ws.close()
+		}
+	}
+}
+
+// close is a complete, idempotent shutdown barrier. It prevents new warmups,
+// cancels dials and waits until even cancellation-resistant late results close.
+func (p *cfWorkerPool) close() {
+	p.lifecycleMu.Lock()
+	defer p.lifecycleMu.Unlock()
+	p.mu.Lock()
+	if p.closed {
+		p.mu.Unlock()
+		return
+	}
+	p.closed = true
+	p.mu.Unlock()
+	p.cancel()
+	p.clear()
+	p.wg.Wait()
 }
 
 func itoa(n int) string {

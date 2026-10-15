@@ -8,7 +8,10 @@ import (
 	"io"
 )
 
-const h2MaxPacket = 4 * 1024 * 1024
+const (
+	h2MaxPacket       = 4 * 1024 * 1024
+	h2MaxPlainPadding = 256
+)
 
 // readH2Packet removes only the client's transport encryption and framing.
 // The enclosed MTProto message (including its end-to-end encryption) goes
@@ -49,7 +52,7 @@ func readH2Packet(reader io.Reader, decryptor cipher.Stream, proto uint32) ([]by
 	}
 	limit := uint64(h2MaxPacket)
 	if proto == protoIntPaddedIntermediate {
-		limit += 15
+		limit += h2MaxPlainPadding
 	}
 	if length < 24 || length > limit {
 		return nil, false, fmt.Errorf("native packet length outside supported range: %d", length)
@@ -60,11 +63,13 @@ func readH2Packet(reader io.Reader, decryptor cipher.Stream, proto uint32) ([]by
 	}
 	if proto == protoIntPaddedIntermediate {
 		packetLength := uint64(24) + (length-24)/16*16
+		maxPadding := uint64(15)
 		if binary.LittleEndian.Uint64(body[:8]) == 0 {
 			packetLength = 20 + uint64(binary.LittleEndian.Uint32(body[16:20]))
+			maxPadding = h2MaxPlainPadding
 		}
-		if packetLength < 24 || packetLength > length || length-packetLength > 15 {
-			return nil, false, fmt.Errorf("invalid padded native packet")
+		if packetLength < 24 || packetLength > length || length-packetLength > maxPadding {
+			return nil, false, fmt.Errorf("invalid padded native packet: frame=%d packet=%d padding limit=%d", length, packetLength, maxPadding)
 		}
 		body = body[:int(packetLength)]
 	}

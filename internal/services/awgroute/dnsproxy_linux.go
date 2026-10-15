@@ -60,14 +60,14 @@ func (svc *Service) awgEnsureDNSProxy(cfg *awg.ServerConfig) bool {
 	identity := tbl.hash + ":" + strconv.FormatInt(tbl.revision, 10) + ":" + strconv.FormatUint(svc.routingDNSGate.version(), 10)
 	if p != nil {
 		if p.PolicyChanged(identity) {
-			svc.awgSetLegacyDNSLearner(p)
+			svc.awgSetLegacyDNSLearner(p, cfg)
 			p.SetMatchers(ms)
 		}
 		return true
 	}
 	np := awg.NewDNSProxy(awgDNSAddr, awgDNSUpstream, nil)
 	np.PolicyChanged(identity)
-	svc.awgSetLegacyDNSLearner(np)
+	svc.awgSetLegacyDNSLearner(np, cfg)
 	// Trace hooks for the per-flow debug log. Both are no-ops when trace is off
 	// (the ring's atomic enabled-check kicks the hot path out in ~5ns).
 	//

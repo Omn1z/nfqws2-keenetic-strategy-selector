@@ -21,8 +21,9 @@ const SIZE_WARN = 512 * 1024;
 
 interface Props {
   kind: Nfqws2Kind;
-  /** Offer to apply (SIGHUP reload) the live engine after a save. */
-  reload: () => Promise<void>;
+  /** Apply saved files by restarting NFQWS2; bypass uses its own callback. */
+  apply: () => Promise<void | boolean>;
+  canApply?: boolean;
   applyTitle?: string;
   applyBody?: string;
   applyConfirmLabel?: string;
@@ -35,10 +36,11 @@ interface Props {
  *  download / delete and (for lists) dedup / clear. */
 export function FileManager({
   kind,
-  reload,
-  applyTitle = "Применить изменения?",
-  applyBody = "Перезагрузить конфиг nfqws2 (reload, без обрыва очереди).",
-  applyConfirmLabel = "Применить",
+  apply,
+  canApply = true,
+  applyTitle = "Перезапустить службу NFQWS2?",
+  applyBody = "Применить сохранённые настройки, стратегии, Lua-скрипты и списки полным перезапуском службы. Обход DPI ненадолго прервётся; роутер не перезагружается.",
+  applyConfirmLabel = "Перезапуск службы",
   allowCreate = true,
   allowUpload = true,
 }: Props) {
@@ -115,11 +117,11 @@ export function FileManager({
       window.dispatchEvent(new CustomEvent("nfqws2-files-changed", { detail: { source: `editor:${kind}` } }));
       await loadFiles(sel);
       if (kind === "bypass") {
-        await reload();
+        await apply();
         toast(`Сохранён и применён ${sel}`, "ok");
       } else {
         toast(`Сохранён ${sel}`, "ok");
-        if (await confirmDialog({ title: applyTitle, body: applyBody, confirmLabel: applyConfirmLabel, cancelLabel: "Позже" })) await reload();
+        if (canApply && await confirmDialog({ title: applyTitle, body: applyBody, confirmLabel: applyConfirmLabel, cancelLabel: "Позже" })) await apply();
       }
     } catch (e) {
       toast(saved && kind === "bypass" ? `Список сохранён, но bypass не применён: ${(e as Error).message}` : (e as Error).message, "err");
@@ -311,6 +313,7 @@ export function FileManager({
               {(kind === "list" || kind === "bypass") && <Button disabled={busy} variant="ghost" onClick={clear}>Очистить</Button>}
               {!dirty && <span className="text-xs text-muted">сохранено</span>}
             </div>
+            {!canApply && kind !== "bypass" && <p className="mt-2 text-xs text-muted">Для применения сохранённых правок включите службу NFQWS2 и дождитесь подтверждения её состояния.</p>}
           </Card>
         )}
       </div>
