@@ -32,11 +32,10 @@ const (
 var awgFlowPTR = struct {
 	sync.Mutex
 	inFlight map[string]bool
-	negative map[string]time.Time
+	negative traceTTLCache
 	slots    chan struct{}
 }{
 	inFlight: map[string]bool{},
-	negative: map[string]time.Time{},
 	slots:    make(chan struct{}, 4),
 }
 
@@ -301,12 +300,9 @@ func (svc *Service) awgFlowTraceMaybeResolveHost(c netmon.Conn, dec awgFlowTrace
 	}
 	now := time.Now()
 	awgFlowPTR.Lock()
-	if until, ok := awgFlowPTR.negative[ip]; ok {
-		if until.After(now) {
-			awgFlowPTR.Unlock()
-			return
-		}
-		delete(awgFlowPTR.negative, ip)
+	if _, ok := awgFlowPTR.negative.load(ip, now); ok {
+		awgFlowPTR.Unlock()
+		return
 	}
 	if awgFlowPTR.inFlight[ip] {
 		awgFlowPTR.Unlock()
@@ -326,14 +322,14 @@ func (svc *Service) awgFlowTraceMaybeResolveHost(c netmon.Conn, dec awgFlowTrace
 			defer func() { <-awgFlowPTR.slots }()
 		default:
 			awgFlowPTR.Lock()
-			awgFlowPTR.negative[ip] = time.Now().Add(time.Minute)
+			awgFlowPTR.negative.store(ip, "", time.Now(), time.Minute)
 			awgFlowPTR.Unlock()
 			return
 		}
 		host := awgFlowTraceLookupPTR(ip)
 		if host == "" {
 			awgFlowPTR.Lock()
-			awgFlowPTR.negative[ip] = time.Now().Add(awgFlowTracePTRNegative)
+			awgFlowPTR.negative.store(ip, "", time.Now(), awgFlowTracePTRNegative)
 			awgFlowPTR.Unlock()
 			return
 		}

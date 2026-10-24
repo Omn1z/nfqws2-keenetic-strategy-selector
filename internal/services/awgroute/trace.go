@@ -1,6 +1,7 @@
 package awgroute
 
 import (
+	"container/list"
 	"net"
 	"strings"
 	"sync"
@@ -17,6 +18,8 @@ import (
 
 const traceRingCap = 5000
 const traceHostTTL = 30 * time.Minute
+const traceCacheCapacity = 4096
+const traceCacheSweepInterval = time.Minute
 
 // TraceEntry is one routed-traffic event. Field names are short because they
 // are serialized to JSON on every API hit (the ring can hold thousands).
@@ -67,12 +70,77 @@ var awgTrace = func() *traceRing {
 	return r
 }()
 
-type traceHostRecord struct {
-	name string
-	exp  int64
+type traceCacheRecord struct {
+	value   string
+	expires int64
+	order   *list.Element
 }
 
-var traceHostCache sync.Map // ip string -> traceHostRecord
+// Diagnostic caches must stay bounded even when a destination is never seen
+// again. Expiry is checked on every lookup; ordinary traffic also sweeps old
+// entries once a minute, without adding a background goroutine.
+type traceTTLCache struct {
+	mu        sync.Mutex
+	entries   map[string]traceCacheRecord
+	order     list.List
+	nextSweep int64
+}
+
+func (c *traceTTLCache) removeLocked(key string) {
+	if entry, ok := c.entries[key]; ok {
+		c.order.Remove(entry.order)
+		delete(c.entries, key)
+	}
+}
+
+func (c *traceTTLCache) sweepLocked(now int64) {
+	if now < c.nextSweep {
+		return
+	}
+	for key, entry := range c.entries {
+		if entry.expires <= now {
+			c.removeLocked(key)
+		}
+	}
+	c.nextSweep = now + int64(traceCacheSweepInterval)
+}
+
+func (c *traceTTLCache) store(key, value string, now time.Time, ttl time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.sweepLocked(now.UnixNano())
+	if c.entries == nil {
+		c.entries = make(map[string]traceCacheRecord)
+	}
+	entry, exists := c.entries[key]
+	if exists {
+		c.order.MoveToBack(entry.order)
+	} else {
+		if len(c.entries) >= traceCacheCapacity {
+			c.removeLocked(c.order.Front().Value.(string))
+		}
+		entry.order = c.order.PushBack(key)
+	}
+	entry.value, entry.expires = value, now.Add(ttl).UnixNano()
+	c.entries[key] = entry
+}
+
+func (c *traceTTLCache) load(key string, now time.Time) (string, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.sweepLocked(now.UnixNano())
+	entry, ok := c.entries[key]
+	if !ok {
+		return "", false
+	}
+	if entry.expires <= now.UnixNano() {
+		c.removeLocked(key)
+		return "", false
+	}
+	return entry.value, true
+}
+
+var traceHostCache traceTTLCache // ip string -> recently observed hostname
 
 // traceEnabled is the hot-path check. One atomic load. Inlinable.
 func traceEnabled() bool { return awgTrace.enabled.Load() }
@@ -126,7 +194,7 @@ func traceRememberHost(ip, name string) {
 	if name == "" || net.ParseIP(name) != nil {
 		return
 	}
-	traceHostCache.Store(ip, traceHostRecord{name: name, exp: time.Now().Add(traceHostTTL).UnixNano()})
+	traceHostCache.store(ip, name, time.Now(), traceHostTTL)
 }
 
 func traceHostForIP(ip string) string {
@@ -134,16 +202,8 @@ func traceHostForIP(ip string) string {
 	if ip == "<nil>" {
 		return ""
 	}
-	v, ok := traceHostCache.Load(ip)
-	if !ok {
-		return ""
-	}
-	rec, ok := v.(traceHostRecord)
-	if !ok || rec.exp <= time.Now().UnixNano() {
-		traceHostCache.Delete(ip)
-		return ""
-	}
-	return rec.name
+	name, _ := traceHostCache.load(ip, time.Now())
+	return name
 }
 
 // traceSnapshot returns entries newer than `since` (nanoseconds), in time
