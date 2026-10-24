@@ -34,7 +34,7 @@ jobs:
       - name: Check service controls and routing history concurrency
         run: |
           go test -race ./internal/app -run 'Nfqws2|BackupRestore'
-          go test -race ./internal/services/awgroute -run 'Discover|Learned|Learning|RoutingHistory'
+          go test -race ./internal/services/awgroute -run 'Discover|Learned|Learning|RoutingHistory|TraceCache|TraceAppendObserves'
       - name: Test installation hooks
         run: |
           sh packaging/test-bypass-hooks.sh
