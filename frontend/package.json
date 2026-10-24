@@ -37,6 +37,6 @@
     "esbuild": "0.28.2",
     "tailwindcss": "^4.1.0",
     "typescript": "^5.7.0",
-    "vite": "^7.3.6"
+    "vite": "^7.3.7"
   }
 }
