@@ -849,7 +849,7 @@ sh /tmp/n2s-uninstall.sh
 
 ## Сборка из исходников
 
-Для сборки используются Go 1.26.9 и Node 20.19+ или 22.12+ (веб-интерфейс — React 19 + TypeScript + Tailwind на
+Для сборки используются Go 1.26.10 и Node 20.19+ или 22.12+ (веб-интерфейс — React 19 + TypeScript + Tailwind на
 Vite). Скрипты сборки сами собирают фронтенд (`npm`) в один встраиваемый файл,
 а затем линкуют бинарь.
 
@@ -860,7 +860,7 @@ powershell -File scripts/build.ps1 -Version v1.0.0   # Windows
 
 Бинарники появятся в `dist/` для `arm64`, `arm` (v7), `mipsle`, `mips` и `amd64` (x86_64 OpenWrt).
 
-Движок AmneziaWG собирается отдельно с Go 1.26.9:
+Движок AmneziaWG собирается отдельно с Go 1.26.10:
 
 ```sh
 sh scripts/build-engine.sh
