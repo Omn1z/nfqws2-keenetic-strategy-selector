@@ -2,7 +2,7 @@
 // Used through -modfile; upstream protocol implementation is unchanged.
 module github.com/amnezia-vpn/amneziawg-go/v3
 
-go 1.26.9
+go 1.26.10
 
 require (
 	github.com/goccy/go-yaml v1.17.1

@@ -2,7 +2,7 @@ module nfqws2strategy
 
 go 1.26.4
 
-toolchain go1.26.9
+toolchain go1.26.10
 
 require (
 	github.com/AdguardTeam/urlfilter v0.23.4
