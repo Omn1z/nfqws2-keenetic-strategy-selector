@@ -265,8 +265,8 @@ apt-get install -y iproute2 iptables curl ca-certificates git make build-essenti
 work=$(mktemp -d /tmp/nfqws-awg.XXXXXXXX)
 trap 'rm -rf "$work"' EXIT HUP INT TERM
 case "$(uname -m)" in
-  x86_64) arch=amd64; checksum=42d158b4d8f7b61ac0a830567c940a86098fb7aac52e467a5ebec03ef5cc2f8d ;;
-  aarch64|arm64) arch=arm64; checksum=4a97373d49fcacdcf3694fea368a500b00ee3e963974f3e7514132717632f052 ;;
+  x86_64) arch=amd64; checksum=ccfe7ae822d2c2f41f4fe7c956199967a4dac22d0ee0d2b2bfdb440aab3b20c5 ;;
+  aarch64|arm64) arch=arm64; checksum=3f4227ce7b206a513e794f1393adb473a07b46e94d18bd15d1c684bbb7319797 ;;
   *) echo 'Unsupported VPS architecture for pinned Go toolchain'; exit 1 ;;
 esac
 runtime=/usr/local/lib/nfqws-awg/go%[8]s
