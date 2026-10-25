@@ -206,6 +206,23 @@ func TestShadowRenewalDHCPServiceParsing(t *testing.T) {
 	}
 }
 
+func TestShadowRenewalPPPWANExplainsWhyDHCPIsUnavailable(t *testing.T) {
+	a := New(nil, nil)
+	a.cfg.WANIfaces = []string{"ppp0"}
+	previous := command
+	t.Cleanup(func() { command = previous })
+	command = func(context.Context, string, ...string) (string, error) {
+		t.Fatal("PPP preflight must not issue a native mutation or reconnect")
+		return "", nil
+	}
+	if _, err := a.shadowRenewTarget(context.Background()); err == nil || !strings.Contains(err.Error(), "обновление DHCP неприменимо") || !strings.Contains(err.Error(), "обновление не выполнялось") {
+		t.Fatalf("PPP preflight did not explain the unsupported DHCP action: %v", err)
+	}
+	if !a.shadowRenewal.next.IsZero() {
+		t.Fatal("PPP preflight consumed mutation cooldown")
+	}
+}
+
 func TestShadowRenewalDoesNotApplyDNSAfterWANChanges(t *testing.T) {
 	for _, kind := range []string{"ack", "nak"} {
 		t.Run(kind, func(t *testing.T) {

@@ -15,6 +15,21 @@ type shadowBroadcastWAN struct {
 // the live main default may originate discovery. An interface name alone is
 // insufficient: LAN Ethernet ports and arbitrarily named VPNs also exist.
 func parseShadowBroadcastWANs(output, routes string, configured []string, devices map[string]string) []shadowBroadcastWAN {
+	var result []shadowBroadcastWAN
+	parseShadowNativeWANs(output, routes, configured, devices, func(values map[string]string, wan shadowBroadcastWAN) bool {
+		switch values["type"] {
+		case "Ethernet", "GigabitEthernet", "FastEthernet", "Vlan", "VLAN":
+			result = append(result, wan)
+			return true
+		}
+		return false
+	})
+	return result
+}
+
+// Both discovery paths require the same native/public/main-route ownership.
+// The caller additionally checks the transport: PPP must never originate DHCP.
+func parseShadowNativeWANs(output, routes string, configured []string, devices map[string]string, accept func(map[string]string, shadowBroadcastWAN) bool) {
 	defaults := map[string]bool{}
 	for _, line := range strings.Split(routes, "\n") {
 		fields := strings.Fields(line)
@@ -31,10 +46,9 @@ func parseShadowBroadcastWANs(output, routes string, configured []string, device
 			}
 		}
 	}
-	var result []shadowBroadcastWAN
 	seen := map[string]bool{}
 	var values map[string]string
-	name, nested := "", false
+	name, nested, scalarColumn := "", false, -1
 	flush := func() {
 		if name == "" || values == nil || values["connected"] != "yes" || values["global"] != "yes" || values["defaultgw"] != "yes" || values["security-level"] != "public" {
 			return
@@ -46,11 +60,6 @@ func parseShadowBroadcastWANs(output, routes string, configured []string, device
 		if !validKeeneticInterface(id) {
 			return
 		}
-		switch values["type"] {
-		case "Ethernet", "GigabitEthernet", "FastEthernet", "Vlan", "VLAN":
-		default:
-			return
-		}
 		ip := net.ParseIP(values["address"])
 		if ip.To4() == nil || !ip.IsGlobalUnicast() || ip.IsLoopback() {
 			return
@@ -59,21 +68,23 @@ func parseShadowBroadcastWANs(output, routes string, configured []string, device
 		if !defaults[device] || seen[device] {
 			return
 		}
-		seen[device] = true
-		result = append(result, shadowBroadcastWAN{native: id, device: device, client: ip})
+		if accept(values, shadowBroadcastWAN{native: id, device: device, client: ip}) {
+			seen[device] = true
+		}
 	}
 	for _, line := range strings.Split(strings.ReplaceAll(output, "\x1b[K", ""), "\n") {
+		column := strings.Index(line, ":")
 		line = strings.TrimSpace(line)
 		if rest, ok := strings.CutPrefix(line, "Interface, name = "); ok {
 			flush()
-			name, nested, values = "", false, map[string]string{}
+			name, nested, scalarColumn, values = "", false, -1, map[string]string{}
 			decoded, err := strconv.Unquote(strings.TrimSuffix(rest, ":"))
 			if err == nil && validKeeneticInterface(decoded) {
 				name = decoded
 			}
 			continue
 		}
-		if name == "" || nested {
+		if name == "" || nested && column != scalarColumn {
 			continue
 		}
 		key, value, ok := strings.Cut(line, ":")
@@ -81,19 +92,23 @@ func parseShadowBroadcastWANs(output, routes string, configured []string, device
 			continue
 		}
 		key, value = strings.TrimSpace(key), strings.TrimSpace(value)
+		if scalarColumn < 0 {
+			scalarColumn = column
+		}
+		nested = false
 		// Firmware prints IPv6, ports and summaries below the scalar status.
-		// Their address/id/defaultgw fields must never fill missing WAN data.
+		// Their colons are further right than top-level scalars. Ignore child
+		// fields, but resume when PPP session fields follow an IPv6 block.
 		if key == "ipv6" || key == "summary" || key == "addresses" || strings.HasPrefix(key, "port,") {
 			nested = true
 			continue
 		}
 		switch key {
-		case "id", "type", "address", "connected", "global", "defaultgw", "security-level":
+		case "id", "type", "address", "connected", "global", "defaultgw", "security-level", "session-id", "uptime":
 			if _, exists := values[key]; !exists {
 				values[key] = value
 			}
 		}
 	}
 	flush()
-	return result
 }

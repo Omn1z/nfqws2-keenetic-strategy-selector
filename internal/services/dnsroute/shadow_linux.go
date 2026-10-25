@@ -217,6 +217,16 @@ func discoverShadowServersWithObserver(ctx context.Context, wan []string, rememb
 				}
 			}
 			routerNow := time.Time{}
+			var pppCandidates []string
+			pppBefore := ""
+			if key != "" {
+				for _, device := range wanDevices {
+					if shadowPPPDevice(device) {
+						pppBefore, _ = readNative("show interface")
+						break
+					}
+				}
+			}
 			if log, err := readNative("show log"); err == nil {
 				if clock, err := command(ctx, "date", "+%Y-%m-%dT%H:%M:%S%z"); err == nil {
 					routerNow, _ = time.Parse("2006-01-02T15:04:05-0700", strings.TrimSpace(clock))
@@ -224,6 +234,15 @@ func discoverShadowServersWithObserver(ctx context.Context, wan []string, rememb
 				logLeases := parseKeeneticShadowLeases(log)
 				shadowDiagnosticEvent(ctx, "native.leases", fmt.Sprintf("Связанных DHCP ACK в журнале: %d", len(logLeases)), 0)
 				logShadowNativeLeases(ctx, log, logLeases, routerNow)
+				if pppBefore != "" {
+					// A reconnect during the log read must not revive the old
+					// session, even if the peer reuses its session ID and address.
+					interfacesRead = false
+					if interfaces, err := readNative("show interface"); err == nil {
+						pppCandidates = discoverShadowPPPServers(ctx, log, pppBefore, interfaces, defaultRoutes, wan, wanDevices, local, routerNow)
+						candidates = append(candidates, pppCandidates...)
+					}
+				}
 				for _, lease := range logLeases {
 					// Native IDs and aliases (ISP/GigabitEthernet1) may differ in
 					// ring logs. Compare fresh packet evidence across the WAN/IP.
@@ -288,7 +307,7 @@ func discoverShadowServersWithObserver(ctx context.Context, wan []string, rememb
 					eligible := parseShadowBroadcastWANs(interfaces, defaultRoutes, wan, wanDevices)
 					nativeObserved = observe(ctx, key, eligible, local, routerNow)
 					if nativeObserved {
-						candidates = nil
+						candidates = append([]string(nil), pppCandidates...)
 					}
 				} else {
 					observe(ctx, "", nil, local, routerNow)
@@ -351,6 +370,9 @@ func discoverShadowServersWithObserver(ctx context.Context, wan []string, rememb
 					}
 				}
 			}
+			// DHCP refresh/expiry decisions concern their own transport. A
+			// separately verified PPP WAN keeps its current IPCP candidates.
+			candidates = append(candidates, pppCandidates...)
 		}
 	} else if ubus, err := exec.LookPath("ubus"); err == nil {
 		if observe != nil {

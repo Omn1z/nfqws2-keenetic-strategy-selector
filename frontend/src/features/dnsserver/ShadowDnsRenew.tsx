@@ -30,7 +30,7 @@ export async function confirmAndRenewShadowDns(begin: () => boolean): Promise<Dn
 }
 
 export function ShadowDnsRenewOutcome({ result, error }: { result: DnsShadowRenewResult | null; error: string }) {
-  if (error) return <p role="alert" className="mt-2 text-xs text-bad [overflow-wrap:anywhere]">{error}</p>;
+  if (error) return <p role="alert" className="mt-2 text-xs text-bad [overflow-wrap:anywhere]">{error} Проверьте состояние и диагностику перед повторной попыткой.</p>;
   if (!result) return null;
   const titles = {
     resolved: "DNS провайдера получены",
@@ -70,7 +70,7 @@ export function ShadowDnsRenew({ status, disabled = false, onBusyChange, onRefre
       });
       if (mounted.current && next) { setResult(next); current.current.onResult?.(next); }
     } catch (e) {
-      if (mounted.current) setError(`${(e as Error).message} Обновление аренды могло уже начаться. Проверьте состояние и диагностику перед повторной попыткой.`);
+      if (mounted.current) setError((e as Error).message);
     } finally {
       working.current = false;
       if (started) {

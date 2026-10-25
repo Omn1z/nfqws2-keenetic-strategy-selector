@@ -67,6 +67,20 @@ test("A failed renewal remains visible and is not automatically repeated", async
   assert.match(html, /WAN eth3 недоступен/);
 });
 
+test("A rejected renewal preflight does not suggest that the lease renewal started", async (t) => {
+  windowConfirm(t, () => true);
+  const reason = "нет активного наблюдения DHCP на подтверждённом WAN; обновление не выполнялось";
+  const request = t.mock.method(globalThis, "fetch", async () => new Response(JSON.stringify({ error: reason }), { status: 400 }));
+  let error = "";
+  try { await confirmAndRenewShadowDns(() => true); }
+  catch (e) { error = (e as Error).message; }
+  assert.equal(request.mock.callCount(), 1);
+  const html = renderToStaticMarkup(<ShadowDnsRenewOutcome result={null} error={error} />);
+  assert.ok(html.includes(reason));
+  assert.match(html, /Проверьте состояние и диагностику перед повторной попыткой/);
+  assert.doesNotMatch(html, /Обновление аренды могло уже начаться/);
+});
+
 test("Renewal outcomes distinguish provider silence, DNS omission and rejection from success", () => {
   for (const [status, title] of [
     ["resolved", "DNS провайдера получены"], ["waiting", "Ожидание ответа провайдера"],

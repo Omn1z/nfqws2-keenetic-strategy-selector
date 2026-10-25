@@ -62,4 +62,7 @@ func TestShadowBroadcastRequiresNativePhysicalMainWAN(t *testing.T) {
 	if parse(strings.ReplaceAll(strings.ReplaceAll(shadowBroadcastFixture, "GigabitEthernet1", "GigabitEthernet1/Vlan2"), "type: GigabitEthernet", "type: Vlan"), routes, []string{"eth3"}) != 1 {
 		t.Fatal("verified physical VLAN rejected")
 	}
+	if parse(strings.Replace(shadowBroadcastFixture, "type: GigabitEthernet", "type: PPPoE", 1)+shadowBroadcastFixture, routes, []string{"eth3"}) != 1 {
+		t.Fatal("an ineligible transport hid the physical WAN")
+	}
 }

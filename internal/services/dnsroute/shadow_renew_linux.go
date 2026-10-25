@@ -36,6 +36,13 @@ func (a *Adapter) shadowRenewTarget(ctx context.Context) (shadowNativeState, err
 	defer a.shadow.discoveryMu.Unlock()
 	s := a.shadow.native
 	if s.reader == nil || s.reader.snapshot().closed || !validKeeneticInterface(s.iface) || !validShadowWAN(s.device) {
+		pppOnly := len(a.cfg.WANIfaces) > 0
+		for _, device := range a.cfg.WANIfaces {
+			pppOnly = pppOnly && shadowPPPDevice(device)
+		}
+		if pppOnly {
+			return shadowNativeState{}, fmt.Errorf("на PPP WAN обновление DHCP неприменимо; DNS читаются из IPCP текущего PPPoE-сеанса. Если записи сеанса отсутствуют в журнале, переподключите PPPoE вручную и повторите проверку; обновление не выполнялось")
+		}
 		return shadowNativeState{}, fmt.Errorf("нет активного наблюдения DHCP на подтверждённом WAN; обновление не выполнялось")
 	}
 	s.client = append(net.IP(nil), s.client...)
