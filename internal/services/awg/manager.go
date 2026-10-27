@@ -287,6 +287,15 @@ func (m *Manager) SetClientEnabled(v bool) {
 	m.clientEnabled.Store(v)
 }
 
+// SetClientFailoverPolicy changes local policy without validating an unrelated
+// draft VPS configuration or replacing the running manager and its status.
+func (m *Manager) SetClientFailoverPolicy(fallbacks []string, standby bool) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.cfg.Client.FallbackTunnelIDs = append([]string{}, fallbacks...)
+	m.cfg.Client.Standby = standby
+}
+
 // SetEnabled toggles the profile availability flag used by the server selector.
 func (m *Manager) SetEnabled(v bool) {
 	m.mu.Lock()

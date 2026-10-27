@@ -1566,11 +1566,7 @@ func (s *Server) awg2SetServerEnabled(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) awg2DeleteServer(w http.ResponseWriter, r *http.Request) {
-	if err := s.app.AWG2DeleteServer(r.PathValue("id")); err != nil {
-		httpErr(w, 400, err)
-		return
-	}
-	writeJSON(w, 200, s.app.AWG2StatusView())
+	serveAWG2Delete(w, r, s.app.AWG2DeleteServerWithReplacement, s.app.AWG2StatusView)
 }
 
 func (s *Server) awg2Config(w http.ResponseWriter, r *http.Request) {

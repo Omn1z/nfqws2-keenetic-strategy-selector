@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"errors"
 
 	"nfqws2strategy/internal/services/awg"
 	"nfqws2strategy/internal/services/awgroute"
@@ -40,9 +41,14 @@ func (a *App) AWG2CreateWARP(ctx context.Context, opts awgroute.WARPCreateOption
 	return a.awgroute.AWG2CreateWARP(ctx, opts)
 }
 func (a *App) AWG2DeleteServer(id string) error {
+	return a.AWG2DeleteServerWithReplacement(id, "")
+}
+
+func (a *App) AWG2DeleteServerWithReplacement(id, replacementID string) error {
 	ifaces := a.awgroute.ClientIfaces()
-	err := a.awgroute.AWG2DeleteServer(id)
-	if err == nil {
+	err := a.awgroute.AWG2DeleteServerWithReplacement(id, replacementID)
+	var committed *awgroute.DeleteServerCommittedError
+	if err == nil || errors.As(err, &committed) {
 		for _, iface := range ifaces {
 			tunnelroute.DelTGFrontRoutes(iface)
 		}

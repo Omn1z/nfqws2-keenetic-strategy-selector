@@ -8,7 +8,6 @@ import { Badge } from "@/components/ui/Badge";
 import { Button } from "@/components/ui/Button";
 import { Switch } from "@/components/ui/Switch";
 import { toast } from "@/components/ui/Toast";
-import { confirmDialog } from "@/components/ui/Confirm";
 import { Modal } from "@/components/ui/Modal";
 import { Dropzone } from "@/components/ui/Dropzone";
 import { Field, Input, Select, Textarea } from "@/components/ui/form";
@@ -21,6 +20,9 @@ import RoutingPane from "./RoutingPane";
 import DevicesRoutingPane from "./DevicesRoutingPane";
 import TracePane from "./TracePane";
 import { SpeedTestPanel } from "./SpeedTestCard";
+import DeleteConnectionModal from "./DeleteConnectionModal";
+import { deleteConnection } from "./deleteConnection";
+import type { DeleteConnectionSelection } from "./deleteConnection";
 import type { Awg2ServerSummary, Awg2Status, AwgDeployResult, AwgRoutingConfig } from "@/types/api";
 
 type Sub = "server" | "general" | "routing" | "devices" | "trace";
@@ -87,6 +89,8 @@ export default function AWG2() {
   const [toggling, setToggling] = useState<Record<string, boolean>>({});
   const [selectingID, setSelectingID] = useState("");
   const [deletingID, setDeletingID] = useState("");
+  const [deleteTarget, setDeleteTarget] = useState<{ id: string; label: string } | null>(null);
+  const [deleteWarning, setDeleteWarning] = useState("");
   const [selected, setSelected] = useState<Record<string, boolean>>({});
   const [batch, setBatch] = useState<{ done: number; total: number } | null>(null);
   const [addOpen, setAddOpen] = useState(false);
@@ -393,16 +397,28 @@ export default function AWG2() {
     }
   };
 
-  const deleteServer = async (id: string) => {
+  const deleteServer = (id: string) => {
     if (!id || mutationBusy) return;
-    if (!(await confirmDialog({ title: "Удалить VPN-подключение?", body: "Конфиг, ключи и пиры этого сервера будут удалены из панели. На самом VPS уже установленный сервис не трогается.", confirmLabel: "Удалить", danger: true }))) return;
+    const source = st?.servers.find((server) => server.id === id);
+    if (source) setDeleteTarget({ id, label: source.label || source.client_iface || id });
+  };
+
+  const confirmDeleteServer = async (selection: DeleteConnectionSelection) => {
+    if (!st || !deleteTarget || mutationBusy) return;
+    const id = deleteTarget.id;
     setDeletingID(id);
     try {
-      const next = await api<Awg2Status>("DELETE", `/api/awg2/servers/${encodeURIComponent(id)}`);
+      const next = await deleteConnection(st, id, selection);
       acceptStatus(next);
-      toast("VPN-подключение удалено", "ok");
+      setDeleteTarget(null);
+      setDeleteWarning(next.warning || "");
+      setSelected((previous) => { const remaining = { ...previous }; delete remaining[id]; return remaining; });
+      toast(next.warning ? "Подключение удалено; проверьте предупреждение о маршрутизации" : selection.mode === "transfer" ? "VPN-подключение удалено, связанные правила перенесены" : "VPN-подключение удалено, правила сохранены в ожидании", next.warning ? "err" : "ok");
     } catch (e) {
-      toast((e as Error).message, "err");
+      // A failed routing apply may follow a persisted deletion. Refresh before
+      // allowing a retry, retaining the chosen target and the concrete error.
+      await reload();
+      throw e;
     } finally {
       setDeletingID("");
     }
@@ -463,6 +479,7 @@ export default function AWG2() {
 
   return (
     <>
+      {deleteWarning && <Card><p className="text-xs text-warn" role="alert">Подключение удалено, изменения сохранены. {deleteWarning}</p><Button mini className="mt-2" onClick={() => setDeleteWarning("")}>Скрыть предупреждение</Button></Card>}
       {statusError && <Card><p className="text-xs text-warn" role="status">Статус временно недоступен: {statusError} Показаны последние полученные данные.</p><Button mini className="mt-2" disabled={mutationBusy} onClick={() => { void reload(); }}>Обновить статус</Button></Card>}
       {(routingState?.applying || routingState?.error || (routingState && routingState.revision > 0 && !routingState.ready) || reconnectRevision > 0) && (
         <Card title="Состояние маршрутизации">
@@ -629,6 +646,7 @@ export default function AWG2() {
       </div>
       {sub === "trace" && <fieldset disabled={mutationBusy}><TracePane externalBusy={mutationBusy} runMutation={runTraceMutation} reload={reload} /></fieldset>}
       {clientsOpen && <PeerShareModal st={st} reload={reload} onClose={() => setClientsOpen(false)} />}
+      {deleteTarget && <DeleteConnectionModal key={deleteTarget.id} st={st} sourceID={deleteTarget.id} sourceLabel={deleteTarget.label} externalBusy={mutationBusy} onClose={() => setDeleteTarget(null)} onDelete={confirmDeleteServer} />}
       {speedServer && (
         <Modal
           title={`Замер скорости: ${speedServer.label || speedServer.host || speedServer.id}`}
