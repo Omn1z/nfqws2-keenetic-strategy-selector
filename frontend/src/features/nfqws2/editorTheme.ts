@@ -39,6 +39,9 @@ export const editorTheme = EditorView.theme({
   },
   ".cm-lineNumbers .cm-gutterElement": { padding: "0 10px 0 12px", minWidth: "36px" },
   ".cm-activeLine": { backgroundColor: "var(--editor-active-line, var(--c-line-soft))" },
+  // drawSelection paints below the lines. An opaque active-line background
+  // otherwise hides the selected part of the line containing the range head.
+  '&[data-selection="range"] .cm-activeLine': { backgroundColor: "transparent" },
   ".cm-activeLineGutter": {
     backgroundColor: "var(--editor-active-line, var(--c-line-soft))", color: "var(--c-ink)",
   },
@@ -47,8 +50,17 @@ export const editorTheme = EditorView.theme({
   // class so its built-in light/dark colors cannot win on specificity.
   "&.cm-editor > .cm-scroller > .cm-selectionLayer .cm-selectionBackground, &.cm-editor.cm-focused > .cm-scroller > .cm-selectionLayer .cm-selectionBackground": {
     backgroundColor: "var(--editor-selection, var(--c-track))",
+    outline: "1px solid var(--editor-selection-edge, var(--c-ink-soft))", outlineOffset: "-1px",
   },
-  "&.cm-editor .cm-content ::selection": { backgroundColor: "var(--editor-selection, var(--c-track))" },
+  // Without native selection foreground, preserve readable syntax colors.
+  "&.cm-editor:not(.cm-focused) > .cm-scroller > .cm-selectionLayer .cm-selectionBackground": {
+    backgroundColor: "var(--editor-selection-inactive, var(--editor-selection, var(--c-track)))",
+  },
+  // Keep the native foreground legible over the drawn layer; drawSelection
+  // itself suppresses the native background, preserving its range geometry.
+  "&.cm-editor .cm-content::selection, &.cm-editor .cm-content ::selection": {
+    backgroundColor: "transparent", color: "var(--editor-selection-ink, var(--c-ink))", textShadow: "none",
+  },
   ".cm-selectionMatch": { backgroundColor: "var(--editor-selection-match, var(--c-line-soft))" },
   "&.cm-editor .cm-searchMatch": {
     backgroundColor: "var(--editor-search-match, var(--c-warn-bg))",
@@ -77,7 +89,7 @@ export const editorTheme = EditorView.theme({
     margin: "6px 0 2px 8px", padding: "4px 8px", background: "var(--c-line-soft)",
     color: "var(--c-ink)", border: "1px solid var(--c-line)", borderRadius: "4px", cursor: "pointer",
   },
-  ".cm-diagnosticAction:hover": { background: "var(--editor-selection, var(--c-track))" },
+  ".cm-diagnosticAction:hover": { background: "var(--c-line-soft)" },
   ".cm-diagnosticAction:focus-visible": { outline: "2px solid var(--c-track)", outlineOffset: "2px" },
   ".cm-lintRange-warning": { backgroundImage: "none", textDecoration: "underline wavy var(--c-warn)", textUnderlineOffset: "4px" },
   ".cm-lintRange-error": { backgroundImage: "none", textDecoration: "underline wavy var(--c-bad)", textUnderlineOffset: "4px" },

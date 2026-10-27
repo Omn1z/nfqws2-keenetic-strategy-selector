@@ -730,7 +730,36 @@ export interface AwgRulesImportResult {
   routing_revision: number;
   routing: AwgRoutingConfig;
 }
-export interface AwgClientConfig { enabled: boolean; peer_id: string }
+export interface AwgClientConfig {
+  enabled: boolean;
+  peer_id: string;
+  fallback_tunnel_ids?: string[];
+  standby?: boolean;
+}
+export interface AwgConnectionFailoverStatus {
+  fallback_tunnel_ids: string[];
+  active_tunnel_id: string;
+  standby: boolean;
+  activated: boolean;
+}
+export interface AwgConnectionTestResult {
+  server_id: string;
+  success: boolean;
+  handshake: boolean;
+  data_ok: boolean;
+  latency_ms: number;
+  endpoint: string;
+  egress_ip?: string;
+  error?: string;
+  checked_at: number;
+}
+export interface AwgRecoverySettings {
+  fast_retry_seconds: number;
+  retry_delay_seconds: number;
+  slow_retry_after_seconds: number;
+  slow_retry_delay_seconds: number;
+  handshake_timeout_seconds: number;
+}
 export interface AwgServerConfig {
   enabled: boolean;
   protocol?: string;
@@ -777,12 +806,15 @@ export interface AwgClientStatus {
   running: boolean; iface_present: boolean; last_handshake: number; rx_bytes: number; tx_bytes: number;
   endpoint: string; address: string; mtu: number; connected: boolean; error?: string;
   recovering?: boolean; retry_at?: number; retry_count?: number; recovery_error?: string;
+  /** Handshake verification deadline; it remains in the past during a retry pause. */
+  verification_until?: number;
 }
 export interface Awg2ServerSummary {
   deployment_pending?: boolean;
   id: string; label: string; host: string; endpoint: string;
   client_iface?: string;
   client?: AwgClientStatus | null;
+  failover?: AwgConnectionFailoverStatus;
   enabled: boolean; imported: boolean; protocol: string;
   protocol_version?: string; traffic_obfuscation?: boolean; is_warp?: boolean;
   active: boolean; deployed: boolean; connected: boolean; reachable: boolean;
@@ -792,6 +824,8 @@ export interface AwgDeployServerResult {
   id: string; label: string; ok: boolean; result: AwgDeployResult; error?: string;
 }
 export interface Awg2Status {
+  /** Global recovery schedule, independent of the profile selected for editing. */
+  recovery_settings?: AwgRecoverySettings;
   deployment_pending?: boolean;
   config: AwgServerConfig; // redacted (no secrets)
   active_server_id: string;

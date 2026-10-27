@@ -46,10 +46,16 @@ func TestClientRecoveryNeverExhaustsAndOnlyHandshakeResets(t *testing.T) {
 		if got := r.observe(ClientStatus{}, r.RetryAt.Add(-time.Nanosecond)); got != clientWait {
 			t.Fatalf("attempt %d bypassed backoff", i)
 		}
-		if r.RetryAt.Sub(now) > clientRetryMax {
+		if r.RetryAt.Sub(now) > 90*time.Second {
 			t.Fatal("unbounded backoff")
 		}
-		now = r.RetryAt
+		if r.RetryAt.Equal(now) {
+			// The first phase adds no pause; the supervisor still runs at its
+			// fixed cadence instead of spinning on a failed local start.
+			now = now.Add(clientWatchInterval)
+		} else {
+			now = r.RetryAt
+		}
 	}
 	if r.Attempts != 40 {
 		t.Fatal("attempt limit/reset while offline")
@@ -60,20 +66,15 @@ func TestClientRecoveryNeverExhaustsAndOnlyHandshakeResets(t *testing.T) {
 	if got := r.observe(st, now.Add(time.Second)); got != clientWait || r.Attempts != 41 {
 		t.Fatal("iface-up reset failures")
 	}
-	if got := r.observe(st, r.VerifyUntil); got != clientWait { // retry cap is longer than initial handshake grace
+	if got := r.observe(st, r.VerifyUntil); got != clientWait { // the second-phase pause follows verification
 		t.Fatal("backoff must also hold while verifying")
 	}
 	if got := r.observe(st, r.RetryAt); got != clientReconnect {
 		t.Fatal("unanswered handshake did not retry")
 	}
 	st.LastHandshake = r.RetryAt.Unix()
-	if got := r.observe(st, r.RetryAt); got != clientWait || r.Attempts != 0 || r.Recovering {
+	if got := r.observe(st, r.RetryAt); got != clientWait || r.Attempts != 0 || r.Recovering || !r.FailureSince.IsZero() {
 		t.Fatal("fresh handshake did not reset backoff")
-	}
-	for n, want := range []time.Duration{15 * time.Second, 30 * time.Second, time.Minute, 2 * time.Minute, 4 * time.Minute, 5 * time.Minute, 5 * time.Minute} {
-		if got := clientRetryDelay(n + 1); got != want {
-			t.Fatalf("delay %d: %s != %s", n+1, got, want)
-		}
 	}
 }
 
@@ -241,8 +242,8 @@ func TestClientSupervisorEveryEnabledServerAndStartupFailure(t *testing.T) {
 		t.Fatal("disabled tunnel was started")
 	}
 	svc.checkClients()
-	if d.attempts[servers[0].Manager] != 1 {
-		t.Fatal("startup failure bypassed backoff")
+	if d.attempts[servers[0].Manager] != 2 {
+		t.Fatal("first-minute startup failure did not retry on the next supervisor pass")
 	}
 	// The next window must retry the startup failure, and re-check user intent
 	// after obtaining the operation lock rather than acting on an old snapshot.
@@ -254,7 +255,7 @@ func TestClientSupervisorEveryEnabledServerAndStartupFailure(t *testing.T) {
 	svc.clients.mu.Unlock()
 	servers[0].Manager.SetClientEnabled(false)
 	svc.checkClients()
-	if d.attempts[servers[0].Manager] != 1 || d.attempts[servers[1].Manager] != 2 {
+	if d.attempts[servers[0].Manager] != 2 || d.attempts[servers[1].Manager] != 3 {
 		t.Fatal("retry ignored updated client intent")
 	}
 	svc.mu.Lock()
@@ -263,7 +264,7 @@ func TestClientSupervisorEveryEnabledServerAndStartupFailure(t *testing.T) {
 	_, unlock := svc.lockClientOps(false)
 	svc.checkClient(servers[1])
 	unlock()
-	if d.attempts[servers[1].Manager] != 2 {
+	if d.attempts[servers[1].Manager] != 3 {
 		t.Fatal("deleted snapshot was resurrected")
 	}
 }
@@ -278,8 +279,8 @@ func TestClientSupervisorOldBinaryIsReplacedDespiteFreshHandshake(t *testing.T) 
 		t.Fatal("routing restore ran before old engine replacement")
 	}
 	svc.checkClients()
-	if d.attempts[m] != 1 {
-		t.Fatal("fresh old binary either skipped replacement or reset retry backoff")
+	if d.attempts[m] != 2 {
+		t.Fatal("fresh old binary skipped replacement or blocked first-minute retries after failed starts")
 	}
 }
 

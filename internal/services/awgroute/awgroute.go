@@ -19,11 +19,12 @@ import (
 const awgConfigFile = "awg.json"
 
 type awgPersisted struct {
-	ActiveID       string                       `json:"active_id"`
-	Servers        []awgPersistedServer         `json:"servers"`
-	Routing        *awgRoutingSettings          `json:"routing,omitempty"`
-	PendingRules   []awg.Zone                   `json:"pending_rules,omitempty"`
-	ConnectionRefs map[string]AWG2ConnectionRef `json:"connection_refs,omitempty"`
+	ActiveID         string                       `json:"active_id"`
+	Servers          []awgPersistedServer         `json:"servers"`
+	Routing          *awgRoutingSettings          `json:"routing,omitempty"`
+	PendingRules     []awg.Zone                   `json:"pending_rules,omitempty"`
+	ConnectionRefs   map[string]AWG2ConnectionRef `json:"connection_refs,omitempty"`
+	RecoverySettings *RecoverySettings            `json:"recovery_settings,omitempty"`
 }
 
 type awgPersistedServer struct {
@@ -37,27 +38,28 @@ type awgPersistedServer struct {
 // server only chooses the profile being edited; local tunnels can stay up in
 // parallel on their own awgN interfaces.
 type AWG2ServerSummary struct {
-	ID                 string        `json:"id"`
-	Label              string        `json:"label"`
-	Host               string        `json:"host"`
-	Endpoint           string        `json:"endpoint"`
-	ClientIface        string        `json:"client_iface,omitempty"`
-	Client             *ClientStatus `json:"client,omitempty"`
-	Enabled            bool          `json:"enabled"`
-	Imported           bool          `json:"imported"`
-	Protocol           string        `json:"protocol"`
-	ProtocolVersion    string        `json:"protocol_version"`
-	TrafficObfuscation bool          `json:"traffic_obfuscation"`
-	DeploymentPending  bool          `json:"deployment_pending"`
-	IsWARP             bool          `json:"is_warp"`
-	Active             bool          `json:"active"`
-	Deployed           bool          `json:"deployed"`
-	Connected          bool          `json:"connected"`
-	Reachable          bool          `json:"reachable"`
-	HasPassword        bool          `json:"has_password"`
-	HasKey             bool          `json:"has_key"`
-	HasServerKey       bool          `json:"has_server_key"`
-	LastError          string        `json:"last_error,omitempty"`
+	ID                 string                    `json:"id"`
+	Label              string                    `json:"label"`
+	Host               string                    `json:"host"`
+	Endpoint           string                    `json:"endpoint"`
+	ClientIface        string                    `json:"client_iface,omitempty"`
+	Client             *ClientStatus             `json:"client,omitempty"`
+	Enabled            bool                      `json:"enabled"`
+	Imported           bool                      `json:"imported"`
+	Protocol           string                    `json:"protocol"`
+	ProtocolVersion    string                    `json:"protocol_version"`
+	TrafficObfuscation bool                      `json:"traffic_obfuscation"`
+	DeploymentPending  bool                      `json:"deployment_pending"`
+	IsWARP             bool                      `json:"is_warp"`
+	Active             bool                      `json:"active"`
+	Deployed           bool                      `json:"deployed"`
+	Connected          bool                      `json:"connected"`
+	Reachable          bool                      `json:"reachable"`
+	HasPassword        bool                      `json:"has_password"`
+	HasKey             bool                      `json:"has_key"`
+	HasServerKey       bool                      `json:"has_server_key"`
+	LastError          string                    `json:"last_error,omitempty"`
+	Failover           *ConnectionFailoverStatus `json:"failover,omitempty"`
 }
 
 type AWG2DeployServerResult struct {
@@ -87,6 +89,7 @@ type AWG2Status struct {
 	Engine            EngineInfo                   `json:"engine"`
 	Client            *ClientStatus                `json:"client"`
 	DeploymentPending bool                         `json:"deployment_pending"`
+	RecoverySettings  RecoverySettings             `json:"recovery_settings"`
 }
 
 // initAWG loads the persisted AWG2 config (or defaults). It NEVER auto-deploys —
@@ -158,14 +161,18 @@ func (svc *Service) loadAWGState() awgPersisted {
 func defaultAWGState() awgPersisted {
 	cfg := awg.Default()
 	settings := routingSettingsFrom(cfg.Routing)
+	recovery := DefaultRecoverySettings()
 	return awgPersisted{
-		ActiveID: "awg0",
-		Servers:  []awgPersistedServer{{ID: "awg0", Config: *cfg}},
-		Routing:  &settings,
+		ActiveID:         "awg0",
+		Servers:          []awgPersistedServer{{ID: "awg0", Config: *cfg}},
+		Routing:          &settings,
+		RecoverySettings: &recovery,
 	}
 }
 
 func normalizeAWGState(st awgPersisted) awgPersisted {
+	recovery := normalizeRecoverySettings(st.RecoverySettings)
+	st.RecoverySettings = &recovery
 	if len(st.Servers) == 0 {
 		defaults := defaultAWGState()
 		if awgPendingReferencesID(st.PendingRules, defaults.ActiveID) || st.ConnectionRefs[defaults.ActiveID].Ref != "" {
@@ -327,6 +334,8 @@ func (svc *Service) installAWGState(st awgPersisted) {
 	svc.activeID = st.ActiveID
 	settings := *st.Routing
 	svc.routing = &settings
+	recovery := *st.RecoverySettings
+	svc.recoverySettings = &recovery
 	svc.pendingRules = cloneAWGZones(st.PendingRules)
 	svc.connectionRefs = cloneAWGConnectionRefs(st.ConnectionRefs)
 	if active := servers[svc.activeID]; active != nil {
@@ -344,6 +353,7 @@ func (svc *Service) snapshotAWGState() awgPersisted {
 	activeID := svc.activeID
 	pendingRules := cloneAWGZones(svc.pendingRules)
 	connectionRefs := cloneAWGConnectionRefs(svc.connectionRefs)
+	recovery := normalizeRecoverySettings(svc.recoverySettings)
 	entries := make([]*managedServer, 0, len(svc.order))
 	for _, id := range svc.order {
 		if srv := svc.servers[id]; srv != nil {
@@ -353,7 +363,7 @@ func (svc *Service) snapshotAWGState() awgPersisted {
 	svc.mu.RUnlock()
 
 	settings := svc.currentRoutingSettings()
-	st := awgPersisted{ActiveID: activeID, Servers: make([]awgPersistedServer, 0, len(entries)), Routing: &settings, PendingRules: pendingRules, ConnectionRefs: connectionRefs}
+	st := awgPersisted{ActiveID: activeID, Servers: make([]awgPersistedServer, 0, len(entries)), Routing: &settings, PendingRules: pendingRules, ConnectionRefs: connectionRefs, RecoverySettings: &recovery}
 	for _, srv := range entries {
 		st.Servers = append(st.Servers, awgPersistedServer{
 			ID:            srv.ID,
@@ -405,17 +415,19 @@ func (svc *Service) activeServerID() string {
 func (svc *Service) AWG2StatusView() AWG2Status {
 	rules := svc.awgRoutingRules()
 	routing := svc.globalRoutingConfig(rules)
+	recovery := svc.currentRecoverySettings()
 	am := svc.awgActive()
 	if am == nil {
 		return AWG2Status{
-			ActiveID:       svc.activeServerID(),
-			Servers:        svc.awgServerSummaries(),
-			RoutingRules:   rules,
-			RoutingConfig:  routing,
-			RoutingState:   svc.RoutingDNSReadiness(),
-			ConnectionRefs: svc.connectionRefSnapshot(),
-			Engine:         svc.AWG2EngineInfo(),
-			Client:         svc.awgClientStatus(),
+			ActiveID:         svc.activeServerID(),
+			Servers:          svc.awgServerSummaries(),
+			RoutingRules:     rules,
+			RoutingConfig:    routing,
+			RoutingState:     svc.RoutingDNSReadiness(),
+			ConnectionRefs:   svc.connectionRefSnapshot(),
+			Engine:           svc.AWG2EngineInfo(),
+			Client:           svc.awgClientStatus(),
+			RecoverySettings: recovery,
 		}
 	}
 	full := am.Config()
@@ -437,6 +449,7 @@ func (svc *Service) AWG2StatusView() AWG2Status {
 		Engine:            svc.AWG2EngineInfo(),
 		Client:            svc.awgClientStatus(),
 		DeploymentPending: am.PendingApply(),
+		RecoverySettings:  recovery,
 	}
 }
 
@@ -452,6 +465,13 @@ func (svc *Service) awgServerSummaries() []AWG2ServerSummary {
 	svc.mu.RUnlock()
 
 	out := make([]AWG2ServerSummary, 0, len(entries))
+	// One live UAPI read per connection; the same snapshot drives logical
+	// failover status and physical profile status during this poll.
+	statuses := make(map[string]*ClientStatus, len(entries))
+	driver := svc.clientLifecycleDriver()
+	for _, srv := range entries {
+		statuses[srv.ID] = driver.status(srv.Manager)
+	}
 	for _, srv := range entries {
 		cfg := srv.Manager.Config()
 		runtime := srv.Manager.RuntimeConfig()
@@ -474,12 +494,13 @@ func (svc *Service) awgServerSummaries() []AWG2ServerSummary {
 			HasPassword:        strings.TrimSpace(cfg.Conn.Password) != "",
 			HasKey:             strings.TrimSpace(cfg.Conn.KeyPEM) != "",
 			HasServerKey:       strings.TrimSpace(cfg.PrivateKey) != "",
+			Failover:           svc.connectionFailoverStatus(srv, statuses),
 		}
 		if st != nil {
 			sum.Reachable = st.Up || st.Reachable
 			sum.LastError = st.Error
 		}
-		if cs := svc.awgClientStatusManagerOS(srv.Manager); cs != nil {
+		if cs := statuses[srv.ID]; cs != nil {
 			sum.Client = cs
 			sum.Connected = cs.Connected
 			// Imported profiles (including WARP) do not have a remote SSH
@@ -847,8 +868,13 @@ func (svc *Service) AWG2SetServerEnabled(id string, enabled bool) error {
 				srv.Manager.SetRoutingActive(true)
 			}
 			svc.awgSave()
-			err := svc.awgClientUpManagerOS(srv.Manager)
-			svc.recordClientAttempt(srv.Manager, err)
+			var err error
+			if svc.clientShouldRun(srv.Manager) {
+				err = svc.awgClientUpManagerOS(srv.Manager)
+			}
+			if svc.clientShouldRun(srv.Manager) {
+				svc.recordClientAttempt(srv.Manager, err)
+			}
 			if err != nil {
 				svc.awgSave()
 				svc.awgApplyMultiHostRoutesOS()
@@ -962,6 +988,16 @@ func (svc *Service) awgDeleteServerWithOps(id string, teardown func() error, dow
 	svc.mu.Unlock()
 	for _, other := range svc.serverSnapshot() {
 		cfg := other.Manager.Config()
+		filtered := []string{}
+		for _, backupID := range cfg.Client.FallbackTunnelIDs {
+			if backupID != id {
+				filtered = append(filtered, backupID)
+			}
+		}
+		if len(filtered) != len(cfg.Client.FallbackTunnelIDs) {
+			cfg.Client.FallbackTunnelIDs = filtered
+			operationErr = errors.Join(operationErr, other.Manager.SetConfig(&cfg))
+		}
 		cfg.Routing.Zones = part[other.ID]
 		activeState := cfg.Routing.Active
 		if len(cfg.Routing.Zones) == 0 && !remainingReferences[other.ID] {
@@ -975,6 +1011,7 @@ func (svc *Service) awgDeleteServerWithOps(id string, teardown func() error, dow
 	svc.syncActiveAWGIface()
 	svc.route.tunnelUpAt.Store(0)
 	operationErr = errors.Join(operationErr, svc.awgSaveErr())
+	svc.reconcileStandbyClients()
 	return errors.Join(operationErr, apply())
 }
 
@@ -1114,7 +1151,7 @@ func (svc *Service) AWG2SetConfig(in *awg.ServerConfig) error {
 	}
 	svc.awgSave()
 	next := m.Config()
-	if (wireChanged && next.Install == "imported" || mtuChanged && !m.PendingApply()) && awgShouldAutostartClient(next) {
+	if (wireChanged && next.Install == "imported" || mtuChanged && !m.PendingApply()) && svc.clientShouldRun(m) {
 		err := svc.awgRecoverClientOS(m)
 		svc.recordClientAttempt(m, err)
 		if err != nil {

@@ -108,6 +108,9 @@ type Peer struct {
 type ClientConfig struct {
 	Enabled bool   `json:"enabled"` // bring awg0 up (boot + now)
 	PeerID  string `json:"peer_id"` // which Peer represents this router
+	// Standby keeps the saved connection offline until a primary needs it.
+	Standby           bool     `json:"standby"`
+	FallbackTunnelIDs []string `json:"fallback_tunnel_ids,omitempty"`
 }
 
 // Zone (rendered in the UI as «Правило») is a named match-list for split

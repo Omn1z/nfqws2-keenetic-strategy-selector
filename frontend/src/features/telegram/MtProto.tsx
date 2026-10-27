@@ -1,20 +1,15 @@
 import { useRef, useState } from "react";
-import type { ReactNode } from "react";
 import { api } from "@/lib/api";
-import { cn } from "@/lib/cn";
 import { usePoll } from "@/lib/hooks";
 import { toast } from "@/components/ui/Toast";
 import { confirmDialog } from "@/components/ui/Confirm";
 import { Card } from "@/components/ui/Card";
-import { Button } from "@/components/ui/Button";
-import { Badge } from "@/components/ui/Badge";
-import { Switch } from "@/components/ui/Switch";
-import { Field, Input, Textarea } from "@/components/ui/form";
-import { tableCls, tdCls } from "@/components/ui/Table";
+import { PageHeader, compactCard } from "@/components/ui/FeaturePage";
 import AwgFallback from "./AwgFallback";
+import { MtProtoContent } from "./MtProtoPresentation";
 import type { TgwsConfig, TgwsStatus } from "@/types/api";
 
-interface Form {
+export interface Form {
   port: string;
   secret: string;
   dc: string;
@@ -64,13 +59,6 @@ export const collect = (f: Form) => ({
   cfproxy_worker_domains: f.cfproxy_worker_domain.split(/[\s,;]+/).filter(Boolean),
 });
 
-const StatRow = ({ l, v }: { l: string; v: ReactNode }) => (
-  <tr><td className={cn(tdCls, "text-ink-soft")}>{l}</td><td className={cn(tdCls, "tabular-nums")}>{v}</td></tr>
-);
-const ToggleField = ({ label, checked, onChange }: { label: string; checked: boolean; onChange: (v: boolean) => void }) => (
-  <div className="flex h-[38px] items-center"><Switch checked={checked} onChange={onChange} label={label} /></div>
-);
-
 export default function MtProto() {
   const [form, setForm] = useState<Form | null>(null);
   const [live, setLive] = useState<TgwsStatus | null>(null);
@@ -91,74 +79,6 @@ export default function MtProto() {
   const newSecret = async () => { if (!(await confirmDialog({ title: "Сгенерировать новый секрет?", body: "Старые tg:// ссылки перестанут работать.", confirmLabel: "Сгенерировать" }))) return; try { await api("POST", "/api/tgws/secret", {}); apply(await api<TgwsStatus>("GET", "/api/tgws")); toast("Новый секрет сгенерирован", "ok"); } catch (e) { toast((e as Error).message, "err"); } };
   const copy = async () => { const v = live?.link; if (!v) return; try { await navigator.clipboard.writeText(v); toast("Ссылка скопирована", "ok"); } catch { toast("Скопируйте вручную", "err"); } };
 
-  if (!form || !live) return <Card><span className="text-xs text-muted">Загрузка…</span></Card>;
-  const { connections: cc, traffic: t, ws: w } = live.stats;
-
-  return (
-    <>
-      <Card title="Telegram MTProto прокси" sub={live.upstream_version ? `TG WS Proxy ${live.upstream_version}` : undefined} head={<Badge kind={live.running ? "ok" : "bad"}>{live.running ? "работает" : "остановлен"}</Badge>}>
-        <p className="mb-3 text-xs text-muted">Прокси для Telegram прямо на роутере: клиенты в LAN ходят через <code>&lt;роутер&gt;:порт</code>, трафик идёт к Telegram по WSS с запасными путями.</p>
-        <div className="flex flex-wrap items-center gap-4">
-          <ToggleField label="Прокси включён" checked={live.config.enabled} onChange={toggle} />
-          <span className="text-xs text-muted">{live.running ? `слушает порт ${form.port}` : live.config.enabled ? "не удалось запустить" : ""}</span>
-        </div>
-      </Card>
-
-      <AwgFallback />
-
-      <Card title="Подключение Telegram" sub="ссылка содержит секрет">
-        <Field label="tg:// ссылка"><div className="flex gap-2"><Input readOnly value={live.link} className="font-mono text-xs" /><Button onClick={copy}>Копировать</Button></div></Field>
-        <p className="text-xs text-muted">Откройте ссылку на устройстве с Telegram (например, в «Избранное») — прокси добавится автоматически.</p>
-      </Card>
-
-      <Card title="Настройки">
-        <div className="flex flex-wrap gap-4">
-          <Field label="Порт прокси" className="w-32 shrink-0"><Input type="number" min={1} max={65535} value={form.port} onChange={(e) => set("port", e.target.value)} /></Field>
-          <Field label="Секрет (32 hex)" className="min-w-[220px] flex-1"><div className="flex gap-2"><Input readOnly value={form.secret} className="font-mono text-xs" /><Button onClick={newSecret}>Сгенерировать</Button></div></Field>
-        </div>
-        <Field label="DC-редиректы" hint="по строке: DC=IP (например 2=149.154.167.220)"><Textarea rows={3} value={form.dc} placeholder={"2=149.154.167.220\n4=149.154.167.220"} onChange={(e) => set("dc", e.target.value)} /></Field>
-        <div className="flex flex-wrap gap-4">
-          <Field label="Fake-TLS домен" hint="пусто = выкл." className="min-w-[200px] flex-1"><Input value={form.fake_tls_domain} placeholder="напр. www.cloudflare.com" onChange={(e) => set("fake_tls_domain", e.target.value)} /></Field>
-          <Field label="Хост для ссылки" hint="пусто = авто" className="min-w-[200px] flex-1"><Input value={form.link_host} placeholder="192.168.1.1" onChange={(e) => set("link_host", e.target.value)} /></Field>
-        </div>
-        <div className="flex flex-wrap gap-4">
-          <Field label="Размер пула WS" hint="0 — без прямого WS, только резервные маршруты" className="w-40 shrink-0"><Input type="number" min={0} max={16} value={form.pool_size} onChange={(e) => set("pool_size", e.target.value)} /></Field>
-          <Field label="Буфер сокета (байт)" className="w-40 shrink-0"><Input type="number" min={4096} step={4096} value={form.buffer_size} onChange={(e) => set("buffer_size", e.target.value)} /></Field>
-        </div>
-        <div className="flex flex-wrap items-end gap-6">
-          <ToggleField label="CF fallback" checked={form.cfproxy} onChange={(v) => set("cfproxy", v)} />
-          <ToggleField label="HTTP/2 для медиа через CF" checked={form.cfproxy_h2_media} onChange={(v) => set("cfproxy_h2_media", v)} />
-          <ToggleField label="PROXY protocol" checked={form.proxy_protocol} onChange={(v) => set("proxy_protocol", v)} />
-          <ToggleField label="Резервный SNI" checked={form.sni_fronting} onChange={(v) => set("sni_fronting", v)} />
-          <ToggleField label="CF без TLS (порт 80)" checked={form.disable_secure} onChange={(v) => set("disable_secure", v)} />
-          <ToggleField label="Тестовые DC Telegram" checked={form.force_test_dc} onChange={(v) => set("force_test_dc", v)} />
-        </div>
-        <p className="text-xs text-muted">Тестовые DC нужны для тестовой среды Telegram. Для обычного аккаунта оставьте этот переключатель выключенным.</p>
-        <p className="text-xs text-muted">HTTP/2 передаёт несколько загрузок медиа через общее соединение CF Proxy. Используется при отсутствии готового прямого WS и после CF Worker. Требует включённого CF fallback и TLS; для тестовых DC не применяется.</p>
-        <p className="text-xs text-muted">Резервный SNI помогает при блокировке обычного TLS к Telegram. Включайте его при необходимости: некоторые фронты принимают подключение, но не передают трафик.</p>
-        <div className="flex flex-wrap gap-4">
-          <Field label="Свои CF-домены" hint="По одному на строку или через запятую. Пусто — встроенный пул с автоматическим обновлением." className="min-w-[200px] flex-1"><Textarea rows={3} value={form.cfproxy_user_domain} onChange={(e) => set("cfproxy_user_domain", e.target.value)} /></Field>
-          <Field label="Домены CF Worker" hint="Пробуются первыми; при ошибке используется следующий. По одному на строку или через запятую." className="min-w-[200px] flex-1"><Textarea rows={3} value={form.cfproxy_worker_domain} onChange={(e) => set("cfproxy_worker_domain", e.target.value)} /></Field>
-        </div>
-        <div className="mt-2 flex items-center gap-2.5"><Button variant="primary" onClick={save}>Сохранить настройки</Button><span className="text-xs text-muted">при включённом прокси сохранение перезапустит его</span></div>
-      </Card>
-
-      <Card title="Статистика" sub="обновляется, пока открыта вкладка">
-        <table className={tableCls}>
-          <tbody>
-            <StatRow l="Соединения" v={cc.total} />
-            <StatRow l="Активные" v={cc.active} />
-            <StatRow l="WS / TCP-fallback / CF" v={`${cc.ws} / ${cc.tcp_fallback} / ${cc.cfproxy}`} />
-            <StatRow l="Медиа через HTTP/2 · TCP-соединения" v={`${cc.h2 ?? 0} · ${live.stats.h2?.tcp_connections ?? 0}`} />
-            <StatRow l="HTTP/2 запросы / повторы / ошибки" v={`${live.stats.h2?.requests ?? 0} / ${live.stats.h2?.replays ?? 0} / ${live.stats.h2?.errors ?? 0}`} />
-            <StatRow l="Отклонено (плохой секрет) / маскировка" v={`${cc.bad} / ${cc.masked}`} />
-            <StatRow l="Трафик ↑ / ↓" v={`${t.human_up || "0.0B"} / ${t.human_down || "0.0B"}`} />
-            <StatRow l="Пул (попаданий/всего) · ошибки WS" v={`${w.pool_hits}/${w.pool_hits + w.pool_misses} · ${w.errors}`} />
-            <StatRow l="Пул CF Worker (попаданий/всего)" v={`${w.cf_pool_hits ?? 0}/${(w.cf_pool_hits ?? 0) + (w.cf_pool_misses ?? 0)}`} />
-            <StatRow l="Соединения через резервный SNI" v={cc.fronting ?? 0} />
-          </tbody>
-        </table>
-      </Card>
-    </>
-  );
+  if (!form || !live) return <div className="flex min-w-0 flex-col gap-4"><PageHeader title="Telegram MTProto" description="Прокси на роутере с резервными путями подключения." /><Card className={compactCard}><span role="status" className="text-xs text-muted">Загрузка…</span></Card></div>;
+  return <MtProtoContent live={live} form={form} set={set} onToggle={toggle} onSave={save} onNewSecret={newSecret} onCopy={copy} fallback={<AwgFallback />} />;
 }

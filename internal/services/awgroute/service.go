@@ -36,6 +36,9 @@ type Service struct {
 	// connection references remain available for explicit reassignment/export.
 	pendingRules   []awg.Zone
 	connectionRefs map[string]AWG2ConnectionRef
+	// recoverySettings applies to every local tunnel, independently of the
+	// connection selected for editing and of the router's routing policy.
+	recoverySettings *RecoverySettings
 	// routingDNSGate prevents replies from crossing a partially replaced policy.
 	// Its lifecycle is owned by the OS routing apply and the DNS observer.
 	routingDNSGate        routingDNSGate

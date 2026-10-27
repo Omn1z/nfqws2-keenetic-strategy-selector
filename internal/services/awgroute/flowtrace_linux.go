@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"nfqws2strategy/internal/services/awg"
 	"nfqws2strategy/internal/tools/logbuf"
 	"nfqws2strategy/internal/tools/netmon"
 )
@@ -162,8 +163,17 @@ func (svc *Service) awgFlowTraceRules() []awgFlowTraceRule {
 	for _, srv := range svc.serverSnapshot() {
 		servers[srv.ID] = srv
 	}
+	routingEnabled := svc.connectionRoutingEligibility()
+	connected, known := map[string]bool{}, map[string]bool{}
+	isConnected := func(id string) bool {
+		if !known[id] {
+			connected[id] = svc.tunnelUpForManagedServer(servers[id])
+			known[id] = true
+		}
+		return connected[id]
+	}
 	out := []awgFlowTraceRule{}
-	for i, z := range svc.awgRoutingRules() {
+	for i, z := range svc.awgPolicyRoutingRules() {
 		if !z.Enabled || z.WaitingForConnection {
 			continue
 		}
@@ -171,18 +181,30 @@ func (svc *Service) awgFlowTraceRules() []awgFlowTraceRule {
 		if srv == nil {
 			continue
 		}
-		cfg := srv.Manager.Config()
-		if !cfg.Enabled || cfg.Routing.Mode == "off" || !cfg.Routing.Active {
-			continue
-		}
 		route := z.RouteValue()
 		if route != "tunnel" && route != "direct" {
 			continue
 		}
 		tunnelIface := ""
+		tunnelID := strings.TrimSpace(z.TunnelID)
 		if route == "tunnel" {
-			tunnelIface = awgClientIfaceName(cfg)
-			if tunnelIface == "" {
+			// Use the same ordered rule/connection reserves as the datapath.
+			// The rule still belongs to its logical primary, while a flow names
+			// the physical interface currently selected for that rule.
+			tunnelID = selectFallbackTunnelID(tunnelID, svc.connectionFallbackTunnelIDs(tunnelID, z.FallbackTunnelIDs),
+				func(id string) bool { return routingEnabled[id] }, isConnected)
+			selected := servers[tunnelID]
+			if selected == nil {
+				continue
+			}
+			identity := selected.Manager.RuntimeLocalClientIdentity()
+			if strings.TrimSpace(identity.Endpoint) == "" {
+				continue
+			}
+			tunnelIface = awgClientIfaceName(awg.ServerConfig{ClientIface: identity.ClientIface})
+		} else {
+			identity := srv.Manager.RuntimeLocalClientIdentity()
+			if !identity.Enabled || !identity.ClientEnabled || identity.RoutingMode == "off" || !identity.RoutingActive {
 				continue
 			}
 		}
@@ -197,7 +219,7 @@ func (svc *Service) awgFlowTraceRules() []awgFlowTraceRule {
 			name:        z.Name,
 			route:       route,
 			rule:        i + 1,
-			tunnelID:    z.TunnelID,
+			tunnelID:    tunnelID,
 			tunnelIface: tunnelIface,
 			sources:     append([]string(nil), z.SourceIPs...),
 			prefixes:    prefixes,

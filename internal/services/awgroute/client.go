@@ -31,20 +31,21 @@ type EngineInfo struct {
 
 // ClientStatus is one local awgN tunnel state (from the userspace UAPI socket).
 type ClientStatus struct {
-	Running       bool   `json:"running"`
-	IfacePresent  bool   `json:"iface_present"`
-	LastHandshake int64  `json:"last_handshake"`
-	RxBytes       int64  `json:"rx_bytes"`
-	TxBytes       int64  `json:"tx_bytes"`
-	Endpoint      string `json:"endpoint"`
-	Address       string `json:"address"`
-	MTU           int    `json:"mtu"`
-	Connected     bool   `json:"connected"` // handshake within ~180s
-	Error         string `json:"error,omitempty"`
-	Recovering    bool   `json:"recovering"`
-	RetryAt       int64  `json:"retry_at"`
-	RetryCount    int    `json:"retry_count"`
-	RecoveryError string `json:"recovery_error,omitempty"`
+	Running           bool   `json:"running"`
+	IfacePresent      bool   `json:"iface_present"`
+	LastHandshake     int64  `json:"last_handshake"`
+	RxBytes           int64  `json:"rx_bytes"`
+	TxBytes           int64  `json:"tx_bytes"`
+	Endpoint          string `json:"endpoint"`
+	Address           string `json:"address"`
+	MTU               int    `json:"mtu"`
+	Connected         bool   `json:"connected"` // handshake within ~180s
+	Error             string `json:"error,omitempty"`
+	Recovering        bool   `json:"recovering"`
+	VerificationUntil int64  `json:"verification_until,omitempty"`
+	RetryAt           int64  `json:"retry_at"`
+	RetryCount        int    `json:"retry_count"`
+	RecoveryError     string `json:"recovery_error,omitempty"`
 }
 
 // AWGConn is one AWG2 tunnel's live state, shaped for the dashboard (state +
@@ -306,19 +307,16 @@ func (svc *Service) TunnelUp() bool {
 }
 
 func (svc *Service) tunnelUpForManagedServer(srv *managedServer) bool {
-	if srv == nil || !srv.Manager.Enabled() || !srv.Manager.ClientEnabled() {
+	if srv == nil || !svc.clientShouldRun(srv.Manager) {
 		return false
 	}
-	cs := svc.awgClientStatusManagerOS(srv.Manager)
+	cs := svc.clientLifecycleDriver().status(srv.Manager)
 	return cs != nil && cs.Connected
 }
 
 func (svc *Service) TunnelUpForServer(id string) bool {
 	id = strings.TrimSpace(id)
-	svc.mu.RLock()
-	srv := svc.servers[id]
-	svc.mu.RUnlock()
-	return svc.tunnelUpForManagedServer(srv)
+	return svc.effectiveConnectedServer(id) != nil
 }
 
 // ServerInfo describes one selectable AWG2 server for the Telegram-proxy fallback
@@ -409,10 +407,8 @@ func (svc *Service) FallbackIface(sel string) string {
 		}
 		return ""
 	default:
-		svc.mu.RLock()
-		srv := svc.servers[strings.TrimSpace(sel)]
-		svc.mu.RUnlock()
-		if !svc.tunnelUpForManagedServer(srv) {
+		srv := svc.effectiveConnectedServer(strings.TrimSpace(sel))
+		if srv == nil {
 			return ""
 		}
 		return awgClientIfaceName(srv.Manager.RuntimeConfig())

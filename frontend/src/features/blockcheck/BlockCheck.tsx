@@ -9,11 +9,57 @@ import { toast } from "@/components/ui/Toast";
 import { Card } from "@/components/ui/Card";
 import { Button } from "@/components/ui/Button";
 import { VerdictBadge } from "@/components/ui/Badge";
-import { Field, Input } from "@/components/ui/form";
+import { Field, Input, Select } from "@/components/ui/form";
+import { PageHeader, StatsStrip, compactCard } from "@/components/ui/FeaturePage";
 import { Args, EmptyRow, TableWrap, tableCls, tdCls, thBase } from "@/components/ui/Table";
 import { SourceSelector } from "@/components/SourceSelector";
 import type { SourceSelectorHandle } from "@/components/SourceSelector";
-import type { BlockCheck as BC, TargetSource } from "@/types/api";
+import type { BlockCheck as BC, TargetCheck, TargetSource } from "@/types/api";
+import { blockCheckCounts, visibleBlockCheckTargets, type CheckFilter } from "./presentation";
+
+export function BlockCheckSummary({ check }: { check: BC | null }) {
+  const counts = blockCheckCounts(check?.targets ?? []);
+  const status = { running: "В работе", done: "Завершена", cancelled: "Отменена", error: "Ошибка" };
+  return <StatsStrip label="Сводка проверки" items={[
+    { label: "Статус проверки", value: check ? status[check.status] : "Готов", hint: "Проверка без обхода", tone: check?.status === "error" ? "bad" : "neutral" },
+    { label: "Проверено целей", value: check ? `${check.done} / ${check.total}` : "—", hint: check?.total ? `${Math.round(check.done * 100 / check.total)}% завершено` : "Ожидание запуска" },
+    { label: "Заблокировано", value: check ? counts.blocked : "—", hint: "По результатам проверки", tone: counts.blocked ? "bad" : "neutral" },
+    { label: "Доступно напрямую", value: check ? counts.available : "—", hint: "Подтверждён ответ OK", tone: counts.available ? "ok" : "neutral" },
+    { label: "Не определено", value: check ? counts.undetermined : "—", hint: `Локальные ошибки: ${counts.localErrors}`, tone: counts.undetermined ? "warn" : "neutral" },
+  ]} />;
+}
+
+export function BlockCheckResults({ targets, query, filter, onQuery, onFilter, running, hasCheck }: {
+  targets: TargetCheck[]; query: string; filter: CheckFilter;
+  onQuery: (query: string) => void; onFilter: (filter: CheckFilter) => void;
+  running: boolean; hasCheck: boolean;
+}) {
+  const visible = visibleBlockCheckTargets(targets, query, filter);
+  return <Card title="Результаты проверки" sub="заблокированные сверху" className={compactCard}>
+    <div className="mb-3 flex flex-wrap items-center gap-2">
+      <Input aria-label="Поиск результатов BlockCheck" value={query} onChange={event => onQuery(event.target.value)} placeholder="Цель / код / ошибка" className="min-w-0 flex-1 sm:min-w-48" />
+      <Select aria-label="Фильтр результатов BlockCheck" value={filter} onChange={event => onFilter(event.target.value as CheckFilter)} className="w-full sm:w-auto">
+        <option value="all">Все результаты</option><option value="blocked">Блокировки</option><option value="ok">Доступные</option><option value="local_error">Локальные ошибки</option>
+      </Select>
+      <span className="text-xs tabular-nums text-muted">{visible.length} / {targets.length}</span>
+    </div>
+    <TableWrap>
+      <table className={cn(tableCls, "min-w-[560px]")}>
+        <thead><tr><th className={thBase}>Цель</th><th className={thBase}>Статус</th><th className={thBase}>Задержка</th><th className={thBase}>Скорость</th><th className={thBase}>Код</th></tr></thead>
+        <tbody>
+          {visible.length === 0 && <EmptyRow colSpan={5}>{targets.length ? "Нет целей под выбранный фильтр." : running ? "Ожидаем первые результаты проверки…" : hasCheck ? "Результатов пока нет." : "Запустите проверку."}</EmptyRow>}
+          {visible.map((target, index) => <tr key={target.host + index} className="hover:bg-line-soft">
+            <td className={cn(tdCls, "min-w-[150px] max-w-[260px] [overflow-wrap:anywhere]")}>{target.host}</td>
+            <td className={tdCls}><VerdictBadge v={target.verdict} />{target.err && <Args>{target.err}</Args>}</td>
+            <td className={cn(tdCls, "whitespace-nowrap tabular-nums")}>{target.ttfb_ms ? `${target.ttfb_ms} мс` : "—"}</td>
+            <td className={cn(tdCls, "whitespace-nowrap tabular-nums")}>{target.speed_bps ? `${kb(target.speed_bps)} КБ/с` : "—"}</td>
+            <td className={cn(tdCls, "tabular-nums")}>{target.code || "—"}</td>
+          </tr>)}
+        </tbody>
+      </table>
+    </TableWrap>
+  </Card>;
+}
 
 export default function BlockCheck() {
   const { lists, geo } = useStore();
@@ -21,6 +67,8 @@ export default function BlockCheck() {
   const [threads, setThreads] = useState("4");
   const [bc, setBc] = useState<BC | null>(null);
   const [running, setRunning] = useState(false);
+  const [query, setQuery] = useState("");
+  const [filter, setFilter] = useState<CheckFilter>("all");
 
   usePoll(async () => {
     if (!bc) return;
@@ -50,45 +98,27 @@ export default function BlockCheck() {
   const pct = bc?.total ? Math.round((bc.done * 100) / bc.total) : 0;
 
   return (
-    <>
-      <Card title="BlockCheck" sub="проверка блокировки без обхода">
-        <p className="mb-3 text-xs text-muted">Проверяет доступность доменов/IP напрямую: тестовое соединение исключается из основного сервиса nfqws2 и не обходится — видно, что реально блокирует провайдер (RST, таймаут, обрыв на ~16 КБ).</p>
-        <SourceSelector ref={srcRef} lists={lists} geo={geo} />
-        <div className="mb-1.5 flex flex-wrap items-end gap-4">
-          <Field label="Потоков" className="w-28 shrink-0"><Input type="number" min={1} max={8} value={threads} onChange={(e) => setThreads(e.target.value)} /></Field>
-        </div>
-        <div className="mt-3 flex flex-wrap items-center gap-2.5">
+    <div className="flex min-w-0 flex-col gap-4">
+      <PageHeader title="BlockCheck" description="Проверка доступности доменов и IP напрямую, без обхода." actions={<>
           <Button variant="primary" onClick={start} disabled={running}>▶ Проверить</Button>
           {running && <Button variant="danger" onClick={cancel}>■ Отменить</Button>}
-          {bc && <span className="text-xs text-muted">{bc.status}</span>}
+      </>} />
+      <BlockCheckSummary check={bc} />
+      <Card title="Параметры проверки" className={compactCard}>
+        <p className="mb-4 text-xs leading-relaxed text-ink-soft">Проверяет доступность доменов/IP напрямую: тестовое соединение исключается из основного сервиса nfqws2 и не обходится — видно, что реально блокирует провайдер (RST, таймаут, обрыв на ~16 КБ).</p>
+        <div className="grid items-end gap-4 sm:grid-cols-[minmax(0,1fr)_112px]">
+          <section aria-label="Цели проверки" className="min-w-0"><h3 className="mb-3 text-xs font-medium">Источник целей</h3><SourceSelector ref={srcRef} lists={lists} geo={geo} /></section>
+          <Field label="Потоков" hint="1–8"><Input type="number" min={1} max={8} value={threads} onChange={(e) => setThreads(e.target.value)} /></Field>
         </div>
-        {bc?.error && <p role="alert" className="mt-2 text-xs text-bad">{bc.error}</p>}
+        {bc?.error && <p role="alert" className="mt-2 text-xs text-bad [overflow-wrap:anywhere]">{bc.error}</p>}
         {running && bc && (
           <div className="mt-2">
             <div className="h-2 overflow-hidden rounded-full bg-line"><div className="h-full rounded-full bg-accent transition-[width]" style={{ width: `${pct}%` }} /></div>
-            <span className="text-xs text-muted">{bc.done}/{bc.total} целей · {bc.status}</span>
+            <span className="text-xs text-muted">{bc.done}/{bc.total} целей · {bc.threads} потоков · {bc.status}</span>
           </div>
         )}
       </Card>
-      <Card title="Результаты проверки" sub="заблокированные сверху">
-        <TableWrap>
-          <table className={tableCls}>
-            <thead><tr><th className={thBase}>Цель</th><th className={thBase}>Статус</th><th className={thBase}>Задержка</th><th className={thBase}>Скорость</th><th className={thBase}>Код</th></tr></thead>
-            <tbody>
-              {targets.length === 0 && <EmptyRow colSpan={5}>Запустите проверку.</EmptyRow>}
-              {[...targets].sort((a, b) => Number(b.blocked) - Number(a.blocked)).map((t, i) => (
-                <tr key={t.host + i} className="hover:bg-line-soft">
-                  <td className={tdCls}>{t.host}</td>
-                  <td className={tdCls}><VerdictBadge v={t.verdict} />{t.err && <Args>{t.err}</Args>}</td>
-                  <td className={cn(tdCls, "tabular-nums")}>{t.ttfb_ms ? `${t.ttfb_ms} мс` : "—"}</td>
-                  <td className={cn(tdCls, "tabular-nums")}>{t.speed_bps ? `${kb(t.speed_bps)} КБ/с` : "—"}</td>
-                  <td className={cn(tdCls, "tabular-nums")}>{t.code || "—"}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </TableWrap>
-      </Card>
-    </>
+      <BlockCheckResults targets={targets} query={query} filter={filter} onQuery={setQuery} onFilter={setFilter} running={running} hasCheck={!!bc} />
+    </div>
   );
 }

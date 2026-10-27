@@ -49,6 +49,7 @@ func TestPublicConnectionIdentityDoesNotAllocateForLargeRoutingLists(t *testing.
 func TestRuntimeLocalClientIdentityUsesCommittedEndpointAndDesiredLocalFlags(t *testing.T) {
 	cfg := Default()
 	cfg.Enabled, cfg.Client.Enabled = true, true
+	cfg.Conn.Host = "desired.example"
 	cfg.Endpoint, cfg.ClientIface = "desired.example:443", "awg2"
 	cfg.PrivateKey, cfg.Conn.Password = "private-secret", "password-secret"
 	cfg.Routing.Zones = []Zone{{Domains: make([]string, 10000)}}
@@ -63,7 +64,7 @@ func TestRuntimeLocalClientIdentityUsesCommittedEndpointAndDesiredLocalFlags(t *
 		t.Fatal("local DNS identity ignored committed endpoint or desired local controls")
 	}
 	encoded, err := json.Marshal(got)
-	if err != nil || strings.Contains(string(encoded), "secret") || strings.Contains(string(encoded), "Routing") || strings.Contains(string(encoded), "Peers") {
+	if err != nil || strings.Contains(string(encoded), "secret") || strings.Contains(string(encoded), "Zones") || strings.Contains(string(encoded), "Peers") || strings.Contains(string(encoded), "Credentials") {
 		t.Fatal("local DNS identity exposed unrelated or secret state")
 	}
 	got.Endpoint = "mutated.example:1"
@@ -72,5 +73,22 @@ func TestRuntimeLocalClientIdentityUsesCommittedEndpointAndDesiredLocalFlags(t *
 	}
 	if allocations := testing.AllocsPerRun(100, func() { got = manager.RuntimeLocalClientIdentity() }); allocations != 0 {
 		t.Fatal("DNS client identity cloned a large routing config")
+	}
+	next := manager.Config()
+	next.Client.Standby, next.Client.FallbackTunnelIDs = true, []string{"backup"}
+	next.Routing.Mode, next.Routing.Active = "full", true
+	if err := manager.SetConfig(&next); err != nil {
+		t.Fatal(err)
+	}
+	got = manager.RuntimeLocalClientIdentity()
+	if !got.Standby || len(got.FallbackTunnelIDs) != 1 || got.FallbackTunnelIDs[0] != "backup" || got.RoutingMode != "full" || !got.RoutingActive || got.Endpoint != "committed.example:443" {
+		t.Fatal("pending deployment hid desired local failover policy")
+	}
+	got.FallbackTunnelIDs[0] = "mutated"
+	if manager.RuntimeLocalClientIdentity().FallbackTunnelIDs[0] != "backup" {
+		t.Fatal("local policy identity exposed mutable backup references")
+	}
+	if allocations := testing.AllocsPerRun(100, func() { got = manager.RuntimeLocalClientIdentity() }); allocations > 1 {
+		t.Fatal("DNS identity copied more than the small backup ID list")
 	}
 }

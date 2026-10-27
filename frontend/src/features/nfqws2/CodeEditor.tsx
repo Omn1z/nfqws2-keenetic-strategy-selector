@@ -56,6 +56,7 @@ export function CodeEditor({ value, onChange, kind, label = "Редактор к
       syntaxHighlighting(editorHighlightStyle),
       ...(kind === "text" ? [] : [kind === "strategy" ? strategyLanguage : kind === "conf" ? configLanguage : StreamLanguage.define(lua)]),
       editable.current.of([EditorState.readOnly.of(readOnly), EditorView.editable.of(!readOnly)]),
+      EditorView.editorAttributes.of((view) => ({ "data-selection": view.state.selection.ranges.some((range) => !range.empty) ? "range" : "cursor" })),
       EditorView.contentAttributes.of({ "aria-label": label, spellcheck: "false", autocapitalize: "off", autocorrect: "off" }),
       keymap.of([{ key: "Mod-s", run: () => { callbacks.current.onSave?.(); return true; } }, ...closeBracketsKeymap, ...defaultKeymap, ...historyKeymap, ...searchKeymap, indentWithTab]),
       EditorView.updateListener.of((update) => { if (update.docChanged && !externalChange.current) callbacks.current.onChange(update.state.doc.toString()); }),

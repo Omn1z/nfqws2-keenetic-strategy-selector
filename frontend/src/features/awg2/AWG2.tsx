@@ -13,14 +13,17 @@ import { Modal } from "@/components/ui/Modal";
 import { Dropzone } from "@/components/ui/Dropzone";
 import { Field, Input, Select, Textarea } from "@/components/ui/form";
 import ServerPane from "./ServerPane";
+import FailoverPane, { ConnectionFailoverBadge } from "./FailoverPane";
+import GeneralPane from "./GeneralPane";
+import RecoveryStatus from "./RecoveryStatus";
 import PeerShareModal from "./PeerShareModal";
 import RoutingPane from "./RoutingPane";
 import DevicesRoutingPane from "./DevicesRoutingPane";
 import TracePane from "./TracePane";
 import { SpeedTestPanel } from "./SpeedTestCard";
-import type { Awg2ServerSummary, Awg2Status, AwgClientStatus, AwgDeployResult, AwgRoutingConfig } from "@/types/api";
+import type { Awg2ServerSummary, Awg2Status, AwgDeployResult, AwgRoutingConfig } from "@/types/api";
 
-type Sub = "server" | "routing" | "devices" | "trace";
+type Sub = "server" | "general" | "routing" | "devices" | "trace";
 type DeployOpts = { quiet?: boolean; skipReload?: boolean };
 type NewConnectionMode = "import" | "warp" | "selfhosted";
 
@@ -65,23 +68,13 @@ function serverLine(srv: Awg2ServerSummary, deploying: boolean) {
 function tunnelLine(srv: Awg2ServerSummary) {
   const cl = srv.client;
   if (!srv.enabled) return { kind: "neutral" as const, label: "туннель выкл" };
+  if (srv.failover?.standby && !srv.failover.activated) return { kind: "neutral" as const, label: "резерв ожидает сбоя" };
   if (cl?.recovering) return { kind: "warn" as const, label: "переподключение" };
   if (srv.connected) return { kind: "ok" as const, label: "connected" };
   if (!srv.deployed && !srv.imported) return { kind: "neutral" as const, label: "черновик" };
   if (!cl?.running) return { kind: "neutral" as const, label: "туннель опущен" };
   if (cl.connected) return { kind: "ok" as const, label: "туннель connected" };
   return { kind: "warn" as const, label: "туннель поднят" };
-}
-
-function RecoveryStatus({ client }: { client: AwgClientStatus }) {
-  if (!client.recovering) return null;
-  const wait = Math.max(0, (client.retry_at || 0) - Math.floor(Date.now() / 1000));
-  return (
-    <div className="mt-2 text-[11.5px] text-warn" role="status">
-      <span><MiniSpinner /> Автовосстановление{client.retry_count ? ` · попыток: ${client.retry_count}` : ""}{wait > 0 ? ` · повтор через ${wait} с` : " · проверяем соединение"}</span>
-      {client.recovery_error && <div className="mt-0.5 [overflow-wrap:anywhere]">{client.recovery_error}</div>}
-    </div>
-  );
 }
 
 /** «Сервисы → AmneziaWG»: deploy a VPN server on a VPS over SSH, hand out
@@ -106,6 +99,8 @@ export default function AWG2() {
   const [creating, setCreating] = useState(false);
   const [formatBusy, setFormatBusy] = useState(false);
   const [serverBusy, setServerBusy] = useState(false);
+  const [failoverBusy, setFailoverBusy] = useState(false);
+  const [generalBusy, setGeneralBusy] = useState(false);
   const [routingBusy, setRoutingBusy] = useState(false);
   const [traceBusy, setTraceBusy] = useState(false);
   const traceTail = useRef<Promise<void>>(Promise.resolve());
@@ -128,7 +123,7 @@ export default function AWG2() {
   const [speedServer, setSpeedServer] = useState<Awg2ServerSummary | null>(null);
   const statusEpoch = useRef(0);
   const statusRequest = useRef(0);
-  const otherMutationBusy = creating || renaming || !!selectingID || !!deletingID || !!batch || formatBusy || serverBusy || routingBusy ||
+  const otherMutationBusy = creating || renaming || !!selectingID || !!deletingID || !!batch || formatBusy || serverBusy || failoverBusy || generalBusy || routingBusy ||
     Object.values(deploying).some(Boolean) || Object.values(toggling).some(Boolean);
   const mutationBusy = otherMutationBusy || traceBusy;
 
@@ -451,13 +446,15 @@ export default function AWG2() {
   const activeServer = servers.find((s) => s.id === st.active_server_id) ?? servers.find((s) => s.active);
   const connectedCount = servers.filter((s) => s.connected).length;
   const enabledCount = servers.filter((s) => s.enabled).length;
+  const waitingReserveCount = servers.filter((s) => s.enabled && s.failover?.standby && !s.failover.activated && !s.connected).length;
+  const activeTunnelCount = enabledCount - waitingReserveCount;
   const selectedIDs = servers.filter((s) => selected[s.id]).map((s) => s.id);
   const canDeploySelected = selectedIDs.some((id) => {
     const srv = servers.find((s) => s.id === id);
     return !!srv?.enabled && !srv.imported;
   });
-  const statusKind = connectedCount > 0 ? "ok" : enabledCount > 0 ? "warn" : "neutral";
-  const statusText = enabledCount > 0 ? `${connectedCount}/${enabledCount} туннелей connected` : "туннели выключены";
+  const statusKind = connectedCount > 0 ? "ok" : activeTunnelCount > 0 ? "warn" : "neutral";
+  const statusText = `${activeTunnelCount > 0 ? `${connectedCount}/${activeTunnelCount} активных туннелей` : enabledCount > 0 ? "Нет активных туннелей" : "туннели выключены"}${waitingReserveCount ? ` · резервов в ожидании: ${waitingReserveCount}` : ""}`;
   const newConnectionSubmitLabel =
     newMode === "import" ? "Добавить подключение" :
     newMode === "warp" ? "Создать WARP" :
@@ -568,6 +565,7 @@ export default function AWG2() {
                 <div className="mt-3 flex flex-wrap gap-1.5">
                   <Badge kind={sLine.kind}>{busy && <MiniSpinner />} {sLine.label}</Badge>
                   <Badge kind={tLine.kind}>{tLine.label}</Badge>
+                  <ConnectionFailoverBadge server={srv} servers={servers} />
                   <Badge kind="neutral">{srv.deployment_pending ? "Последний успешный: " : ""}{vpnProfileLabel(srv)}</Badge>
                   {srv.deployment_pending && <Badge kind="warn">изменения не развёрнуты</Badge>}
                   {!srv.is_warp && srv.protocol !== "wireguard" && srv.traffic_obfuscation === false && <Badge kind="neutral">обфускация выкл.</Badge>}
@@ -608,14 +606,19 @@ export default function AWG2() {
         </div>
       </Card>
 
-      <div className="mb-4 inline-flex overflow-hidden rounded-lg border border-line">
+      <div className="mb-4 inline-flex max-w-full flex-wrap overflow-hidden rounded-lg border border-line">
         {seg("server", "Сервер")}
+        {seg("general", "Общие")}
         {seg("routing", "Маршрутизация")}
         {seg("devices", "Устройства")}
         {seg("trace", "Трассировка")}
       </div>
 
+      <div hidden={sub !== "general"} className="space-y-4">
+        <GeneralPane settings={st.recovery_settings} acceptStatus={acceptStatus} onBusyChange={setGeneralBusy} externalBusy={mutationBusy} />
+      </div>
       <div hidden={sub !== "server"} className="space-y-4">
+        <FailoverPane key={st.active_server_id} st={st} reload={reload} acceptStatus={acceptStatus} onBusyChange={setFailoverBusy} externalBusy={mutationBusy} />
         <ServerPane st={st} reload={reload} acceptStatus={acceptStatus} deployActive={() => activeServer ? deployServer(activeServer.id) : Promise.resolve(false)} deploying={!!(activeServer && deploying[activeServer.id])} onFormatBusyChange={setFormatBusy} onBusyChange={setServerBusy} externalBusy={mutationBusy} onOpenEngineSettings={() => setSub("routing")} />
       </div>
       <div hidden={sub !== "routing"} className="space-y-4">

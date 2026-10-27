@@ -84,3 +84,12 @@ func TestMultiFirewallHookCanRedirectDNS(t *testing.T) {
 		}
 	}
 }
+
+func TestMultiPolicyLeavesExplicitProbeMarkUntouchedBeforeCatchAll(t *testing.T) {
+	doc := awgMultiPolicyDocument(nil, []awgMultiRule{{Tunnel: &awgMultiTunnel{Mark: awgMultiMark(1)}, CatchAll: true}})
+	bypass := strings.Index(doc, "-m mark --mark 0x20000000/0x20000000 -j RETURN")
+	mark := strings.Index(doc, "-j MARK")
+	if bypass < 0 || mark < 0 || bypass > mark {
+		t.Fatalf("explicit probe mark is changed by catch-all routing:\n%s", doc)
+	}
+}

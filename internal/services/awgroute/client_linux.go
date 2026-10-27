@@ -435,6 +435,10 @@ func (svc *Service) awgClientDownOS() error {
 }
 
 func (svc *Service) awgClientDownManagerOS(am *awg.Manager) error {
+	return svc.awgClientDownManagerContextOS(svc.clientOpContext(), am)
+}
+
+func (svc *Service) awgClientDownManagerContextOS(parent context.Context, am *awg.Manager) error {
 	if am == nil {
 		return fmt.Errorf("AWG2-server is not selected")
 	}
@@ -444,11 +448,15 @@ func (svc *Service) awgClientDownManagerOS(am *awg.Manager) error {
 		"ip link del " + iface + " 2>/dev/null || true",
 		"pkill -f '(^|/)amneziawg-go " + iface + "$' 2>/dev/null || true",
 		"rm -f " + awgSockPath(iface) + " 2>/dev/null || true",
+		"if ip link show " + iface + " >/dev/null 2>&1; then echo 'interface remains after teardown' >&2; exit 1; fi",
 		"echo down",
 	}, "\n")
-	ctx, cancel := context.WithTimeout(svc.clientOpContext(), 15*time.Second)
+	ctx, cancel := context.WithTimeout(parent, 15*time.Second)
 	defer cancel()
-	out, _ := exec.CommandContext(ctx, "sh", "-c", script).CombinedOutput()
+	out, err := exec.CommandContext(ctx, "sh", "-c", script).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("отключение %s: %w: %s", iface, err, strs.LastLines(strings.TrimSpace(string(out)), 2))
+	}
 	logbuf.Append("awg2", "info", "туннель "+iface+" опущен: "+strs.LastLines(strings.TrimSpace(string(out)), 2))
 	return nil
 }

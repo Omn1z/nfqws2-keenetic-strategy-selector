@@ -16,8 +16,9 @@ import { Pager, pageSlice } from "@/components/ui/Pager";
 import { Args, EmptyRow, SortTh, TableWrap, nextSort, tableCls, tdCls, thBase } from "@/components/ui/Table";
 import type { Sort } from "@/components/ui/Table";
 import { SourceSelector } from "@/components/SourceSelector";
+import { PageHeader, StatsStrip, compactCard } from "@/components/ui/FeaturePage";
 import type { SourceSelectorHandle } from "@/components/SourceSelector";
-import type { RunRequest, StrategyResult, TargetSource } from "@/types/api";
+import type { Run, RunRequest, StrategyResult, TargetSource } from "@/types/api";
 
 const sortVal = (r: StrategyResult, k: string): string | number => {
   switch (k) {
@@ -41,13 +42,13 @@ const FILTERS: Record<string, (r: StrategyResult) => boolean> = {
 };
 
 // Live run log built from results (chronological completion order), errors in red.
-function RunLog({ results, status, done, total }: { results: StrategyResult[]; status: string; done: number; total: number }) {
+export function RunLog({ results, status, done, total }: { results: StrategyResult[]; status: string; done: number; total: number }) {
   const ref = useRef<HTMLDivElement>(null);
   useEffect(() => { if (ref.current) ref.current.scrollTop = ref.current.scrollHeight; }, [results.length]);
   return (
     <div className="flex h-full flex-col">
-      <div className="mb-2 text-xs text-ink-soft">статус <b>{status}</b> · {done}/{total}</div>
-      <div ref={ref} className="max-h-[420px] min-h-[120px] flex-1 overflow-auto rounded-lg border border-line bg-input p-2.5 font-mono text-[11.5px] leading-relaxed">
+      <div className="mb-2 text-xs text-ink-soft">Статус <b>{status}</b> · {done}/{total}</div>
+      <div ref={ref} className="max-h-[520px] min-h-[220px] flex-1 overflow-auto rounded-lg border border-line bg-input p-3 font-mono text-[11.5px] leading-relaxed">
         {results.length === 0 && <div className="text-muted">Лог появится по мере прогона…</div>}
         {results.map((r, i) => {
           const cls = r.error ? "text-bad" : r.success ? "text-ok" : "text-ink-soft";
@@ -68,6 +69,37 @@ function RunLog({ results, status, done, total }: { results: StrategyResult[]; s
       </div>
     </div>
   );
+}
+
+export function RunSummary({ run, threads }: { run: Run | null; threads: string }) {
+  const results = run?.results ?? [];
+  const found = results.filter(result => result.success).length;
+  const errors = results.filter(result => result.error).length;
+  const best = results.reduce((value, result) => result.success && Number.isFinite(result.coefficient) ? Math.max(value, result.coefficient) : value, 0);
+  const status = { running: "В работе", done: "Завершён", cancelled: "Отменён", error: "Ошибка" };
+  return <StatsStrip label="Сводка прогона" items={[
+    { label: "Статус прогона", value: run ? status[run.status] : "Готов", hint: run ? run.list_name || "Выбранные цели" : "Ожидание запуска", tone: run?.status === "error" ? "bad" : "neutral" },
+    { label: "Параллельность", value: run?.threads ?? (threads || "—"), hint: run ? "Потоков в этом прогоне" : "Потоков для нового прогона" },
+    { label: "Прогресс", value: run ? `${run.done} / ${run.total}` : "—", hint: run?.total ? `${Math.round(run.done * 100 / run.total)}% проверено` : "Проверено / всего" },
+    { label: "Рабочих решений", value: run ? found : "—", hint: `С ошибкой: ${errors}`, tone: found ? "ok" : "neutral" },
+    { label: "Лучший коэффициент", value: best > 0 ? Math.round(best) : "—", hint: "Среди успешных результатов" },
+  ]} />;
+}
+
+export function RunResultRow({ result: r }: { result: StrategyResult }) {
+  return <tr className="hover:bg-line-soft">
+    <td className={tdCls}>{r.error ? <Badge kind="bad">ошибка</Badge> : r.success ? <Badge kind="ok">OK</Badge> : <Badge kind="bad">нет</Badge>}</td>
+    <td className={cn(tdCls, "min-w-[260px] max-w-[440px] [overflow-wrap:anywhere]")}>{r.name || r.strategy_id}<Args>{r.args}</Args>{r.error && <p className="mt-1 text-xs text-bad [overflow-wrap:anywhere]">{r.error}</p>}</td>
+    <td className={tdCls}><DnsBadge name={r.dns} id={r.dns_id} /></td>
+    <td className={cn(tdCls, "whitespace-nowrap tabular-nums")}>{r.targets_ok}/{r.targets_total}</td>
+    <td className={cn(tdCls, "whitespace-nowrap tabular-nums")}>{r.avg_ttfb_ms ? `${r.avg_ttfb_ms} мс` : "—"}</td>
+    <td className={cn(tdCls, "whitespace-nowrap tabular-nums")}>{r.avg_speed_bps ? `${kb(r.avg_speed_bps)} КБ/с` : "—"}</td>
+    <td className={cn(tdCls, "tabular-nums")}>{r.coefficient ? Math.round(r.coefficient) : "—"}</td>
+    <td className={tdCls}><div className="flex flex-wrap gap-1.5">
+      {r.success && <Button mini onClick={() => applyStrategyToConfig(r.args)}>Применить</Button>}
+      <Button mini title="Экспорт (ZIP)" onClick={() => exportStrategy(r.name || r.strategy_id, r.l7 || "", r.args).catch((e) => toast((e as Error).message, "err"))}>⤓ ZIP</Button>
+    </div></td>
+  </tr>;
 }
 
 export default function Runs() {
@@ -114,28 +146,27 @@ export default function Runs() {
   const baseSummary = summarizeTargetChecks(base);
 
   return (
-    <>
-      <div className="flex flex-col gap-4 lg:flex-row lg:items-start">
-        <div className="min-w-0 flex-1">
-          <Card title="Прогон стратегий" sub="подбор рабочих стратегий обхода">
-            <SourceSelector ref={srcRef} lists={lists} geo={geo} initialText={initialText} />
-            <div className="mb-1.5 flex flex-wrap items-end gap-4">
-              <Field label="Потоков" className="w-28 shrink-0"><Input type="number" min={1} max={8} value={threads} onChange={(e) => setThreads(e.target.value)} /></Field>
-              <div className="flex h-[38px] items-center"><Switch checked={auto} onChange={setAuto} label="Автоподбор" /></div>
+    <div className="flex min-w-0 flex-col gap-4">
+      <PageHeader title="Прогоны стратегий" description="Подбор рабочих стратегий обхода по выбранным доменам и IP." actions={<>
+        <Button variant="primary" onClick={start} disabled={running}>▶ Запустить прогон</Button>
+        {running && <Button variant="danger" onClick={cancelRun}>■ Отменить</Button>}
+        {running && <Button onClick={addRunThread} disabled={(run?.threads ?? 0) >= 8}>+ поток</Button>}
+      </>} />
+      <RunSummary run={run} threads={threads} />
+      {run?.error && <p role="alert" className="rounded-lg border border-line p-3 text-xs text-bad [overflow-wrap:anywhere]">{run.error}</p>}
+      <div className="grid items-start gap-4 xl:grid-cols-[minmax(0,2fr)_minmax(300px,1fr)]">
+          <Card title="Параметры прогона" className={compactCard} head={<Switch checked={auto} onChange={setAuto} label="Автоподбор" />}>
+            <section aria-label="Цели прогона" className="mb-4 border-b border-line pb-4"><h3 className="mb-3 text-xs font-medium">Источник целей</h3><SourceSelector ref={srcRef} lists={lists} geo={geo} initialText={initialText} /></section>
+            <div className="mb-4 flex flex-wrap items-end gap-3">
+              <Field label="Потоков" className="w-28 shrink-0"><Input type="number" min={1} max={8} value={threads} onChange={(e) => setThreads(e.target.value)} /></Field><p className="pb-2 text-xs text-muted">От 1 до 8 параллельных проверок.</p>
             </div>
-            <div className="flex flex-wrap items-start gap-4">
-              <Checklist title="Стратегии" hint="пусто = все" items={stratItems} value={stratSel} onChange={setStratSel} disabled={auto} />
-              <Checklist title="Фейк-пейлоад (blob)" hint="по умолч. tls_clienthello" items={blobItems} value={blobSel} onChange={setBlobSel} />
-              <Checklist title="DNS" hint="каждый DNS — отдельный прогон" items={dnsItems} value={dnsSel} onChange={setDnsSel} />
+            <div className="grid items-start gap-3 sm:grid-cols-2 xl:grid-cols-3 [&>div]:min-w-0 [&_label>span]:[overflow-wrap:anywhere]">
+              <Checklist compact title="Стратегии" hint="пусто = все" items={stratItems} value={stratSel} onChange={setStratSel} disabled={auto} />
+              <Checklist compact title="Фейк-пейлоад (blob)" hint="по умолч. tls_clienthello" items={blobItems} value={blobSel} onChange={setBlobSel} />
+              <Checklist compact title="DNS" hint="каждый DNS — отдельный прогон" items={dnsItems} value={dnsSel} onChange={setDnsSel} />
             </div>
             <p className="mt-2 text-xs text-muted">Сначала прогоняются выбранные блобы (фейк <code>blob=</code>), затем — пейлоад по умолчанию. <code>--payload=tls_client_hello</code> — это L7-фильтр, а не сам пейлоад.</p>
             {auto && <p className="mt-2 text-xs text-muted">Автоподбор сам перебирает встроенный каталог кандидатов — выбор стратегий не используется.</p>}
-            <div className="mt-3 flex flex-wrap items-center gap-2.5">
-              <Button variant="primary" onClick={start} disabled={running}>▶ Запустить прогон</Button>
-              {running && <Button variant="danger" onClick={cancelRun}>■ Отменить</Button>}
-              {running && <Button mini onClick={addRunThread} disabled={(run?.threads ?? 0) >= 8}>+ поток</Button>}
-              {run && <span className="text-xs text-muted">{run.status}</span>}
-            </div>
             {running && run && (
               <div className="mt-2">
                 <div className="h-2 overflow-hidden rounded-full bg-line"><div className="h-full rounded-full bg-accent transition-[width]" style={{ width: `${pct}%` }} /></div>
@@ -143,23 +174,20 @@ export default function Runs() {
               </div>
             )}
           </Card>
-        </div>
-        {run && (
-          <div className="w-full shrink-0 lg:w-[360px]">
-            <Card title="Лог прогона" sub="ошибки и ход подбора">
-              <RunLog results={results} status={run.status} done={run.done} total={run.total} />
+            <Card title="Лог прогона" sub="ошибки и ход подбора" className={compactCard}>
+              <RunLog results={results} status={run?.status || "не запущен"} done={run?.done ?? 0} total={run?.total ?? 0} />
+              <p className="mt-2 text-[11px] text-muted">Лог дополняется по завершении проверок. Автопрокрутка включена.</p>
             </Card>
-          </div>
-        )}
       </div>
 
       <Card
         title="Результаты прогона"
         sub="клик по заголовку — сортировка"
+        className={compactCard}
         head={
           <div className="flex flex-wrap items-center gap-2">
-            <Input value={query} onChange={(e) => { setQuery(e.target.value); setPage(1); }} placeholder="Поиск по стратегии / args / DNS" className="h-8 w-full py-1 sm:w-56" />
-            <Select value={filterMode} onChange={(e) => { setFilterMode(e.target.value); setPage(1); }} className="w-auto">
+            <Input aria-label="Поиск результатов прогона" value={query} onChange={(e) => { setQuery(e.target.value); setPage(1); }} placeholder="Поиск по стратегии / args / DNS" className="h-8 w-full py-1 sm:w-56" />
+            <Select aria-label="Фильтр результатов по успешным целям" value={filterMode} onChange={(e) => { setFilterMode(e.target.value); setPage(1); }} className="w-auto">
               <option value="all">Все</option>
               <option value="one">≥1 цель пройдена</option>
               <option value="50">≥50% целей</option>
@@ -177,7 +205,7 @@ export default function Runs() {
           </div>
         )}
         <TableWrap scrollable>
-          <table className={tableCls}>
+          <table className={cn(tableCls, "min-w-[820px]")}>
             <thead><tr>
               <SortTh label="Статус" k="status" sort={sort} onSort={onSort} />
               <SortTh label="Стратегия" k="name" sort={sort} onSort={onSort} />
@@ -186,32 +214,18 @@ export default function Runs() {
               <SortTh label="Задержка" k="latency" sort={sort} onSort={onSort} />
               <SortTh label="Скорость" k="speed" sort={sort} onSort={onSort} />
               <SortTh label="Коэф." k="coef" sort={sort} onSort={onSort} />
-              <th className={thBase} />
+              <th className={thBase}>Действия</th>
             </tr></thead>
             <tbody>
               {sorted.length === 0 && <EmptyRow colSpan={8}>{results.length ? "Нет результатов под фильтр." : "Запустите прогон."}</EmptyRow>}
               {pageSlice(sorted, page, pageSize).map((r, i) => (
-                <tr key={(r.strategy_id || "") + (r.dns_id || "") + i} className="hover:bg-line-soft">
-                  <td className={tdCls}>{r.error ? <Badge kind="bad">ошибка</Badge> : r.success ? <Badge kind="ok">OK</Badge> : <Badge kind="bad">нет</Badge>}</td>
-                  <td className={tdCls}>{r.name || r.strategy_id}<Args>{r.args}</Args></td>
-                  <td className={tdCls}><DnsBadge name={r.dns} id={r.dns_id} /></td>
-                  <td className={cn(tdCls, "tabular-nums")}>{r.targets_ok}/{r.targets_total}</td>
-                  <td className={cn(tdCls, "tabular-nums")}>{r.avg_ttfb_ms ? `${r.avg_ttfb_ms} мс` : "—"}</td>
-                  <td className={cn(tdCls, "tabular-nums")}>{r.avg_speed_bps ? `${kb(r.avg_speed_bps)} КБ/с` : "—"}</td>
-                  <td className={cn(tdCls, "tabular-nums")}>{r.coefficient ? Math.round(r.coefficient) : "—"}</td>
-                  <td className={tdCls}>
-                    <div className="flex flex-wrap gap-1.5">
-                      {r.success && <Button mini onClick={() => applyStrategyToConfig(r.args)}>Применить</Button>}
-                      <Button mini title="Экспорт (ZIP)" onClick={() => exportStrategy(r.name || r.strategy_id, r.l7 || "", r.args).catch((e) => toast((e as Error).message, "err"))}>⤓</Button>
-                    </div>
-                  </td>
-                </tr>
+                <RunResultRow key={(r.strategy_id || "") + (r.dns_id || "") + i} result={r} />
               ))}
             </tbody>
           </table>
         </TableWrap>
         <Pager total={sorted.length} page={page} setPage={setPage} pageSize={pageSize} setPageSize={setPageSize} />
       </Card>
-    </>
+    </div>
   );
 }

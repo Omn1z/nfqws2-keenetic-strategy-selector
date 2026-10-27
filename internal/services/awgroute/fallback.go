@@ -81,18 +81,19 @@ func selectFallbackTunnelID(primary string, fallbacks []string, usable, connecte
 	return ""
 }
 
-// fallbackRoutingSignature describes the effective connection selected for
-// every fallback rule. The watchdog compares it every health pass, so a
-// disconnect or recovery triggers one policy rebuild instead of waiting for
-// the slower periodic policy refresh.
+// fallbackRoutingSignature describes both LAN rule targets and logical
+// connections used by DNS/proxies. The latter also exist with LAN routing off:
+// their Telegram front host routes still need updating when the peer changes.
 func (svc *Service) fallbackRoutingSignature() (string, bool) {
 	servers := make(map[string]*managedServer)
-	for _, srv := range svc.serverSnapshot() {
+	ordered := svc.serverSnapshot()
+	for _, srv := range ordered {
 		if srv != nil {
 			servers[srv.ID] = srv
 		}
 	}
 	connected := make(map[string]bool)
+	routingEnabled := svc.connectionRoutingEligibility()
 	known := make(map[string]bool)
 	isConnected := func(id string) bool {
 		if !known[id] {
@@ -106,20 +107,44 @@ func (svc *Service) fallbackRoutingSignature() (string, bool) {
 		if srv == nil {
 			return false
 		}
-		cfg := srv.Manager.RuntimeConfig()
-		return cfg.Enabled && cfg.Client.Enabled && cfg.Routing.Mode != "off" && cfg.Routing.Active
+		return routingEnabled[srv.ID]
 	}
 	var b strings.Builder
 	hasFallback := false
-	for i, z := range svc.awgRoutingRules() {
-		if !z.Enabled || z.WaitingForConnection || z.RouteValue() != "tunnel" || len(z.FallbackTunnelIDs) == 0 {
+	for i, z := range svc.awgPolicyRoutingRules() {
+		fallbacks := svc.connectionFallbackTunnelIDs(z.TunnelID, z.FallbackTunnelIDs)
+		if !z.Enabled || z.WaitingForConnection || z.RouteValue() != "tunnel" || len(fallbacks) == 0 {
 			continue
 		}
 		hasFallback = true
-		selected := selectFallbackTunnelID(z.TunnelID, z.FallbackTunnelIDs, usable, isConnected)
+		selected := selectFallbackTunnelID(z.TunnelID, fallbacks, usable, isConnected)
 		b.WriteString(strconv.Itoa(i))
 		b.WriteByte('=')
 		b.WriteString(selected)
+		b.WriteByte(';')
+	}
+	for _, srv := range ordered {
+		if srv == nil {
+			continue
+		}
+		identity := srv.Manager.RuntimeLocalClientIdentity()
+		if len(identity.FallbackTunnelIDs) == 0 {
+			continue
+		}
+		hasFallback = true
+		selected := ""
+		if identity.Enabled && identity.ClientEnabled {
+			for _, id := range fallbackCandidates(srv.ID, svc.connectionFallbackTunnelIDs(srv.ID, nil)) {
+				if isConnected(id) {
+					selected = id
+					break
+				}
+			}
+		}
+		b.WriteString("connection:")
+		b.WriteString(strconv.Quote(srv.ID))
+		b.WriteByte('=')
+		b.WriteString(strconv.Quote(selected))
 		b.WriteByte(';')
 	}
 	return b.String(), hasFallback
@@ -156,9 +181,9 @@ func (svc *Service) refreshFallbackRouting(signature string, hasFallback bool, a
 	if !ok {
 		return false
 	}
-	defer unlock()
 	err := apply()
 	if err != nil {
+		unlock()
 		logbuf.Append("awg2", "warn", "fallback-маршрутизация: "+err.Error())
 		return false
 	}
@@ -166,6 +191,14 @@ func (svc *Service) refreshFallbackRouting(signature string, hasFallback bool, a
 	// The next supervisor pass retries with cached policy preparation.
 	svc.clients.mu.Lock()
 	svc.clients.fallbackSignature = signature
+	hook := svc.clients.onRecovered
 	svc.clients.mu.Unlock()
+	// The selected reserve may have been healthy all along, so its recovery
+	// callback will never fire. Notify the app to move the Telegram /32 routes
+	// after the policy was installed, without holding lifecycle serialization.
+	unlock()
+	if hook != nil {
+		hook()
+	}
 	return true
 }

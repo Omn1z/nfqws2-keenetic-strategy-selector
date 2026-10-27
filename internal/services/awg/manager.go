@@ -88,6 +88,7 @@ type Status struct {
 
 func (c ServerConfig) clone() ServerConfig {
 	cp := c
+	cp.Client.FallbackTunnelIDs = append([]string{}, c.Client.FallbackTunnelIDs...)
 	if c.TrafficObfuscation != nil {
 		on := *c.TrafficObfuscation
 		cp.TrafficObfuscation = &on
@@ -102,6 +103,7 @@ func (c ServerConfig) clone() ServerConfig {
 		z.Domains = append([]string{}, z.Domains...)
 		z.IPs = append([]string{}, z.IPs...)
 		z.SourceIPs = append([]string{}, z.SourceIPs...)
+		z.FallbackTunnelIDs = append([]string{}, z.FallbackTunnelIDs...)
 		cp.Routing.Zones[i] = z
 	}
 	return cp
@@ -142,6 +144,11 @@ func (m *Manager) PublicConnectionIdentity() ConnectionIdentity {
 type LocalClientIdentity struct {
 	Enabled, ClientEnabled bool
 	Endpoint, ClientIface  string
+	Standby                bool
+	FallbackTunnelIDs      []string
+	CanStart               bool
+	RoutingMode            string
+	RoutingActive          bool
 }
 
 // RuntimeLocalClientIdentity is the small public subset needed by DNS route
@@ -150,10 +157,12 @@ func (m *Manager) RuntimeLocalClientIdentity() LocalClientIdentity {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	endpoint := m.cfg.Endpoint
+	wire := m.cfg
 	if m.applied != nil {
 		endpoint = m.applied.Endpoint
+		wire = m.applied
 	}
-	return LocalClientIdentity{Enabled: m.cfg.Enabled, ClientEnabled: m.cfg.Client.Enabled, Endpoint: endpoint, ClientIface: m.cfg.ClientIface}
+	return LocalClientIdentity{Enabled: m.cfg.Enabled, ClientEnabled: m.cfg.Client.Enabled, Endpoint: endpoint, ClientIface: m.cfg.ClientIface, Standby: m.cfg.Client.Standby, FallbackTunnelIDs: append([]string{}, m.cfg.Client.FallbackTunnelIDs...), CanStart: strings.TrimSpace(endpoint) != "" && (wire.Install == "imported" || wire.DeployedAt > 0), RoutingMode: m.cfg.Routing.Mode, RoutingActive: m.cfg.Routing.Active}
 }
 
 // SetAppliedConfig installs a last-successful deployment snapshot. The service
@@ -200,7 +209,7 @@ func (m *Manager) runtimeConfigLocked() ServerConfig {
 	}
 	cfg := m.applied.clone()
 	cfg.Enabled = desired.Enabled
-	cfg.Client.Enabled = desired.Client.Enabled
+	cfg.Client = desired.Client
 	cfg.ClientIface = desired.ClientIface
 	cfg.Routing = desired.Routing
 	return cfg

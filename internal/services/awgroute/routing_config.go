@@ -135,7 +135,7 @@ func (svc *Service) globalRoutingConfig(rules []awg.Zone) awg.RoutingConfig {
 		}
 		primary := strings.TrimSpace(z.TunnelID)
 		if z.RouteValue() == "tunnel" {
-			for _, id := range fallbackCandidates(primary, z.FallbackTunnelIDs) {
+			for _, id := range fallbackCandidates(primary, svc.connectionFallbackTunnelIDs(primary, z.FallbackTunnelIDs)) {
 				if usable[id] {
 					routing.Active = true
 					return routing

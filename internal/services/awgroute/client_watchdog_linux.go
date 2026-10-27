@@ -132,6 +132,12 @@ func (svc *Service) awgRestoreClientRoutesOS(am *awg.Manager) (restoreErr error)
 		}
 		return nil
 	}
+	return svc.awgRestoreMultiPolicyOS(rules, tunnels)
+}
+
+// Failover changes the selected tunnel while domain intent and learned sets
+// stay intact. Share recovery's in-place refresh instead of clearing all sets.
+func (svc *Service) awgRestoreMultiPolicyOS(rules []awgMultiRule, tunnels []awgMultiTunnel) (restoreErr error) {
 	wasReady := svc.RoutingDNSReadiness().Ready
 	finishDNS := svc.routingDNSGate.begin(false)
 	defer func() { finishDNS(restoreErr) }()

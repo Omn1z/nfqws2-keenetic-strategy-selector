@@ -36,8 +36,25 @@ func (svc *Service) awgApplyMultiHostRoutesOSErr() error {
 // Automatic fallback only changes the target connection, not domain intent.
 // The DNS learner installs newly observed addresses before replying to clients.
 func (svc *Service) awgApplyFallbackPolicyOSErr() error {
-	svc.awgClearLegacyHostRoutesOS()
-	return svc.awgApplyMultiPolicyCachedOS()
+	rules, tunnels := svc.awgBuildMultiPolicyCached()
+	if len(rules) == 0 || len(tunnels) == 0 {
+		return nil
+	}
+	return svc.awgRestoreMultiPolicyOS(rules, tunnels)
+}
+
+func (svc *Service) awgApplyConnectionFailoverPolicyOS() error {
+	if err := svc.awgApplyMultiHostRoutesOSErr(); err != nil {
+		return err
+	}
+	// Removing the final backup from legacy full mode removes its synthetic
+	// multi-rule too. Restore the existing blanket route after multi cleanup.
+	if len(svc.awgPolicyRoutingRules()) == 0 {
+		if owner := svc.legacyFullRoutingOwner(); owner != nil {
+			return svc.awgRestoreLegacyClientRoutesOS(owner.Manager)
+		}
+	}
+	return nil
 }
 
 func (svc *Service) awgApplyLegacyMultiHostRoutesOS() {

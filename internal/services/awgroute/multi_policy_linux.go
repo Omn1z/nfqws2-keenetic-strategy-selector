@@ -100,6 +100,7 @@ func (svc *Service) awgBuildMultiPolicyCached() ([]awgMultiRule, []awgMultiTunne
 }
 
 func (svc *Service) awgBuildMultiPolicyWithResolve(resolve bool) ([]awgMultiRule, []awgMultiTunnel) {
+	routingEnabled := svc.connectionRoutingEligibility()
 	lookup := svc.policyDNSLookup(false, nil)
 	discoverySeeds := svc.routingDiscoveryWarmupCandidates()
 	if resolve {
@@ -133,7 +134,7 @@ func (svc *Service) awgBuildMultiPolicyWithResolve(resolve bool) ([]awgMultiRule
 			return t
 		}
 		cfg := srv.Manager.RuntimeConfig()
-		if !cfg.Enabled || !cfg.Client.Enabled || cfg.Routing.Mode == "off" || !cfg.Routing.Active {
+		if !routingEnabled[srv.ID] {
 			return nil
 		}
 		iface := awgClientIfaceName(cfg)
@@ -183,15 +184,14 @@ func (svc *Service) awgBuildMultiPolicyWithResolve(resolve bool) ([]awgMultiRule
 		if srv == nil {
 			continue
 		}
-		cfg := srv.Manager.RuntimeConfig()
-		if !cfg.Enabled || !cfg.Client.Enabled || cfg.Routing.Mode == "off" || !cfg.Routing.Active {
+		if !routingEnabled[srv.ID] {
 			continue
 		}
 		_ = getTunnel(srv)
 	}
 
 	out := []awgMultiRule{}
-	for i, z := range svc.awgRoutingRules() {
+	for i, z := range svc.awgPolicyRoutingRules() {
 		if !z.Enabled || z.WaitingForConnection {
 			continue
 		}
@@ -204,15 +204,15 @@ func (svc *Service) awgBuildMultiPolicyWithResolve(resolve bool) ([]awgMultiRule
 		var tun *awgMultiTunnel
 		if route == "tunnel" {
 			selectedID := primaryID
-			if len(z.FallbackTunnelIDs) > 0 {
-				selectedID = selectFallbackTunnelID(primaryID, z.FallbackTunnelIDs,
+			fallbacks := svc.connectionFallbackTunnelIDs(primaryID, z.FallbackTunnelIDs)
+			if len(fallbacks) > 0 {
+				selectedID = selectFallbackTunnelID(primaryID, fallbacks,
 					func(id string) bool {
 						candidate := servers[id]
 						if candidate == nil {
 							return false
 						}
-						cfg := candidate.Manager.RuntimeConfig()
-						return cfg.Enabled && cfg.Client.Enabled && cfg.Routing.Mode != "off" && cfg.Routing.Active
+						return routingEnabled[candidate.ID]
 					},
 					func(id string) bool { return isConnected(servers[id]) },
 				)
@@ -435,6 +435,9 @@ func awgMultiPolicyDocument(tunnels []awgMultiTunnel, rules []awgMultiRule) stri
 	var doc strings.Builder
 	doc.WriteString("*mangle\n")
 	doc.WriteString(":" + awgMultiChain + " -\n")
+	// Explicit tunnel probes and speed tests own their socket's route mark.
+	// Catch-all user rules must not redirect them into a different connection.
+	doc.WriteString("-A " + awgMultiChain + " -m mark --mark 0x20000000/0x20000000 -j RETURN\n")
 	for _, ex := range awgExcludes {
 		doc.WriteString("-A " + awgMultiChain + " -d " + ex + " -j RETURN\n")
 	}
@@ -711,6 +714,7 @@ func (svc *Service) awgStopMultiPolicyRefresh() {
 }
 
 func (svc *Service) awgBuildMultiTunnelsOnly() []awgMultiTunnel {
+	routingEnabled := svc.connectionRoutingEligibility()
 	tunnelByID := map[string]*awgMultiTunnel{}
 	tunnelOrder := []string{}
 	// Keep every active interface in the same deterministic order as the full
@@ -721,7 +725,7 @@ func (svc *Service) awgBuildMultiTunnelsOnly() []awgMultiTunnel {
 			continue
 		}
 		cfg := srv.Manager.RuntimeConfig()
-		if !cfg.Enabled || !cfg.Client.Enabled || cfg.Routing.Mode == "off" || !cfg.Routing.Active {
+		if !routingEnabled[srv.ID] {
 			continue
 		}
 		if tunnelByID[srv.ID] != nil {

@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { api, downloadFile, uploadForm } from "@/lib/api";
 import { cn } from "@/lib/cn";
 import { usePoll } from "@/lib/hooks";
@@ -6,13 +6,17 @@ import { useStore } from "@/providers/StoreProvider";
 import { toast } from "@/components/ui/Toast";
 import { confirmDialog } from "@/components/ui/Confirm";
 import { Card } from "@/components/ui/Card";
+import { Badge } from "@/components/ui/Badge";
+import { PageHeader, StatsStrip, compactCard } from "@/components/ui/FeaturePage";
 import { Button } from "@/components/ui/Button";
 import { Modal } from "@/components/ui/Modal";
 import { Dropzone } from "@/components/ui/Dropzone";
 import { Field, Input, Select } from "@/components/ui/form";
 import { Pager, pageSlice } from "@/components/ui/Pager";
-import { EmptyRow, TableWrap, tableCls, tdCls, thBase } from "@/components/ui/Table";
+import { EmptyRow, SortTh, TableWrap, nextSort, tableCls, tdCls, thBase } from "@/components/ui/Table";
+import type { Sort } from "@/components/ui/Table";
 import type { BlobCapture, BlobCaptureStart, ClientHelloCandidate, Device, InstallResult } from "@/types/api";
+import { availableBlobSelection, blobCatalog, blobRows, type BlobSource } from "./blobCatalog";
 
 const blobName = (sni: string, fallback = "site") => `clienthello_${(sni || fallback).replace(/[^\w.-]+/g, "_")}.bin`;
 
@@ -29,16 +33,16 @@ const VER_OPTS = [
 ];
 
 // One captured ClientHello: shows its SNI/destination and saves it under an editable name.
-function CandidateRow({ c, index, onSave }: { c: ClientHelloCandidate; index: number; onSave: (i: number, name: string) => void }) {
+function CandidateRow({ c, index, onSave, disabled }: { c: ClientHelloCandidate; index: number; onSave: (i: number, name: string) => void; disabled?: boolean }) {
   const [name, setName] = useState(blobName(c.sni, c.dst_ip));
   return (
-    <div className="border-t border-line-soft py-2 first:border-t-0">
+    <div className="min-w-0 border-t border-line-soft py-2 [overflow-wrap:anywhere] first:border-t-0">
       <div className="flex flex-wrap items-center gap-2">
         <span className={cn("text-xs font-bold", c.valid ? "text-ok" : "text-bad")} title={c.detail}>{c.valid ? "✓" : "✗"}</span>
-        <span className="font-mono text-[13px] font-semibold">{c.sni || "(без SNI)"}</span>
-        <span className="text-xs text-muted">→ {c.dst_ip}:{c.dst_port} · {c.size} Б</span>
-        <Input className="w-full sm:ml-auto sm:w-56" value={name} onChange={(e) => setName(e.target.value)} />
-        <Button mini onClick={() => onSave(index, name)}>Сохранить</Button>
+        <span className="max-w-full font-mono text-xs font-semibold">{c.sni || "(без SNI)"}</span>
+        <span className="max-w-full text-xs text-muted">→ {c.dst_ip.includes(":") ? `[${c.dst_ip}]` : c.dst_ip}:{c.dst_port} · {c.size} Б</span>
+        <Input aria-label={`Имя блоба для кандидата ${index + 1}`} className="min-w-0 flex-1 basis-full sm:basis-48" value={name} disabled={disabled} onChange={(e) => setName(e.target.value)} />
+        <Button mini disabled={disabled} onClick={() => onSave(index, name)}>Сохранить</Button>
       </div>
       <div className={cn("mt-0.5 text-[11px]", c.valid ? "text-muted" : "text-bad")}>{c.detail}</div>
     </div>
@@ -49,6 +53,8 @@ export default function Blobs() {
   const { blobs, reloadBlobs } = useStore();
   const [sel, setSel] = useState<Set<string>>(new Set());
   const [status, setStatus] = useState("");
+  const [busy, setBusy] = useState<string | null>(null);
+  const pending = useRef(false);
 
   const [mode, setMode] = useState<"capture" | "generate">("capture");
   const [genSni, setGenSni] = useState("");
@@ -66,6 +72,8 @@ export default function Blobs() {
   const [installing, setInstalling] = useState(false);
 
   const [blobQ, setBlobQ] = useState("");
+  const [blobSource, setBlobSource] = useState<BlobSource>("all");
+  const [blobSort, setBlobSort] = useState<Sort>({ key: "name", dir: 1 });
   const [blobPage, setBlobPage] = useState(1);
   const [blobPageSize, setBlobPageSize] = useState("20");
   const [trashQ, setTrashQ] = useState("");
@@ -90,9 +98,10 @@ export default function Blobs() {
     } catch (e) { setCapturing(false); toast((e as Error).message, "err"); }
   }, 1000, capturing);
 
-  const all = [...blobs.custom.map((n) => ({ name: n, custom: true })), ...blobs.system.map((n) => ({ name: n, custom: false }))];
-  const bq = blobQ.trim().toLowerCase();
-  const shown = bq ? all.filter((b) => b.name.toLowerCase().includes(bq)) : all;
+  const all = blobCatalog(blobs);
+  const shadowed = blobs.system.some(name => blobs.custom.includes(name));
+  const shown = blobRows(all, blobQ, blobSource, blobSort);
+  useEffect(() => { setSel(selection => availableBlobSelection(selection, blobCatalog(blobs))); }, [blobs.custom, blobs.system]);
   const allShownSelected = shown.length > 0 && shown.every((b) => sel.has(b.name));
   const toggle = (n: string) => setSel((s) => { const x = new Set(s); if (x.has(n)) x.delete(n); else x.add(n); return x; });
   const toggleAll = () => setSel((s) => { const x = new Set(s); shown.forEach((b) => (allShownSelected ? x.delete(b.name) : x.add(b.name))); return x; });
@@ -100,6 +109,15 @@ export default function Blobs() {
 
   const tq = trashQ.trim().toLowerCase();
   const shownTrash = tq ? blobs.trash.filter((n) => n.toLowerCase().includes(tq)) : blobs.trash;
+
+  const perform = async (key: string, operation: () => Promise<void>) => {
+    if (pending.current) return;
+    pending.current = true; setBusy(key);
+    try { await operation(); }
+    catch (error) { toast((error as Error).message, "err"); }
+    finally { pending.current = false; setBusy(null); }
+  };
+  const disabled = busy !== null;
 
   const validate = async (name: string) => {
     try { const r = await api<{ valid: boolean; detail: string }>("GET", `/api/blobs/${encodeURIComponent(name)}/validate`); toast(`${name}: ${r.detail}`, r.valid ? "ok" : "warn"); }
@@ -146,10 +164,10 @@ export default function Blobs() {
     await reloadBlobs();
     setSel(new Set());
   };
-  const exportSel = () => {
+  const exportSel = async () => {
     const names = [...sel];
     if (!names.length) { toast("Выберите блобы для экспорта", "err"); return; }
-    downloadFile("/api/blobs/export", "blobs.zip", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ names }) }).catch((e) => toast((e as Error).message, "err"));
+    await downloadFile("/api/blobs/export", "blobs.zip", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ names }) }).catch((e) => toast((e as Error).message, "err"));
   };
 
   const restore = async (name: string) => {
@@ -208,41 +226,50 @@ export default function Blobs() {
 
   const cb = "h-4 w-4 rounded-[4px] accent-[var(--c-accent)] outline-none focus-visible:ring-2 focus-visible:ring-ring/40";
   const seg = (m: "capture" | "generate", label: string) => (
-    <button type="button" onClick={() => setMode(m)} className={cn("rounded-md px-3 py-1.5 text-[13px] font-semibold outline-none transition focus-visible:ring-2 focus-visible:ring-ring/40", mode === m ? "bg-accent text-primary-foreground" : "text-ink-soft hover:bg-line-soft")}>{label}</button>
+    <Button mini variant="ghost" aria-pressed={mode === m} disabled={disabled} onClick={() => setMode(m)} className={mode === m ? "bg-panel shadow-sm" : "text-muted"}>{label}</Button>
   );
 
   return (
-    <>
-      <Card title="Создать блоб" sub="TLS ClientHello">
+    <div className="flex min-w-0 flex-col gap-4">
+      <PageHeader title="Блобы" description="Бинарные файлы для фейковых пакетов: захват, генерация и каталог дампов." />
+      <StatsStrip label="Сводка блобов" items={[
+        { label: "Каталог", value: all.length, hint: "Доступные уникальные имена" },
+        { label: "Пользовательские", value: blobs.custom.length, hint: "Загруженные и созданные файлы" },
+        { label: "Системные", value: blobs.system.length, hint: "Файлы из поставки nfqws2" },
+        { label: "Корзина", value: blobs.trash.length, hint: "Можно восстановить" },
+        { label: "ClientHello", value: cap ? (cap.candidates ?? []).length : "—", hint: capturing ? "Идёт захват" : cap ? "Кандидаты последней записи" : "Захват ещё не запускался" },
+      ]} />
+      <div className="grid min-w-0 gap-4 xl:grid-cols-2">
+      <Card title="Создание бинарного блоба" sub="TLS ClientHello" className={compactCard}>
         <p className="mb-3 text-xs text-muted">
           Блоб — это сырой <code>ClientHello</code>, который движок подставляет как фейковый пакет. Снимите настоящий с трафика устройства или сгенерируйте по домену.
         </p>
-        <div className="mb-3 inline-flex rounded-lg border border-line p-0.5">{seg("capture", "Снять с трафика")}{seg("generate", "Сгенерировать")}</div>
+        <div role="group" aria-label="Способ создания блоба" className="mb-3 inline-flex max-w-full flex-wrap gap-0.5 rounded-md border border-line bg-line-soft p-0.5">{seg("capture", "С трафика")}{seg("generate", "Генератор")}</div>
 
         {mode === "capture" ? (
           <>
-            <div className="flex flex-wrap items-end gap-3">
-              <Field label="Устройство" className="min-w-[200px] flex-1">
-                <Select value={capIP} onChange={(e) => setCapIP(e.target.value)}>
+            <div className="grid min-w-0 items-end gap-3 sm:grid-cols-3">
+              <Field label="Устройство" className="min-w-0 sm:col-span-2">
+                <Select value={capIP} disabled={disabled || capturing} onChange={(e) => setCapIP(e.target.value)}>
                   {!devices.length && <option value="">нет устройств</option>}
                   {devices.map((d) => <option key={d.ip} value={d.ip}>{d.ip}{d.mac ? ` · ${d.mac}` : ""}</option>)}
                 </Select>
               </Field>
-              <Field label="Длительность" className="w-36">
-                <Select value={String(capSecs)} onChange={(e) => setCapSecs(Number(e.target.value))}>
+              <Field label="Длительность" className="min-w-0">
+                <Select value={String(capSecs)} disabled={disabled || capturing} onChange={(e) => setCapSecs(Number(e.target.value))}>
                   <option value="10">10 секунд</option>
                   <option value="20">20 секунд</option>
                   <option value="30">30 секунд</option>
                 </Select>
               </Field>
-              <Button onClick={() => beginCapture(capIP)} disabled={capturing || installing}>{capturing ? "Захват…" : "Начать захват"}</Button>
             </div>
             <p className="mt-2 text-xs text-muted">Запустите захват и откройте нужный сайт на выбранном устройстве — поймаем его ClientHello.</p>
+            <div className="mt-3 border-t border-line-soft pt-3"><Button variant="primary" onClick={() => { void perform("capture", () => beginCapture(capIP)); }} disabled={disabled || capturing || installing || !capIP}>{capturing || busy === "capture" ? "Захват…" : "Начать захват"}</Button></div>
             {cap && (
               <div className="mt-3 rounded-lg border border-line bg-input p-3">
                 <div className="mb-2 flex flex-wrap items-center gap-3 text-xs text-ink-soft">
-                  <span className="font-mono">{cap.ip} · {cap.iface}</span>
-                  <span>{capturing ? "идёт захват…" : cap.status === "error" ? `ошибка: ${cap.error}` : `готово · ${(cap.elapsed_ms / 1000).toFixed(1)} с`}</span>
+                  <span className="max-w-full font-mono [overflow-wrap:anywhere]">{cap.ip} · {cap.iface}</span>
+                  <span className="max-w-full [overflow-wrap:anywhere]">{capturing ? "идёт захват…" : cap.status === "error" ? `ошибка: ${cap.error}` : `готово · ${(cap.elapsed_ms / 1000).toFixed(1)} с`}</span>
                   <Button mini variant="ghost" className="ml-auto" onClick={() => { setCap(null); setCapturing(false); }}>Закрыть</Button>
                 </div>
                 {capturing && (
@@ -253,54 +280,61 @@ export default function Blobs() {
                 {!capturing && cap.status === "done" && (cap.candidates ?? []).length === 0 && (
                   <p className="text-xs text-muted">Ничего не поймано. Откройте нужный сайт на устройстве и повторите захват.</p>
                 )}
-                {(cap.candidates ?? []).map((c, i) => <CandidateRow key={i} c={c} index={i} onSave={saveCandidate} />)}
+                <div className="max-h-80 min-w-0 overflow-y-auto">{(cap.candidates ?? []).map((c, i) => <CandidateRow key={`${cap.id}:${i}`} c={c} index={i} disabled={disabled} onSave={(index, name) => { void perform(`candidate:${index}`, () => saveCandidate(index, name)); }} />)}</div>
               </div>
             )}
           </>
         ) : (
-          <div className="flex flex-wrap items-end gap-3">
-            <Field label="Домен (SNI)" className="min-w-[200px] flex-1"><Input value={genSni} onChange={(e) => setGenSni(e.target.value)} placeholder="www.google.com" /></Field>
-            <Field label="ALPN" className="w-44"><Select value={genAlpn} onChange={(e) => setGenAlpn(e.target.value)}>{ALPN_OPTS.map((o) => <option key={o.v} value={o.v}>{o.l}</option>)}</Select></Field>
-            <Field label="Версия TLS" className="w-40"><Select value={genVer} onChange={(e) => setGenVer(e.target.value)}>{VER_OPTS.map((o) => <option key={o.v} value={o.v}>{o.l}</option>)}</Select></Field>
-            <Field label="Имя блоба" className="min-w-[180px] flex-1"><Input value={genName} onChange={(e) => setGenName(e.target.value)} placeholder={blobName(genSni)} /></Field>
-            <Button onClick={doGenerate} disabled={generating}>{generating ? "Создание…" : "Создать"}</Button>
-          </div>
+          <fieldset disabled={disabled || generating} className="grid min-w-0 gap-3 sm:grid-cols-2">
+            <Field label="Домен (SNI)"><Input value={genSni} onChange={(e) => setGenSni(e.target.value)} placeholder="www.google.com" /></Field>
+            <Field label="ALPN"><Select value={genAlpn} onChange={(e) => setGenAlpn(e.target.value)}>{ALPN_OPTS.map((o) => <option key={o.v} value={o.v}>{o.l}</option>)}</Select></Field>
+            <Field label="Версия TLS"><Select value={genVer} onChange={(e) => setGenVer(e.target.value)}>{VER_OPTS.map((o) => <option key={o.v} value={o.v}>{o.l}</option>)}</Select></Field>
+            <Field label="Имя блоба"><Input value={genName} onChange={(e) => setGenName(e.target.value)} placeholder={blobName(genSni)} /></Field>
+            <div className="border-t border-line-soft pt-3 sm:col-span-2"><Button variant="primary" onClick={() => { void perform("generate", doGenerate); }}>{generating ? "Создание…" : "Создать"}</Button></div>
+          </fieldset>
         )}
       </Card>
 
-      <Card title="Загрузка блобов">
-        <p className="mb-3 text-xs text-muted">Свой блоб используется в стратегии так: <code>--blob=имя:@/путь</code>. Можно загрузить несколько файлов сразу или ZIP-архив.</p>
-        <Dropzone multiple onFiles={upload}>
+      <Card title="Загрузка дампов" sub="Файлы .bin / ZIP" className={compactCard}>
+        <p className="mb-3 text-xs text-muted">Можно загрузить несколько файлов сразу или ZIP-архив. Уже существующие пользовательские имена файлов пропускаются.</p>
+        <fieldset disabled={disabled} className="min-w-0">
+        <Dropzone multiple onFiles={files => { void perform("upload", () => upload(files)); }}>
           <svg className="mx-auto mb-2 text-accent" viewBox="0 0 24 24" width="34" height="34" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 16V4m0 0 4 4m-4-4L8 8M5 16v2a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-2" /></svg>
-          <div className="text-[13.5px]"><b className="text-ink">Перетащите файлы или ZIP</b> или нажмите, чтобы выбрать</div>
-          <div className="mt-1.5 min-h-[16px] text-[12.5px] font-semibold text-accent-d">{status}</div>
+          <div className="text-xs"><b className="text-ink">Перетащите файлы или ZIP</b> или нажмите, чтобы выбрать</div>
+          <div role="status" className="mt-1.5 min-h-4 text-xs font-medium text-ink-soft [overflow-wrap:anywhere]">{status}</div>
         </Dropzone>
+        </fieldset>
+        <p className="mt-3 border-t border-line-soft pt-3 text-[11px] text-muted [overflow-wrap:anywhere]">Синтаксис в стратегии: <code>--blob=имя:@/путь</code></p>
       </Card>
+      </div>
 
       <Card
-        title="Список блобов"
-        head={
-          <div className="flex flex-wrap items-center gap-2">
-            <Input value={blobQ} onChange={(e) => { setBlobQ(e.target.value); setBlobPage(1); }} placeholder="Поиск по имени" className="h-8 w-48 py-1" />
-            <Button mini onClick={exportSel}>Экспорт выбранных (ZIP)</Button>
-            {selCustom().length > 0 && <Button mini variant="danger" onClick={delSel}>В корзину</Button>}
-          </div>
-        }
+        title="Хранилище дампов"
+        sub={`${shown.length} из ${all.length}`}
+        className={compactCard}
+        head={<span className="text-xs text-muted">Выбрано: {sel.size}</span>}
       >
-        <TableWrap>
-          <table className={tableCls}>
-            <thead><tr><th className={cn(thBase, "w-8")}><input type="checkbox" aria-label="Выбрать все" className={cb} checked={allShownSelected} onChange={toggleAll} /></th><th className={thBase}>Имя</th><th className={thBase}>Тип</th><th className={cn(thBase, "text-right")} /></tr></thead>
+        <div className="mb-3 flex flex-wrap items-center gap-2.5">
+          <Input type="search" aria-label="Поиск блобов" value={blobQ} onChange={(e) => { setBlobQ(e.target.value); setBlobPage(1); }} placeholder="Поиск по имени блоба…" className="min-w-0 flex-1 basis-full sm:basis-60" />
+          <Select aria-label="Источник блобов" value={blobSource} onChange={event => { setBlobSource(event.target.value as BlobSource); setBlobPage(1); }} className="w-full sm:w-40"><option value="all">Все источники</option><option value="custom">Пользовательские</option><option value="system">Системные</option></Select>
+          <Button mini disabled={disabled || !sel.size} onClick={() => { void perform("export", exportSel); }}>{busy === "export" ? "Экспорт…" : "Экспорт выбранных (ZIP)"}</Button>
+          <Button mini variant="danger" disabled={disabled || !selCustom().length} onClick={() => { void perform("delete-selected", delSel); }}>В корзину</Button>
+        </div>
+        {shadowed && <p className="mb-3 text-[11px] leading-relaxed text-muted">Своя версия заменяет встроенный файл с тем же именем. В каталоге каждое имя показано один раз.</p>}
+        <TableWrap scrollable>
+          <table className={cn(tableCls, "min-w-[660px]")}>
+            <thead><tr><th className={cn(thBase, "w-8")}><input type="checkbox" aria-label="Выбрать все отфильтрованные блобы" className={cb} checked={allShownSelected} disabled={disabled || !shown.length} onChange={toggleAll} /></th><SortTh label="Имя файла" k="name" sort={blobSort} onSort={key => setBlobSort(sort => nextSort(sort, key, 1))} /><SortTh label="Тип" k="type" sort={blobSort} onSort={key => setBlobSort(sort => nextSort(sort, key, 1))} /><th className={cn(thBase, "text-right")}>Действия</th></tr></thead>
             <tbody>
               {shown.length === 0 && <EmptyRow colSpan={4}>{all.length ? "Ничего не найдено." : "Нет блобов."}</EmptyRow>}
               {pageSlice(shown, blobPage, blobPageSize).map((b) => (
                 <tr key={b.name} className="hover:bg-line-soft">
-                  <td className={cn(tdCls, "align-middle")}><input type="checkbox" aria-label={`Выбрать ${b.name}`} className={cb} checked={sel.has(b.name)} onChange={() => toggle(b.name)} /></td>
-                  <td className={cn(tdCls, "font-mono")}>{b.name}</td>
-                  <td className={tdCls}>{b.custom ? "свой" : "системный"}</td>
+                  <td className={cn(tdCls, "align-middle")}><input type="checkbox" aria-label={`Выбрать ${b.name}`} className={cb} checked={sel.has(b.name)} disabled={disabled} onChange={() => toggle(b.name)} /></td>
+                  <td className={cn(tdCls, "min-w-48 max-w-96 font-mono text-xs [overflow-wrap:anywhere]")}>{b.name}</td>
+                  <td className={tdCls}><Badge>{b.custom ? "свой" : "системный"}</Badge></td>
                   <td className={cn(tdCls, "text-right")}>
-                    <div className="flex justify-end gap-1.5">
-                      <Button mini variant="ghost" onClick={() => validate(b.name)}>проверить</Button>
-                      {b.custom && <Button mini variant="danger" onClick={() => del(b.name)}>×</Button>}
+                    <div className="flex flex-wrap justify-end gap-1.5">
+                      <Button mini variant="ghost" disabled={disabled} onClick={() => { void perform(`validate:${b.name}`, () => validate(b.name)); }}>{busy === `validate:${b.name}` ? "Проверка…" : "Проверить"}</Button>
+                      {b.custom && <Button mini variant="danger" title={`Переместить ${b.name} в корзину`} aria-label={`В корзину ${b.name}`} disabled={disabled} onClick={() => { void perform(`delete:${b.name}`, () => del(b.name)); }}>В корзину</Button>}
                     </div>
                   </td>
                 </tr>
@@ -308,33 +342,34 @@ export default function Blobs() {
             </tbody>
           </table>
         </TableWrap>
-        <Pager total={shown.length} page={blobPage} setPage={setBlobPage} pageSize={blobPageSize} setPageSize={setBlobPageSize} />
+        <div className="mt-3 border-t border-line-soft pt-0.5"><Pager total={shown.length} page={blobPage} setPage={setBlobPage} pageSize={blobPageSize} setPageSize={setBlobPageSize} /></div>
       </Card>
 
       {blobs.trash.length > 0 && (
         <Card
           title="Корзина"
           sub={`${blobs.trash.length}`}
+          className={compactCard}
           head={
             <div className="flex flex-wrap items-center gap-2">
-              <Input value={trashQ} onChange={(e) => { setTrashQ(e.target.value); setTrashPage(1); }} placeholder="Поиск по имени" className="h-8 w-48 py-1" />
-              <Button mini variant="danger" onClick={emptyTrash}>Очистить корзину</Button>
+              <Button mini variant="danger" disabled={disabled} onClick={() => { void perform("empty-trash", emptyTrash); }}>Очистить корзину</Button>
             </div>
           }
         >
           <p className="mb-3 text-xs text-muted">Удалённые блобы хранятся здесь — можно восстановить или удалить навсегда.</p>
-          <TableWrap>
-            <table className={tableCls}>
-              <thead><tr><th className={thBase}>Имя</th><th className={cn(thBase, "w-44 text-right")} /></tr></thead>
+          <Input type="search" aria-label="Поиск в корзине блобов" value={trashQ} onChange={(e) => { setTrashQ(e.target.value); setTrashPage(1); }} placeholder="Поиск по имени…" className="mb-3 min-w-0 w-full sm:max-w-sm" />
+          <TableWrap scrollable>
+            <table className={cn(tableCls, "min-w-[540px]")}>
+              <thead><tr><th className={thBase}>Имя файла</th><th className={cn(thBase, "w-56 text-right")}>Действия</th></tr></thead>
               <tbody>
                 {shownTrash.length === 0 && <EmptyRow colSpan={2}>Ничего не найдено.</EmptyRow>}
                 {pageSlice(shownTrash, trashPage, trashPageSize).map((n) => (
                   <tr key={n} className="hover:bg-line-soft">
-                    <td className={cn(tdCls, "font-mono")}>{n}</td>
+                    <td className={cn(tdCls, "max-w-96 font-mono text-xs [overflow-wrap:anywhere]")}>{n}</td>
                     <td className={cn(tdCls, "text-right")}>
-                      <div className="flex justify-end gap-2">
-                        <Button mini onClick={() => restore(n)}>Восстановить</Button>
-                        <Button mini variant="danger" onClick={() => purge(n)}>Удалить навсегда</Button>
+                      <div className="flex flex-wrap justify-end gap-2">
+                        <Button mini disabled={disabled} onClick={() => { void perform(`restore:${n}`, () => restore(n)); }}>Восстановить</Button>
+                        <Button mini variant="danger" disabled={disabled} onClick={() => { void perform(`purge:${n}`, () => purge(n)); }}>Удалить навсегда</Button>
                       </div>
                     </td>
                   </tr>
@@ -353,7 +388,7 @@ export default function Blobs() {
           actions={
             <>
               <Button variant="ghost" onClick={() => setInstallShow(false)} disabled={installing}>Отмена</Button>
-              <Button variant="primary" onClick={confirmInstall} disabled={installing}>{installing ? "Установка…" : "Установить"}</Button>
+              <Button variant="primary" onClick={() => { void perform("install", confirmInstall); }} disabled={disabled || installing}>{installing ? "Установка…" : "Установить"}</Button>
             </>
           }
         >
@@ -361,6 +396,6 @@ export default function Blobs() {
           <p className="mt-2 text-muted">Установка единоразовая. После неё захват запустится автоматически.</p>
         </Modal>
       )}
-    </>
+    </div>
   );
 }
