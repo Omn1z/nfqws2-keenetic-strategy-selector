@@ -23,9 +23,9 @@ func provisionShell(t *testing.T) string {
 func TestUserspaceProvisionCarriesReviewedDependencyLock(t *testing.T) {
 	script := userspaceInstallScript()
 	for _, want := range []string{
-		"go1.26.10.linux-$arch.tar.gz",
-		"ccfe7ae822d2c2f41f4fe7c956199967a4dac22d0ee0d2b2bfdb440aab3b20c5",
-		"3f4227ce7b206a513e794f1393adb473a07b46e94d18bd15d1c684bbb7319797",
+		"go1.26.11.linux-$arch.tar.gz",
+		"9849f4e04ee35303714e34fbc3ac8ab44ea3e448a95aa182f91e3b9b79c710ec",
+		"6c2f29b458b5add0835f18b776f69c8881a6d88428f1484a6da55755e620757e",
 		`-modfile="$work/engine-deps.mod" -mod=readonly`,
 		`GOTOOLCHAIN=local CGO_ENABLED=0`,
 		`engine_current "$work/amneziawg-go"`,
@@ -85,9 +85,11 @@ func TestUserspaceProvisionRebuildsEngineWithOldDependencies(t *testing.T) {
 		{"current verified build", current, true},
 		{"same source old compiler", withCompiler("go1.26.8"), false},
 		{"same source vulnerable 1.26 compiler", withCompiler("go1.26.9"), false},
+		{"same source vulnerable 1.26.10 compiler", withCompiler("go1.26.10"), false},
 		{"same source unpatched next compiler", withCompiler("go1.27.1"), false},
 		{"same source vulnerable 1.27 compiler", withCompiler("go1.27.2"), false},
-		{"same source unreviewed patched compiler", withCompiler("go1.27.3"), false},
+		{"same source vulnerable 1.27.3 compiler", withCompiler("go1.27.3"), false},
+		{"same source unreviewed patched compiler", withCompiler("go1.27.4"), false},
 		{"same source old crypto", strings.ReplaceAll(current, "\tv0.57.0\t", "\tv0.42.0\t"), false},
 		{"same source old net", strings.ReplaceAll(current, "\tv0.60.0\t", "\tv0.59.0\t"), false},
 		{"same source old sys", strings.ReplaceAll(current, "\tv0.48.0\t", "\tv0.36.0\t"), false},

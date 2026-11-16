@@ -1,5 +1,5 @@
 # Pinned AmneziaWG 3.1 source with our security lock and router memory overlay.
-# Requires Go 1.26.10+.
+# Requires Go 1.26.11+.
 # Set GOVULNCHECK to check an audit build per target, kept outside release assets.
 param([string]$Go = "go", [string]$Ref = "v3.1.20260828")
 $ErrorActionPreference = "Stop"

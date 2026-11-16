@@ -4,6 +4,9 @@ refuses unexpected upstream constants and never edits the checkout.
 Both builds record the `n2s_router_memory_v1` build tag. The panel reads that
 marker from Go build information to offer this profile to users whose older
 engine has the same upstream version and security dependencies.
+Build with Go 1.26.11 or a newer security-patched toolchain; Go 1.27 builds
+require at least 1.27.4. An older compiler still triggers the update indicator
+even when its engine includes the router memory marker.
 
 The batch is 64 packets, which is the minimum supported by the current Linux
 UDP GRO split path (64 segments). Two UDP readers and the TUN reader therefore

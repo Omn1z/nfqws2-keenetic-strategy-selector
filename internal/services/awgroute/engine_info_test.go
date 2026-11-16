@@ -23,7 +23,7 @@ func TestEngineBuildInfoDetectsWireCapability(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			bi := &debug.BuildInfo{Main: debug.Module{Path: tc.path, Version: tc.version}, Settings: []debug.BuildSetting{{Key: "GOARCH", Value: "arm64"}, {Key: "vcs.revision", Value: tc.revision}}}
 			bi.Settings = append(bi.Settings, debug.BuildSetting{Key: "-tags", Value: awgEngineRouterMemoryTag})
-			bi.GoVersion, bi.Deps = "go1.26.10", patchedEngineDeps()
+			bi.GoVersion, bi.Deps = "go1.26.11", patchedEngineDeps()
 			got := engineBuildInfo(bi)
 			if got.AWG3Supported != tc.want31 || got.UpdateAvailable == tc.want31 || got.AwgVersion != tc.wantVersion || got.Arch != "arm64" || !got.Installed || got.TargetVersion != AWGEngineVersion {
 				t.Fatalf("unexpected engine info: %+v", got)
@@ -50,14 +50,17 @@ func TestEngineBuildInfoOffersSecurityRebuild(t *testing.T) {
 		{"old compiler", func(b *debug.BuildInfo) { b.GoVersion = "go1.25.7" }, true},
 		{"unpatched 1.26", func(b *debug.BuildInfo) { b.GoVersion = "go1.26.7" }, true},
 		{"previously patched 1.26", func(b *debug.BuildInfo) { b.GoVersion = "go1.26.8" }, true},
-		{"last vulnerable 1.26", func(b *debug.BuildInfo) { b.GoVersion = "go1.26.9" }, true},
-		{"patched 1.26", func(b *debug.BuildInfo) { b.GoVersion = "go1.26.10" }, false},
-		{"newer patch 1.26", func(b *debug.BuildInfo) { b.GoVersion = "go1.26.11" }, false},
+		{"previous security patch 1.26", func(b *debug.BuildInfo) { b.GoVersion = "go1.26.9" }, true},
+		{"last vulnerable 1.26", func(b *debug.BuildInfo) { b.GoVersion = "go1.26.10" }, true},
+		{"patched 1.26", func(b *debug.BuildInfo) { b.GoVersion = "go1.26.11" }, false},
+		{"newer patch 1.26", func(b *debug.BuildInfo) { b.GoVersion = "go1.26.12" }, false},
 		{"prerelease 1.26", func(b *debug.BuildInfo) { b.GoVersion = "go1.26rc1" }, true},
 		{"unpatched 1.27", func(b *debug.BuildInfo) { b.GoVersion = "go1.27.0" }, true},
 		{"previously patched 1.27", func(b *debug.BuildInfo) { b.GoVersion = "go1.27.1" }, true},
-		{"last vulnerable 1.27", func(b *debug.BuildInfo) { b.GoVersion = "go1.27.2" }, true},
-		{"patched 1.27", func(b *debug.BuildInfo) { b.GoVersion = "go1.27.3" }, false},
+		{"previous security patch 1.27", func(b *debug.BuildInfo) { b.GoVersion = "go1.27.2" }, true},
+		{"last vulnerable 1.27", func(b *debug.BuildInfo) { b.GoVersion = "go1.27.3" }, true},
+		{"patched 1.27", func(b *debug.BuildInfo) { b.GoVersion = "go1.27.4" }, false},
+		{"newer patch 1.27", func(b *debug.BuildInfo) { b.GoVersion = "go1.27.5" }, false},
 		{"prerelease 1.27", func(b *debug.BuildInfo) { b.GoVersion = "go1.27rc1" }, true},
 		{"future minor", func(b *debug.BuildInfo) { b.GoVersion = "go1.28.0" }, false},
 		{"unknown compiler", func(b *debug.BuildInfo) { b.GoVersion = "" }, true},
@@ -72,7 +75,7 @@ func TestEngineBuildInfoOffersSecurityRebuild(t *testing.T) {
 		{"unknown replacement", func(b *debug.BuildInfo) { b.Deps[0].Replace = &debug.Module{Path: "../crypto"} }, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			bi := &debug.BuildInfo{GoVersion: "go1.26.10", Main: debug.Module{Path: "github.com/amnezia-vpn/amneziawg-go/v3", Version: AWGEngineVersion}, Deps: patchedEngineDeps(), Settings: []debug.BuildSetting{{Key: "-tags", Value: awgEngineRouterMemoryTag}}}
+			bi := &debug.BuildInfo{GoVersion: "go1.26.11", Main: debug.Module{Path: "github.com/amnezia-vpn/amneziawg-go/v3", Version: AWGEngineVersion}, Deps: patchedEngineDeps(), Settings: []debug.BuildSetting{{Key: "-tags", Value: awgEngineRouterMemoryTag}}}
 			tc.edit(bi)
 			info := engineBuildInfo(bi)
 			if !info.AWG3Supported || info.UpdateAvailable != tc.wantUpdate {
@@ -95,7 +98,7 @@ func TestEngineBuildInfoOffersRouterMemoryRebuild(t *testing.T) {
 		{"additional space-separated tags", "custom " + awgEngineRouterMemoryTag + " debug", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			bi := &debug.BuildInfo{GoVersion: "go1.26.10", Main: debug.Module{Path: "github.com/amnezia-vpn/amneziawg-go/v3", Version: AWGEngineVersion}, Deps: patchedEngineDeps()}
+			bi := &debug.BuildInfo{GoVersion: "go1.26.11", Main: debug.Module{Path: "github.com/amnezia-vpn/amneziawg-go/v3", Version: AWGEngineVersion}, Deps: patchedEngineDeps()}
 			if tc.tags != "" {
 				bi.Settings = []debug.BuildSetting{{Key: "-tags", Value: tc.tags}}
 			}

@@ -98,10 +98,10 @@ func engineRouterMemoryBuildCurrent(bi *debug.BuildInfo) bool {
 // Protocol support alone does not identify a patched engine: we rebuild the
 // same upstream revision with the lock in internal/services/awg/engine-deps.mod.
 func engineSecurityBuildCurrent(bi *debug.BuildInfo) bool {
-	if !goversion.IsValid(bi.GoVersion) || goversion.Compare(bi.GoVersion, "go1.26.10") < 0 {
+	if !goversion.IsValid(bi.GoVersion) || goversion.Compare(bi.GoVersion, "go1.26.11") < 0 {
 		return false
 	}
-	if goversion.Lang(bi.GoVersion) == "go1.27" && goversion.Compare(bi.GoVersion, "go1.27.3") < 0 {
+	if goversion.Lang(bi.GoVersion) == "go1.27" && goversion.Compare(bi.GoVersion, "go1.27.4") < 0 {
 		return false
 	}
 	required := map[string]string{
