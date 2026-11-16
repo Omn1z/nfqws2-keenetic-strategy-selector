@@ -51,9 +51,10 @@ type Service struct {
 
 	// awg is the currently selected server manager. Low-level client/routing code
 	// still operates on one local awg0 tunnel, so it always reads this active one.
-	awg     *awg.Manager
-	route   awgRouteState
-	clients clientSupervisor
+	awg          *awg.Manager
+	route        awgRouteState
+	clients      clientSupervisor
+	acceleration awgAccelerationState
 
 	// statusCache memoises the last AWG server Status() result. Status() can
 	// hang for up to 25 s when the VPS is slow (SSH, v6 timeouts) — without

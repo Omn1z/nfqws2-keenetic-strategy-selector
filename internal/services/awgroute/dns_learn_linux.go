@@ -4,6 +4,7 @@ package awgroute
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"strings"
@@ -129,6 +130,10 @@ func (svc *Service) awgIPSetLearnSync(ctx context.Context, requests []ipsetAddRe
 }
 
 func (svc *Service) awgIPSetLearnWith(ctx context.Context, requests []ipsetAddReq, run func(context.Context, string, string) (string, error)) error {
+	return svc.awgIPSetLearnWithAcceleration(ctx, requests, run, svc.awgSelectiveAccelerationActive, svc.awgInvalidateAccelerationCache)
+}
+
+func (svc *Service) awgIPSetLearnWithAcceleration(ctx context.Context, requests []ipsetAddReq, run func(context.Context, string, string) (string, error), selectiveActive func() bool, invalidate func() error) error {
 	script, err := awgDNSLearnScript(requests)
 	if err != nil || script == "" {
 		return err
@@ -175,6 +180,27 @@ func (svc *Service) awgIPSetLearnWith(ctx context.Context, requests []ipsetAddRe
 		}
 	}
 	g.mu.Unlock()
+	// A previous restore may already have inserted the address even though
+	// flushing its formerly direct accelerated flow failed. Retry the flush
+	// before membership checks: an existing member must not hide that debt.
+	flushDirty := func() error {
+		g.mu.Lock()
+		dirty := g.accelerationDirty
+		g.mu.Unlock()
+		if !dirty {
+			return nil
+		}
+		if err := invalidate(); err != nil {
+			return fmt.Errorf("DNS route acceleration cache: %w", err)
+		}
+		g.mu.Lock()
+		g.accelerationDirty = false
+		g.mu.Unlock()
+		return nil
+	}
+	if err := flushDirty(); err != nil {
+		return err
+	}
 	if len(pending) == 0 {
 		return nil
 	}
@@ -184,11 +210,43 @@ func (svc *Service) awgIPSetLearnWith(ctx context.Context, requests []ipsetAddRe
 	}
 	ctx, cancel := context.WithTimeout(ctx, 2*time.Second)
 	defer cancel()
-	out, err := run(ctx, "ipset restore -exist", script)
-	if err != nil {
-		err = awgCmdErr("DNS route ipset restore", out, err)
-		logbuf.Append("awg2", "warn", err.Error())
-		return err
+	selective := selectiveActive()
+	if selective {
+		check, err := awgDNSLearnMembershipScript(pending)
+		if err != nil {
+			return err
+		}
+		out, err := run(ctx, "sh", check)
+		if err != nil {
+			return awgCmdErr("DNS route ipset membership", out, err)
+		}
+		switch strings.TrimSpace(out) {
+		case "present":
+			// A memo expiry only rechecks the kernel. Multi-policy sets have
+			// no member timeout; an existing route needs neither add nor flush.
+			script = ""
+		case "missing":
+		default:
+			return fmt.Errorf("invalid DNS route membership result")
+		}
+	}
+	if script != "" {
+		if selective {
+			g.mu.Lock()
+			g.accelerationDirty = true
+			g.mu.Unlock()
+		}
+		out, err := run(ctx, "ipset restore -exist", script)
+		if err != nil {
+			err = awgCmdErr("DNS route ipset restore", out, err)
+			logbuf.Append("awg2", "warn", err.Error())
+			// Restore is not transactional: clear old acceleration even if a
+			// later add failed, then keep the DNS answer unsuccessful.
+			return errors.Join(err, flushDirty())
+		}
+		if err := flushDirty(); err != nil {
+			return err
+		}
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -206,6 +264,29 @@ func (svc *Service) awgIPSetLearnWith(ctx context.Context, requests []ipsetAddRe
 		}
 	}
 	return nil
+}
+
+// One bounded shell invocation tests only the reply's validated destinations,
+// without dumping potentially large GeoIP sets. Stop at the first missing
+// member: the subsequent checked restore installs the complete reply. Some
+// ipset versions also use exit 1 for a missing set; restore must still fail
+// closed for that case rather than treating it as an unchanged membership.
+func awgDNSLearnMembershipScript(requests []ipsetAddReq) (string, error) {
+	restore, err := awgDNSLearnScript(requests)
+	if err != nil {
+		return "", err
+	}
+	var script strings.Builder
+	script.WriteString("set -e\n")
+	for _, line := range strings.Split(strings.TrimSpace(restore), "\n") {
+		if line == "" {
+			continue
+		}
+		fields := strings.Fields(line)
+		script.WriteString("if ipset test " + fields[1] + " " + fields[2] + " >/dev/null 2>&1; then\n :\nelse\n rc=$?\n [ \"$rc\" -eq 1 ] || exit \"$rc\"\n printf 'missing\\n'\n exit 0\nfi\n")
+	}
+	script.WriteString("printf 'present\\n'\n")
+	return script.String(), nil
 }
 
 func awgDNSLearnScript(requests []ipsetAddReq) (string, error) {

@@ -1,11 +1,14 @@
 package app
 
 import (
+	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
+	"regexp"
 	"runtime"
 	"strings"
 	"time"
@@ -21,7 +24,17 @@ type UpdateInfo struct {
 	Latest    string `json:"latest"`
 	Available bool   `json:"available"`
 	URL       string `json:"url"`
+
+	// A Pages fallback is pinned to the verified bootstrap's release and
+	// checksum. These details are internal to this check/update operation.
+	assetURL    string
+	assetSHA256 string
 }
+
+const (
+	officialUpdateRepo = "Omn1z/nfqws2-keenetic-strategy-selector"
+	officialUpdateSite = "https://omn1z.github.io/nfqws2-keenetic-strategy-selector"
+)
 
 // SelfUpdateStatus is the observable state of a UI-triggered self-update.
 type SelfUpdateStatus struct {
@@ -34,33 +47,178 @@ type SelfUpdateStatus struct {
 	FinishedAt int64  `json:"finished_at,omitempty"`
 }
 
-// CheckUpdate queries the GitHub Releases API for the latest tag.
+// CheckUpdate prefers GitHub Releases, with the official verified Pages mirror
+// as a fallback when the API is rate limited or temporarily unavailable.
 func (a *App) CheckUpdate() (UpdateInfo, error) {
 	info := UpdateInfo{Current: a.Cfg.Version}
 	if a.Cfg.Repo == "" {
 		return info, fmt.Errorf("repo not configured")
 	}
-	req, _ := http.NewRequest("GET", "https://api.github.com/repos/"+a.Cfg.Repo+"/releases/latest", nil)
+	// The UI's read timeout is 30 seconds. Share one budget across the API,
+	// bootstrap and manifest rather than spending a fresh timeout on each.
+	ctx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+	defer cancel()
+	client := &http.Client{Timeout: 12 * time.Second, CheckRedirect: selfUpdateHTTPSRedirect}
+	latest, releaseURL, canFallback, err := checkGitHubUpdate(ctx, client, a.Cfg.Repo)
+	if err != nil {
+		if !canFallback || !strings.EqualFold(a.Cfg.Repo, officialUpdateRepo) {
+			return info, err
+		}
+		fallback, fallbackErr := checkPagesUpdate(ctx, client)
+		if fallbackErr != nil {
+			return info, fmt.Errorf("%w; official Pages fallback: %v", err, fallbackErr)
+		}
+		info = fallback
+		info.Current = a.Cfg.Version
+	} else {
+		info.Latest = latest
+		info.URL = releaseURL
+	}
+	info.Available = selfUpdateAvailable(a.Cfg.Version, info.Latest)
+	return info, nil
+}
+
+func checkGitHubUpdate(ctx context.Context, client *http.Client, repo string) (tag, releaseURL string, canFallback bool, err error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", "https://api.github.com/repos/"+repo+"/releases/latest", nil)
+	if err != nil {
+		return "", "", false, err
+	}
 	req.Header.Set("User-Agent", "nfqws2-strategy")
 	req.Header.Set("Accept", "application/vnd.github+json")
-	resp, err := (&http.Client{Timeout: 12 * time.Second}).Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
-		return info, err
+		return "", "", true, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return info, fmt.Errorf("github api status %d", resp.StatusCode)
+		canFallback = resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusTooManyRequests || (resp.StatusCode >= 500 && resp.StatusCode < 600)
+		return "", "", canFallback, fmt.Errorf("github api status %d", resp.StatusCode)
 	}
 	var rel struct {
 		TagName string `json:"tag_name"`
 		HTMLURL string `json:"html_url"`
 	}
 	if err := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&rel); err != nil {
+		return "", "", false, err
+	}
+	return rel.TagName, rel.HTMLURL, false, nil
+}
+
+func selfUpdateHTTPSRedirect(req *http.Request, via []*http.Request) error {
+	if len(via) >= 10 {
+		return fmt.Errorf("too many update redirects")
+	}
+	if req.URL.Scheme != "https" {
+		return fmt.Errorf("update redirect must use HTTPS")
+	}
+	return nil
+}
+
+func readUpdateMetadata(ctx context.Context, client *http.Client, url string, limit int64) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", "nfqws2-strategy")
+	req.Header.Set("Cache-Control", "no-cache")
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("metadata status %d", resp.StatusCode)
+	}
+	data, err := io.ReadAll(io.LimitReader(resp.Body, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(data) == 0 || int64(len(data)) > limit {
+		return nil, fmt.Errorf("update metadata is empty or too large")
+	}
+	return data, nil
+}
+
+// The Pages publisher writes these three literal assignments after verifying
+// the original release assets. Treat the bootstrap solely as bounded data;
+// never source it or execute any of its commands.
+func parseUpdateBootstrap(data []byte) (tag, manifestSHA256 string, err error) {
+	values := make(map[string]string)
+	literal := regexp.MustCompile(`^(PAGES_BASE_URL|RELEASE_TAG|SHA256SUMS_SHA256)='([^'\r\n]*)'$`)
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSuffix(line, "\r")
+		name, _, assignment := strings.Cut(line, "=")
+		name = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(name), "export "))
+		if !assignment || (name != "PAGES_BASE_URL" && name != "RELEASE_TAG" && name != "SHA256SUMS_SHA256") {
+			continue
+		}
+		match := literal.FindStringSubmatch(line)
+		_, exists := values[name]
+		if match == nil || exists {
+			return "", "", fmt.Errorf("invalid or duplicate bootstrap assignment: %s", name)
+		}
+		values[name] = match[2]
+	}
+	if values["PAGES_BASE_URL"] != officialUpdateSite {
+		return "", "", fmt.Errorf("invalid bootstrap Pages URL")
+	}
+	tag = values["RELEASE_TAG"]
+	if !regexp.MustCompile(`^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$`).MatchString(tag) || len(tag) > 64 || !semver.IsValid(tag) {
+		return "", "", fmt.Errorf("invalid bootstrap release tag")
+	}
+	manifestSHA256 = values["SHA256SUMS_SHA256"]
+	if !regexp.MustCompile(`^[0-9a-f]{64}$`).MatchString(manifestSHA256) {
+		return "", "", fmt.Errorf("invalid bootstrap checksum")
+	}
+	return tag, manifestSHA256, nil
+}
+
+func parseUpdateChecksums(data []byte, asset string) (string, error) {
+	checksums := make(map[string]string)
+	entry := regexp.MustCompile(`^([0-9a-fA-F]{64}) [ *]([A-Za-z0-9][A-Za-z0-9._-]*)$`)
+	for _, line := range strings.Split(strings.TrimSuffix(string(data), "\n"), "\n") {
+		match := entry.FindStringSubmatch(strings.TrimSuffix(line, "\r"))
+		if match == nil {
+			return "", fmt.Errorf("invalid update checksum entry")
+		}
+		if _, exists := checksums[match[2]]; exists {
+			return "", fmt.Errorf("duplicate update checksum entry")
+		}
+		checksums[match[2]] = strings.ToLower(match[1])
+	}
+	if checksums[asset] == "" {
+		return "", fmt.Errorf("missing update checksum for %s", asset)
+	}
+	return checksums[asset], nil
+}
+
+func checkPagesUpdate(ctx context.Context, client *http.Client) (UpdateInfo, error) {
+	var info UpdateInfo
+	bootstrap, err := readUpdateMetadata(ctx, client, officialUpdateSite+"/install.sh", 256<<10)
+	if err != nil {
 		return info, err
 	}
-	info.Latest = rel.TagName
-	info.URL = rel.HTMLURL
-	info.Available = selfUpdateAvailable(a.Cfg.Version, rel.TagName)
+	tag, manifestSHA256, err := parseUpdateBootstrap(bootstrap)
+	if err != nil {
+		return info, err
+	}
+	releaseURL := officialUpdateSite + "/releases/" + tag
+	manifest, err := readUpdateMetadata(ctx, client, releaseURL+"/SHA256SUMS", 1<<20)
+	if err != nil {
+		return info, err
+	}
+	if fmt.Sprintf("%x", sha256.Sum256(manifest)) != manifestSHA256 {
+		return info, fmt.Errorf("update checksum manifest SHA-256 mismatch")
+	}
+	asset := "nfqws2-strategy-linux-" + runtime.GOARCH
+	assetSHA256, err := parseUpdateChecksums(manifest, asset)
+	if err != nil {
+		return info, err
+	}
+	info.Latest = tag
+	info.URL = "https://github.com/" + officialUpdateRepo + "/releases/tag/" + tag
+	info.assetURL = releaseURL + "/" + asset
+	info.assetSHA256 = assetSHA256
 	return info, nil
 }
 
@@ -206,17 +364,11 @@ func (a *App) selfUpdateWithProgress(progress func(string, UpdateInfo)) (UpdateI
 	if err != nil {
 		return info, err
 	}
-	asset := "nfqws2-strategy-linux-" + runtime.GOARCH
-	urls := []string{
-		fmt.Sprintf("https://github.com/%s/releases/download/%s/%s", a.Cfg.Repo, info.Latest, asset),
-		fmt.Sprintf("https://github.com/%s/releases/latest/download/%s", a.Cfg.Repo, asset),
-	}
-
 	tmp := exe + ".new"
 	if progress != nil {
 		progress("downloading", info)
 	}
-	if err := downloadFile(urls, tmp); err != nil {
+	if err := downloadSelfUpdate(info, a.Cfg.Repo, tmp); err != nil {
 		_ = os.Remove(tmp)
 		return info, fmt.Errorf("download: %w", err)
 	}
@@ -239,6 +391,44 @@ func (a *App) selfUpdateWithProgress(progress func(string, UpdateInfo)) (UpdateI
 		return info, fmt.Errorf("schedule restart: %w", err)
 	}
 	return info, nil
+}
+
+func downloadSelfUpdate(info UpdateInfo, repo, dst string) error {
+	asset := "nfqws2-strategy-linux-" + runtime.GOARCH
+	urls := []string{
+		fmt.Sprintf("https://github.com/%s/releases/download/%s/%s", repo, info.Latest, asset),
+		fmt.Sprintf("https://github.com/%s/releases/latest/download/%s", repo, asset),
+	}
+	if info.assetURL != "" {
+		if info.assetSHA256 == "" {
+			return fmt.Errorf("missing pinned update checksum")
+		}
+		// Never use a mutable latest URL for a hash-pinned Pages update.
+		urls = []string{info.assetURL}
+	}
+	if err := downloadFile(urls, dst); err != nil {
+		return err
+	}
+	if info.assetSHA256 != "" {
+		f, err := os.Open(dst)
+		if err != nil {
+			return err
+		}
+		hash := sha256.New()
+		_, hashErr := io.Copy(hash, f)
+		closeErr := f.Close()
+		if hashErr != nil {
+			return hashErr
+		}
+		if closeErr != nil {
+			return closeErr
+		}
+		if fmt.Sprintf("%x", hash.Sum(nil)) != info.assetSHA256 {
+			_ = os.Remove(dst)
+			return fmt.Errorf("update binary SHA-256 mismatch")
+		}
+	}
+	return nil
 }
 
 func downloadFile(urls []string, dst string) error {
@@ -265,7 +455,7 @@ func downloadFile(urls []string, dst string) error {
 func downloadWithRetry(url, dst string) error {
 	part := dst + ".part"
 	_ = os.Remove(part)
-	client := &http.Client{Timeout: 180 * time.Second}
+	client := &http.Client{Timeout: 180 * time.Second, CheckRedirect: selfUpdateHTTPSRedirect}
 	var lastErr error
 	for attempt := 1; attempt <= 5; attempt++ {
 		err := downloadAttempt(client, url, part)

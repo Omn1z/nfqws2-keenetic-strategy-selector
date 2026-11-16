@@ -18,6 +18,7 @@ import (
 // Use the Go module/version embedded in the executable instead.
 const AWGEngineVersion = "v3.1.20260828"
 const awgEngineRevision = "b5928efb6ca19f0153958460c3d141f04abc5c2e"
+const awgEngineRouterMemoryTag = "n2s_router_memory_v1"
 
 var engineInfoCache struct {
 	sync.Mutex
@@ -72,8 +73,26 @@ func engineBuildInfo(bi *debug.BuildInfo) EngineInfo {
 		}
 	}
 	info.AWG3Supported = bi.Main.Path == "github.com/amnezia-vpn/amneziawg-go/v3" && (versionAtLeast31(version) || rev == awgEngineRevision)
-	info.UpdateAvailable = !info.AWG3Supported || !engineSecurityBuildCurrent(bi)
+	info.UpdateAvailable = !info.AWG3Supported || !engineSecurityBuildCurrent(bi) || !engineRouterMemoryBuildCurrent(bi)
 	return info
+}
+
+// The router queue/batch profile is an overlay over the same upstream version
+// and dependency lock as older releases. Go records build tags even in stripped
+// binaries, so the release/audit marker distinguishes this rebuild without
+// changing upstream protocol compatibility or restarting a running daemon.
+func engineRouterMemoryBuildCurrent(bi *debug.BuildInfo) bool {
+	for _, setting := range bi.Settings {
+		if setting.Key != "-tags" {
+			continue
+		}
+		for _, tag := range strings.Fields(strings.ReplaceAll(setting.Value, ",", " ")) {
+			if tag == awgEngineRouterMemoryTag {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // Protocol support alone does not identify a patched engine: we rebuild the

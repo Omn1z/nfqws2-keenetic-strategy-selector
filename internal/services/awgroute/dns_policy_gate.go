@@ -21,6 +21,9 @@ type routingDNSGate struct {
 	writeEpoch uint64
 	learnToken chan struct{}
 	learned    map[string]time.Time
+	// An ipset restore can partially succeed, and a cache flush can fail after
+	// a successful add. Keep that debt across retries and memo invalidation.
+	accelerationDirty bool
 }
 
 // RoutingDNSReadiness contains lifecycle state and installation diagnostics,

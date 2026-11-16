@@ -30,7 +30,14 @@ func (a *App) Nfqws2CheckUpdate() Nfqws2VersionInfo { return a.nfqws2.CheckUpdat
 func (a *App) Nfqws2Update() (string, error) {
 	return a.withNfqws2PackageUpdate(func() (string, error) { return a.nfqws2.Update() })
 }
-func (a *App) Nfqws2Reload() error { return a.nfqws2.Reload() }
+func (a *App) Nfqws2Reload() error {
+	resume, err := a.suspendNfqws2Acceleration()
+	if err != nil {
+		return err
+	}
+	defer resume()
+	return a.nfqws2.Reload()
+}
 func (a *App) Nfqws2ApplyBypass() error {
 	return a.withNfqws2FirewallApply(false, func() error { return a.nfqws2.ApplyBypass() })
 }

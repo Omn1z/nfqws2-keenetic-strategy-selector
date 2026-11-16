@@ -75,6 +75,10 @@ type clientRecovery struct {
 	Recovering    bool
 	Error         string
 	RoutesPending bool
+	LastStatus    ClientStatus
+	LastStatusAt  time.Time
+	UnavailableAt time.Time
+	UnavailableID string
 }
 
 type clientRecoveryAction int
@@ -93,6 +97,19 @@ func (r *clientRecovery) observe(st ClientStatus, now time.Time) clientRecoveryA
 }
 
 func (r *clientRecovery) observeWithSettings(st ClientStatus, now time.Time, settings RecoverySettings) clientRecoveryAction {
+	if st.StatusUnavailable && st.Running && st.engineID != "" {
+		return r.observeUnavailable(st, now, settings)
+	}
+	if !r.UnavailableAt.IsZero() && r.Attempts == 0 {
+		r.ProbeAt, r.ProbeUntil = time.Time{}, time.Time{}
+		r.Recovering, r.Error = false, ""
+		r.FailureSince = time.Time{}
+	}
+	r.UnavailableAt, r.UnavailableID = time.Time{}, ""
+	defer func() {
+		st.Connected = st.Connected || r.authenticatedStatus(&st, now)
+		r.LastStatus, r.LastStatusAt = st, now
+	}()
 	progress := r.Seen && (st.RxBytes > r.RX || st.LastHandshake > r.Handshake)
 	r.Seen, r.RX, r.Handshake = true, st.RxBytes, st.LastHandshake
 	fresh := st.LastHandshake > 0 && now.Unix()-st.LastHandshake >= 0 && now.Unix()-st.LastHandshake < int64(clientStaleAfter/time.Second)
@@ -132,6 +149,24 @@ func (r *clientRecovery) observeWithSettings(st ClientStatus, now time.Time, set
 		return clientProbe
 	}
 	if now.Before(r.probeDeadline()) {
+		return clientWait
+	}
+	return clientReconnect
+}
+
+// A stalled status socket is not proof that its live daemon has died. Give
+// that exact process one bounded verification window; failed reads neither
+// renew authenticated health nor restart the window on every poll.
+func (r *clientRecovery) observeUnavailable(st ClientStatus, now time.Time, settings RecoverySettings) clientRecoveryAction {
+	if r.UnavailableAt.IsZero() || r.UnavailableID != st.engineID {
+		r.UnavailableAt, r.UnavailableID = now, st.engineID
+		r.ProbeAt = now
+		r.ProbeUntil = now.Add(settings.handshakeTimeout())
+	}
+	r.beginFailure(now)
+	r.Recovering = true
+	r.Error = "временно недоступен статус работающего туннеля"
+	if now.Before(r.RetryAt) || now.Before(r.ProbeUntil) {
 		return clientWait
 	}
 	return clientReconnect
@@ -300,6 +335,14 @@ func (svc *Service) clientRecoveryStatus(am *awg.Manager, st *ClientStatus) {
 	svc.clients.mu.Lock()
 	r := svc.clients.states[am]
 	svc.clients.mu.Unlock()
+	now := time.Now()
+	r.restoreUnavailableStatus(st, now, svc.currentRecoverySettings())
+	// A successful receive is authenticated by the engine just like a fresh
+	// handshake. Keep status/failover consistent with observeWithSettings: an
+	// idle rekey timestamp must not hide a tunnel still receiving valid data.
+	// Read-only polls do not extend this window, and counters/handshake must
+	// still belong to the generation the supervisor actually observed.
+	st.Connected = st.Connected || r.authenticatedStatus(st, now)
 	st.Recovering, st.RetryCount, st.RecoveryError = r.Recovering, r.Attempts, r.Error
 	verification := r.VerifyUntil
 	next := r.RetryAt
@@ -317,6 +360,30 @@ func (svc *Service) clientRecoveryStatus(am *awg.Manager, st *ClientStatus) {
 	if !next.IsZero() {
 		st.RetryAt = next.Unix()
 	}
+}
+
+func (r clientRecovery) authenticatedStatus(st *ClientStatus, now time.Time) bool {
+	if st == nil || !st.Running || st.StatusUnavailable || !r.Seen || r.Recovering || st.LastHandshake <= 0 ||
+		st.LastHandshake != r.Handshake || st.RxBytes < r.RX || r.HealthyAt.IsZero() {
+		return false
+	}
+	age := now.Sub(r.HealthyAt)
+	return age >= 0 && age < clientStaleAfter
+}
+
+func (r clientRecovery) restoreUnavailableStatus(st *ClientStatus, now time.Time, settings RecoverySettings) {
+	if !st.StatusUnavailable || !st.Running || !r.LastStatus.Running || st.engineID == "" || st.engineID != r.LastStatus.engineID {
+		return
+	}
+	age := now.Sub(r.LastStatusAt)
+	if r.LastStatusAt.IsZero() || age < 0 || age >= settings.handshakeTimeout() {
+		return
+	}
+	old := r.LastStatus
+	st.LastHandshake, st.RxBytes, st.TxBytes = old.LastHandshake, old.RxBytes, old.TxBytes
+	st.Endpoint, st.Address, st.MTU = old.Endpoint, old.Address, old.MTU
+	healthAge := now.Sub(r.HealthyAt)
+	st.Connected = old.Connected && !r.HealthyAt.IsZero() && healthAge >= 0 && healthAge < clientStaleAfter
 }
 
 func (svc *Service) startClientSupervisor() {

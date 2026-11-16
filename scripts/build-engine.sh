@@ -1,5 +1,6 @@
 #!/bin/sh
-# Build the pinned AmneziaWG 3.1 source with our security dependency lock:
+# Build the pinned AmneziaWG 3.1 source with our security dependency lock and
+# router memory overlay:
 # `amneziawg-go` daemon (pure Go, CGO off → fully static, runs on Entware
 # regardless of libc). The panel drives it DIRECTLY over its UAPI socket, so
 # NO C `awg` tool and NO musl toolchain are needed — this is just a cross-compile
@@ -16,6 +17,7 @@ AWG_GO_REF="${AWG_GO_REF:-v3.1.20260828}"
 OUT="$(pwd)/dist"
 WORK="$(pwd)/.engine-build"
 MODFILE="$(pwd)/internal/services/awg/engine-deps.mod"
+MEMORY_TOOL="$(pwd)/scripts/engine-memory-overlay/main.go"
 mkdir -p "$OUT" "$WORK"
 
 [ -d "$WORK/amneziawg-go/.git" ] || git clone --no-checkout --depth 1 "$AWG_GO_REPO" "$WORK/amneziawg-go"
@@ -25,6 +27,7 @@ git -C "$WORK/amneziawg-go" checkout --detach "$AWG_GO_REF"
 # The dependency lock is reviewed for this exact source revision. Updating the
 # engine requires reviewing the lock too; changing the tag alone is unsafe.
 [ "$(git -C "$WORK/amneziawg-go" rev-parse HEAD)" = b5928efb6ca19f0153958460c3d141f04abc5c2e ] || { echo "unexpected upstream revision for dependency lock" >&2; exit 1; }
+OVERLAY="$(go run "$MEMORY_TOOL" -source "$WORK/amneziawg-go" -output "$WORK/router-memory")"
 
 build() { # name GOARCH GOARM GOMIPS
   name="$1"
@@ -34,14 +37,14 @@ build() { # name GOARCH GOARM GOMIPS
     export GOOS=linux GOARCH="$2" CGO_ENABLED=0
     if [ -n "$3" ]; then export GOARM="$3"; else unset GOARM; fi
     if [ -n "$4" ]; then export GOMIPS="$4"; else unset GOMIPS; fi
-    # Keep upstream files untouched and forbid implicit dependency changes.
-    go build -modfile="$MODFILE" -mod=readonly -trimpath -ldflags "-s -w" -o "$stage/amneziawg-go" .
+    # The memory overlay keeps upstream files untouched; forbid implicit dependency changes.
+    go build -tags=n2s_router_memory_v1 -overlay="$OVERLAY" -modfile="$MODFILE" -mod=readonly -trimpath -ldflags "-s -w" -o "$stage/amneziawg-go" .
     if [ -n "${GOVULNCHECK:-}" ]; then
       audit="$WORK/audit-$name/amneziawg-go"
       mkdir -p "$(dirname "$audit")"
       # Stripped binaries force govulncheck to assume every package of each
       # linked module is present. Retain symbols for an accurate binary scan.
-      go build -modfile="$MODFILE" -mod=readonly -trimpath -ldflags "-w" -o "$audit" .
+      go build -tags=n2s_router_memory_v1 -overlay="$OVERLAY" -modfile="$MODFILE" -mod=readonly -trimpath -ldflags "-w" -o "$audit" .
       "$GOVULNCHECK" -mode=binary "$audit"
     fi
   )

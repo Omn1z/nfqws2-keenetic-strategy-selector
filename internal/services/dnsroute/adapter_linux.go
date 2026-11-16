@@ -98,36 +98,16 @@ func (a *Adapter) prepareOS(ctx context.Context, l ListenOptions) error {
 	if !validInterface(iface) {
 		return fmt.Errorf("invalid LAN interface")
 	}
-	if data, e := os.ReadFile(hookPath); e == nil && !strings.Contains(string(data), hookSignature) {
-		return fmt.Errorf("refusing to replace foreign netfilter hook %s", hookPath)
-	} else if e != nil && !os.IsNotExist(e) {
-		return e
+	if _, err := inspectDNSHook(hookPath, "replace"); err != nil {
+		return err
 	}
 	// Own remnants may survive an unclean restart; only our exact mark/table
 	// pairs and named chains are cleaned. Never flush the user's routing tables.
 	if err = a.cleanupLocked(ctx); err != nil {
 		return err
 	}
-	if err = os.MkdirAll(filepath.Dir(hookPath), 0755); err != nil {
-		return err
-	}
 	script := firewallScript(a.cfg.MainQueue, l, iface, subnet)
-	tmp, err := os.CreateTemp(filepath.Dir(hookPath), ".nfqws-dns-*")
-	if err != nil {
-		return err
-	}
-	tmpName := tmp.Name()
-	defer os.Remove(tmpName)
-	if _, err = tmp.WriteString(script); err == nil {
-		err = tmp.Chmod(0755)
-	}
-	if e := tmp.Close(); err == nil {
-		err = e
-	}
-	if err != nil {
-		return err
-	}
-	if err = os.Rename(tmpName, hookPath); err != nil {
+	if err = installDNSHook(hookPath, dnsHookRecoveryDir(a.cfg.DataDir, hookPath), script); err != nil {
 		return err
 	}
 	if _, err = command(ctx, "sh", hookPath); err != nil {
@@ -686,18 +666,16 @@ func (a *Adapter) closeOS() error {
 	defer a.mu.Unlock()
 	// Disabling a previously prepared adapter is safe to repeat. With no hook
 	// and no preparation, leave the host entirely untouched (default is off).
-	data, err := os.ReadFile(hookPath)
-	if err != nil && os.IsNotExist(err) && !a.hookReady {
-		return nil
-	}
-	if err == nil && !strings.Contains(string(data), hookSignature) {
-		return fmt.Errorf("refusing to remove foreign netfilter hook %s", hookPath)
-	}
-	if err != nil && !os.IsNotExist(err) {
+	state, err := inspectDNSHook(hookPath, "remove")
+	if err != nil {
 		return err
 	}
-	if err == nil {
-		if err = os.Remove(hookPath); err != nil {
+	if !state.exists && !a.hookReady {
+		return nil
+	}
+	if state.exists {
+		if err = removeDNSHook(hookPath, dnsHookRecoveryDir(a.cfg.DataDir, hookPath)); err != nil {
+			a.hookReady = true // a durable unlink failure still needs firewall cleanup on retry
 			return err
 		}
 	}

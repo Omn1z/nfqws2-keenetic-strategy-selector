@@ -6,10 +6,13 @@ import (
 	"strings"
 )
 
+const awgMultiActionPrefix = "AWG2_TO_"
+
 // Only a complete ordered policy and all its required shared rules can avoid
 // a refresh. Unknown/missing output is conservative: the caller repairs it.
 func awgMultiFirewallIntact(snapshot, chain string, expected []string, shared map[string][]string) bool {
 	actual := map[string][]string{}
+	declaredActions := map[string]bool{}
 	complete := map[string]bool{}
 	table := ""
 	for _, raw := range strings.Split(snapshot, "\n") {
@@ -29,6 +32,12 @@ func awgMultiFirewallIntact(snapshot, chain string, expected []string, shared ma
 			table = ""
 			continue
 		}
+		if table == "mangle" && strings.HasPrefix(line, ":") {
+			fields := strings.Fields(strings.TrimPrefix(line, ":"))
+			if len(fields) > 0 && awgIsMultiActionChain(fields[0]) {
+				declaredActions[fields[0]] = true
+			}
+		}
 		if table == "" || !strings.HasPrefix(line, "-A ") {
 			continue
 		}
@@ -42,12 +51,30 @@ func awgMultiFirewallIntact(snapshot, chain string, expected []string, shared ma
 	if table != "" || (len(expected) > 0 && !complete["mangle"]) {
 		return false
 	}
-	policy := actual["mangle/"+chain]
-	if len(policy) != len(expected) {
+	expectedChains := map[string][]string{}
+	for _, want := range expected {
+		fields := strings.Fields(want)
+		if len(fields) < 4 || fields[0] != "-A" || (fields[1] != chain && !awgIsMultiActionChain(fields[1])) {
+			return false
+		}
+		expectedChains[fields[1]] = append(expectedChains[fields[1]], awgCanonicalFirewallRule(want))
+	}
+	if len(expected) > 0 && len(expectedChains[chain]) == 0 {
 		return false
 	}
-	for i, want := range expected {
-		if policy[i] != awgCanonicalFirewallRule(want) {
+	for name, rules := range expectedChains {
+		policy := actual["mangle/"+name]
+		if len(policy) != len(rules) {
+			return false
+		}
+		for i, want := range rules {
+			if policy[i] != want {
+				return false
+			}
+		}
+	}
+	for name := range declaredActions {
+		if len(expected) > 0 && len(expectedChains[name]) == 0 {
 			return false
 		}
 	}
@@ -76,8 +103,21 @@ func awgMultiFirewallIntact(snapshot, chain string, expected []string, shared ma
 	return len(expected) > 0 || len(shared) > 0
 }
 
+func awgIsMultiActionChain(name string) bool {
+	if len(name) != len(awgMultiActionPrefix)+8 || !strings.HasPrefix(name, awgMultiActionPrefix) {
+		return false
+	}
+	_, err := strconv.ParseUint(strings.TrimPrefix(name, awgMultiActionPrefix), 16, 32)
+	return err == nil
+}
+
 func awgCanonicalFirewallRule(line string) string {
 	fields := strings.Fields(line)
+	for i, field := range fields {
+		if field == "--goto" {
+			fields[i] = "-g"
+		}
+	}
 	for i := 1; i < len(fields); i++ {
 		if fields[i-1] == "--tcp-flags" && i+1 < len(fields) {
 			fields[i], fields[i+1] = awgCanonicalTCPFlags(fields[i]), awgCanonicalTCPFlags(fields[i+1])

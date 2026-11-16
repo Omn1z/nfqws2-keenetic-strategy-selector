@@ -141,6 +141,9 @@ func (svc *Service) awgRestoreMultiPolicyOS(rules []awgMultiRule, tunnels []awgM
 	wasReady := svc.RoutingDNSReadiness().Ready
 	finishDNS := svc.routingDNSGate.begin(false)
 	defer func() { finishDNS(restoreErr) }()
+	if err := svc.awgBeginAccelerationTransition(); err != nil {
+		return err
+	}
 	_, missing := os.Stat(awgMultiHookPath)
 	// A failed apply can leave the hook file present but its sets incomplete.
 	// Healthy tunnel recovery keeps learned sets; failed readiness repairs them.
@@ -160,10 +163,12 @@ func (svc *Service) awgRestoreMultiPolicyOS(rules []awgMultiRule, tunnels []awgM
 	if awgMultiDynamicRuleCount(rules) > 0 && !dnsOn {
 		return fmt.Errorf("multi-routing: DNS route learner failed to start")
 	}
-	if err := awgWriteMultiHook(tunnels, rules, dnsOn); err != nil {
+	if err := svc.awgWriteMultiHook(tunnels, rules, dnsOn); err != nil {
 		return err
 	}
-	awgSetAccel(false)
+	if err := svc.awgFinishAccelerationTransition(); err != nil {
+		return err
+	}
 	// Recovery may resolve a new engine endpoint or choose a new fallback.
 	// Replace the watchdog's installed-policy snapshot too; keeping the old
 	// snapshot would reassert the previous endpoint/rules on its next tick.
@@ -183,6 +188,9 @@ func (svc *Service) awgRestoreLegacyClientRoutesOS(am *awg.Manager) (restoreErr 
 	wasReady := svc.RoutingDNSReadiness().Ready
 	finishDNS := svc.routingDNSGate.begin(false)
 	defer func() { finishDNS(restoreErr) }()
+	if err := svc.awgBeginAccelerationTransition(); err != nil {
+		return err
+	}
 	_, missing := os.Stat(awgHookPath)
 	if err := awgRestoreRoutingSets(missing != nil, wasReady, func() error {
 		// Full mode needs only empty set definitions; packet routing is in
@@ -223,7 +231,6 @@ func (svc *Service) awgRestoreLegacyClientRoutesOS(am *awg.Manager) (restoreErr 
 	if err := awgWriteHook(awgEffectiveMode(cfg.Routing), endpointIP, dev, awgTunnelMTU(cfg), dnsOn, awgTunnelV6Reaches(), cfg.Routing.Zones); err != nil {
 		return err
 	}
-	awgSetAccel(false)
 	if !refreshing {
 		svc.awgStartRefresh()
 	}

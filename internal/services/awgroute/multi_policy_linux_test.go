@@ -30,7 +30,7 @@ func TestMultiFirewallHookWaitsForXtablesLock(t *testing.T) {
 		"iptables -w -t mangle -I PREROUTING 1 -j AWG2_MULTI",
 		"iptables -w -t nat -A POSTROUTING -o awg0 -j MASQUERADE",
 		"iptables -w -t mangle -A FORWARD -o awg0",
-		"-A AWG2_MULTI -s 192.168.3.151 -m set --match-set awgm_000 dst -j ACCEPT",
+		"-A AWG2_MULTI -s 192.168.3.151 -m set --match-set awgm_000 dst -g AWG2_TO_10100000",
 		"nft insert rule inet fw4 forward iifname \"$br\" oifname \"awg0\" accept comment \"nfqws2-awg2\"",
 	} {
 		if !strings.Contains(hook, want) {

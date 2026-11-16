@@ -115,13 +115,7 @@ func (svc *Service) awgMultiPolicyIntact(rules []awgMultiRule, tunnels []awgMult
 			return false
 		}
 	}
-	for _, sysctl := range awgAccelSysctls {
-		value, err := os.ReadFile("/proc/sys/" + strings.ReplaceAll(sysctl, ".", "/"))
-		if err == nil && strings.TrimSpace(string(value)) != "0" {
-			return false
-		}
-	}
-	return len(tunnels) > 0
+	return len(tunnels) > 0 && svc.awgAccelerationIntact()
 }
 
 func awgRefreshMultiSets(rules []awgMultiRule) error {

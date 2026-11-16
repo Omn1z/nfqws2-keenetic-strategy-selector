@@ -41,11 +41,13 @@ type ClientStatus struct {
 	MTU               int    `json:"mtu"`
 	Connected         bool   `json:"connected"` // handshake within ~180s
 	Error             string `json:"error,omitempty"`
+	StatusUnavailable bool   `json:"status_unavailable,omitempty"`
 	Recovering        bool   `json:"recovering"`
 	VerificationUntil int64  `json:"verification_until,omitempty"`
 	RetryAt           int64  `json:"retry_at"`
 	RetryCount        int    `json:"retry_count"`
 	RecoveryError     string `json:"recovery_error,omitempty"`
+	engineID          string // PID/start time; never reuse health across daemon replacement
 }
 
 // AWGConn is one AWG2 tunnel's live state, shaped for the dashboard (state +

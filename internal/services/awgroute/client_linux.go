@@ -86,28 +86,7 @@ func awgTuneClientKernelBuffers() {
 }
 
 func awgDaemonStartCmd(iface string) string {
-	return "GOMEMLIMIT=128MiB GOGC=200 GODEBUG=madvdontneed=1 " + shell.Quote(awgGoBin()) + " " + shell.Quote(iface)
-}
-
-func awgDaemonEnvGuardScript(iface string) string {
-	qiface := shell.Quote(iface)
-	qsock := shell.Quote(awgSockPath(iface))
-	return strings.Join([]string{
-		"if ip link show " + qiface + " >/dev/null 2>&1; then",
-		"  p=$(ps w | awk -v i=" + qiface + " '$0 ~ \"amneziawg-go \" i && $0 !~ /awk/ {print $1; exit}')",
-		"  ok=0",
-		"  if [ -n \"$p\" ]; then",
-		"    envs=$(tr '\\0' '\\n' </proc/$p/environ 2>/dev/null || true)",
-		"    echo \"$envs\" | grep -qx 'GOMEMLIMIT=128MiB' && echo \"$envs\" | grep -qx 'GOGC=200' && echo \"$envs\" | grep -qx 'GODEBUG=madvdontneed=1' && ok=1",
-		"  fi",
-		"  if [ \"$ok\" != 1 ]; then",
-		"    ip link del " + qiface + " 2>/dev/null || true",
-		"    [ -n \"$p\" ] && kill \"$p\" 2>/dev/null || true",
-		"    rm -f " + qsock + " 2>/dev/null || true",
-		"    sleep 1",
-		"  fi",
-		"fi",
-	}, "\n")
+	return awgDaemonMemoryEnvironmentOS() + " " + shell.Quote(awgGoBin()) + " " + shell.Quote(iface)
 }
 
 func awgSetActiveIfaceOS(iface string) {
@@ -356,7 +335,6 @@ func (svc *Service) awgClientUpManagerOS(am *awg.Manager) error {
 	// 1) start the userspace daemon (creates the iface + UAPI socket) + bring up.
 	script := strings.Join([]string{
 		"mkdir -p /var/run/amneziawg",
-		awgDaemonEnvGuardScript(iface),
 		"ip link show " + iface + " >/dev/null 2>&1 || (rm -f " + shell.Quote(awgSockPath(iface)) + " 2>/dev/null || true; " + awgDaemonStartCmd(iface) + "; sleep 1)",
 		"ip addr flush dev " + iface + " 2>/dev/null || true",
 		awgAddressScript(iface, p.Address),
@@ -508,12 +486,19 @@ func awgClientStatusIfaceContextOS(opCtx context.Context, iface string) *ClientS
 	}
 	resp, err := uapiRequestIfaceContext(opCtx, iface, "get=1\n\n")
 	if err != nil || !strings.Contains(resp, "public_key=") {
+		st.engineID = awgClientProcessIdentityOS(iface)
+		if st.engineID != "" {
+			st.Running, st.StatusUnavailable = true, true
+			st.Error = "не удалось прочитать статус работающего туннеля"
+		}
 		return st
 	}
 	u := awg.ParseUAPIGet(resp)
 	st.LastHandshake, st.RxBytes, st.TxBytes, st.Endpoint = u.LastHandshake, u.RxBytes, u.TxBytes, u.Endpoint
 	st.Running = st.Endpoint != ""
-	st.Connected = u.LastHandshake > 0 && time.Now().Unix()-u.LastHandshake < 180
+	st.engineID = awgClientProcessIdentityOS(iface)
+	age := time.Now().Unix() - u.LastHandshake
+	st.Connected = u.LastHandshake > 0 && age >= 0 && age < 180
 	return st
 }
 

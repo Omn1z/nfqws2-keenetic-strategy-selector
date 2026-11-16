@@ -93,6 +93,9 @@ func (svc *Service) awgApplyRoutingOS() (applyErr error) {
 	sets := svc.awgPrepareSetPlan(&cfg, true)
 	finishDNS := svc.routingDNSGate.begin(true)
 	defer func() { finishDNS(applyErr) }()
+	if err := svc.awgBeginAccelerationTransition(); err != nil {
+		return err
+	}
 	// 1) pin the endpoint via the ORIGINAL gateway first (prevents the WG loop)
 	// 2) ipset membership — force=true so a user-triggered apply always rebuilds
 	if err := svc.awgCommitSetPlan(sets); err != nil {
@@ -150,7 +153,6 @@ func (svc *Service) awgApplyRoutingOS() (applyErr error) {
 	}
 	// 6) disable Keenetic's NAT accelerators — their fast-path silently drops our
 	// policy-routed tunnel segments (see awgSetAccel). Restored on teardown.
-	awgSetAccel(false)
 	// 7) arm the dead-man's switch + start the hook-watchdog / domain refresher
 	svc.awgArmRollback(90 * time.Second)
 	svc.awgStartRefresh()
@@ -187,6 +189,9 @@ func (svc *Service) awgRefreshRoutingOS() (applyErr error) {
 	sets := svc.awgPrepareSetPlan(&cfg, true)
 	finishDNS := svc.routingDNSGate.begin(true)
 	defer func() { finishDNS(applyErr) }()
+	if err := svc.awgBeginAccelerationTransition(); err != nil {
+		return err
+	}
 	if endpointIP != "" && wandev != "" {
 		_, _ = awgRun(awgEndpointRouteCmd(endpointIP, gw, wandev))
 	}
@@ -224,7 +229,6 @@ func (svc *Service) awgRefreshRoutingOS() (applyErr error) {
 	if err := awgWriteHook(awgEffectiveMode(r), endpointIP, wandev, awgTunnelMTU(cfg), dnsOn, awgTunnelV6Reaches(), r.Zones); err != nil {
 		return fmt.Errorf("firewall-хук: %w", err)
 	}
-	awgSetAccel(false)
 	svc.route.mu.Lock()
 	svc.route.active = true
 	svc.route.mu.Unlock()
@@ -333,7 +337,7 @@ func (svc *Service) awgStartRefresh() {
 					svc.route.hookSkipsSinceFull.Store(0)
 				}
 				skips := int(svc.route.hookSkipsSinceFull.Load())
-				if same && skips < 3 && svc.RoutingDNSReadiness().Ready {
+				if same && skips < 3 && svc.RoutingDNSReadiness().Ready && svc.awgAccelerationIntact() {
 					// Cheap path: nothing changed and we re-asserted within the last
 					// 3 ticks. Still advance the tick counter for the persistence cadence
 					// below so seen domains/sets get snapshotted on schedule.
@@ -359,6 +363,12 @@ func (svc *Service) awgStartRefresh() {
 				// through here forever, defeating the whole skip cache.
 				svc.route.hookSkipsSinceFull.Store(0)
 				finishDNS := svc.routingDNSGate.begin(false)
+				if err := svc.awgBeginAccelerationTransition(); err != nil {
+					finishDNS(err)
+					logbuf.Append("awg2", "warn", err.Error())
+					unlock()
+					continue
+				}
 				var refreshErr error
 				if hookMissing != nil {
 					refreshErr = awgWriteHook(awgEffectiveMode(c.Routing), endpointIP, wandev, awgTunnelMTU(c), dnsOn, awgTunnelV6Reaches(), c.Routing.Zones)
@@ -374,7 +384,6 @@ func (svc *Service) awgStartRefresh() {
 					refreshErr = err
 				}
 				awgApplyKillswitch(c.Routing.Killswitch)
-				awgSetAccel(false)        // re-assert: Keenetic may re-enable accelerators on reconfig
 				svc.awgEnsureSNISniff(&c) // re-assert the SNI sniffer (idempotent; restarts if a socket died)
 				ticks++
 				// Check sets every ~15 min in the effective include/exclude mode.
@@ -433,6 +442,9 @@ func (svc *Service) awgStopLegacyRoutingRuntimeOS() {
 func (svc *Service) awgTeardownRoutingOS() (applyErr error) {
 	finishDNS := svc.routingDNSGate.begin(true)
 	defer func() { finishDNS(applyErr) }()
+	if err := svc.awgSuspendAcceleration(); err != nil {
+		return err
+	}
 	svc.awgClearMultiPolicyOS()
 	svc.awgStopLegacyRoutingRuntimeOS()
 	// Wait for any in-flight refresh goroutine to actually exit before we tear
@@ -443,7 +455,6 @@ func (svc *Service) awgTeardownRoutingOS() (applyErr error) {
 
 	svc.awgStopDNSProxy()      // stop the domain-mask proxy + remove its LAN :53 REDIRECT
 	svc.awgStopSNISniff()      // stop the SNI sniffer (closes its AF_PACKET sockets)
-	awgSetAccel(true)          // restore Keenetic's NAT accelerators (off only while routing active)
 	_ = os.Remove(awgHookPath) // stop Keenetic's ndm from re-adding our rules
 	_, _ = awgRun("while iptables -w -t mangle -D PREROUTING -j " + awgChain + " 2>/dev/null; do :; done")
 	_, _ = awgRun("while iptables -w -t mangle -D OUTPUT -j " + awgChain + " 2>/dev/null; do :; done")
@@ -488,6 +499,9 @@ func (svc *Service) awgTeardownRoutingOS() (applyErr error) {
 	// shape (REJECT vs ACCEPT, with/without --match-set), so delete by line
 	// number in reverse — comment-only -D would fail to find them.
 	_, _ = awgRun("for n in $(ip6tables -L FORWARD --line-numbers 2>/dev/null | awk '/" + awgV6LeakComment + "/ {print $1}' | sort -rn); do ip6tables -D FORWARD \"$n\" 2>/dev/null; done")
+	if err := svc.awgRestoreAcceleration(); err != nil {
+		return err
+	}
 	logbuf.Append("awg2", "info", "маршрутизация снята")
 	return nil
 }

@@ -38,33 +38,6 @@ var awgAccelSysctls = []string{
 	"net.hwnat.ppe_enabled",
 }
 
-// awgSetAccel toggles Keenetic's NAT accelerators (off while tunnel routing is
-// active). Disabling also flushes already-accelerated flows so existing
-// connections re-evaluate the route.
-//
-// Batched into ONE sysctl -w invocation. The previous form forked 4-5 times
-// per call — every watchdog tick (60s) on the IPQ9554 burned ~50-150 ms on
-// idempotent writes. Single fork now.
-func awgSetAccel(on bool) {
-	v := "0"
-	if on {
-		v = "1"
-	}
-	if on {
-		_, _ = awgRun("ndmc -c 'ppe hardware' >/dev/null 2>&1; ndmc -c 'ppe software' >/dev/null 2>&1; true")
-	} else {
-		_, _ = awgRun("ndmc -c 'no ppe hardware' >/dev/null 2>&1; ndmc -c 'no ppe software' >/dev/null 2>&1; true")
-	}
-	var args []string
-	for _, s := range awgAccelSysctls {
-		args = append(args, "-w", s+"="+v)
-	}
-	if !on {
-		args = append(args, "-w", "net.core.swnat_reset=1")
-	}
-	_, _ = awgRun("sysctl " + strings.Join(args, " ") + " 2>/dev/null")
-}
-
 // awgApplyKillswitch toggles the "Эксклюзивный маршрут" blackhole in the tunnel
 // table. ON: a blackhole default (high metric) sits below the awg0 default — while
 // awg0 is up the tunnel route wins; the moment awg0 goes down (its route is auto-

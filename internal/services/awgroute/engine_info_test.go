@@ -22,6 +22,7 @@ func TestEngineBuildInfoDetectsWireCapability(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			bi := &debug.BuildInfo{Main: debug.Module{Path: tc.path, Version: tc.version}, Settings: []debug.BuildSetting{{Key: "GOARCH", Value: "arm64"}, {Key: "vcs.revision", Value: tc.revision}}}
+			bi.Settings = append(bi.Settings, debug.BuildSetting{Key: "-tags", Value: awgEngineRouterMemoryTag})
 			bi.GoVersion, bi.Deps = "go1.26.10", patchedEngineDeps()
 			got := engineBuildInfo(bi)
 			if got.AWG3Supported != tc.want31 || got.UpdateAvailable == tc.want31 || got.AwgVersion != tc.wantVersion || got.Arch != "arm64" || !got.Installed || got.TargetVersion != AWGEngineVersion {
@@ -34,7 +35,7 @@ func TestEngineBuildInfoDetectsWireCapability(t *testing.T) {
 func patchedEngineDeps() []*debug.Module {
 	return []*debug.Module{
 		{Path: "golang.org/x/crypto", Version: "v0.57.0"},
-		{Path: "golang.org/x/net", Version: "v0.59.0"},
+		{Path: "golang.org/x/net", Version: "v0.60.0"},
 		{Path: "golang.org/x/sys", Version: "v0.48.0"},
 	}
 }
@@ -71,11 +72,59 @@ func TestEngineBuildInfoOffersSecurityRebuild(t *testing.T) {
 		{"unknown replacement", func(b *debug.BuildInfo) { b.Deps[0].Replace = &debug.Module{Path: "../crypto"} }, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			bi := &debug.BuildInfo{GoVersion: "go1.26.10", Main: debug.Module{Path: "github.com/amnezia-vpn/amneziawg-go/v3", Version: AWGEngineVersion}, Deps: patchedEngineDeps()}
+			bi := &debug.BuildInfo{GoVersion: "go1.26.10", Main: debug.Module{Path: "github.com/amnezia-vpn/amneziawg-go/v3", Version: AWGEngineVersion}, Deps: patchedEngineDeps(), Settings: []debug.BuildSetting{{Key: "-tags", Value: awgEngineRouterMemoryTag}}}
 			tc.edit(bi)
 			info := engineBuildInfo(bi)
 			if !info.AWG3Supported || info.UpdateAvailable != tc.wantUpdate {
 				t.Fatalf("security update must be independent of protocol support: %+v", info)
+			}
+		})
+	}
+}
+
+func TestEngineBuildInfoOffersRouterMemoryRebuild(t *testing.T) {
+	for _, tc := range []struct {
+		name, tags string
+		wantUpdate bool
+	}{
+		{"1.8.4 security build without router profile", "", true},
+		{"different router profile", "n2s_router_memory_v0", true},
+		{"marker prefix is insufficient", awgEngineRouterMemoryTag + "_other", true},
+		{"current router profile", awgEngineRouterMemoryTag, false},
+		{"additional comma-separated tags", "custom," + awgEngineRouterMemoryTag + ",debug", false},
+		{"additional space-separated tags", "custom " + awgEngineRouterMemoryTag + " debug", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			bi := &debug.BuildInfo{GoVersion: "go1.26.10", Main: debug.Module{Path: "github.com/amnezia-vpn/amneziawg-go/v3", Version: AWGEngineVersion}, Deps: patchedEngineDeps()}
+			if tc.tags != "" {
+				bi.Settings = []debug.BuildSetting{{Key: "-tags", Value: tc.tags}}
+			}
+			info := engineBuildInfo(bi)
+			if !engineSecurityBuildCurrent(bi) || !info.AWG3Supported || info.UpdateAvailable != tc.wantUpdate {
+				t.Fatalf("router profile update must be independent of protocol/security support: %+v", info)
+			}
+		})
+	}
+}
+
+// Optional local/release integration fixtures use the actual published old
+// engine and the newly built stripped Linux engine without executing either.
+func TestInspectEngineRouterProfileBuildFixtures(t *testing.T) {
+	for _, tc := range []struct {
+		env        string
+		wantUpdate bool
+	}{
+		{"AWG_ENGINE_PREVIOUS_TEST_BINARY", true},
+		{"AWG_ENGINE_CURRENT_TEST_BINARY", false},
+	} {
+		t.Run(tc.env, func(t *testing.T) {
+			path := os.Getenv(tc.env)
+			if path == "" {
+				t.Skip("set " + tc.env + " to inspect an actual engine build")
+			}
+			info := inspectEngine(path)
+			if !info.AWG3Supported || info.Error != "" || info.UpdateAvailable != tc.wantUpdate {
+				t.Fatalf("actual engine build classification: %+v", info)
 			}
 		})
 	}

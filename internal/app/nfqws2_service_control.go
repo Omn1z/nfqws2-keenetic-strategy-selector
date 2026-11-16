@@ -146,6 +146,13 @@ func (a *App) Nfqws2ServiceStatus() Nfqws2ServiceState {
 }
 
 func (a *App) runNfqws2ServiceOperation(action string) ServiceResult {
+	if action == "start" || action == "stop" || action == "restart" {
+		resume, err := a.suspendNfqws2Acceleration()
+		if err != nil {
+			return ServiceResult{Name: "nfqws2", Detail: err.Error()}
+		}
+		defer resume()
+	}
 	var operation func() ServiceResult
 	if a.automation != nil && a.automation.serviceOps != nil {
 		switch action {
@@ -170,6 +177,18 @@ func (a *App) runNfqws2ServiceOperation(action string) ServiceResult {
 	default:
 		return ServiceResult{Name: "nfqws2", Detail: "неизвестная команда сервиса"}
 	}
+}
+
+// Native offload must stay suspended while NFQUEUE selection is rebuilt. The
+// routing controller rechecks the completed rules before enabling it again.
+func (a *App) suspendNfqws2Acceleration() (func(), error) {
+	if a.awgroute == nil {
+		return func() {}, nil
+	}
+	if err := a.awgroute.SuspendAccelerationForNFQWSChange(); err != nil {
+		return nil, fmt.Errorf("подготовка изменения NFQWS2: %w", err)
+	}
+	return a.awgroute.ResumeAccelerationAfterNFQWSChange, nil
 }
 
 // Save under the automation state mutex so config posts and pick-history writes
@@ -310,21 +329,30 @@ func (a *App) restoreNfqws2ManualOff() {
 }
 
 func (a *App) withNfqws2FirewallApply(background bool, apply func() error) error {
-	if a.automation == nil {
-		return apply()
-	}
-	a.automation.serviceMu.Lock()
-	defer a.automation.serviceMu.Unlock()
-	if a.nfqws2ManuallyOff() {
-		if background {
-			return nil
+	if a.automation != nil {
+		a.automation.serviceMu.Lock()
+		defer a.automation.serviceMu.Unlock()
+		if a.nfqws2ManuallyOff() {
+			if background {
+				return nil
+			}
+			return fmt.Errorf("список сохранён; NFQWS2 выключен вручную — включите сервис перед применением NFQUEUE bypass")
 		}
-		return fmt.Errorf("список сохранён; NFQWS2 выключен вручную — включите сервис перед применением NFQUEUE bypass")
 	}
+	resume, err := a.suspendNfqws2Acceleration()
+	if err != nil {
+		return err
+	}
+	defer resume()
 	return apply()
 }
 
 func (a *App) withNfqws2PackageUpdate(update func() (string, error)) (string, error) {
+	resume, suspendErr := a.suspendNfqws2Acceleration()
+	if suspendErr != nil {
+		return "", suspendErr
+	}
+	defer resume()
 	if a.automation == nil {
 		return update()
 	}
