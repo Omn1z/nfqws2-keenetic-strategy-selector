@@ -15,6 +15,7 @@ import ServerPane from "./ServerPane";
 import FailoverPane, { ConnectionFailoverBadge } from "./FailoverPane";
 import GeneralPane from "./GeneralPane";
 import RecoveryStatus from "./RecoveryStatus";
+import { EndpointSelectionStatus } from "./EndpointBackupsPane";
 import PeerShareModal from "./PeerShareModal";
 import RoutingPane from "./RoutingPane";
 import DevicesRoutingPane from "./DevicesRoutingPane";
@@ -593,6 +594,7 @@ export default function AWG2() {
                   </div>
                 )}
                 {srv.enabled && cl && <RecoveryStatus client={cl} />}
+                {srv.enabled && cl && <EndpointSelectionStatus client={cl} />}
                 {srv.deployment_pending && <p className="mt-2 text-[11.5px] text-warn">Роутер и экспорт используют последнюю успешно развёрнутую конфигурацию. Завершите развёртывание в настройках.</p>}
                 {srv.last_error && <div className="mt-2 line-clamp-2 text-[11px] text-warn" title={srv.last_error}>{srv.last_error}</div>}
                 {busy && (

@@ -33,6 +33,7 @@ POST=nfqws_post
 PRE=nfqws_pre
 BASE=$(CDPATH= cd -- "$(dirname -- "$0")" 2>/dev/null && pwd)
 LIST="$BASE/lists"
+TRANSPORT="$BASE/nfqws-transport-endpoints"
 RESTORE="${CMD}-restore"
 case "$CMD" in
   iptables) SET=n2s_nfqb4; FAMILY=inet ;;
@@ -84,7 +85,7 @@ cleanup() {
   fi
   [ "$stage_owned" != 1 ] || ipset destroy "$STAGE" 2>/dev/null || true
   if [ -n "$work" ]; then
-    rm -f "$work/linear" "$work/sets" "$work/restore"
+    rm -f "$work/linear" "$work/sets" "$work/transport" "$work/restore"
     rmdir "$work" 2>/dev/null || true
   fi
   rm -f "$lock/pid"
@@ -105,13 +106,15 @@ done
 work=$(mktemp -d "${TMPDIR:-/tmp}/nfqws-bypass.XXXXXX") || exit 1
 : > "$work/linear"
 : > "$work/sets"
+: > "$work/transport"
 set --
 for file in "$LIST/nfqueue_bypass_ips.list" "$LIST/nfqueue_bypass_resolved.list"; do
   [ ! -r "$file" ] || set -- "$@" "$file"
 done
+[ ! -r "$TRANSPORT" ] || set -- "$@" "$TRANSPORT"
 # One parser process for the whole cache, without DNS or per-address forks.
 # Keep linear rules available for kernels lacking hash:net or xt_set.
-awk -v family="$FAMILY" -v chain="$BYPASS" -v stage="$STAGE" -v out="$work" '
+awk -v family="$FAMILY" -v chain="$BYPASS" -v stage="$STAGE" -v transport="$TRANSPORT" -v out="$work" '
 function valid(ip, parts, n, a, count, i, groups, compressed) {
   n = split(ip, parts, "/")
   if (n > 2 || (n == 2 && parts[2] !~ /^[0-9]+$/)) return 0
@@ -138,6 +141,12 @@ function valid(ip, parts, n, a, count, i, groups, compressed) {
 function add(ip) { if (!setseen[ip]++) print "add " stage " " ip >> (out "/sets") }
 {
   sub(/[#;].*$/, ""); gsub(/^[ \t\r]+|[ \t\r]+$/, "")
+  if (FILENAME == transport) {
+    if (NF != 2 || index($1, "/") || !valid($1) || $2 !~ /^[0-9]+$/ || $2 < 1 || $2 > 65535 || transportseen[$0]++) next
+    print "-A " chain " -p udp -d " $1 " --dport " $2 " -j ACCEPT" >> (out "/transport")
+    print "-A " chain " -p udp -s " $1 " --sport " $2 " -j ACCEPT" >> (out "/transport")
+    next
+  }
   if (NF != 1 || !valid($0) || seen[$0]++) next
   # ACCEPT prevents returning to the NFQUEUE rule in the parent chain.
   print "-A " chain " -d " $0 " -j ACCEPT" >> (out "/linear")
@@ -169,6 +178,7 @@ if command -v ipset >/dev/null 2>&1; then
   fi
 fi
 printf '*%s\n:%s - [0:0]\n' "$TABLE" "$BYPASS" > "$work/restore"
+cat "$work/transport" >> "$work/restore" || exit 1
 if [ "$use_sets" = 1 ]; then
   ipset -exist restore < "$work/sets" || { echo "NFQUEUE bypass: cannot stage $SET" >&2; exit 1; }
   ipset list "$SET" >/dev/null 2>&1 ||
@@ -226,10 +236,10 @@ func ensureBypassScript(name string) error {
 			if filepath.Base(name) == "nfqws-strategy-bypass.sh" {
 				return fmt.Errorf("NFQUEUE bypass helper %s was modified outside the panel", name)
 			}
-			return os.Chmod(name, 0o755)
+			return ensureBypassExecutable(name)
 		}
 		if string(current) == generatedBypassScript {
-			return os.Chmod(name, 0o755)
+			return ensureBypassExecutable(name)
 		}
 	} else if !os.IsNotExist(err) {
 		return err
@@ -253,6 +263,17 @@ func ensureBypassScript(name string) error {
 	return os.Rename(tmp.Name(), name)
 }
 
+func ensureBypassExecutable(name string) error {
+	st, err := os.Stat(name)
+	if err != nil {
+		return err
+	}
+	if st.Mode().Perm() == 0o755 {
+		return nil
+	}
+	return os.Chmod(name, 0o755)
+}
+
 // ensureBypassPersistence installs the bypass after the platform's firewall
 // rebuild hook.  Keenetic runs netfilter.d hooks in lexical order, so 101 runs
 // after nfqws2's 100-nfqws2.sh has recreated its own chains.  OpenWrt uses a
@@ -270,20 +291,41 @@ func ensureBypassPersistence(confDir, initScript, bypassScript string) error {
 	}
 	body := fmt.Sprintf("#!/bin/sh\n%s firewall_iptables >/dev/null 2>&1 || true\n%s firewall_ip6tables >/dev/null 2>&1 || true\n%s iptables >/dev/null || echo 'NFQUEUE bypass: IPv4 firewall reload failed' >&2\n%s ip6tables >/dev/null || echo 'NFQUEUE bypass: IPv6 firewall reload failed' >&2\n",
 		shell.Quote(initScript), shell.Quote(initScript), shell.Quote(bypassScript), shell.Quote(bypassScript))
-	if err := os.WriteFile(hook, []byte(body), 0o755); err != nil {
-		return err
+	current, readErr := os.ReadFile(hook)
+	if readErr != nil && !os.IsNotExist(readErr) {
+		return readErr
 	}
-	if err := os.Chmod(hook, 0o755); err != nil {
-		return err
+	if string(current) != body {
+		if err := os.WriteFile(hook, []byte(body), 0o755); err != nil {
+			return err
+		}
 	}
-	cmd := "uci -q show firewall.nfqws2_bypass_fw4 >/dev/null 2>&1 || uci set firewall.nfqws2_bypass_fw4=include; " +
-		"uci set firewall.nfqws2_bypass_fw4.type=script; " +
-		"uci set firewall.nfqws2_bypass_fw4.path=" + shell.Quote(filepath.ToSlash(hook)) + "; " +
-		"uci set firewall.nfqws2_bypass_fw4.fw4_compatible=1; uci commit firewall"
+	if st, err := os.Stat(hook); err != nil {
+		return err
+	} else if st.Mode().Perm() != 0o755 {
+		if err := os.Chmod(hook, 0o755); err != nil {
+			return err
+		}
+	}
+	cmd := openWrtBypassIncludeCommand(hook)
 	if out, err := exec.Command("sh", "-c", cmd).CombinedOutput(); err != nil {
 		return fmt.Errorf("uci include: %v: %s", err, out)
 	}
 	return nil
+}
+
+func openWrtBypassIncludeCommand(hook string) string {
+	path := shell.Quote(filepath.ToSlash(hook))
+	// Endpoint retries may call this repeatedly. Commit to flash only when the
+	// include actually changes; the kernel rules still refresh independently.
+	return "if [ \"$(uci -q get firewall.nfqws2_bypass_fw4)\" = include ] && " +
+		"[ \"$(uci -q get firewall.nfqws2_bypass_fw4.type)\" = script ] && " +
+		"[ \"$(uci -q get firewall.nfqws2_bypass_fw4.path)\" = " + path + " ] && " +
+		"[ \"$(uci -q get firewall.nfqws2_bypass_fw4.fw4_compatible)\" = 1 ]; then :; else " +
+		"uci set firewall.nfqws2_bypass_fw4=include && " +
+		"uci set firewall.nfqws2_bypass_fw4.type=script && " +
+		"uci set firewall.nfqws2_bypass_fw4.path=" + path + " && " +
+		"uci set firewall.nfqws2_bypass_fw4.fw4_compatible=1 && uci commit firewall; fi"
 }
 
 const keeneticBypassHookName = "101-nfqws2-bypass.sh"
@@ -305,6 +347,11 @@ func ensureKeeneticBypassPersistence(confDir, bypassScript string) error {
 		"case \"${type:-}\" in iptables|ip6tables) ;; *) exit 0 ;; esac\n" +
 		"[ -x " + shell.Quote(bypassScript) + " ] || exit 0\n" +
 		shell.Quote(bypassScript) + " \"$type\" >/dev/null || echo 'NFQUEUE bypass: Keenetic firewall reload failed' >&2\n"
+	if current, err := os.ReadFile(hook); err == nil && string(current) == body {
+		return ensureBypassExecutable(hook)
+	} else if err != nil && !os.IsNotExist(err) {
+		return err
+	}
 	tmp, err := os.CreateTemp(filepath.Dir(hook), ".nfqws2-bypass-*")
 	if err != nil {
 		return err

@@ -4,6 +4,7 @@ package awgroute
 
 import (
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -86,7 +87,7 @@ func (svc *Service) awgMultiPolicyIntact(rules []awgMultiRule, tunnels []awgMult
 			return false
 		}
 		_, linkErr := os.Stat("/sys/class/net/" + t.Iface)
-		routeExpected = append(routeExpected, awgMultiRouteExpectation{Table: t.Table, Iface: t.Iface, EndpointIP: t.EndpointIP, Online: linkErr == nil, Killswitch: t.Killswitch})
+		routeExpected = append(routeExpected, awgMultiRouteExpectation{Table: t.Table, Iface: t.Iface, EndpointIP: t.EndpointIP, EndpointIPs: t.EndpointIPs, Online: linkErr == nil, Killswitch: t.Killswitch})
 	}
 	routes, err := awgRun("ip -4 route show table all")
 	if err != nil {
@@ -101,6 +102,32 @@ func (svc *Service) awgMultiPolicyIntact(rules []awgMultiRule, tunnels []awgMult
 	gw, wan := selectDefaultRoute(defaults.String())
 	if !awgMultiRoutesIntact(routes, gw, wan, routeExpected) {
 		return false
+	}
+	var v6Endpoints []string
+	activeV6 := false
+	for _, tunnel := range tunnels {
+		if ip := net.ParseIP(tunnel.EndpointIP); ip != nil && ip.To4() == nil {
+			activeV6 = true
+		}
+		for _, ip := range awgMultiEndpointIPs(tunnel) {
+			if net.ParseIP(ip).To4() == nil {
+				v6Endpoints = append(v6Endpoints, ip)
+			}
+		}
+	}
+	if len(v6Endpoints) > 0 {
+		v6Routes, err := awgRun("ip -6 route show table main")
+		v6GW, v6WAN := selectDefaultRoute(v6Routes)
+		if (err != nil || v6WAN == "") && activeV6 {
+			return false
+		}
+		if err == nil && v6WAN != "" {
+			for _, ip := range canonicalEndpointIPs(v6Endpoints...) {
+				if !awgEndpointRouteIntact(v6Routes, ip, v6GW, v6WAN) {
+					return false
+				}
+			}
+		}
 	}
 	setNames, err := awgRun("ipset list -name")
 	if err != nil {

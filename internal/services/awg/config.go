@@ -111,6 +111,7 @@ type ClientConfig struct {
 	// Standby keeps the saved connection offline until a primary needs it.
 	Standby           bool     `json:"standby"`
 	FallbackTunnelIDs []string `json:"fallback_tunnel_ids,omitempty"`
+	EndpointBackups   []string `json:"endpoint_backups,omitempty"` // ordered IPs of this same server; local client policy only
 }
 
 // Zone (rendered in the UI as «Правило») is a named match-list for split
@@ -280,6 +281,9 @@ func (c *ServerConfig) Normalize() {
 		}
 	}
 	c.Routing.Normalize()
+	if endpoints, err := NormalizeEndpointBackups(c.Endpoint, c.Client.EndpointBackups); err == nil {
+		c.Client.EndpointBackups = endpoints
+	}
 }
 
 // Normalize fills zero/blank routing-only fields without touching the owning
@@ -329,6 +333,9 @@ func (r *RoutingConfig) Normalize() {
 // Validate returns Russian-language problems with the config (empty = valid).
 func (c *ServerConfig) Validate() []string {
 	var errs []string
+	if _, err := NormalizeEndpointBackups(c.Endpoint, c.Client.EndpointBackups); err != nil {
+		errs = append(errs, err.Error())
+	}
 	if c.Install != "imported" {
 		if strings.TrimSpace(c.Conn.Host) == "" {
 			errs = append(errs, "укажите адрес VPS")

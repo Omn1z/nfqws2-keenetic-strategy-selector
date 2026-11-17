@@ -7,6 +7,7 @@ import (
 	"nfqws2strategy/internal/services/awg"
 	"nfqws2strategy/internal/services/awgroute"
 	"nfqws2strategy/internal/services/tunnelroute"
+	"nfqws2strategy/internal/tools/logbuf"
 )
 
 // The AWG2 server manager + the router-side client/split-routing runtime now live
@@ -21,24 +22,37 @@ type (
 	AWG2DeployServerResult = awgroute.AWG2DeployServerResult
 )
 
-func (a *App) AWG2StatusView() AWG2Status           { return a.awgroute.AWG2StatusView() }
-func (a *App) AWG2AddServer(name string) AWG2Status { return a.awgroute.AWG2AddServer(name) }
-func (a *App) AWG2SelectServer(id string) error     { return a.awgroute.AWG2SelectServer(id) }
+func (a *App) AWG2StatusView() AWG2Status { return a.awgroute.AWG2StatusView() }
+func (a *App) AWG2AddServer(name string) AWG2Status {
+	status := a.awgroute.AWG2AddServer(name)
+	a.syncAWGTransportBypass()
+	return status
+}
+func (a *App) AWG2SelectServer(id string) error { return a.awgroute.AWG2SelectServer(id) }
 func (a *App) AWG2RenameServer(id, name string) error {
 	return a.awgroute.AWG2RenameServer(id, name)
 }
 func (a *App) AWG2SetServerEnabled(id string, enabled bool) error {
 	err := a.awgroute.AWG2SetServerEnabled(id, enabled)
 	if err == nil {
+		a.syncAWGTransportBypass()
 		a.syncProxyTunnelRoutes(a.proxy.AWGFallback())
 	}
 	return err
 }
 func (a *App) AWG2Import(text, name string) (AWG2Status, error) {
-	return a.awgroute.AWG2Import(text, name)
+	status, err := a.awgroute.AWG2Import(text, name)
+	if err == nil {
+		a.syncAWGTransportBypass()
+	}
+	return status, err
 }
 func (a *App) AWG2CreateWARP(ctx context.Context, opts awgroute.WARPCreateOptions) (AWG2Status, error) {
-	return a.awgroute.AWG2CreateWARP(ctx, opts)
+	status, err := a.awgroute.AWG2CreateWARP(ctx, opts)
+	if err == nil {
+		a.syncAWGTransportBypass()
+	}
+	return status, err
 }
 func (a *App) AWG2DeleteServer(id string) error {
 	return a.AWG2DeleteServerWithReplacement(id, "")
@@ -49,6 +63,7 @@ func (a *App) AWG2DeleteServerWithReplacement(id, replacementID string) error {
 	err := a.awgroute.AWG2DeleteServerWithReplacement(id, replacementID)
 	var committed *awgroute.DeleteServerCommittedError
 	if err == nil || errors.As(err, &committed) {
+		a.syncAWGTransportBypass()
 		for _, iface := range ifaces {
 			tunnelroute.DelTGFrontRoutes(iface)
 		}
@@ -56,13 +71,44 @@ func (a *App) AWG2DeleteServerWithReplacement(id, replacementID string) error {
 	}
 	return err
 }
-func (a *App) AWG2SetConfig(in *awg.ServerConfig) error { return a.awgroute.AWG2SetConfig(in) }
-func (a *App) AWG2Deploy() (awg.DeployResult, error)    { return a.awgroute.AWG2Deploy() }
+func (a *App) AWG2SetConfig(in *awg.ServerConfig) error {
+	err := a.awgroute.AWG2SetConfig(in)
+	if err == nil {
+		a.syncAWGTransportBypass()
+	}
+	return err
+}
+func (a *App) AWG2SetEndpointBackups(id string, endpoints []string) error {
+	err := a.awgroute.AWG2SetEndpointBackups(id, endpoints)
+	var committed *awgroute.EndpointBackupsCommittedError
+	if err == nil || errors.As(err, &committed) {
+		a.syncAWGTransportBypass()
+	}
+	return err
+}
+func (a *App) AWG2Deploy() (awg.DeployResult, error) {
+	result, err := a.awgroute.AWG2Deploy()
+	a.syncAWGTransportBypass()
+	return result, err
+}
 func (a *App) AWG2DeployServer(id string) (awg.DeployResult, error) {
-	return a.awgroute.AWG2DeployServer(id)
+	result, err := a.awgroute.AWG2DeployServer(id)
+	a.syncAWGTransportBypass()
+	return result, err
 }
 func (a *App) AWG2DeployServers(ids []string) []AWG2DeployServerResult {
-	return a.awgroute.AWG2DeployServers(ids)
+	results := a.awgroute.AWG2DeployServers(ids)
+	a.syncAWGTransportBypass()
+	return results
+}
+
+func (a *App) syncAWGTransportBypass() {
+	if a.nfqws2 == nil {
+		return
+	}
+	if err := a.nfqws2.RefreshTransportBypass(); err != nil {
+		logbuf.Append("awg2", "warn", "NFQUEUE bypass адресов VPN: "+err.Error())
+	}
 }
 func (a *App) AWG2RefreshStatus() (awg.Status, error) { return a.awgroute.AWG2RefreshStatus() }
 func (a *App) AWG2AddPeer(in awg.Peer) (awg.Peer, error) {

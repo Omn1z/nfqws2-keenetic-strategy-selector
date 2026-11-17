@@ -103,6 +103,10 @@ func New(cfg *config.Config) (*App, error) {
 	a.arpspoof = arpspoof.New(cfg, st)
 	a.arpblock = arpblock.New()
 	a.awgroute = awgroute.New(cfg, st) // creates the manager; may autostart the tunnel + re-apply committed routing
+	a.nfqws2.SetTransportEndpointProvider(a.awgroute.ClientEndpointCandidates)
+	// Recovery already holds its operation lock. This hook only refreshes the
+	// owned NFQUEUE bypass chain and leaves stopped NFQWS services stopped.
+	a.awgroute.SetClientEndpointHook(a.nfqws2.RefreshTransportBypass)
 	// Apply trace policy as soon as the AWG service exists: "always" turns
 	// recording on right away, "off" pins it off; "auto" leaves it to the
 	// TracePane mount/unmount lifecycle. saveSettings already ran in initAuth.
@@ -114,7 +118,10 @@ func New(cfg *config.Config) (*App, error) {
 	}
 	a.monitor = monitor.New(cfg, st, a.proxy, a.awgroute) // dashboard reads the proxy + AWG2 tunnel status
 	a.proxy.SetAWGFallbackProbe(a.proxyTunnelFallbackUp)  // Telegram proxies route ISP-blocked DC1/3/5 via the selected tunnel backend while it is up
-	a.awgroute.SetClientRecoveryHook(func() { a.syncProxyTunnelRoutes(a.proxy.AWGFallback()) })
+	a.awgroute.SetClientRecoveryHook(func() {
+		a.syncAWGTransportBypass()
+		a.syncProxyTunnelRoutes(a.proxy.AWGFallback())
+	})
 	a.syncProxyTunnelRoutes(a.proxy.AWGFallback())
 	a.initDNS()
 	// Repair any sandbox state leaked by a previous unclean exit (stale STRAT_*

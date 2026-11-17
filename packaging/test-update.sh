@@ -26,13 +26,30 @@ EOF
 cat > "$tmp/bin/curl" <<'EOF'
 #!/bin/sh
 set -eu
-[ "$1" = -fSL ]
-[ "$2" = https://github.com/Omn1z/nfqws2-keenetic-strategy-selector/releases/latest/download/install.sh ]
-[ "$3" = -o ]
-cp "$N2S_TEST_INSTALLER" "$4"
-printf '%s\n' "$4" > "$N2S_TEST_DOWNLOAD"
+if [ "$1" = --version ]; then printf 'curl 8.23.0\nProtocols: http https\n'; exit 0; fi
+secure=0; redirect=0; deadline=0; dest=; url=
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -4|-fSL) ;;
+    --proto) shift; [ "$1" = '=https' ]; secure=1 ;;
+    --proto-redir) shift; [ "$1" = '=https' ]; redirect=1 ;;
+    --connect-timeout) shift; [ "$1" = 15 ] ;;
+    --max-time) shift; [ "$1" = 300 ]; deadline=1 ;;
+    -o) shift; dest=$1 ;;
+    https://github.com/Omn1z/nfqws2-keenetic-strategy-selector/releases/latest/download/install.sh) url=$1 ;;
+    *) exit 90 ;;
+  esac
+  shift
+done
+[ "$secure$redirect$deadline" = 111 ] && [ -n "$dest" ] && [ -n "$url" ]
+cp "$N2S_TEST_INSTALLER" "$dest"
+printf '%s\n' "$dest" > "$N2S_TEST_DOWNLOAD"
 EOF
-chmod +x "$tmp/bin/id" "$tmp/bin/curl"
+cat > "$tmp/bin/wget" <<'EOF'
+#!/bin/sh
+exit 99
+EOF
+chmod +x "$tmp/bin/id" "$tmp/bin/curl" "$tmp/bin/wget"
 
 PATH="$tmp/bin:$PATH"
 N2S_PORT=8123
@@ -41,7 +58,8 @@ N2S_SKIP_DEPS=1
 N2S_TEST_RESULT="$tmp/result"
 N2S_TEST_INSTALLER="$tmp/fake-install.sh"
 N2S_TEST_DOWNLOAD="$tmp/download"
-export PATH N2S_PORT N2S_BIN_SRC N2S_SKIP_DEPS
+N2S_ENTWARE_WGET="$tmp/bin/wget"
+export N2S_ENTWARE_WGET PATH N2S_PORT N2S_BIN_SRC N2S_SKIP_DEPS
 export N2S_TEST_RESULT N2S_TEST_INSTALLER N2S_TEST_DOWNLOAD
 unset N2S_INSTALLER
 

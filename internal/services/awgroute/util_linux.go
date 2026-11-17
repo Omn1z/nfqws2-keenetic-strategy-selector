@@ -225,7 +225,7 @@ func selectDefaultRoute(out string) (gw, dev string) {
 	var fallbackDev string
 	for _, ln := range strings.Split(out, "\n") {
 		g, d := parseDefaultRouteLine(ln)
-		if d == "" || d == awgIface {
+		if d == "" || d == awgIface || validAWGClientIfaceName(d) {
 			continue
 		}
 		if g != "" {
@@ -255,10 +255,14 @@ func parseDefaultRouteLine(line string) (gw, dev string) {
 }
 
 func awgEndpointRouteCmd(endpointIP, gw, dev string) string {
-	if gw != "" {
-		return "ip route replace " + endpointIP + "/32 via " + gw + " dev " + dev
+	prefix, command := "/32", "ip route replace "
+	if ip := net.ParseIP(endpointIP); ip != nil && ip.To4() == nil {
+		prefix, command = "/128", "ip -6 route replace "
 	}
-	return "ip route replace " + endpointIP + "/32 dev " + dev
+	if gw != "" {
+		return command + endpointIP + prefix + " via " + gw + " dev " + dev
+	}
+	return command + endpointIP + prefix + " dev " + dev
 }
 
 // awgMarkCollision returns a non-empty fwmark string if some EXISTING ip rule
@@ -316,10 +320,7 @@ func resolveHostIPContext(ctx context.Context, host string) string {
 		return ""
 	}
 	if ip := net.ParseIP(host); ip != nil {
-		if v4 := ip.To4(); v4 != nil {
-			return v4.String()
-		}
-		return ""
+		return ip.String()
 	}
 	for _, ip := range resolveDomainContext(ctx, host) {
 		return ip

@@ -10,6 +10,12 @@ trap 'rm -rf "$test_dir"' 0
 mkdir -p "$test_dir/bin" "$test_dir/source" "$test_dir/etc" "$test_dir/router-tmp" "$test_dir/opt-tmp"
 N2S_TEST_REAL_MV=$(command -v mv)
 export N2S_TEST_REAL_MV
+# A deliberately closed PATH prevents a removed fake apk or an unhealthy fake
+# wget from revealing a real package manager/downloader on the test host.
+for tool in awk cat chmod cp date dirname grep mkdir mktemp rm sed sh sha256sum sort tail tr wc; do
+  real_tool=$(command -v "$tool") || { echo "missing test utility: $tool" >&2; exit 1; }
+  ln -s "$real_tool" "$test_dir/bin/$tool"
+done
 
 cat > "$test_dir/bin/id" <<'EOF'
 #!/bin/sh
@@ -19,7 +25,11 @@ cat > "$test_dir/pm-apk" <<'EOF'
 #!/bin/sh
 if [ "$1" = --print-arch ]; then printf '%s\n' "${N2S_TEST_ARCH-aarch64_cortex-a53}"; exit; fi
 printf 'apk %s\n' "$*" >> "$N2S_TEST_PACKAGES"
-exit "${N2S_TEST_PM_STATUS:-0}"
+[ "${N2S_TEST_PM_STATUS:-0}" = 0 ] || exit "$N2S_TEST_PM_STATUS"
+if [ "$*" = '--update-cache add coreutils-timeout' ] && [ "${N2S_TEST_HELPER_BROKEN:-0}" = 0 ]; then
+  : > "$N2S_TEST_TIMEOUT_INSTALLED"
+fi
+exit 0
 EOF
 cat > "$test_dir/bin/opkg" <<'EOF'
 #!/bin/sh
@@ -31,7 +41,11 @@ if [ "$1" = print-architecture ]; then
   exit
 fi
 printf 'opkg %s\n' "$*" >> "$N2S_TEST_PACKAGES"
-exit "${N2S_TEST_PM_STATUS:-0}"
+[ "${N2S_TEST_PM_STATUS:-0}" = 0 ] || exit "$N2S_TEST_PM_STATUS"
+if [ "$*" = 'install coreutils-timeout' ] && [ "${N2S_TEST_HELPER_BROKEN:-0}" = 0 ]; then
+  : > "$N2S_TEST_TIMEOUT_INSTALLED"
+fi
+exit 0
 EOF
 cat > "$test_dir/bin/od" <<'EOF'
 #!/bin/sh
@@ -43,16 +57,18 @@ printf '%s\n' "${N2S_TEST_UNAME:-aarch64}"
 EOF
 cat > "$test_dir/bin/mv" <<'EOF'
 #!/bin/sh
-case "$1" in *.part) [ "${N2S_TEST_RENAME_FAIL:-0}" = 0 ] || exit 1 ;; esac
+for argument in "$@"; do
+  case "$argument" in *.part) [ "${N2S_TEST_RENAME_FAIL:-0}" = 0 ] || exit 1 ;; esac
+done
 exec "$N2S_TEST_REAL_MV" "$@"
 EOF
 cat > "$test_dir/bin/timeout" <<'EOF'
 #!/bin/sh
 set -eu
-[ "${N2S_TEST_TIMEOUT_MISSING:-0}" = 0 ] || exit 127
+[ "${N2S_TEST_TIMEOUT_MISSING:-0}" = 0 ] || [ -f "$N2S_TEST_TIMEOUT_INSTALLED" ] || exit 127
 [ "$1" = -s ] && [ "$2" = KILL ]
 if [ "$3" = 1 ] && [ "$4" = true ]; then exit 0; fi
-[ "$3" = 300 ]
+[ "$3" -ge 1 ] && [ "$3" -le 300 ]
 printf 'timeout %s\n' "$*" >> "$N2S_TEST_DOWNLOADS"
 [ "${N2S_TEST_TIMEOUT_EXPIRED:-0}" = 0 ] || exit 137
 shift 3
@@ -64,7 +80,7 @@ set -eu
 [ "${N2S_TEST_BUSYBOX_TIMEOUT:-0}" = 1 ] || exit 127
 [ "$1" = timeout ] && [ "$2" = -s ] && [ "$3" = KILL ]
 if [ "$4" = 1 ] && [ "$5" = true ]; then exit 0; fi
-[ "$4" = 300 ]
+[ "$4" -ge 1 ] && [ "$4" -le 300 ]
 printf 'busybox %s\n' "$*" >> "$N2S_TEST_DOWNLOADS"
 shift 4
 exec "$@"
@@ -72,25 +88,36 @@ EOF
 cat > "$test_dir/bin/curl" <<'EOF'
 #!/bin/sh
 set -eu
+if [ "$1" = --version ]; then
+  case "${N2S_TEST_CURL_MODE:-ok}" in
+    loader) echo 'curl: libnghttp2.so.14: cannot open shared object file' >&2; exit 127 ;;
+    nossl) printf 'curl 8.23.0\nProtocols: http\n' ;;
+    *) printf 'curl 8.23.0\nProtocols: http https\n' ;;
+  esac
+  exit 0
+fi
 printf 'curl %s\n' "$*" >> "$N2S_TEST_DOWNLOADS"
-family=auto; secure=0; redirect=0; dest=; url=
+family=auto; secure=0; redirect=0; connected=0; deadline=0; dest=; url=
 while [ "$#" -gt 0 ]; do
   case "$1" in
     -4) family=ipv4 ;;
     -fSL) ;;
     --proto) shift; [ "$1" = '=https' ]; secure=1 ;;
     --proto-redir) shift; [ "$1" = '=https' ]; redirect=1 ;;
-    --connect-timeout|--max-time) shift ;;
+    --connect-timeout) shift; [ "$1" = 15 ]; connected=1 ;;
+    --max-time) shift; case "$1" in 180|300) deadline=1 ;; *) exit 2 ;; esac ;;
     -o) shift; dest=$1 ;;
     https://example.invalid/n2s/releases/v1.7.1/*|https://omn1z.github.io/nfqws2-keenetic-strategy-selector/install.sh) url=$1 ;;
     *) echo "unexpected curl argument: $1" >&2; exit 2 ;;
   esac
   shift
 done
-[ "$secure" = 1 ] && [ "$redirect" = 1 ] && [ -n "$dest" ] && [ -n "$url" ]
+[ "$secure$redirect$connected$deadline" = 1111 ] && [ -n "$dest" ] && [ -n "$url" ]
 case "${N2S_TEST_CURL_MODE:-ok}" in
   fail) printf 'incomplete\n' > "$dest"; exit 35 ;;
   crash) printf 'incomplete\n' > "$dest"; exit 139 ;;
+  loader) exit 127 ;;
+  nossl) exit 35 ;;
   empty) : > "$dest"; exit 0 ;;
   ipv4) [ "$family" = ipv4 ] || exit 7 ;;
   cancel) kill -TERM "$PPID"; exit 143 ;;
@@ -104,19 +131,38 @@ cat > "$test_dir/bin/entware-wget" <<'EOF'
 #!/bin/sh
 set -eu
 if [ "$1" = --version ]; then
-  if [ "${N2S_TEST_WGET_GNU:-1}" = 1 ]; then printf 'GNU Wget 1.24\n'; else printf 'BusyBox wget\n'; fi
-  exit
+  [ "${N2S_TEST_WGET_LOADER:-0}" = 0 ] || exit 127
+  if [ "${N2S_TEST_WGET_GNU:-1}" = 1 ]; then
+    printf 'GNU Wget 1.24\n'
+    if [ "${N2S_TEST_WGET_HTTPS:-1}" = 1 ]; then printf '+https +ssl/openssl\n'; else printf '%s\n' '-https'; fi
+    printf 'wget: libpcre2.so: no version information available\n' >&2
+  else
+    printf 'BusyBox wget\n'
+  fi
+  exit 0
 fi
 printf 'wget %s\n' "$*" >> "$N2S_TEST_DOWNLOADS"
-if [ "$1" = -4 ]; then
-  [ "$2" = --https-only ] && [ "$3" = --max-redirect=0 ]
-  [ "$4" = --timeout=30 ] && [ "$5" = --tries=1 ] && [ "$6" = -O ]
-  dest=$7; url=$8
-else
-  [ "$1" = --https-only ] && [ "$2" = --max-redirect=0 ]
-  [ "$3" = -T ] && [ "$4" = 30 ] && [ "$5" = -t ] && [ "$6" = 2 ] && [ "$7" = -O ]
-  dest=$8; url=$9
-fi
+family=auto; secure=0; redirect=0; headers=0; bounded=0; tries=0; dest=; url=
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -4) family=ipv4 ;;
+    --https-only) secure=1 ;;
+    --max-redirect=0) redirect=1 ;;
+    --server-response) headers=1 ;;
+    --timeout=30) bounded=1 ;;
+    --tries=1) tries=1 ;;
+    -T) shift; [ "$1" = 30 ]; bounded=1 ;;
+    -t) shift; [ "$1" = 2 ]; tries=1 ;;
+    -O) shift; dest=$1 ;;
+    https://example.invalid/n2s/releases/v1.7.1/*|https://omn1z.github.io/nfqws2-keenetic-strategy-selector/install.sh) url=$1 ;;
+    *) echo "unexpected wget argument: $1" >&2; exit 2 ;;
+  esac
+  shift
+done
+[ "$secure$redirect$bounded$tries" = 1111 ] && [ -n "$dest" ] && [ -n "$url" ]
+case "$url" in
+  https://example.invalid/n2s/releases/*) [ "$family" = ipv4 ] && [ "$headers" = 1 ] ;;
+esac
 [ "${N2S_TEST_WGET_FAIL:-0}" = 0 ] || { printf 'partial\n' > "$dest"; exit 1; }
 if [ "${N2S_TEST_WGET_EMPTY:-0}" = 1 ]; then : > "$dest"; exit 0; fi
 case "$url" in
@@ -140,15 +186,23 @@ EOF
 for arch in arm64 arm mipsle mips amd64; do
   printf 'verified panel fixture\n' > "$test_dir/source/nfqws2-strategy-linux-$arch"
 done
-chmod +x "$test_dir/bin/"* "$test_dir/pm-apk"
-PATH="$test_dir/bin:$PATH"
+cp "$test_dir/bin/entware-wget" "$test_dir/bin/wget"
+chmod +x "$test_dir/bin/id" "$test_dir/bin/opkg" "$test_dir/bin/od" "$test_dir/bin/uname" \
+  "$test_dir/bin/mv" "$test_dir/bin/timeout" "$test_dir/bin/busybox" "$test_dir/bin/curl" \
+  "$test_dir/bin/entware-wget" "$test_dir/bin/wget" "$test_dir/pm-apk"
+PATH="$test_dir/bin"
 N2S_TEST_SOURCE="$test_dir/source"
 N2S_TEST_PACKAGES="$test_dir/packages"
 N2S_TEST_DOWNLOADS="$test_dir/downloads"
 N2S_TEST_INSTALLED="$test_dir/installed"
 N2S_TEST_BINARY_PATH="$test_dir/binary-path"
+N2S_TEST_TIMEOUT_INSTALLED="$test_dir/timeout-installed"
+N2S_TIMEOUT="$test_dir/bin/timeout"
+N2S_ENTWARE_TIMEOUT=$N2S_TIMEOUT
+N2S_BUSYBOX="$test_dir/bin/busybox"
+N2S_ENTWARE_WGET="$test_dir/bin/entware-wget"
 N2S_PORT=8123
-export PATH N2S_TEST_SOURCE N2S_TEST_PACKAGES N2S_TEST_DOWNLOADS N2S_TEST_INSTALLED N2S_TEST_BINARY_PATH N2S_PORT
+export PATH N2S_TEST_SOURCE N2S_TEST_PACKAGES N2S_TEST_DOWNLOADS N2S_TEST_INSTALLED N2S_TEST_BINARY_PATH N2S_PORT N2S_TEST_TIMEOUT_INSTALLED N2S_TIMEOUT N2S_ENTWARE_TIMEOUT N2S_BUSYBOX N2S_ENTWARE_WGET
 unset N2S_SKIP_DEPS
 
 make_bootstrap() {
@@ -166,12 +220,13 @@ make_bootstrap() {
     -e "s#/etc/init.d#$test_dir/etc/init.d#g" \
     -e "s#/opt/bin/wget#$test_dir/bin/entware-wget#g" \
     -e "s#/bin/busybox#$test_dir/bin/busybox#g" \
+    -e 's#:/opt/bin:/opt/sbin:/opt/usr/bin##g' \
     -e "s#temp_base=/opt/tmp#temp_base='$test_dir/opt-tmp'#g" \
     -e "s#temp_base=/tmp#temp_base='$test_dir/router-tmp'#g" \
     "$script_dir/bootstrap.sh" > "$test_dir/bootstrap.sh"
 }
 reset_result() {
-  rm -f "$N2S_TEST_PACKAGES" "$N2S_TEST_DOWNLOADS" "$N2S_TEST_INSTALLED" "$N2S_TEST_BINARY_PATH"
+  rm -f "$N2S_TEST_PACKAGES" "$N2S_TEST_DOWNLOADS" "$N2S_TEST_INSTALLED" "$N2S_TEST_BINARY_PATH" "$N2S_TEST_TIMEOUT_INSTALLED"
 }
 check_clean() {
   for base in "$test_dir/router-tmp" "$test_dir/opt-tmp"; do
@@ -201,25 +256,26 @@ make_bootstrap
 : > "$test_dir/etc/openwrt_release"
 cp "$test_dir/pm-apk" "$test_dir/bin/apk"
 run_ok
-grep -qx 'apk --update-cache add ca-bundle ca-certificates curl' "$N2S_TEST_PACKAGES"
+grep -qx 'apk --update-cache add ca-bundle ca-certificates' "$N2S_TEST_PACKAGES"
 grep -qx 'nfqws2-strategy-linux-arm64' "$N2S_TEST_INSTALLED"
 rm "$test_dir/bin/apk"
 run_ok
-grep -qx 'opkg install ca-bundle ca-certificates curl' "$N2S_TEST_PACKAGES"
+grep -qx 'opkg install ca-bundle ca-certificates' "$N2S_TEST_PACKAGES"
 rm "$test_dir/etc/openwrt_release"
 run_ok
-grep -qx 'opkg install ca-certificates curl wget-ssl' "$N2S_TEST_PACKAGES"
+grep -qx 'opkg install ca-certificates' "$N2S_TEST_PACKAGES"
 grep -q '/opt-tmp/' "$N2S_TEST_BINARY_PATH"
 
 # Broken IPv6, crashing/empty curl, GNU wget fallback, and all-download failure.
-for mode in ipv4 crash empty; do
+for mode in ipv4 crash empty loader nossl; do
   N2S_TEST_CURL_MODE=$mode; export N2S_TEST_CURL_MODE
   run_ok
   if [ "$mode" = ipv4 ]; then
     grep -q '^curl -4 ' "$N2S_TEST_DOWNLOADS"
   else
     grep -q '^wget ' "$N2S_TEST_DOWNLOADS"
-    grep -q '^timeout -s KILL 300 ' "$N2S_TEST_DOWNLOADS"
+    grep -Eq '^timeout -s KILL [1-9][0-9]{0,2} ' "$N2S_TEST_DOWNLOADS"
+    case "$mode" in loader|nossl) ! grep -q '^curl ' "$N2S_TEST_DOWNLOADS" ;; esac
   fi
 done
 N2S_TEST_CURL_MODE=fail; N2S_TEST_WGET_FAIL=1
@@ -229,17 +285,32 @@ unset N2S_TEST_WGET_FAIL
 N2S_TEST_WGET_GNU=0; export N2S_TEST_WGET_GNU
 run_bad
 ! grep -q '^wget ' "$N2S_TEST_DOWNLOADS"
-unset N2S_TEST_CURL_MODE N2S_TEST_WGET_GNU
+unset N2S_TEST_WGET_GNU
+for mode in loader nossl; do
+  case "$mode" in
+    loader) N2S_TEST_WGET_LOADER=1; export N2S_TEST_WGET_LOADER ;;
+    nossl) N2S_TEST_WGET_HTTPS=0; export N2S_TEST_WGET_HTTPS ;;
+  esac
+  run_bad
+  ! grep -q '^wget ' "$N2S_TEST_DOWNLOADS"
+  unset N2S_TEST_WGET_LOADER N2S_TEST_WGET_HTTPS
+done
+unset N2S_TEST_CURL_MODE
 
 # GNU wget receives a total deadline; absent or expired timeout never runs it.
 N2S_TEST_CURL_MODE=fail; N2S_TEST_TIMEOUT_MISSING=1; N2S_TEST_BUSYBOX_TIMEOUT=1
 export N2S_TEST_CURL_MODE N2S_TEST_TIMEOUT_MISSING N2S_TEST_BUSYBOX_TIMEOUT
 run_ok
-grep -q '^busybox timeout -s KILL 300 ' "$N2S_TEST_DOWNLOADS"
+grep -Eq '^busybox timeout -s KILL [1-9][0-9]{0,2} ' "$N2S_TEST_DOWNLOADS"
 unset N2S_TEST_BUSYBOX_TIMEOUT
+N2S_TEST_HELPER_BROKEN=1; export N2S_TEST_HELPER_BROKEN
 run_bad
 grep -q 'refusing an unbounded download' "$test_dir/log"
 ! grep -q '^wget ' "$N2S_TEST_DOWNLOADS"
+unset N2S_TEST_HELPER_BROKEN
+run_ok
+grep -qx 'opkg install coreutils-timeout' "$N2S_TEST_PACKAGES"
+[ -f "$N2S_TEST_TIMEOUT_INSTALLED" ]
 unset N2S_TEST_TIMEOUT_MISSING
 N2S_TEST_TIMEOUT_EXPIRED=1; export N2S_TEST_TIMEOUT_EXPIRED
 run_bad
@@ -341,6 +412,8 @@ sed -e "s#/etc/openwrt_release#$test_dir/etc/openwrt_release#g" \
   -e "s#/etc/rc.common#$test_dir/etc/rc.common#g" \
   -e "s#/etc/init.d#$test_dir/etc/init.d#g" \
   -e "s#/opt/bin/wget#$test_dir/bin/entware-wget#g" \
+  -e "s#/opt/bin/timeout#$test_dir/bin/timeout#g" \
+  -e "s#/bin/busybox#$test_dir/bin/busybox#g" \
   -e "s#/opt/bin:/opt/sbin:#$test_dir/bin:#g" \
   -e "s#/tmp/n2s-install\.#$test_dir/launcher-tmp/n2s-install.#g" \
   "$test_dir/launcher-original.sh" > "$test_dir/launcher-test.sh"
@@ -381,9 +454,10 @@ for platform in apk opkg entware; do
     apk) grep -qx 'apk --update-cache add ca-bundle ca-certificates curl' "$N2S_TEST_PACKAGES" ;;
     opkg) grep -qx 'opkg install ca-bundle ca-certificates curl' "$N2S_TEST_PACKAGES" ;;
     entware)
-      grep -qx 'opkg install ca-certificates wget-ssl' "$N2S_TEST_PACKAGES"
+      grep -qx 'opkg install ca-certificates' "$N2S_TEST_PACKAGES"
       grep -q '^wget ' "$N2S_TEST_DOWNLOADS"
-      ! grep -q '^curl ' "$N2S_TEST_DOWNLOADS" ;;
+      ! grep -q '^curl ' "$N2S_TEST_DOWNLOADS"
+      grep -q '^timeout -s KILL 180 ' "$N2S_TEST_DOWNLOADS" ;;
   esac
   N2S_TEST_PM_STATUS=1; export N2S_TEST_PM_STATUS
   launcher_bad
@@ -409,4 +483,4 @@ for platform in apk opkg entware; do
   fi
 done
 
-printf 'Pages bootstrap and README launcher: passed (platforms, architecture parity, secure fallback, checksums, cleanup, failure propagation)\n'
+printf 'Pages bootstrap and README launcher: passed (platforms, architecture parity, HTTPS health probes, bounded fallback, verified timeout install, checksums, cleanup, failure propagation)\n'

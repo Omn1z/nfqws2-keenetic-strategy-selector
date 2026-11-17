@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"fmt"
+	"net"
 	"strconv"
 	"strings"
 )
@@ -88,7 +89,7 @@ func RenderUAPISet(c *ServerConfig, p Peer, endpointIP string, port int) (string
 			fmt.Fprintf(&b, "preshared_key=%s\n", psk)
 		}
 	}
-	fmt.Fprintf(&b, "endpoint=%s:%d\n", endpointIP, port)
+	fmt.Fprintf(&b, "endpoint=%s\n", net.JoinHostPort(endpointIP, strconv.Itoa(port)))
 	fmt.Fprintf(&b, "persistent_keepalive_interval=%s\n", c.PeerKeepaliveValue(p))
 	b.WriteString("replace_allowed_ips=true\n")
 	for _, a := range splitAllowed(p.AllowedIPs) {

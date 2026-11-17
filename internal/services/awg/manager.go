@@ -38,13 +38,15 @@ func defaultDialer(ctx context.Context, cred Credentials) (runner, string, error
 // no allocation. Writers (SetConfig/SetClientEnabled/SetEnabled) keep the
 // mirror in sync under m.mu.
 type Manager struct {
-	mu         sync.Mutex
-	cfg        *ServerConfig
-	applied    *ServerConfig // last deployed wire config while a desired update is pending; persistence lives in the service wrapper
-	lastDep    *DeployResult
-	lastStatus *Status
-	deploying  bool
-	dial       Dialer
+	mu                     sync.Mutex
+	cfg                    *ServerConfig
+	applied                *ServerConfig // last deployed wire config while a desired update is pending; persistence lives in the service wrapper
+	lastDep                *DeployResult
+	lastStatus             *Status
+	deploying              bool
+	clientEndpoint         string // runtime-only choice; never persisted or exported
+	clientEndpointIdentity clientEndpointIdentity
+	dial                   Dialer
 
 	clientEnabled atomic.Bool // mirror of cfg.Client.Enabled — hot-path Telegram + awgroute
 	enabled       atomic.Bool // mirror of cfg.Enabled
@@ -89,6 +91,7 @@ type Status struct {
 func (c ServerConfig) clone() ServerConfig {
 	cp := c
 	cp.Client.FallbackTunnelIDs = append([]string{}, c.Client.FallbackTunnelIDs...)
+	cp.Client.EndpointBackups = append([]string(nil), c.Client.EndpointBackups...)
 	if c.TrafficObfuscation != nil {
 		on := *c.TrafficObfuscation
 		cp.TrafficObfuscation = &on
@@ -162,6 +165,7 @@ func (m *Manager) RuntimeLocalClientIdentity() LocalClientIdentity {
 		endpoint = m.applied.Endpoint
 		wire = m.applied
 	}
+	endpoint = m.selectedClientEndpointLocked(endpoint)
 	return LocalClientIdentity{Enabled: m.cfg.Enabled, ClientEnabled: m.cfg.Client.Enabled, Endpoint: endpoint, ClientIface: m.cfg.ClientIface, Standby: m.cfg.Client.Standby, FallbackTunnelIDs: append([]string{}, m.cfg.Client.FallbackTunnelIDs...), CanStart: strings.TrimSpace(endpoint) != "" && (wire.Install == "imported" || wire.DeployedAt > 0), RoutingMode: m.cfg.Routing.Mode, RoutingActive: m.cfg.Routing.Active}
 }
 
@@ -199,7 +203,9 @@ func (m *Manager) PendingApply() bool {
 func (m *Manager) RuntimeConfig() ServerConfig {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.runtimeConfigLocked()
+	cfg := m.runtimeConfigLocked()
+	cfg.Endpoint = m.selectedClientEndpointLocked(cfg.Endpoint)
+	return cfg
 }
 
 func (m *Manager) runtimeConfigLocked() ServerConfig {

@@ -85,7 +85,7 @@ func (svc *Service) policyHostIPWithLookup(host string, live func(string) string
 
 func (svc *Service) rememberPolicyEndpointIP(host, rawIP string) {
 	ip := net.ParseIP(rawIP)
-	if ip == nil || ip.To4() == nil {
+	if ip == nil {
 		return
 	}
 	key := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(host), "."))
@@ -103,12 +103,12 @@ func (svc *Service) rememberPolicyEndpointIP(host, rawIP string) {
 			break
 		}
 	}
-	svc.policyEndpointIPs[key] = ip.To4().String()
+	svc.policyEndpointIPs[key] = ip.String()
 }
 
 func (svc *Service) cachedPolicyEndpointIP(host string) string {
-	if ip := net.ParseIP(strings.TrimSpace(host)); ip != nil && ip.To4() != nil {
-		return ip.To4().String()
+	if ip := net.ParseIP(strings.TrimSpace(host)); ip != nil {
+		return ip.String()
 	}
 	key := strings.ToLower(strings.TrimSuffix(strings.TrimSpace(host), "."))
 	svc.policyDNSMu.Lock()
@@ -121,13 +121,36 @@ func (svc *Service) cachedPolicyEndpointIP(host string) string {
 }
 
 func (svc *Service) cachedPolicyHostIP(host string) string {
-	if ip := net.ParseIP(strings.TrimSpace(host)); ip != nil && ip.To4() != nil {
-		return ip.To4().String()
+	if ip := net.ParseIP(strings.TrimSpace(host)); ip != nil {
+		return ip.String()
 	}
+	var fallback string
 	for _, raw := range svc.policyDNSLookup(false, nil)(host) {
-		if ip := net.ParseIP(raw); ip != nil && ip.To4() != nil {
-			return ip.To4().String()
+		if ip := net.ParseIP(raw); ip != nil {
+			if ip.To4() != nil {
+				return ip.To4().String()
+			}
+			if fallback == "" {
+				fallback = ip.String()
+			}
 		}
 	}
-	return ""
+	return fallback
+}
+
+func canonicalEndpointIPs(values ...string) []string {
+	var out []string
+	seen := map[string]bool{}
+	for _, raw := range values {
+		ip := net.ParseIP(strings.TrimSpace(raw))
+		if ip == nil {
+			continue
+		}
+		text := ip.String()
+		if !seen[text] {
+			seen[text] = true
+			out = append(out, text)
+		}
+	}
+	return out
 }

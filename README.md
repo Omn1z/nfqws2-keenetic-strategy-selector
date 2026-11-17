@@ -125,8 +125,18 @@ if [ -f /etc/openwrt_release ] || { [ -f /etc/rc.common ] && [ -d /etc/init.d ];
 else
   export PATH="/opt/bin:/opt/sbin:$PATH"
   opkg update
-  opkg install ca-certificates wget-ssl
-  client=wget
+  wget_info=$(/opt/bin/wget --version 2>/dev/null) || wget_info=
+  curl_info=$(curl --version 2>/dev/null) || curl_info=
+  if printf "%s\n" "$wget_info" | grep -q "^GNU Wget " && printf "%s\n" "$wget_info" | grep -q "+https"; then
+    opkg install ca-certificates
+    client=wget
+  elif printf "%s\n" "$curl_info" | grep -q "^Protocols:.* https"; then
+    opkg install ca-certificates
+    client=curl
+  else
+    opkg install ca-certificates wget-ssl
+    client=wget
+  fi
 fi
 f=$(mktemp /tmp/n2s-install.XXXXXX)
 trap "rm -f \"$f\"" 0
@@ -134,7 +144,27 @@ if [ "$client" = curl ]; then
   curl -fSL --proto "=https" --proto-redir "=https" --connect-timeout 15 --max-time 180 -o "$f" "$url" ||
   curl -4 -fSL --proto "=https" --proto-redir "=https" --connect-timeout 15 --max-time 180 -o "$f" "$url"
 else
-  /opt/bin/wget --https-only --max-redirect=0 -T 30 -t 2 -O "$f" "$url"
+  timeout_ready() {
+    for tool in timeout /opt/bin/timeout; do
+      if command -v "$tool" >/dev/null 2>&1 && "$tool" -s KILL 1 true >/dev/null 2>&1; then
+        timeout_tool=$tool; timeout_busybox=0; return 0
+      fi
+    done
+    if /bin/busybox timeout -s KILL 1 true >/dev/null 2>&1; then
+      timeout_tool=/bin/busybox; timeout_busybox=1; return 0
+    fi
+    return 1
+  }
+  if ! timeout_ready; then
+    opkg install coreutils-timeout
+    hash -r 2>/dev/null || true
+    timeout_ready || { echo "Не удалось запустить timeout для безопасной загрузки" >&2; exit 1; }
+  fi
+  if [ "$timeout_busybox" = 1 ]; then
+    "$timeout_tool" timeout -s KILL 180 /opt/bin/wget --https-only --max-redirect=0 -T 30 -t 2 -O "$f" "$url"
+  else
+    "$timeout_tool" -s KILL 180 /opt/bin/wget --https-only --max-redirect=0 -T 30 -t 2 -O "$f" "$url"
+  fi
 fi
 test -s "$f"
 sh "$f"
@@ -704,6 +734,27 @@ DNS-ответы и продолжают обучать IP-маршруты; ф�
 подключения можно выбирать в самом правиле; ключи и параметры туннелей остаются
 отдельными для каждого подключения.
 
+В настройках сервера блок **«Резервные IP-адреса»** позволяет добавить до восьми
+дополнительных адресов того же VPS без отдельных VPN-профилей. Адреса должны быть
+закреплены за этим сервером и вести к тому же AWG/WireGuard-сервису с теми же ключами;
+покупки IP без настройки у хостера и доступа к UDP-порту недостаточно.
+Поддерживаются IPv4 и IPv6. Без порта используется UDP-порт основного endpoint;
+при другом порте укажите `203.0.113.20:443` или `[2001:db8::20]:443`.
+Добавьте IP, задайте приоритет стрелками и нажмите **«Сохранить резервные IP»**.
+Это настройка роутера: повторное развёртывание VPS и генерация ключей не требуются.
+
+Сначала используется основной endpoint. При сбое остальные адреса проверяются
+ping-запросами параллельно: ответившие получают приоритет, при одинаковом
+результате сохраняется порядок списка. Ping служит подсказкой для выбора адреса;
+отсутствие ответа не исключает адрес из проверки VPN. Успех подтверждается
+аутентифицированным handshake или входящими данными VPN. Временная ошибка чтения
+статуса сама по себе не вызывает переключение. Рабочий резервный IP остаётся
+выбранным до следующего сбоя или перезапуска подключения. При следующем сбое
+снова проверяется и основной адрес, который за это время мог стать доступен.
+Только после неудачных попыток на всех IP этого сервера запускаются резервные
+VPN-подключения. Текущий адрес показан в состоянии подключения; сохранённый
+основной endpoint и экспортируемые клиентские настройки не заменяются резервным.
+
 В настройках сервера блок **«Резервные подключения»** задаёт общий список
 резервов для всех правил этого подключения. Можно выбрать несколько сохранённых
 VPN-профилей сразу, изменить приоритет стрелками и сохранить список. Если у правила
@@ -717,7 +768,7 @@ Telegram, добавьте AWG2 в общий список резервов са
 
 Чтобы резерв оставался offline до сбоя основного, включите для него
 **«Ожидать сбоя основного»**. Само VPN-подключение должно быть включено.
-После второй неудачной попытки или истечения проверки handshake запускается
+Если резервных IP нет, после второй неудачной попытки или истечения проверки handshake запускается
 первый резерв; при его неудаче — следующий. Основной продолжает попытки
 восстановления. После подтверждённого восстановления он получает приоритет,
 а резерв возвращается в ожидание, если больше не нужен другим подключениям.

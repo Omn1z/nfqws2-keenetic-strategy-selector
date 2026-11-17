@@ -128,11 +128,16 @@ type bypassRun struct {
 	err         error
 }
 
-func runMockBypass(t *testing.T, family, mode, ips, resolved string) bypassRun {
+func runMockBypass(t *testing.T, family, mode, ips, resolved string, transport ...string) bypassRun {
 	t.Helper()
 	dir := t.TempDir()
 	for _, sub := range []string{"lists", "tmp"} {
 		if err := os.Mkdir(filepath.Join(dir, sub), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(transport) > 0 {
+		if err := os.WriteFile(filepath.Join(dir, transportEndpointsFile), []byte(transport[0]), 0o600); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -154,6 +159,45 @@ func runMockBypass(t *testing.T, family, mode, ips, resolved string) bypassRun {
 	cmd.Env = append(os.Environ(), "TESTROOT="+filepath.ToSlash(dir), "TMPDIR="+filepath.ToSlash(filepath.Join(dir, "tmp")), "MODE="+mode)
 	out, err := cmd.CombinedOutput()
 	return bypassRun{dir, string(out), err}
+}
+
+func TestGeneratedBypassVPNTransportIsUDPAndPortScoped(t *testing.T) {
+	transport := "192.0.2.44 443\n192.0.2.44 443\n2001:db8::44 51820\n" +
+		"192.0.2.44 0\n192.0.2.45 65536\nhost.example 443\n192.0.2.0/24 443\n192.0.2.46 443 -j DROP\n"
+	for _, family := range []string{"iptables", "ip6tables"} {
+		for _, mode := range []string{"normal", "no-ipset"} {
+			t.Run(family+"/"+mode, func(t *testing.T) {
+				r := runMockBypass(t, family, mode, "", "", transport)
+				if r.err != nil {
+					t.Fatalf("helper: %v: %s", r.err, r.output)
+				}
+				ip, port := "192.0.2.44", "443"
+				if family == "ip6tables" {
+					ip, port = "2001:db8::44", "51820"
+				}
+				chain := r.read(t, "chain")
+				for _, rule := range []string{
+					"-A nfqws2_bypass -p udp -d " + ip + " --dport " + port + " -j ACCEPT\n",
+					"-A nfqws2_bypass -p udp -s " + ip + " --sport " + port + " -j ACCEPT\n",
+				} {
+					if strings.Count(chain, rule) != 1 {
+						t.Fatalf("transport rule missing or duplicated: %s", chain)
+					}
+				}
+				if strings.Contains(chain, "DROP") || strings.Contains(chain, " -p tcp ") || strings.Contains(chain, "192.0.2.45") || strings.Contains(chain, "/24") {
+					t.Fatalf("invalid or broad transport exemption: %s", chain)
+				}
+				set := "n2s_nfqb4"
+				if family == "ip6tables" {
+					set = "n2s_nfqb6"
+				}
+				if mode == "normal" && r.read(t, set) != "" {
+					t.Fatal("transport endpoint leaked into the unrestricted address set")
+				}
+				r.absent(t, "tmp/nfqws-bypass-"+family+".lock")
+			})
+		}
+	}
 }
 
 func (r bypassRun) read(t *testing.T, name string) string {

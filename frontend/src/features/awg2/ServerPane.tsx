@@ -9,6 +9,7 @@ import { Badge } from "@/components/ui/Badge";
 import { Switch } from "@/components/ui/Switch";
 import { Field, Input, Select, Textarea } from "@/components/ui/form";
 import type { Awg2Status, AwgServerConfig } from "@/types/api";
+import EndpointBackupsPane from "./EndpointBackupsPane";
 
 interface Form {
   enabled: boolean; protocol: string;
@@ -78,6 +79,7 @@ export default function ServerPane({ st, reload, acceptStatus, deployActive, dep
   const [saving, setSaving] = useState(false);
   const [dirty, setDirty] = useState(false);
   const [applyingFormat, setApplyingFormat] = useState(false);
+  const [endpointSaving, setEndpointSaving] = useState(false);
   const [advanced, setAdvanced] = useState(false);
   const [passwordOpen, setPasswordOpen] = useState(false);
   useEffect(() => {
@@ -90,7 +92,7 @@ export default function ServerPane({ st, reload, acceptStatus, deployActive, dep
   const awg3 = form.protocol_version === "3.1";
   const engineIssue = imported ? "" : vpnEngineIssue(st.engine, form.traffic_obfuscation && awg3);
   const formatChanged = !imported && formatKey(form) !== formatKey(toForm(st.config));
-  const ownWorking = saving || deploying || applyingFormat;
+  const ownWorking = saving || deploying || applyingFormat || endpointSaving;
   const working = ownWorking || externalBusy;
   const set = <K extends keyof Form>(k: K, v: Form[K]) => { if (working) return; setDirty(true); setForm((f) => ({ ...f, [k]: v })); };
   useEffect(() => { onBusyChange(ownWorking); }, [ownWorking, onBusyChange]);
@@ -220,6 +222,8 @@ export default function ServerPane({ st, reload, acceptStatus, deployActive, dep
           <Button variant="primary" onClick={save} disabled={working || formatChanged}>{saving ? "Сохранение…" : "Сохранить MTU"}</Button>
         </div>
       </Card>
+
+      <EndpointBackupsPane key={st.active_server_id} st={st} acceptStatus={acceptStatus} onBusyChange={setEndpointSaving} externalBusy={working} />
 
       {advanced && !imported && (
       <Card

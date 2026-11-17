@@ -31,23 +31,28 @@ type EngineInfo struct {
 
 // ClientStatus is one local awgN tunnel state (from the userspace UAPI socket).
 type ClientStatus struct {
-	Running           bool   `json:"running"`
-	IfacePresent      bool   `json:"iface_present"`
-	LastHandshake     int64  `json:"last_handshake"`
-	RxBytes           int64  `json:"rx_bytes"`
-	TxBytes           int64  `json:"tx_bytes"`
-	Endpoint          string `json:"endpoint"`
-	Address           string `json:"address"`
-	MTU               int    `json:"mtu"`
-	Connected         bool   `json:"connected"` // handshake within ~180s
-	Error             string `json:"error,omitempty"`
-	StatusUnavailable bool   `json:"status_unavailable,omitempty"`
-	Recovering        bool   `json:"recovering"`
-	VerificationUntil int64  `json:"verification_until,omitempty"`
-	RetryAt           int64  `json:"retry_at"`
-	RetryCount        int    `json:"retry_count"`
-	RecoveryError     string `json:"recovery_error,omitempty"`
-	engineID          string // PID/start time; never reuse health across daemon replacement
+	Running               bool   `json:"running"`
+	IfacePresent          bool   `json:"iface_present"`
+	LastHandshake         int64  `json:"last_handshake"`
+	RxBytes               int64  `json:"rx_bytes"`
+	TxBytes               int64  `json:"tx_bytes"`
+	Endpoint              string `json:"endpoint"`
+	EndpointPrimary       string `json:"endpoint_primary,omitempty"`
+	EndpointCandidate     string `json:"endpoint_candidate,omitempty"`
+	EndpointIndex         int    `json:"endpoint_index"`
+	EndpointCount         int    `json:"endpoint_count,omitempty"`
+	EndpointPoolExhausted bool   `json:"endpoint_pool_exhausted,omitempty"`
+	Address               string `json:"address"`
+	MTU                   int    `json:"mtu"`
+	Connected             bool   `json:"connected"` // handshake within ~180s
+	Error                 string `json:"error,omitempty"`
+	StatusUnavailable     bool   `json:"status_unavailable,omitempty"`
+	Recovering            bool   `json:"recovering"`
+	VerificationUntil     int64  `json:"verification_until,omitempty"`
+	RetryAt               int64  `json:"retry_at"`
+	RetryCount            int    `json:"retry_count"`
+	RecoveryError         string `json:"recovery_error,omitempty"`
+	engineID              string // PID/start time; never reuse health across daemon replacement
 }
 
 // AWGConn is one AWG2 tunnel's live state, shaped for the dashboard (state +

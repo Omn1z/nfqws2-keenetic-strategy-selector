@@ -191,7 +191,7 @@ func (svc *Service) awgFlowTraceRules() []awgFlowTraceRule {
 			// Use the same ordered rule/connection reserves as the datapath.
 			// The rule still belongs to its logical primary, while a flow names
 			// the physical interface currently selected for that rule.
-			tunnelID = selectFallbackTunnelID(tunnelID, svc.connectionFallbackTunnelIDs(tunnelID, z.FallbackTunnelIDs),
+			tunnelID = selectFallbackTunnelID(tunnelID, svc.endpointFallbackTunnelIDs(tunnelID, z.FallbackTunnelIDs),
 				func(id string) bool { return routingEnabled[id] }, isConnected)
 			selected := servers[tunnelID]
 			if selected == nil {

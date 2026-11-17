@@ -112,7 +112,7 @@ func (svc *Service) fallbackRoutingSignature() (string, bool) {
 	var b strings.Builder
 	hasFallback := false
 	for i, z := range svc.awgPolicyRoutingRules() {
-		fallbacks := svc.connectionFallbackTunnelIDs(z.TunnelID, z.FallbackTunnelIDs)
+		fallbacks := svc.endpointFallbackTunnelIDs(z.TunnelID, z.FallbackTunnelIDs)
 		if !z.Enabled || z.WaitingForConnection || z.RouteValue() != "tunnel" || len(fallbacks) == 0 {
 			continue
 		}
@@ -134,7 +134,7 @@ func (svc *Service) fallbackRoutingSignature() (string, bool) {
 		hasFallback = true
 		selected := ""
 		if identity.Enabled && identity.ClientEnabled {
-			for _, id := range fallbackCandidates(srv.ID, svc.connectionFallbackTunnelIDs(srv.ID, nil)) {
+			for _, id := range fallbackCandidates(srv.ID, svc.endpointFallbackTunnelIDs(srv.ID, nil)) {
 				if isConnected(id) {
 					selected = id
 					break

@@ -358,6 +358,7 @@ func (s *Server) routes() {
 	m.HandleFunc("POST /api/awg2/servers/{id}/rename", s.awg2RenameServer)
 	m.HandleFunc("POST /api/awg2/servers/{id}/enabled", s.awg2SetServerEnabled)
 	m.HandleFunc("POST /api/awg2/servers/{id}/failover", s.awg2SetFailover)
+	m.HandleFunc("POST /api/awg2/servers/{id}/endpoint-backups", s.awg2SetEndpointBackups)
 	m.HandleFunc("POST /api/awg2/servers/{id}/test", s.awg2TestConnection)
 	m.HandleFunc("POST /api/awg2/settings/recovery", s.awg2SetRecoverySettings)
 	m.HandleFunc("POST /api/awg2/servers/{id}/deploy", s.awg2DeployServer)

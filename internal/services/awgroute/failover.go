@@ -178,7 +178,7 @@ func (svc *Service) reconcileStandbyClients() {
 		if cfg.Standby || !svc.clientShouldRun(primary.Manager) || clientAuthenticated(status(primary.Manager), now) {
 			continue
 		}
-		needsReserve := clientNeedsFallback(states[primary.Manager], now)
+		needsReserve := clientNeedsFallback(states[primary.Manager], now) && svc.endpointPoolAllowsFallback(primary.Manager)
 		lists := [][]string{svc.connectionFallbackTunnelIDs(primary.ID, nil)}
 		for _, rule := range rules {
 			if rule.Enabled && !rule.WaitingForConnection && rule.RouteValue() == "tunnel" && rule.TunnelID == primary.ID && len(rule.FallbackTunnelIDs) > 0 {
@@ -208,7 +208,7 @@ func (svc *Service) reconcileStandbyClients() {
 					continue
 				}
 				wanted[reserve.Manager] = true
-				if connected || !clientNeedsFallback(states[reserve.Manager], now) {
+				if connected || !clientNeedsFallback(states[reserve.Manager], now) || !svc.endpointPoolAllowsFallback(reserve.Manager) {
 					break
 				}
 			}
@@ -247,7 +247,7 @@ func (svc *Service) connectionFailoverStatus(srv *managedServer, statuses map[st
 	for _, candidate := range svc.serverSnapshot() {
 		byID[candidate.ID] = candidate
 	}
-	for _, id := range fallbackCandidates(srv.ID, svc.connectionFallbackTunnelIDs(srv.ID, nil)) {
+	for _, id := range fallbackCandidates(srv.ID, svc.endpointFallbackTunnelIDs(srv.ID, nil)) {
 		candidate := byID[id]
 		if candidate != nil && svc.clientShouldRun(candidate.Manager) && clientAuthenticated(statuses[id], time.Now()) {
 			status.ActiveTunnelID = id
@@ -285,7 +285,7 @@ func (svc *Service) effectiveConnectedServer(primary string) *managedServer {
 	if owner == nil || !owner.Manager.Enabled() || !owner.Manager.ClientEnabled() {
 		return nil
 	}
-	for _, id := range fallbackCandidates(primary, svc.connectionFallbackTunnelIDs(primary, nil)) {
+	for _, id := range fallbackCandidates(primary, svc.endpointFallbackTunnelIDs(primary, nil)) {
 		if srv := byID[id]; srv != nil && svc.tunnelUpForManagedServer(srv) {
 			return srv
 		}

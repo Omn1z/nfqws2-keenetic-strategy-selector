@@ -31,6 +31,8 @@ type clientSupervisor struct {
 	stopping              atomic.Bool
 	waiters               atomic.Int32
 	states                map[*awg.Manager]clientRecovery
+	endpoints             map[*awg.Manager]clientEndpointPool
+	endpointHook          func() error
 	standbyActive         map[*awg.Manager]bool
 	onRecovered           func()
 	driver                clientDriver
@@ -58,6 +60,9 @@ func (d systemClientDriver) restoreRoutes(am *awg.Manager) error {
 }
 func (d systemClientDriver) currentEngine(am *awg.Manager) bool {
 	return awgClientCurrentEngineOS(am.RuntimeConfig())
+}
+func (d systemClientDriver) endpointHints(am *awg.Manager, pool []string) map[string]bool {
+	return d.svc.awgEndpointHintsOS(am, pool)
 }
 
 type clientRecovery struct {
@@ -110,7 +115,11 @@ func (r *clientRecovery) observeWithSettings(st ClientStatus, now time.Time, set
 		st.Connected = st.Connected || r.authenticatedStatus(&st, now)
 		r.LastStatus, r.LastStatusAt = st, now
 	}()
-	progress := r.Seen && (st.RxBytes > r.RX || st.LastHandshake > r.Handshake)
+	sameGeneration := r.LastStatus.engineID == st.engineID && (r.LastStatus.Endpoint == "" || st.Endpoint == "" || r.LastStatus.Endpoint == st.Endpoint)
+	if r.Seen && !sameGeneration {
+		r.HealthyAt = time.Time{}
+	}
+	progress := r.Seen && sameGeneration && (st.RxBytes > r.RX || st.LastHandshake > r.Handshake)
 	r.Seen, r.RX, r.Handshake = true, st.RxBytes, st.LastHandshake
 	fresh := st.LastHandshake > 0 && now.Unix()-st.LastHandshake >= 0 && now.Unix()-st.LastHandshake < int64(clientStaleAfter/time.Second)
 	if st.Running && (fresh || progress) {
@@ -305,6 +314,8 @@ func (svc *Service) clientOpContext() context.Context {
 func (svc *Service) forgetClientRecovery(am *awg.Manager) {
 	svc.clients.mu.Lock()
 	delete(svc.clients.states, am)
+	delete(svc.clients.endpoints, am)
+	am.ResetClientEndpoint()
 	svc.clients.mu.Unlock()
 }
 
@@ -318,6 +329,7 @@ func (svc *Service) SetClientRecoveryHook(fn func()) {
 
 func (svc *Service) recordClientAttempt(am *awg.Manager, err error) {
 	settings := svc.currentRecoverySettings()
+	pool := am.ClientEndpointCandidates()
 	svc.clients.mu.Lock()
 	defer svc.clients.mu.Unlock()
 	if svc.clients.states == nil {
@@ -326,6 +338,12 @@ func (svc *Service) recordClientAttempt(am *awg.Manager, err error) {
 	r := svc.clients.states[am]
 	r.attemptedWithSettings(time.Now(), err, settings)
 	svc.clients.states[am] = r
+	endpoint := svc.endpointPoolLocked(am, pool)
+	endpoint.started = true
+	if index := endpointChoice(pool, am.RuntimeConfig().Endpoint); index >= 0 {
+		endpoint.index = index
+	}
+	svc.clients.endpoints[am] = endpoint
 }
 
 func (svc *Service) clientRecoveryStatus(am *awg.Manager, st *ClientStatus) {
@@ -343,6 +361,7 @@ func (svc *Service) clientRecoveryStatus(am *awg.Manager, st *ClientStatus) {
 	// Read-only polls do not extend this window, and counters/handshake must
 	// still belong to the generation the supervisor actually observed.
 	st.Connected = st.Connected || r.authenticatedStatus(st, now)
+	svc.endpointStatus(am, st)
 	st.Recovering, st.RetryCount, st.RecoveryError = r.Recovering, r.Attempts, r.Error
 	verification := r.VerifyUntil
 	next := r.RetryAt
@@ -365,6 +384,9 @@ func (svc *Service) clientRecoveryStatus(am *awg.Manager, st *ClientStatus) {
 func (r clientRecovery) authenticatedStatus(st *ClientStatus, now time.Time) bool {
 	if st == nil || !st.Running || st.StatusUnavailable || !r.Seen || r.Recovering || st.LastHandshake <= 0 ||
 		st.LastHandshake != r.Handshake || st.RxBytes < r.RX || r.HealthyAt.IsZero() {
+		return false
+	}
+	if r.LastStatus.engineID != st.engineID || r.LastStatus.Endpoint != "" && st.Endpoint != "" && r.LastStatus.Endpoint != st.Endpoint {
 		return false
 	}
 	age := now.Sub(r.HealthyAt)
@@ -483,6 +505,7 @@ func (svc *Service) checkClient(srv *managedServer) {
 	now := time.Now()
 	settings := svc.currentRecoverySettings()
 	observed := *st
+	svc.observeClientEndpoint(am, &observed)
 	if st.Running && !driver.currentEngine(am) {
 		observed.Running = false
 	}
@@ -498,6 +521,9 @@ func (svc *Service) checkClient(srv *managedServer) {
 	action := r.observeWithSettings(observed, now, settings)
 	svc.clients.states[am] = r
 	svc.clients.mu.Unlock()
+	if !r.Recovering && observed.Running && !observed.StatusUnavailable {
+		svc.authenticatedClientEndpoint(am)
+	}
 	if action != clientReconnect && observed.Running && r.RoutesPending && svc.clientOpContext().Err() == nil {
 		if err := driver.restoreRoutes(am); err == nil {
 			svc.clients.mu.Lock()
@@ -525,8 +551,18 @@ func (svc *Service) checkClient(srv *managedServer) {
 	case clientReconnect:
 		iface := awgClientIfaceName(am.Config())
 		logbuf.Append("awg2", "warn", fmt.Sprintf("автовосстановление %s: попытка %d (handshake=%d)", iface, r.Attempts+1, st.LastHandshake))
+		if err := svc.clientOpContext().Err(); err != nil {
+			return
+		}
+		rotateEndpoint := !observed.StatusUnavailable && (!st.Running || observed.Running) && (observed.Running || r.Attempts > 0)
+		rollbackEndpoint := svc.prepareClientEndpointAttempt(am, rotateEndpoint)
+		if svc.clientOpContext().Err() != nil {
+			rollbackEndpoint()
+			return
+		}
 		err := driver.recover(am)
 		if svc.clientOpContext().Err() != nil {
+			rollbackEndpoint()
 			return
 		}
 		svc.recordClientAttempt(am, err)

@@ -357,7 +357,7 @@ func (svc *Service) awgClientUpManagerOS(am *awg.Manager) error {
 			return opCtx.Err()
 		}
 	}
-	if isWARPConfig(cfg) {
+	if isWARPConfig(cfg) && len(cfg.Client.EndpointBackups) == 0 {
 		next, err := svc.awgApplyBestWARPEndpoint(opCtx, am, cfg, p, iface)
 		if next.Endpoint != cfg.Endpoint {
 			// A handshake can arrive just after the probe timeout. Keep policy
@@ -385,8 +385,11 @@ func (svc *Service) awgClientUpManagerOS(am *awg.Manager) error {
 		return fmt.Errorf("не удалось разрешить адрес сервера (endpoint)")
 	}
 	svc.rememberPolicyDNS(host, []string{endpointIP})
-	if gw, dev := awgDefaultRoute(); dev != "" {
-		_, _ = awgRun(awgEndpointRouteCmd(endpointIP, gw, dev))
+	if err := svc.awgPinClientEndpoints(am); err != nil {
+		return err
+	}
+	if err := svc.refreshClientEndpointBypass(); err != nil {
+		return fmt.Errorf("исключения endpoint из NFQUEUE: %w", err)
 	}
 	setText, err := awg.RenderUAPISet(&cfg, p, endpointIP, port)
 	if err != nil {
@@ -452,9 +455,6 @@ func (svc *Service) awgClientStatusManagerOS(am *awg.Manager) *ClientStatus {
 	if st == nil {
 		return nil
 	}
-	if st.Endpoint != "" {
-		svc.rememberPolicyDNS(hostOf(cfg.Endpoint), []string{hostOf(st.Endpoint)})
-	}
 	if st.MTU == 0 {
 		st.MTU = awgTunnelMTU(cfg)
 	}
@@ -467,6 +467,7 @@ func (svc *Service) awgClientStatusManagerOS(am *awg.Manager) *ClientStatus {
 		}
 	}
 	svc.clientRecoveryStatus(am, st)
+	svc.rememberClientEndpointStatus(am, st)
 	return st
 }
 

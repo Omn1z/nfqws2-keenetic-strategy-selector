@@ -27,13 +27,14 @@ const (
 )
 
 type awgMultiTunnel struct {
-	ID         string
-	Iface      string
-	EndpointIP string
-	Table      int
-	Mark       string
-	MTU        int
-	Killswitch bool
+	ID          string
+	Iface       string
+	EndpointIP  string
+	EndpointIPs []string
+	Table       int
+	Mark        string
+	MTU         int
+	Killswitch  bool
 }
 
 type awgMultiRule struct {
@@ -169,13 +170,14 @@ func (svc *Service) awgBuildMultiPolicyWithResolve(resolve bool) ([]awgMultiRule
 		}
 		slot := len(tunnelOrder) + 1
 		t := &awgMultiTunnel{
-			ID:         srv.ID,
-			Iface:      iface,
-			EndpointIP: endpointIP,
-			Table:      awgMultiTableBase + slot,
-			Mark:       awgMultiMark(slot),
-			MTU:        awgTunnelMTU(cfg),
-			Killswitch: cfg.Routing.Killswitch,
+			ID:          srv.ID,
+			Iface:       iface,
+			EndpointIP:  endpointIP,
+			EndpointIPs: canonicalEndpointIPs(append(svc.awgClientEndpointIPs(srv.Manager), endpointIP)...),
+			Table:       awgMultiTableBase + slot,
+			Mark:        awgMultiMark(slot),
+			MTU:         awgTunnelMTU(cfg),
+			Killswitch:  cfg.Routing.Killswitch,
 		}
 		tunnelByID[srv.ID] = t
 		tunnelOrder = append(tunnelOrder, srv.ID)
@@ -208,7 +210,7 @@ func (svc *Service) awgBuildMultiPolicyWithResolve(resolve bool) ([]awgMultiRule
 		var tun *awgMultiTunnel
 		if route == "tunnel" {
 			selectedID := primaryID
-			fallbacks := svc.connectionFallbackTunnelIDs(primaryID, z.FallbackTunnelIDs)
+			fallbacks := svc.endpointFallbackTunnelIDs(primaryID, z.FallbackTunnelIDs)
 			if len(fallbacks) > 0 {
 				selectedID = selectFallbackTunnelID(primaryID, fallbacks,
 					func(id string) bool {
@@ -338,7 +340,9 @@ func awgWriteMultiSets(rules []awgMultiRule) error {
 }
 
 func (svc *Service) awgInstallMultiRoutes(tunnels []awgMultiTunnel) error {
-	gw, wandev := awgDefaultRoute()
+	endpointContext, cancelEndpoints := context.WithTimeout(svc.clientOpContext(), 15*time.Second)
+	defer cancelEndpoints()
+	endpointRun := func(command string) (string, error) { return awgRunShell(endpointContext, command, "") }
 	routeRules, err := awgRun("ip rule show")
 	if err != nil {
 		return awgCmdErr("ip rule show", routeRules, err)
@@ -347,10 +351,8 @@ func (svc *Service) awgInstallMultiRoutes(tunnels []awgMultiTunnel) error {
 	for _, t := range tunnels {
 		awgTuneClientKernelBuffers()
 		_, _ = awgRun("ip link set " + t.Iface + " qlen " + strconv.Itoa(awgClientTxQueueLen) + " 2>/dev/null")
-		if t.EndpointIP != "" && wandev != "" {
-			if err := awgRunCheck(awgEndpointRouteCmd(t.EndpointIP, gw, wandev)); err != nil {
-				logbuf.Append("awg2", "warn", "multi-routing: endpoint route "+t.EndpointIP+": "+err.Error())
-			}
+		if err := awgPinEndpointIPs(awgMultiEndpointIPs(t), t.EndpointIP, endpointRun); err != nil {
+			logbuf.Append("awg2", "warn", "multi-routing: "+err.Error())
 		}
 		// A different enabled tunnel may still be offline or starting. Keep its
 		// policy slot/killswitch, without making a healthy tunnel's restore fail.
@@ -450,8 +452,10 @@ func awgMultiPolicyDocument(tunnels []awgMultiTunnel, rules []awgMultiRule) stri
 		doc.WriteString("-A " + awgMultiChain + " -d " + ex + " -j RETURN\n")
 	}
 	for _, t := range tunnels {
-		if t.EndpointIP != "" {
-			doc.WriteString("-A " + awgMultiChain + " -d " + t.EndpointIP + "/32 -j RETURN\n")
+		for _, ip := range awgMultiEndpointIPs(t) {
+			if net.ParseIP(ip).To4() != nil {
+				doc.WriteString("-A " + awgMultiChain + " -d " + ip + "/32 -j RETURN\n")
+			}
 		}
 	}
 	for _, r := range rules {
@@ -833,13 +837,14 @@ func (svc *Service) awgBuildMultiTunnelsOnly() []awgMultiTunnel {
 		}
 		slot := len(tunnelOrder) + 1
 		tunnelByID[srv.ID] = &awgMultiTunnel{
-			ID:         srv.ID,
-			Iface:      iface,
-			EndpointIP: endpointIP,
-			Table:      awgMultiTableBase + slot,
-			Mark:       awgMultiMark(slot),
-			MTU:        awgTunnelMTU(cfg),
-			Killswitch: cfg.Routing.Killswitch,
+			ID:          srv.ID,
+			Iface:       iface,
+			EndpointIP:  endpointIP,
+			EndpointIPs: canonicalEndpointIPs(append(svc.awgClientEndpointIPs(srv.Manager), endpointIP)...),
+			Table:       awgMultiTableBase + slot,
+			Mark:        awgMultiMark(slot),
+			MTU:         awgTunnelMTU(cfg),
+			Killswitch:  cfg.Routing.Killswitch,
 		}
 		tunnelOrder = append(tunnelOrder, srv.ID)
 	}

@@ -19,11 +19,13 @@ export PATH N2S_TEST_APK_LOG
 # Source only the function under test; the installer entrypoint must not run.
 sed -n '/^install_dependencies() {/,/^}/p' "$script_dir/install.sh" > "$test_dir/function.sh"
 . "$test_dir/function.sh"
+https_prepare() { printf 'checked\n' > "$test_dir/https-prepared"; }
 say() { :; }
 die() { echo "$*" >&2; exit 1; }
 PM=apk
 PLATFORM=openwrt
 install_dependencies
+[ "$(cat "$test_dir/https-prepared")" = checked ]
 
 [ "$(wc -l < "$N2S_TEST_APK_LOG")" -eq 1 ]
 set -- $(cat "$N2S_TEST_APK_LOG")

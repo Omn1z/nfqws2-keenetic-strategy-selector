@@ -41,9 +41,10 @@ import (
 
 // Manager owns the nfqws2 engine's on-disk files + package version/update/reload.
 type Manager struct {
-	cfg      *config.Config
-	bypassMu sync.Mutex
-	assetsMu sync.Mutex // serialize managed assets, imports and snapshots
+	cfg                *config.Config
+	bypassMu           sync.Mutex
+	assetsMu           sync.Mutex      // serialize managed assets, imports and snapshots
+	transportEndpoints func() []string // guarded by bypassMu; no lifecycle calls
 }
 
 // New builds a Manager reading the live app config (router paths + package name).
@@ -490,6 +491,9 @@ func (m *Manager) ApplyBypass() error {
 }
 
 func (m *Manager) applyBypass() error {
+	if _, _, err := m.syncTransportEndpoints(); err != nil {
+		return err
+	}
 	if _, err := m.PrepareWANInterfaces(); err != nil {
 		return fmt.Errorf("prepare NFQUEUE bypass interfaces: %w", err)
 	}
@@ -539,6 +543,12 @@ func nfqws2BypassApplyCommand(initScript, bypassScript string) string {
 // the full apply. This lets upgrades from the vendor helper become effective
 // without asking the user to revisit the Bypass tab.
 func (m *Manager) RestoreBypass() error {
+	m.bypassMu.Lock()
+	_, _, transportErr := m.syncTransportEndpoints()
+	m.bypassMu.Unlock()
+	if transportErr != nil {
+		return transportErr
+	}
 	interfacesChanged, err := m.PrepareWANInterfaces()
 	if err != nil {
 		return fmt.Errorf("prepare NFQUEUE bypass interfaces: %w", err)
@@ -549,7 +559,7 @@ func (m *Manager) RestoreBypass() error {
 	ipList := stdpath.Join(listDir, "nfqueue_bypass_ips.list")
 	cache := stdpath.Join(listDir, "nfqueue_bypass_resolved.list")
 	hasList := false
-	for _, name := range []string{domains, ipList} {
+	for _, name := range []string{domains, ipList, stdpath.Join(confDir, transportEndpointsFile)} {
 		if _, err := os.Stat(name); err == nil {
 			hasList = true
 		} else if !os.IsNotExist(err) {

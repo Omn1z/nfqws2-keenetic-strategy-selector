@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
 	"nfqws2strategy/internal/tools/logbuf"
@@ -83,7 +84,7 @@ func (svc *Service) awgApplyRoutingOS() (applyErr error) {
 		return fmt.Errorf("на роутере уже есть ip rule с пересекающейся fwmark (%s) — применение отменено во избежание конфликта с policy-routing роутера", other)
 	}
 	endpointIP := svc.resolvePolicyHostIP(hostOf(cfg.Endpoint))
-	gw, wandev := awgDefaultRoute()
+	_, wandev := awgEndpointDefaultRoute(endpointIP)
 	if endpointIP == "" {
 		return fmt.Errorf("не удалось определить IP сервера (endpoint)")
 	}
@@ -113,8 +114,8 @@ func (svc *Service) awgApplyRoutingOS() (applyErr error) {
 	// checked batches: on a fresh apply it legitimately returns "not found".
 	// We do check the route/rule add path — a failed fwmark rule leaves packets
 	// marked by iptables but still routed through the native WAN.
-	if err := awgRunCheck(awgEndpointRouteCmd(endpointIP, gw, wandev)); err != nil {
-		logbuf.Append("awg2", "warn", "не удалось закрепить маршрут до endpoint, продолжаем: "+err.Error())
+	if err := svc.awgPinClientEndpoints(am); err != nil {
+		return fmt.Errorf("маршрут до endpoint: %w", err)
 	}
 	if err := awgRunCheck("ip route replace default dev " + awgIface + " table " + awgTable); err != nil {
 		return fmt.Errorf("ip tunnel route: %w", err)
@@ -148,7 +149,7 @@ func (svc *Service) awgApplyRoutingOS() (applyErr error) {
 	// 5) firewall hook (marking chain + FORWARD/NAT/MSS [+ DNS REDIRECT]) — a Keenetic
 	// ndm netfilter.d hook so it survives the firewall rebuilds that flush foreign
 	// iptables chains; awgWriteHook also applies it immediately.
-	if err := awgWriteHook(awgEffectiveMode(r), endpointIP, wandev, awgTunnelMTU(cfg), dnsOn, awgTunnelV6Reaches(), r.Zones); err != nil {
+	if err := awgWriteHook(awgEffectiveMode(r), endpointIP, wandev, awgTunnelMTU(cfg), dnsOn, awgTunnelV6Reaches(), r.Zones, svc.awgClientEndpointIPs(am)...); err != nil {
 		return fmt.Errorf("firewall-хук: %w", err)
 	}
 	// 6) disable Keenetic's NAT accelerators — their fast-path silently drops our
@@ -185,15 +186,15 @@ func (svc *Service) awgRefreshRoutingOS() (applyErr error) {
 		return fmt.Errorf("OpenWrt/маршрутизация: %w", err)
 	}
 	endpointIP := svc.resolvePolicyHostIP(hostOf(cfg.Endpoint))
-	gw, wandev := awgDefaultRoute()
+	_, wandev := awgEndpointDefaultRoute(endpointIP)
 	sets := svc.awgPrepareSetPlan(&cfg, true)
 	finishDNS := svc.routingDNSGate.begin(true)
 	defer func() { finishDNS(applyErr) }()
 	if err := svc.awgBeginAccelerationTransition(); err != nil {
 		return err
 	}
-	if endpointIP != "" && wandev != "" {
-		_, _ = awgRun(awgEndpointRouteCmd(endpointIP, gw, wandev))
+	if err := svc.awgPinClientEndpoints(am); err != nil {
+		return err
 	}
 	// A zone/mask edit must drop the IPs learned for the OLD masks — otherwise a
 	// removed domain stays tunneled ("старая зона не выгрузилась"). Flush the dynamic
@@ -226,7 +227,7 @@ func (svc *Service) awgRefreshRoutingOS() (applyErr error) {
 		return fmt.Errorf("DNS route learner failed to start")
 	}
 	svc.awgEnsureSNISniff(&cfg) // start/stop/refresh the SNI sniffer to match the new zones
-	if err := awgWriteHook(awgEffectiveMode(r), endpointIP, wandev, awgTunnelMTU(cfg), dnsOn, awgTunnelV6Reaches(), r.Zones); err != nil {
+	if err := awgWriteHook(awgEffectiveMode(r), endpointIP, wandev, awgTunnelMTU(cfg), dnsOn, awgTunnelV6Reaches(), r.Zones, svc.awgClientEndpointIPs(am)...); err != nil {
 		return fmt.Errorf("firewall-хук: %w", err)
 	}
 	svc.route.mu.Lock()
@@ -312,7 +313,7 @@ func (svc *Service) awgStartRefresh() {
 				// Force a full re-assert every 4th tick (≈ every 4 min) anyway so a
 				// Keenetic firewall rebuild can't strand us silently for long.
 				endpointIP := svc.cachedPolicyEndpointIP(hostOf(c.Endpoint))
-				_, wandev := awgDefaultRoute()
+				_, wandev := awgEndpointDefaultRoute(endpointIP)
 				dnsOn := svc.awgEnsureDNSProxy(&c)
 				if awgDNSProxyWanted(&c, svc.awgZoneMatchers(&c)) && !dnsOn {
 					failure := fmt.Errorf("DNS route learner failed to start")
@@ -322,7 +323,7 @@ func (svc *Service) awgStartRefresh() {
 					unlock()
 					continue
 				}
-				h := awgHookInputsHash(awgEffectiveMode(c.Routing), endpointIP, wandev, awgTunnelMTU(c), dnsOn, awgTunnelV6Reaches(), c.Routing.Killswitch, svc.zonesRevision.Load())
+				h := awgHookInputsHash(awgEffectiveMode(c.Routing), endpointIP+"|"+strings.Join(svc.awgClientEndpointIPs(am), ","), wandev, awgTunnelMTU(c), dnsOn, awgTunnelV6Reaches(), c.Routing.Killswitch, svc.zonesRevision.Load())
 				_, hookMissing := os.Stat(awgHookPath)
 				// Watchdog hot path: avoid route.mu entirely. lastHookHash is an
 				// atomic.Pointer[string] swapped by the most recent re-assert;
@@ -369,10 +370,10 @@ func (svc *Service) awgStartRefresh() {
 					unlock()
 					continue
 				}
-				var refreshErr error
-				if hookMissing != nil {
-					refreshErr = awgWriteHook(awgEffectiveMode(c.Routing), endpointIP, wandev, awgTunnelMTU(c), dnsOn, awgTunnelV6Reaches(), c.Routing.Zones)
-				} else {
+				refreshErr := svc.awgPinClientEndpoints(am)
+				if refreshErr == nil && (hookMissing != nil || !same) {
+					refreshErr = awgWriteHook(awgEffectiveMode(c.Routing), endpointIP, wandev, awgTunnelMTU(c), dnsOn, awgTunnelV6Reaches(), c.Routing.Zones, svc.awgClientEndpointIPs(am)...)
+				} else if refreshErr == nil {
 					if out, err := awgRun("sh " + awgHookPath); err != nil {
 						refreshErr = awgCmdErr("routing firewall refresh", out, err)
 					}

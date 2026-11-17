@@ -209,12 +209,20 @@ func TestKeeneticBypassHookRunsOnlyAfterMangleRebuild(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	before, err := os.Stat(hook)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := ensureKeeneticBypassPersistence(confDir, bypass); err != nil {
 		t.Fatal(err)
 	}
 	second, err := os.ReadFile(hook)
 	if err != nil || string(first) != string(second) {
 		t.Fatalf("idempotent hook rewrite changed content: %v", err)
+	}
+	after, err := os.Stat(hook)
+	if err != nil || !os.SameFile(before, after) {
+		t.Fatalf("unchanged endpoint retry replaced the persistence hook: %v", err)
 	}
 	if runtime.GOOS == "windows" {
 		return // POSIX hook is exercised in Linux CI and on the router.

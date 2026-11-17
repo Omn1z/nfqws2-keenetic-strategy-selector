@@ -181,7 +181,7 @@ func (svc *Service) awgRestoreMultiPolicyOS(rules []awgMultiRule, tunnels []awgM
 func (svc *Service) awgRestoreLegacyClientRoutesOS(am *awg.Manager) (restoreErr error) {
 	cfg := am.RuntimeConfig()
 	endpointIP := svc.cachedPolicyEndpointIP(hostOf(cfg.Endpoint))
-	gw, dev := awgDefaultRoute()
+	gw, dev := awgEndpointDefaultRoute(endpointIP)
 	if endpointIP == "" || dev == "" {
 		return fmt.Errorf("не удалось определить WAN-маршрут до endpoint")
 	}
@@ -228,7 +228,7 @@ func (svc *Service) awgRestoreLegacyClientRoutesOS(am *awg.Manager) (restoreErr 
 	if !dnsOn {
 		dnsOn = svc.awgEnsureDNSProxy(&cfg)
 	}
-	if err := awgWriteHook(awgEffectiveMode(cfg.Routing), endpointIP, dev, awgTunnelMTU(cfg), dnsOn, awgTunnelV6Reaches(), cfg.Routing.Zones); err != nil {
+	if err := awgWriteHook(awgEffectiveMode(cfg.Routing), endpointIP, dev, awgTunnelMTU(cfg), dnsOn, awgTunnelV6Reaches(), cfg.Routing.Zones, svc.awgClientEndpointIPs(am)...); err != nil {
 		return err
 	}
 	if !refreshing {

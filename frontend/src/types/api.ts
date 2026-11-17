@@ -733,6 +733,8 @@ export interface AwgRulesImportResult {
 export interface AwgClientConfig {
   enabled: boolean;
   peer_id: string;
+  /** Ordered alternate IP endpoints for this same server and VPN profile. */
+  endpoint_backups?: string[];
   fallback_tunnel_ids?: string[];
   standby?: boolean;
 }
@@ -805,6 +807,12 @@ export interface AwgEngineInfo {
 export interface AwgClientStatus {
   running: boolean; iface_present: boolean; last_handshake: number; rx_bytes: number; tx_bytes: number;
   endpoint: string; address: string; mtu: number; connected: boolean; error?: string;
+  endpoint_primary?: string;
+  endpoint_candidate?: string;
+  /** Zero is the primary endpoint; one and above identify ordered backups. */
+  endpoint_index?: number;
+  endpoint_count?: number;
+  endpoint_pool_exhausted?: boolean;
   recovering?: boolean; retry_at?: number; retry_count?: number; recovery_error?: string;
   /** Handshake verification deadline; it remains in the past during a retry pause. */
   verification_until?: number;

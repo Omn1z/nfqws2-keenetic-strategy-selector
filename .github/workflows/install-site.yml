@@ -8,6 +8,9 @@ on:
       - '.github/workflows/install-site.yml'
       - 'packaging/bootstrap.sh'
       - 'packaging/test-bootstrap.sh'
+      - 'packaging/install.sh'
+      - 'packaging/update.sh'
+      - 'packaging/test-download-fallback.sh'
       - 'scripts/build-install-site.py'
       - 'scripts/test-install-site.py'
   workflow_run:
@@ -40,6 +43,7 @@ jobs:
           python-version: '3.12'
       - name: Test download and installation bootstrap
         run: |
+          sh packaging/test-download-fallback.sh
           sh packaging/test-bootstrap.sh
           python scripts/test-install-site.py
       - uses: actions/configure-pages@v5

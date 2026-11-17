@@ -175,6 +175,7 @@ type awgMultiRouteExpectation struct {
 	Table              int
 	Iface              string
 	EndpointIP         string
+	EndpointIPs        []string
 	Online, Killswitch bool
 }
 
@@ -215,7 +216,7 @@ func awgMultiRoutesIntact(snapshot, gateway, wan string, tunnels []awgMultiRoute
 		routes = append(routes, r)
 	}
 	for _, tunnel := range tunnels {
-		online, blackhole, endpoint := !tunnel.Online, !tunnel.Killswitch, tunnel.EndpointIP == "" || wan == ""
+		online, blackhole := !tunnel.Online, !tunnel.Killswitch
 		for _, r := range routes {
 			if r.table == strconv.Itoa(tunnel.Table) && r.dst == "default" {
 				if r.blackhole && r.metric == "1000" {
@@ -225,13 +226,55 @@ func awgMultiRoutesIntact(snapshot, gateway, wan string, tunnels []awgMultiRoute
 					online = true
 				}
 			}
-			if (r.table == "main" || r.table == "254") && !r.blackhole && r.dev == wan && r.via == gateway && (r.dst == tunnel.EndpointIP || r.dst == tunnel.EndpointIP+"/32") {
-				endpoint = true
-			}
 		}
-		if !online || !blackhole || !endpoint {
+		if !online || !blackhole {
 			return false
+		}
+		if wan != "" {
+			for _, endpoint := range canonicalEndpointIPs(append(append([]string(nil), tunnel.EndpointIPs...), tunnel.EndpointIP)...) {
+				if ip, err := netip.ParseAddr(endpoint); err == nil && ip.Is4() && !awgEndpointRouteIntact(snapshot, endpoint, gateway, wan) {
+					return false
+				}
+			}
 		}
 	}
 	return len(tunnels) > 0
+}
+
+func awgEndpointRouteIntact(snapshot, endpoint, gateway, wan string) bool {
+	ip, err := netip.ParseAddr(endpoint)
+	if err != nil || wan == "" {
+		return false
+	}
+	want := netip.PrefixFrom(ip, ip.BitLen())
+	for _, line := range strings.Split(snapshot, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
+			continue
+		}
+		dst, err := netip.ParsePrefix(fields[0])
+		if err != nil {
+			if address, e := netip.ParseAddr(fields[0]); e == nil {
+				dst = netip.PrefixFrom(address, address.BitLen())
+			}
+		}
+		if dst != want {
+			continue
+		}
+		dev, via, table := "", "", "main"
+		for i := 1; i+1 < len(fields); i++ {
+			switch fields[i] {
+			case "dev":
+				dev = fields[i+1]
+			case "via":
+				via = fields[i+1]
+			case "table":
+				table = fields[i+1]
+			}
+		}
+		if dev == wan && via == gateway && (table == "main" || table == "254") {
+			return true
+		}
+	}
+	return false
 }

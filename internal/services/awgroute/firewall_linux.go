@@ -4,6 +4,7 @@ package awgroute
 
 import (
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -61,7 +62,7 @@ func awgApplyKillswitch(on bool) {
 // (-i awg0) the PMTU clamp resolves to the LAN MTU (1500), not the tunnel, so it
 // fails to shrink client→server segments and oversized uploads (large cookies,
 // speed-test POSTs) blackhole → pages "load then stall/RESET".
-func awgFirewallHook(mode, endpointIP, wandev string, mtu int, dnsRedirect, tunnelV6 bool, zones []awg.Zone) string {
+func awgFirewallHook(mode, endpointIP, wandev string, mtu int, dnsRedirect, tunnelV6 bool, zones []awg.Zone, endpointIPs ...string) string {
 	if mtu <= 0 {
 		mtu = 1280
 	}
@@ -163,8 +164,10 @@ func awgFirewallHook(mode, endpointIP, wandev string, mtu int, dnsRedirect, tunn
 	for _, ex := range awgExcludes {
 		v4doc.WriteString("-A " + awgChain + " -d " + ex + " -j RETURN\n")
 	}
-	if endpointIP != "" {
-		v4doc.WriteString("-A " + awgChain + " -d " + endpointIP + "/32 -j RETURN\n")
+	for _, ip := range canonicalEndpointIPs(append(endpointIPs, endpointIP)...) {
+		if net.ParseIP(ip).To4() != nil {
+			v4doc.WriteString("-A " + awgChain + " -d " + ip + "/32 -j RETURN\n")
+		}
 	}
 	// Per-source-device routing. Zones with `source_ips` apply ONLY to packets
 	// from those LAN IPs/CIDRs and are isolated from the global ipsets/mode (see
@@ -230,6 +233,11 @@ func awgFirewallHook(mode, endpointIP, wandev string, mtu int, dnsRedirect, tunn
 	v6doc.WriteString("-A " + awgChain + "6 -m mark --mark " + awgMarkRule + " -j RETURN\n")
 	for _, ex := range []string{"::1/128", "fc00::/7", "fe80::/10", "ff00::/8"} {
 		v6doc.WriteString("-A " + awgChain + "6 -d " + ex + " -j RETURN\n")
+	}
+	for _, ip := range canonicalEndpointIPs(append(endpointIPs, endpointIP)...) {
+		if net.ParseIP(ip).To4() == nil {
+			v6doc.WriteString("-A " + awgChain + "6 -d " + ip + "/128 -j RETURN\n")
+		}
 	}
 	// Read the neighbour table ONCE for all per-source IPv6 emits instead of
 	// forking `ip neigh show <ip>` per source IP per zone. The previous form
@@ -406,11 +414,11 @@ func awgFirewallHook(mode, endpointIP, wandev string, mtu int, dnsRedirect, tunn
 
 // awgWriteHook writes the netfilter.d hook for the given mode/endpoint and runs
 // it once immediately (applying the rules now, not just on the next ndm rebuild).
-func awgWriteHook(mode, endpointIP, wandev string, mtu int, dnsRedirect, tunnelV6 bool, zones []awg.Zone) error {
+func awgWriteHook(mode, endpointIP, wandev string, mtu int, dnsRedirect, tunnelV6 bool, zones []awg.Zone, endpointIPs ...string) error {
 	if err := os.MkdirAll(filepath.Dir(awgHookPath), 0o755); err != nil {
 		return err
 	}
-	if err := os.WriteFile(awgHookPath, []byte(awgFirewallHook(mode, endpointIP, wandev, mtu, dnsRedirect, tunnelV6, zones)), 0o755); err != nil {
+	if err := os.WriteFile(awgHookPath, []byte(awgFirewallHook(mode, endpointIP, wandev, mtu, dnsRedirect, tunnelV6, zones, endpointIPs...)), 0o755); err != nil {
 		return err
 	}
 	awgEnsureFW4IncludeOS([]string{awgIface})
