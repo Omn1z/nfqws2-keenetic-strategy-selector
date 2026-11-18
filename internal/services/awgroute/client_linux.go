@@ -288,7 +288,7 @@ func (svc *Service) awgClientUpOS() error {
 	return svc.awgClientUpManagerOS(svc.awgActive())
 }
 
-func (svc *Service) awgClientUpManagerOS(am *awg.Manager) error {
+func (svc *Service) awgClientUpManagerOS(am *awg.Manager) (startErr error) {
 	opCtx := svc.clientOpContext()
 	if err := opCtx.Err(); err != nil {
 		return err
@@ -332,6 +332,27 @@ func (svc *Service) awgClientUpManagerOS(am *awg.Manager) error {
 	_ = writeFile0600(awgClientConfPath(iface), awg.ClientConf(&cfg, p)) // reference copy
 
 	mtu := awgTunnelMTU(cfg)
+	var transportMark uint32
+	var endpointIP string
+	var port int
+	host, portStr, _ := net.SplitHostPort(strings.TrimSpace(cfg.Endpoint))
+	if outer := svc.doubleTunnelOuter(am); outer != nil {
+		endpointIP = svc.resolvePolicyHostIP(host)
+		port, _ = strconv.Atoi(portStr)
+		if endpointIP == "" || port == 0 {
+			return fmt.Errorf("не удалось разрешить адрес сервера (endpoint)")
+		}
+		defer func() {
+			if startErr != nil {
+				startErr = errors.Join(startErr, svc.awgClientDownManagerContextOS(context.Background(), am))
+			}
+		}()
+		var err error
+		transportMark, mtu, err = svc.prepareDoubleTunnelTransportOS(am, outer, endpointIP)
+		if err != nil {
+			return err
+		}
+	}
 	awgTuneClientKernelBuffers()
 	// 1) start the userspace daemon (creates the iface + UAPI socket) + bring up.
 	script := strings.Join([]string{
@@ -358,7 +379,7 @@ func (svc *Service) awgClientUpManagerOS(am *awg.Manager) error {
 			return opCtx.Err()
 		}
 	}
-	if isWARPConfig(cfg) && len(cfg.Client.EndpointBackups) == 0 {
+	if transportMark == 0 && isWARPConfig(cfg) && len(cfg.Client.EndpointBackups) == 0 {
 		next, err := svc.awgApplyBestWARPEndpoint(opCtx, am, cfg, p, iface)
 		if next.Endpoint != cfg.Endpoint {
 			// A handshake can arrive just after the probe timeout. Keep policy
@@ -381,9 +402,10 @@ func (svc *Service) awgClientUpManagerOS(am *awg.Manager) error {
 		logbuf.Append("awg2", "info", "туннель "+iface+" поднят (WARP endpoint auto)")
 		return nil
 	}
-	host, portStr, _ := net.SplitHostPort(strings.TrimSpace(cfg.Endpoint))
-	endpointIP := svc.resolvePolicyHostIP(host)
-	port, _ := strconv.Atoi(portStr)
+	if transportMark == 0 {
+		endpointIP = svc.resolvePolicyHostIP(host)
+		port, _ = strconv.Atoi(portStr)
+	}
 	if endpointIP == "" || port == 0 {
 		return fmt.Errorf("не удалось разрешить адрес сервера (endpoint)")
 	}
@@ -394,7 +416,7 @@ func (svc *Service) awgClientUpManagerOS(am *awg.Manager) error {
 	if err := svc.refreshClientEndpointBypass(); err != nil {
 		return fmt.Errorf("исключения endpoint из NFQUEUE: %w", err)
 	}
-	setText, err := awg.RenderUAPISet(&cfg, p, endpointIP, port)
+	setText, err := awg.RenderUAPISetWithMark(&cfg, p, endpointIP, port, transportMark)
 	if err != nil {
 		return err
 	}
@@ -441,8 +463,17 @@ func (svc *Service) awgClientDownManagerContextOS(parent context.Context, am *aw
 	if err != nil {
 		return fmt.Errorf("отключение %s: %w: %s", iface, err, strs.LastLines(strings.TrimSpace(string(out)), 2))
 	}
+	// Remove the fail-closed routes only after the marked engine has exited.
+	// A process can still own a UDP socket briefly after deleting the TUN.
+	if _, err := os.Stat(doubleTunnelStatePath(iface)); err == nil {
+		for awgClientProcessIdentityOS(iface) != "" {
+			if !waitClientContext(ctx, 25*time.Millisecond) {
+				return fmt.Errorf("движок %s не завершился: %w", iface, ctx.Err())
+			}
+		}
+	}
 	logbuf.Append("awg2", "info", "туннель "+iface+" опущен: "+strs.LastLines(strings.TrimSpace(string(out)), 2))
-	return nil
+	return clearDoubleTunnelTransportOS(ctx, iface)
 }
 
 func (svc *Service) awgClientStatusOS() *ClientStatus {
@@ -498,6 +529,12 @@ func awgClientStatusIfaceContextOS(opCtx context.Context, iface string) *ClientS
 		return st
 	}
 	u := awg.ParseUAPIGet(resp)
+	if selector, err := newDoubleTunnelSelector(iface); err == nil && u.FWMark == selector.mark {
+		st.transportMarked = true
+		if transport, err := readDoubleTunnelTransport(iface); err == nil {
+			st.transportOuterIface, st.MTU = transport.OuterIface, transport.MTU
+		}
+	}
 	st.LastHandshake, st.RxBytes, st.TxBytes, st.Endpoint = u.LastHandshake, u.RxBytes, u.TxBytes, u.Endpoint
 	st.Running = st.Endpoint != ""
 	st.engineID = awgClientProcessIdentityOS(iface)

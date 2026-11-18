@@ -3,7 +3,7 @@ import test from "node:test";
 import { renderToStaticMarkup } from "react-dom/server";
 import type { Awg2ServerSummary, Awg2Status, AwgConnectionTestResult } from "@/types/api";
 import FailoverPane, { ConnectionFailoverBadge, ConnectionTestResult } from "./FailoverPane";
-import { backupCreatesCycle, backupIDs, connectionTestPresentation, moveBackup } from "./failoverModel";
+import { backupCreatesCycle, backupIDs, connectionTestPresentation, doubleTunnelCreatesCycle, moveBackup } from "./failoverModel";
 
 const summary = (id: string, patch: Partial<Awg2ServerSummary> = {}): Awg2ServerSummary => ({
   id, label: id, host: "", endpoint: "192.0.2.1:51820", client_iface: "awg0", enabled: true, imported: true,
@@ -99,4 +99,24 @@ test("empty connection backup list explains the difference from reserves assigne
   assert.match(html, /Общий резерв для primary ещё не выбран/);
   assert.match(html, /только для этого правила/);
   assert.match(html, /для всех его правил, включая новые списки/);
+});
+
+test("double tunnel picker, active path and egress IP use an independent transport graph", () => {
+  const st = fixture();
+  st.config.client.double_tunnel_id = "outer";
+  st.servers = [
+    summary("primary", { failover: failover([], { double_tunnel_id: "outer", double_tunnel_active: true, double_tunnel_ip: "198.51.100.2" }) }),
+    summary("outer", { label: "Cloudflare", is_warp: true, failover: failover(["primary"]) }),
+    summary("cycle", { failover: failover([], { double_tunnel_id: "chain" }) }),
+    summary("chain", { failover: failover([], { double_tunnel_id: "primary" }) }),
+  ];
+  assert.equal(doubleTunnelCreatesCycle("primary", "outer", st.servers), false);
+  assert.equal(doubleTunnelCreatesCycle("primary", "cycle", st.servers), true);
+  assert.equal(doubleTunnelCreatesCycle("primary", "primary", st.servers), true);
+  const html = renderToStaticMarkup(<FailoverPane st={st} acceptStatus={() => {}} reload={async () => {}} onBusyChange={() => {}} externalBusy={false} />);
+  const picker = html.match(/aria-label="Двойной туннель"[\s\S]+?<\/select>/)?.[0] ?? "";
+  assert.match(html, /двойной туннель · через Cloudflare/);
+  assert.match(picker, /<option value="outer" selected="">Cloudflare · WARP<\/option>/);
+  assert.doesNotMatch(picker, /<option value="(primary|cycle|chain)"/);
+  assert.match(html, /Выходной IP двойного туннеля .+198\.51\.100\.2/);
 });

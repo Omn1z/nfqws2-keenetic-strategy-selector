@@ -206,6 +206,39 @@ func TestConnectionFailoverStorageErrorDoesNotPublishCandidate(t *testing.T) {
 	}
 }
 
+func TestSaveDoubleTunnelValidatesReferencesAndPreservesOmittedSetting(t *testing.T) {
+	svc, _, entries := failoverTestService(t)
+	_, unlock := svc.lockClientOps(false)
+	defer unlock()
+	apply := func() error { return nil }
+	for _, invalid := range []string{"missing", "one"} {
+		if err := svc.setConnectionFailoverWithOps("one", FailoverConfig{DoubleTunnelID: &invalid}, apply); err == nil {
+			t.Fatalf("accepted invalid external transport %q", invalid)
+		}
+	}
+	outer := " two "
+	if err := svc.setConnectionFailoverWithOps("one", FailoverConfig{DoubleTunnelID: &outer}, apply); err != nil {
+		t.Fatal(err)
+	}
+	first := "one"
+	if err := svc.setConnectionFailoverWithOps("two", FailoverConfig{DoubleTunnelID: &first}, apply); err == nil {
+		t.Fatal("accepted a cycle in external transports")
+	}
+	if err := svc.setConnectionFailoverWithOps("one", FailoverConfig{FallbackTunnelIDs: []string{"two"}}, apply); err != nil {
+		t.Fatal(err)
+	}
+	if got := svc.loadAWGState().Servers[0].Config.Client.DoubleTunnelID; got != "two" {
+		t.Fatalf("omitted field changed the saved transport to %q", got)
+	}
+	clear := ""
+	if err := svc.setConnectionFailoverWithOps("one", FailoverConfig{DoubleTunnelID: &clear}, apply); err != nil {
+		t.Fatal(err)
+	}
+	if got := entries[0].Manager.RuntimeLocalClientIdentity().DoubleTunnelID; got != "" {
+		t.Fatalf("cleared transport remained active in the manager: %q", got)
+	}
+}
+
 func TestConnectionFailoverApplyErrorKeepsSavedIntent(t *testing.T) {
 	svc, _, entries := failoverTestService(t)
 	_, unlock := svc.lockClientOps(false)

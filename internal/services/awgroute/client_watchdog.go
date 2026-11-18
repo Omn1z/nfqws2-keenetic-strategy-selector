@@ -34,6 +34,7 @@ type clientSupervisor struct {
 	endpoints             map[*awg.Manager]clientEndpointPool
 	endpointHook          func() error
 	standbyActive         map[*awg.Manager]bool
+	doubleTunnels         map[*awg.Manager]doubleTunnelState
 	onRecovered           func()
 	driver                clientDriver
 	fallbackSignature     string
@@ -66,24 +67,25 @@ func (d systemClientDriver) endpointHints(am *awg.Manager, pool []string) map[st
 }
 
 type clientRecovery struct {
-	Seen          bool
-	RX            int64
-	Handshake     int64
-	HealthyAt     time.Time
-	ProbeAt       time.Time
-	ProbeUntil    time.Time
-	VerifyUntil   time.Time
-	RetryAt       time.Time
-	FailureSince  time.Time
-	AttemptAt     time.Time
-	Attempts      int
-	Recovering    bool
-	Error         string
-	RoutesPending bool
-	LastStatus    ClientStatus
-	LastStatusAt  time.Time
-	UnavailableAt time.Time
-	UnavailableID string
+	Seen            bool
+	RX              int64
+	Handshake       int64
+	HealthyAt       time.Time
+	ProbeAt         time.Time
+	ProbeUntil      time.Time
+	VerifyUntil     time.Time
+	RetryAt         time.Time
+	FailureSince    time.Time
+	AttemptAt       time.Time
+	Attempts        int
+	Recovering      bool
+	Error           string
+	RoutesPending   bool
+	LastStatus      ClientStatus
+	LastStatusAt    time.Time
+	UnavailableAt   time.Time
+	UnavailableID   string
+	directExhausted bool
 }
 
 type clientRecoveryAction int
@@ -130,7 +132,7 @@ func (r *clientRecovery) observeWithSettings(st ClientStatus, now time.Time, set
 		if progress {
 			healthyAt = now
 		}
-		*r = clientRecovery{Seen: true, RX: st.RxBytes, Handshake: st.LastHandshake, HealthyAt: healthyAt, RoutesPending: r.RoutesPending}
+		*r = clientRecovery{Seen: true, RX: st.RxBytes, Handshake: st.LastHandshake, HealthyAt: healthyAt, RoutesPending: r.RoutesPending, directExhausted: st.transportMarked && r.directExhausted}
 		return clientWait
 	}
 	if now.Before(r.RetryAt) {
@@ -322,6 +324,7 @@ func (svc *Service) forgetClientRecovery(am *awg.Manager) {
 	svc.clients.mu.Lock()
 	delete(svc.clients.states, am)
 	delete(svc.clients.endpoints, am)
+	delete(svc.clients.doubleTunnels, am)
 	am.ResetClientEndpoint()
 	svc.clients.mu.Unlock()
 }
@@ -368,6 +371,7 @@ func (svc *Service) clientRecoveryStatus(am *awg.Manager, st *ClientStatus) {
 	// Read-only polls do not extend this window, and counters/handshake must
 	// still belong to the generation the supervisor actually observed.
 	st.Connected = st.Connected || r.authenticatedStatus(st, now)
+	svc.doubleTunnelHealth(am, st)
 	svc.endpointStatus(am, st)
 	st.Recovering, st.RetryCount, st.RecoveryError = r.Recovering, r.Attempts, r.Error
 	verification := r.VerifyUntil
@@ -411,6 +415,7 @@ func (r clientRecovery) restoreUnavailableStatus(st *ClientStatus, now time.Time
 	old := r.LastStatus
 	st.LastHandshake, st.RxBytes, st.TxBytes = old.LastHandshake, old.RxBytes, old.TxBytes
 	st.Endpoint, st.Address, st.MTU = old.Endpoint, old.Address, old.MTU
+	st.transportMarked, st.transportOuterIface = old.transportMarked, old.transportOuterIface
 	healthAge := now.Sub(r.HealthyAt)
 	st.Connected = old.Connected && !r.HealthyAt.IsZero() && healthAge >= 0 && healthAge < clientStaleAfter
 }
@@ -517,6 +522,9 @@ func (svc *Service) checkClient(srv *managedServer) {
 	}
 	now := time.Now()
 	settings := svc.currentRecoverySettings()
+	if svc.checkDoubleTunnel(am, driver, st, now) {
+		return
+	}
 	observed := *st
 	svc.observeClientEndpoint(am, &observed)
 	if st.Running && !driver.currentEngine(am) {
@@ -534,7 +542,7 @@ func (svc *Service) checkClient(srv *managedServer) {
 	action := r.observeWithSettings(observed, now, settings)
 	svc.clients.states[am] = r
 	svc.clients.mu.Unlock()
-	if !r.Recovering && observed.Running && !observed.StatusUnavailable {
+	if !r.Recovering && observed.Running && !observed.StatusUnavailable && !observed.transportMarked {
 		svc.authenticatedClientEndpoint(am)
 	}
 	if action != clientReconnect && observed.Running && r.RoutesPending && svc.clientOpContext().Err() == nil {
@@ -562,6 +570,10 @@ func (svc *Service) checkClient(srv *managedServer) {
 			logbuf.Append("awg2", "warn", "проверка "+awgClientIfaceName(am.Config())+": "+err.Error())
 		}
 	case clientReconnect:
+		if svc.doubleTunnelOuter(am) != nil {
+			svc.restartDoubleTunnel(am, driver, nil)
+			return
+		}
 		iface := awgClientIfaceName(am.Config())
 		logbuf.Append("awg2", "warn", fmt.Sprintf("автовосстановление %s: попытка %d (handshake=%d)", iface, r.Attempts+1, st.LastHandshake))
 		if err := svc.clientOpContext().Err(); err != nil {
@@ -573,7 +585,12 @@ func (svc *Service) checkClient(srv *managedServer) {
 			rollbackEndpoint()
 			return
 		}
-		err := driver.recover(am)
+		var err error
+		if svc.doubleTunnelNeedsOuter(am) {
+			err = recoverWithExistingPeer(driver, am)
+		} else {
+			err = driver.recover(am)
+		}
 		if svc.clientOpContext().Err() != nil {
 			rollbackEndpoint()
 			return

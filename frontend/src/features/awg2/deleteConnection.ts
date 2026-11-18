@@ -20,13 +20,14 @@ export function initialDeleteConnectionSelection(servers: readonly Awg2ServerSum
 }
 
 export function deleteConnectionReferences(st: Awg2Status, sourceID: string): {
-  primaryRules: AwgZone[]; fallbackRules: AwgZone[]; connectionBackups: number;
+  primaryRules: AwgZone[]; fallbackRules: AwgZone[]; connectionBackups: number; doubleTunnelUsers: number;
 } {
   const rules = st.routing_rules ?? st.routing_config?.zones ?? st.config.routing.zones ?? [];
   return {
     primaryRules: rules.filter((rule) => rule.tunnel_id === sourceID),
     fallbackRules: rules.filter((rule) => rule.tunnel_id !== sourceID && rule.fallback_tunnel_ids?.includes(sourceID)),
     connectionBackups: st.servers.filter((server) => server.id !== sourceID && server.failover?.fallback_tunnel_ids?.includes(sourceID)).length,
+    doubleTunnelUsers: st.servers.filter((server) => server.id !== sourceID && server.failover?.double_tunnel_id === sourceID).length,
   };
 }
 
@@ -34,10 +35,20 @@ export function deleteConnectionReferences(st: Awg2Status, sourceID: string): {
 // were valid. Use the graph after removal, with the backend's self/dedup rules.
 export function deletionWouldCreateCycle(servers: readonly Awg2ServerSummary[], sourceID: string, replacementID: string): boolean {
   const inheritedBackups = servers.find((server) => server.id === sourceID)?.failover?.fallback_tunnel_ids ?? [];
-  const graph = new Map(servers.filter((server) => server.id !== sourceID).map((server) => {
+  const remaining = servers.filter((server) => server.id !== sourceID);
+  const backupGraph = new Map(remaining.map((server) => {
     const backups = [...(server.failover?.fallback_tunnel_ids ?? []), ...(server.id === replacementID ? inheritedBackups : [])];
     return [server.id, [...new Set(backups.map((id) => id === sourceID ? replacementID : id))].filter((id) => id !== server.id)];
   }));
+  const doubleTunnelGraph = new Map(remaining.map((server) => {
+    const outer = server.failover?.double_tunnel_id;
+    const next = outer === sourceID ? replacementID : outer;
+    return [server.id, next && next !== server.id ? [next] : []];
+  }));
+  return graphHasCycle(backupGraph) || graphHasCycle(doubleTunnelGraph);
+}
+
+function graphHasCycle(graph: ReadonlyMap<string, string[]>): boolean {
   const visiting = new Set<string>();
   const visited = new Set<string>();
   const visit = (id: string): boolean => {
@@ -58,7 +69,7 @@ export function deleteConnectionProblem(servers: readonly Awg2ServerSummary[], s
   if (!selection.replacementID) return "Выберите подключение для переноса правил.";
   if (selection.replacementID === sourceID) return "Для переноса нужно другое подключение.";
   if (!servers.some((server) => server.id === selection.replacementID)) return "Выбранное подключение больше недоступно. Выберите другое или оставьте правила без подключения.";
-  if (deletionWouldCreateCycle(servers, sourceID, selection.replacementID)) return "Перенос создаст цикл резервных подключений. Выберите другое подключение или измените резервные списки.";
+  if (deletionWouldCreateCycle(servers, sourceID, selection.replacementID)) return "Перенос создаст цикл резервных подключений. Выберите другое подключение или измените настройки резервов.";
   return "";
 }
 

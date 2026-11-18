@@ -19,6 +19,14 @@ import (
 
 func clientSupervisorSupported() bool { return true }
 
+func (d systemClientDriver) repairDoubleTunnel(inner, outer *awg.Manager) error {
+	return d.svc.repairDoubleTunnelTransportOS(inner, outer)
+}
+
+func (d systemClientDriver) recoverWithExistingPeer(am *awg.Manager) error {
+	return d.svc.awgRestartLocalClientOS(am)
+}
+
 var clientEnginePIDs sync.Map // iface -> pid; executable and argv rechecked on use
 
 func awgClientCurrentEngineOS(cfg awg.ServerConfig) bool {
@@ -110,10 +118,14 @@ func (svc *Service) awgRecoverClientOS(am *awg.Manager) error {
 			return err
 		}
 	}
+	return svc.awgRestartLocalClientOS(am)
+}
+
+func (svc *Service) awgRestartLocalClientOS(am *awg.Manager) error {
 	if err := svc.awgClientUpManagerOS(am); err != nil {
 		return err
 	}
-	if err := ctx.Err(); err != nil {
+	if err := svc.clientOpContext().Err(); err != nil {
 		return err
 	}
 	return svc.awgRestoreClientRoutesOS(am)
@@ -123,11 +135,19 @@ func (svc *Service) awgRecoverClientOS(am *awg.Manager) error {
 // selected profile, or toggle committed routing. Re-pin endpoints and restore
 // device routes lost by ip link del, then re-render the existing hook in place.
 func (svc *Service) awgRestoreClientRoutesOS(am *awg.Manager) (restoreErr error) {
-	if am == nil || !awgShouldRestoreRouting(am.RuntimeConfig()) {
+	if am == nil {
 		return nil
 	}
 	if err := svc.clientOpContext().Err(); err != nil {
 		return err
+	}
+	if outer := svc.doubleTunnelOuter(am); outer != nil {
+		if err := svc.repairDoubleTunnelTransportOS(am, outer); err != nil {
+			return err
+		}
+	}
+	if !awgShouldRestoreRouting(am.RuntimeConfig()) {
+		return nil
 	}
 	rules, tunnels := svc.awgBuildMultiPolicyCached()
 	if len(rules) == 0 || len(tunnels) == 0 {
@@ -232,7 +252,7 @@ func (svc *Service) awgRestoreLegacyClientRoutesOS(am *awg.Manager) (restoreErr 
 	if !dnsOn {
 		dnsOn = svc.awgEnsureDNSProxy(&cfg)
 	}
-	if err := awgWriteHook(awgEffectiveMode(cfg.Routing), endpointIP, dev, awgTunnelMTU(cfg), dnsOn, awgTunnelV6Reaches(), cfg.Routing.Zones, svc.awgClientEndpointIPs(am)...); err != nil {
+	if err := awgWriteHook(awgEffectiveMode(cfg.Routing), endpointIP, dev, awgActiveTunnelMTU(cfg), dnsOn, awgTunnelV6Reaches(), cfg.Routing.Zones, svc.awgClientEndpointIPs(am)...); err != nil {
 		return err
 	}
 	if !refreshing {

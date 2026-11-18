@@ -111,6 +111,7 @@ type ClientConfig struct {
 	// Standby keeps the saved connection offline until a primary needs it.
 	Standby           bool     `json:"standby"`
 	FallbackTunnelIDs []string `json:"fallback_tunnel_ids,omitempty"`
+	DoubleTunnelID    string   `json:"double_tunnel_id,omitempty"` // external transport for this peer after ordinary failover
 	EndpointBackups   []string `json:"endpoint_backups,omitempty"` // ordered IPs of this same server; local client policy only
 }
 

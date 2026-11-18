@@ -176,7 +176,7 @@ func (svc *Service) awgBuildMultiPolicyWithResolve(resolve bool) ([]awgMultiRule
 			EndpointIPs: canonicalEndpointIPs(append(svc.awgClientEndpointIPs(srv.Manager), endpointIP)...),
 			Table:       awgMultiTableBase + slot,
 			Mark:        awgMultiMark(slot),
-			MTU:         awgTunnelMTU(cfg),
+			MTU:         awgActiveTunnelMTU(cfg),
 			Killswitch:  cfg.Routing.Killswitch,
 		}
 		tunnelByID[srv.ID] = t
@@ -843,7 +843,7 @@ func (svc *Service) awgBuildMultiTunnelsOnly() []awgMultiTunnel {
 			EndpointIPs: canonicalEndpointIPs(append(svc.awgClientEndpointIPs(srv.Manager), endpointIP)...),
 			Table:       awgMultiTableBase + slot,
 			Mark:        awgMultiMark(slot),
-			MTU:         awgTunnelMTU(cfg),
+			MTU:         awgActiveTunnelMTU(cfg),
 			Killswitch:  cfg.Routing.Killswitch,
 		}
 		tunnelOrder = append(tunnelOrder, srv.ID)

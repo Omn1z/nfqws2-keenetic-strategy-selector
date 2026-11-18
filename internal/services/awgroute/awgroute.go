@@ -202,7 +202,12 @@ func normalizeAWGState(st awgPersisted) awgPersisted {
 	}
 	st.Routing = &settings
 	for i := range st.Servers {
-		st.Servers[i].Config.Routing = settings.apply(st.Servers[i].Config.Routing)
+		cfg := &st.Servers[i].Config
+		cfg.Routing = settings.apply(cfg.Routing)
+		cfg.Client.DoubleTunnelID = strings.TrimSpace(cfg.Client.DoubleTunnelID)
+		if cfg.Client.DoubleTunnelID == st.Servers[i].ID || !seen[cfg.Client.DoubleTunnelID] {
+			cfg.Client.DoubleTunnelID = ""
+		}
 	}
 	normalizeAWGPendingRules(&st)
 	return st
@@ -1016,9 +1021,12 @@ func (svc *Service) awgDeleteServerWithOps(id string, teardown func() error, dow
 				filtered = append(filtered, backupID)
 			}
 		}
-		if len(filtered) != len(cfg.Client.FallbackTunnelIDs) {
-			cfg.Client.FallbackTunnelIDs = filtered
-			operationErr = errors.Join(operationErr, other.Manager.SetConfig(&cfg))
+		outer := cfg.Client.DoubleTunnelID
+		if outer == id {
+			outer = ""
+		}
+		if len(filtered) != len(cfg.Client.FallbackTunnelIDs) || outer != cfg.Client.DoubleTunnelID {
+			other.Manager.SetClientFailoverPolicy(filtered, cfg.Client.Standby, outer)
 		}
 		cfg.Routing.Zones = part[other.ID]
 		activeState := cfg.Routing.Active

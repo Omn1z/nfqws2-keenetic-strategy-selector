@@ -15,6 +15,7 @@ type UAPIStat struct {
 	RxBytes       int64
 	TxBytes       int64
 	Endpoint      string
+	FWMark        uint32
 }
 
 func keyHex(b64 string) (string, error) {
@@ -33,6 +34,11 @@ func keyHex(b64 string) (string, error) {
 // obfuscation + the single server peer. Keys are hex (UAPI requirement) and the
 // endpoint must be a resolved IP (UAPI does not resolve hostnames).
 func RenderUAPISet(c *ServerConfig, p Peer, endpointIP string, port int) (string, error) {
+	return RenderUAPISetWithMark(c, p, endpointIP, port, 0)
+}
+
+// RenderUAPISetWithMark marks the outgoing transport sockets of this device.
+func RenderUAPISetWithMark(c *ServerConfig, p Peer, endpointIP string, port int, mark uint32) (string, error) {
 	priv, err := keyHex(p.PrivateKey)
 	if err != nil {
 		return "", fmt.Errorf("приватный ключ роутера: %w", err)
@@ -44,6 +50,9 @@ func RenderUAPISet(c *ServerConfig, p Peer, endpointIP string, port int) (string
 	var b strings.Builder
 	b.WriteString("set=1\n")
 	fmt.Fprintf(&b, "private_key=%s\n", priv)
+	if mark != 0 {
+		fmt.Fprintf(&b, "fwmark=%d\n", mark)
+	}
 	if c.UseObfuscation() {
 		o := c.Obf
 		fmt.Fprintf(&b, "jc=%d\njmin=%d\njmax=%d\n", o.Jc, o.Jmin, o.Jmax)
@@ -130,6 +139,9 @@ func ParseUAPIGet(resp string) UAPIStat {
 			st.TxBytes = uapiInt(kv[1])
 		case "endpoint":
 			st.Endpoint = kv[1]
+		case "fwmark":
+			mark, _ := strconv.ParseUint(kv[1], 0, 32)
+			st.FWMark = uint32(mark)
 		}
 	}
 	return st

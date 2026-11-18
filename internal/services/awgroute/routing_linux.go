@@ -149,7 +149,7 @@ func (svc *Service) awgApplyRoutingOS() (applyErr error) {
 	// 5) firewall hook (marking chain + FORWARD/NAT/MSS [+ DNS REDIRECT]) — a Keenetic
 	// ndm netfilter.d hook so it survives the firewall rebuilds that flush foreign
 	// iptables chains; awgWriteHook also applies it immediately.
-	if err := awgWriteHook(awgEffectiveMode(r), endpointIP, wandev, awgTunnelMTU(cfg), dnsOn, awgTunnelV6Reaches(), r.Zones, svc.awgClientEndpointIPs(am)...); err != nil {
+	if err := awgWriteHook(awgEffectiveMode(r), endpointIP, wandev, awgActiveTunnelMTU(cfg), dnsOn, awgTunnelV6Reaches(), r.Zones, svc.awgClientEndpointIPs(am)...); err != nil {
 		return fmt.Errorf("firewall-хук: %w", err)
 	}
 	// 6) disable Keenetic's NAT accelerators — their fast-path silently drops our
@@ -227,7 +227,7 @@ func (svc *Service) awgRefreshRoutingOS() (applyErr error) {
 		return fmt.Errorf("DNS route learner failed to start")
 	}
 	svc.awgEnsureSNISniff(&cfg) // start/stop/refresh the SNI sniffer to match the new zones
-	if err := awgWriteHook(awgEffectiveMode(r), endpointIP, wandev, awgTunnelMTU(cfg), dnsOn, awgTunnelV6Reaches(), r.Zones, svc.awgClientEndpointIPs(am)...); err != nil {
+	if err := awgWriteHook(awgEffectiveMode(r), endpointIP, wandev, awgActiveTunnelMTU(cfg), dnsOn, awgTunnelV6Reaches(), r.Zones, svc.awgClientEndpointIPs(am)...); err != nil {
 		return fmt.Errorf("firewall-хук: %w", err)
 	}
 	svc.route.mu.Lock()
@@ -323,7 +323,7 @@ func (svc *Service) awgStartRefresh() {
 					unlock()
 					continue
 				}
-				h := awgHookInputsHash(awgEffectiveMode(c.Routing), endpointIP+"|"+strings.Join(svc.awgClientEndpointIPs(am), ","), wandev, awgTunnelMTU(c), dnsOn, awgTunnelV6Reaches(), c.Routing.Killswitch, svc.zonesRevision.Load())
+				h := awgHookInputsHash(awgEffectiveMode(c.Routing), endpointIP+"|"+strings.Join(svc.awgClientEndpointIPs(am), ","), wandev, awgActiveTunnelMTU(c), dnsOn, awgTunnelV6Reaches(), c.Routing.Killswitch, svc.zonesRevision.Load())
 				_, hookMissing := os.Stat(awgHookPath)
 				// Watchdog hot path: avoid route.mu entirely. lastHookHash is an
 				// atomic.Pointer[string] swapped by the most recent re-assert;
@@ -372,7 +372,7 @@ func (svc *Service) awgStartRefresh() {
 				}
 				refreshErr := svc.awgPinClientEndpoints(am)
 				if refreshErr == nil && (hookMissing != nil || !same) {
-					refreshErr = awgWriteHook(awgEffectiveMode(c.Routing), endpointIP, wandev, awgTunnelMTU(c), dnsOn, awgTunnelV6Reaches(), c.Routing.Zones, svc.awgClientEndpointIPs(am)...)
+					refreshErr = awgWriteHook(awgEffectiveMode(c.Routing), endpointIP, wandev, awgActiveTunnelMTU(c), dnsOn, awgTunnelV6Reaches(), c.Routing.Zones, svc.awgClientEndpointIPs(am)...)
 				} else if refreshErr == nil {
 					if out, err := awgRun("sh " + awgHookPath); err != nil {
 						refreshErr = awgCmdErr("routing firewall refresh", out, err)
@@ -466,7 +466,7 @@ func (svc *Service) awgTeardownRoutingOS() (applyErr error) {
 	_, _ = awgRun("iptables -t nat -D POSTROUTING -o " + awgIface + " -j MASQUERADE 2>/dev/null")
 	mtu := 1280
 	if am := svc.awgActive(); am != nil {
-		mtu = awgTunnelMTU(am.RuntimeConfig())
+		mtu = awgActiveTunnelMTU(am.RuntimeConfig())
 	}
 	mss := strconv.Itoa(mtu - 40)
 	for _, dir := range []string{"-o", "-i"} {

@@ -26,6 +26,16 @@ export function backupCreatesCycle(primary: string, candidate: string, servers: 
   return false;
 }
 
+export function doubleTunnelCreatesCycle(primary: string, candidate: string, servers: readonly Awg2ServerSummary[]): boolean {
+  const byID = new Map(servers.map((server) => [server.id, server]));
+  const seen = new Set<string>();
+  for (let id = candidate; id; id = byID.get(id)?.failover?.double_tunnel_id ?? "") {
+    if (id === primary || seen.has(id)) return true;
+    seen.add(id);
+  }
+  return false;
+}
+
 export function connectionTestPresentation(result: AwgConnectionTestResult): { label: string; kind: "ok" | "warn" | "bad" } {
   if (result.success && result.handshake && result.data_ok) return { label: "Связь подтверждена", kind: "ok" };
   if (result.handshake && result.data_ok) return { label: "Связь есть, проверка завершилась с ошибкой", kind: "warn" };

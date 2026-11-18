@@ -30,6 +30,7 @@ export function DeleteConnectionDetails({ st, sourceID, sourceLabel, selection, 
       <p>Правил этого подключения: <strong>{references.primaryRules.length}</strong></p>
       <p className="mt-1">Правил с ним в резерве: <strong>{references.fallbackRules.length}</strong></p>
       <p className="mt-1">Резервных списков других подключений: <strong>{references.connectionBackups}</strong></p>
+      {references.doubleTunnelUsers > 0 && <p className="mt-1">Двойные туннели через этот VPN <strong>{references.doubleTunnelUsers}</strong></p>}
       <p className="mt-2 text-muted">Учтены также выключенные правила и правила, ожидающие назначения.</p>
     </div>
     <Field label="Что сделать со связанными правилами">
@@ -48,9 +49,11 @@ export function DeleteConnectionDetails({ st, sourceID, sourceLabel, selection, 
       </Field>
       <p className="text-xs text-muted">Правила будут назначены выбранному подключению. Сохранятся домены, IP/CIDR, ссылки на списки, фильтры устройств, порядок, действие и включение/выключение правил. В резервных списках правил и других подключений ссылки на {sourceLabel} заменятся выбранным подключением; повторы и ссылки на себя будут убраны.</p>
       <p className="text-xs text-muted">Резервы удаляемого профиля добавятся после существующих резервов выбранного подключения.</p>
+      {references.doubleTunnelUsers > 0 && <p className="text-xs text-muted">Выбранный VPN станет внешним для связанных двойных туннелей. Если он сам использовал {sourceLabel} как внешний VPN, его двойной туннель будет выключен.</p>}
       {target && (!target.enabled || !target.connected || !target.deployed && !target.imported) && <p className="rounded-lg bg-warn-bg p-3 text-xs text-warn" role="status">{!target.enabled ? "Выбранное подключение выключено." : !target.deployed && !target.imported ? "Выбранное подключение ещё не развёрнуто." : "Выбранное подключение сейчас offline."} Перенос сохранит настройки, но не включит сервер и сам по себе не гарантирует доступ через него.</p>}
     </>}
     {selection.mode === "waiting" && <p className="text-xs text-muted">Правила, назначенные удаляемому подключению, сохранятся в ожидании: до ручного назначения они не участвуют в маршрутизации. Ссылки на него в резервах правил сохранятся как недоступные; из общих резервных списков подключений они будут убраны.</p>}
+    {selection.mode === "waiting" && references.doubleTunnelUsers > 0 && <p className="text-xs text-muted">Двойные туннели, использующие {sourceLabel} как внешний VPN, будут выключены.</p>}
     {!candidates.length && <p className="text-xs text-muted">Других подключений нет. Сохранённые правила можно будет назначить после добавления нового VPN.</p>}
     <p className="text-xs text-muted">Если этот VPN явно выбран в DNS-сервере или Telegram-прокси, выберите новое подключение также в их настройках.</p>
     <p className="text-xs text-muted">Профиль, ключи и пиры удалятся из панели. Сервис на VPS останется установленным.</p>

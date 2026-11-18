@@ -739,10 +739,15 @@ export interface AwgClientConfig {
   /** Ordered alternate IP endpoints for this same server and VPN profile. */
   endpoint_backups?: string[];
   fallback_tunnel_ids?: string[];
+  double_tunnel_id?: string;
   standby?: boolean;
 }
 export interface AwgConnectionFailoverStatus {
   fallback_tunnel_ids: string[];
+  double_tunnel_id?: string;
+  double_tunnel_active?: boolean;
+  double_tunnel_ip?: string;
+  double_tunnel_error?: string;
   active_tunnel_id: string;
   standby: boolean;
   activated: boolean;

@@ -128,7 +128,7 @@ func (svc *Service) fallbackRoutingSignature() (string, bool) {
 			continue
 		}
 		identity := srv.Manager.RuntimeLocalClientIdentity()
-		if len(identity.FallbackTunnelIDs) == 0 {
+		if len(identity.FallbackTunnelIDs) == 0 && identity.DoubleTunnelID == "" {
 			continue
 		}
 		hasFallback = true

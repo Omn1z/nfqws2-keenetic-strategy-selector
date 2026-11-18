@@ -11,10 +11,10 @@ func TestSetClientFailoverPolicyPreservesDraftAndClientIdentity(t *testing.T) {
 	manager := NewManager(cfg)
 	before := manager.Config()
 	ids := []string{"backup"}
-	manager.SetClientFailoverPolicy(ids, true)
+	manager.SetClientFailoverPolicy(ids, true, "outer")
 	ids[0] = "mutated"
 	after := manager.Config()
-	if after.Client.Enabled != before.Client.Enabled || after.Client.PeerID != before.Client.PeerID || !after.Client.Standby || !reflect.DeepEqual(after.Client.FallbackTunnelIDs, []string{"backup"}) {
+	if after.Client.Enabled != before.Client.Enabled || after.Client.PeerID != before.Client.PeerID || !after.Client.Standby || after.Client.DoubleTunnelID != "outer" || !reflect.DeepEqual(after.Client.FallbackTunnelIDs, []string{"backup"}) {
 		t.Fatal("local failover update changed client identity, intent or exposed the caller's mutable slice")
 	}
 	after.Client = before.Client

@@ -7,7 +7,7 @@ import { Switch } from "@/components/ui/Switch";
 import { Field, Select } from "@/components/ui/form";
 import { toast } from "@/components/ui/Toast";
 import type { Awg2ServerSummary, Awg2Status, AwgConnectionTestResult } from "@/types/api";
-import { backupCreatesCycle, backupIDs, connectionTestPresentation, moveBackup } from "./failoverModel";
+import { backupCreatesCycle, backupIDs, connectionTestPresentation, doubleTunnelCreatesCycle, moveBackup } from "./failoverModel";
 
 type TestResult = AwgConnectionTestResult & { request_error?: boolean };
 
@@ -27,6 +27,10 @@ export function ConnectionFailoverBadge({ server, servers }: { server: Awg2Serve
   const status = server.failover;
   if (!status) return null;
   if (status.standby && !status.activated) return <Badge kind="neutral">резерв · ожидание</Badge>;
+  if (status.double_tunnel_active && status.double_tunnel_id) {
+    const outer = servers.find((candidate) => candidate.id === status.double_tunnel_id);
+    return <Badge kind="warn">двойной туннель · через {outer?.label || status.double_tunnel_id}</Badge>;
+  }
   if (status.standby && status.activated) return <Badge kind="warn">резерв задействован</Badge>;
   if (status.active_tunnel_id && status.active_tunnel_id !== server.id) {
     const selected = servers.find((candidate) => candidate.id === status.active_tunnel_id);
@@ -48,7 +52,9 @@ export default function FailoverPane({ st, acceptStatus, reload, onBusyChange, e
   const id = st.active_server_id;
   const server = st.servers.find((candidate) => candidate.id === id);
   const savedIDs = backupIDs(id, st.config.client.fallback_tunnel_ids ?? []);
+  const savedDoubleTunnelID = st.config.client.double_tunnel_id ?? "";
   const [ids, setIDs] = useState(savedIDs);
+  const [doubleTunnelID, setDoubleTunnelID] = useState(savedDoubleTunnelID);
   const [standby, setStandby] = useState(!!st.config.client.standby);
   const [editing, setEditing] = useState(false);
   const [candidateIDs, setCandidateIDs] = useState<string[]>([]);
@@ -58,20 +64,23 @@ export default function FailoverPane({ st, acceptStatus, reload, onBusyChange, e
   const [results, setResults] = useState<Record<string, TestResult>>({});
   const ownBusy = !!operation;
   const busy = ownBusy || externalBusy;
-  const dirty = JSON.stringify(ids) !== JSON.stringify(savedIDs) || standby !== !!st.config.client.standby;
-  const savedKey = JSON.stringify([savedIDs, st.config.client.standby]);
+  const dirty = JSON.stringify(ids) !== JSON.stringify(savedIDs) || doubleTunnelID !== savedDoubleTunnelID || standby !== !!st.config.client.standby;
+  const savedKey = JSON.stringify([savedIDs, savedDoubleTunnelID, st.config.client.standby]);
   useEffect(() => { onBusyChange(ownBusy); }, [ownBusy, onBusyChange]);
   useEffect(() => () => { testController.current?.abort(); onBusyChange(false); }, [onBusyChange]);
   // Polling must not discard an unfinished priority edit.
   useEffect(() => {
     if (!editing && !ownBusy) {
       setIDs(savedIDs);
+      setDoubleTunnelID(savedDoubleTunnelID);
       setStandby(!!st.config.client.standby);
     }
   }, [savedKey, editing, ownBusy]);
 
   const candidates = st.servers.filter((candidate) => candidate.id !== id && !ids.includes(candidate.id) && !backupCreatesCycle(id, candidate.id, st.servers));
   const selectedCandidates = candidateIDs.filter((candidateID) => candidates.some((candidate) => candidate.id === candidateID));
+  const outerCandidates = st.servers.filter((candidate) => !doubleTunnelCreatesCycle(id, candidate.id, st.servers));
+  const selectedOuter = st.servers.find((candidate) => candidate.id === doubleTunnelID);
   const add = () => {
     if (busy || !selectedCandidates.length) return;
     setEditing(true);
@@ -82,9 +91,12 @@ export default function FailoverPane({ st, acceptStatus, reload, onBusyChange, e
     if (busy) return;
     setOperation("save");
     try {
-      const next = await api<Awg2Status>("POST", `/api/awg2/servers/${encodeURIComponent(id)}/failover`, { fallback_tunnel_ids: ids, standby });
+      const next = await api<Awg2Status>("POST", `/api/awg2/servers/${encodeURIComponent(id)}/failover`, {
+        fallback_tunnel_ids: ids, double_tunnel_id: doubleTunnelID, standby,
+      });
       acceptStatus(next);
       setIDs(backupIDs(id, next.config.client.fallback_tunnel_ids ?? []));
+      setDoubleTunnelID(next.config.client.double_tunnel_id ?? "");
       setStandby(!!next.config.client.standby);
       setEditing(false);
       toast("Резервные подключения сохранены", "ok");
@@ -186,12 +198,25 @@ export default function FailoverPane({ st, acceptStatus, reload, onBusyChange, e
       <Button onClick={() => { void testConnections([id, ...ids].filter((testID) => st.servers.some((candidate) => candidate.id === testID && candidate.enabled))); }} disabled={busy || ![id, ...ids].some((testID) => st.servers.some((candidate) => candidate.id === testID && candidate.enabled))}>{operation === "test" ? "Проверяем подключения…" : "Проверить основной и резервы"}</Button>
       {operation === "test" && <Button onClick={() => testController.current?.abort()}>Остановить проверку</Button>}
     </div>
-    {dirty && <p className="mt-2 text-xs text-warn" role="status">Порядок или список изменён. Сохраните резерв, чтобы применить автопереключение.</p>}
     {ids.some((reserveID) => st.servers.some((candidate) => candidate.id === reserveID && candidate.is_warp)) && <p className="mt-3 text-xs text-muted">При выборе WARP как резерва трафик выходит через Cloudflare; внешний IP вашего AWG-сервера не сохраняется.</p>}
     <p className="mt-3 text-xs text-muted">«Ожидать сбоя основного» применяется сразу: резерв остаётся offline, пока не понадобится. Проверка временно запускает ожидающий туннель и проверяет handshake и передачу данных. Результаты ниже относятся к моменту проверки.</p>
+    <div className="mt-4 space-y-2 border-t border-line pt-3">
+      <Field label="Двойной туннель" className="max-w-md">
+        <Select aria-label="Двойной туннель" aria-describedby="double-tunnel-description" value={doubleTunnelID} disabled={busy} onChange={(event) => { setEditing(true); setDoubleTunnelID(event.target.value); }}>
+          <option value="">Выключен</option>
+          {doubleTunnelID && !outerCandidates.some((candidate) => candidate.id === doubleTunnelID) && <option value={doubleTunnelID} disabled>{selectedOuter?.label || doubleTunnelID} · недоступно</option>}
+          {outerCandidates.map((candidate) => <option key={candidate.id} value={candidate.id}>{candidate.label || candidate.id} · {candidate.is_warp ? "WARP" : candidate.client_iface || "VPN"}{!candidate.enabled ? " · выключено" : ""}</option>)}
+        </Select>
+      </Field>
+      <p id="double-tunnel-description" className="text-xs text-muted">Если обычные резервы исчерпаны, роутер подключится к основному серверу через выбранный VPN. Выходной IP основного подключения сохранится.</p>
+      {selectedOuter && !selectedOuter.enabled && <p className="text-xs text-warn">Включите выбранное подключение в списке VPN, чтобы оно могло переносить трафик двойного туннеля.</p>}
+      {server?.failover?.double_tunnel_active && server.failover.double_tunnel_ip && <p className="text-xs text-muted" role="status">Выходной IP двойного туннеля <span className="font-mono">{server.failover.double_tunnel_ip}</span></p>}
+      {server?.failover?.double_tunnel_error && <p className="text-xs text-warn" role="status">{server.failover.double_tunnel_error}</p>}
+    </div>
     <div className="mt-4 border-t border-line pt-3">
       <Switch checked={standby} onChange={(value) => { setEditing(true); setStandby(value); }} disabled={busy} label="Это подключение — резерв по требованию" />
       <p className="mt-2 text-xs text-muted">Включите, если {name} служит резервом для другого подключения. Для самостоятельного постоянного соединения оставьте выключенным.</p>
     </div>
+    {dirty && <p className="mt-2 text-xs text-warn" role="status">Сохраните настройки резерва, чтобы применить изменения.</p>}
   </Card>;
 }

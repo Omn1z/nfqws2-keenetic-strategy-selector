@@ -31,8 +31,8 @@ test("delete dialog defaults to transfer, prefers a connected target, and retain
 test("reference counters include waiting and disabled rules, direct/device criteria and fallback users without double counting owners", () => {
   const primary = [rule("disabled", "source", { enabled: false }), rule("waiting", "source", { waiting_for_connection: true }), rule("devices-direct", "source", { route: "direct", fallback_tunnel_ids: ["source"] })];
   const backups = [rule("backup", "other", { fallback_tunnel_ids: ["source", "source"] })];
-  const st = state([server("source"), server("other", { failover: { standby: false, activated: false, active_tunnel_id: "", fallback_tunnel_ids: ["source"] } })], [...primary, ...backups, rule("unrelated", "other")]);
-  assert.deepEqual(deleteConnectionReferences(st, "source"), { primaryRules: primary, fallbackRules: backups, connectionBackups: 1 });
+  const st = state([server("source"), server("other", { failover: { standby: false, activated: false, active_tunnel_id: "", fallback_tunnel_ids: ["source"], double_tunnel_id: "source" } })], [...primary, ...backups, rule("unrelated", "other")]);
+  assert.deepEqual(deleteConnectionReferences(st, "source"), { primaryRules: primary, fallbackRules: backups, connectionBackups: 1, doubleTunnelUsers: 1 });
   const legacy = { ...st, routing_rules: undefined, routing_config: { mode: "zones", zones: primary, mtu: 1420, killswitch: true, domain_source: "resolve" } };
   assert.equal(deleteConnectionReferences(legacy, "source").primaryRules.length, 3);
   assert.equal(deleteConnectionReferences({ ...st, routing_rules: [] }, "source").primaryRules.length, 0);
@@ -72,6 +72,16 @@ test("inheriting the removed profile's backups cannot close a cycle or become th
   assert.equal(deletionWouldCreateCycle(graph, "source", "backup"), false);
   assert.equal(initialDeleteConnectionSelection(graph, "source").replacementID, "backup");
   assert.equal(JSON.stringify(graph), snapshot);
+});
+
+test("transferring outer transport references blocks cycles and drops a new self reference", () => {
+  const dependent = (id: string, outer: string) => server(id, {
+    failover: { standby: false, activated: false, active_tunnel_id: "", fallback_tunnel_ids: [], double_tunnel_id: outer },
+  });
+  const graph = [server("source"), dependent("inner", "source"), dependent("target", "inner")];
+  assert.equal(deletionWouldCreateCycle(graph, "source", "target"), true);
+  assert.equal(deletionWouldCreateCycle(graph, "source", "inner"), false);
+  assert.equal(deleteConnectionProblem(graph, "source", { mode: "waiting", replacementID: "" }), "");
 });
 
 test("delete details render exact scope, offline warnings, missing targets and backend errors without requesting anything", (t) => {

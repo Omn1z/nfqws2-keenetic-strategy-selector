@@ -149,6 +149,7 @@ type LocalClientIdentity struct {
 	Endpoint, ClientIface  string
 	Standby                bool
 	FallbackTunnelIDs      []string
+	DoubleTunnelID         string
 	CanStart               bool
 	RoutingMode            string
 	RoutingActive          bool
@@ -166,7 +167,14 @@ func (m *Manager) RuntimeLocalClientIdentity() LocalClientIdentity {
 		wire = m.applied
 	}
 	endpoint = m.selectedClientEndpointLocked(endpoint)
-	return LocalClientIdentity{Enabled: m.cfg.Enabled, ClientEnabled: m.cfg.Client.Enabled, Endpoint: endpoint, ClientIface: m.cfg.ClientIface, Standby: m.cfg.Client.Standby, FallbackTunnelIDs: append([]string{}, m.cfg.Client.FallbackTunnelIDs...), CanStart: strings.TrimSpace(endpoint) != "" && (wire.Install == "imported" || wire.DeployedAt > 0), RoutingMode: m.cfg.Routing.Mode, RoutingActive: m.cfg.Routing.Active}
+	return LocalClientIdentity{
+		Enabled: m.cfg.Enabled, ClientEnabled: m.cfg.Client.Enabled,
+		Endpoint: endpoint, ClientIface: m.cfg.ClientIface,
+		Standby: m.cfg.Client.Standby, FallbackTunnelIDs: append([]string{}, m.cfg.Client.FallbackTunnelIDs...),
+		DoubleTunnelID: m.cfg.Client.DoubleTunnelID,
+		CanStart:       strings.TrimSpace(endpoint) != "" && (wire.Install == "imported" || wire.DeployedAt > 0),
+		RoutingMode:    m.cfg.Routing.Mode, RoutingActive: m.cfg.Routing.Active,
+	}
 }
 
 // SetAppliedConfig installs a last-successful deployment snapshot. The service
@@ -295,11 +303,12 @@ func (m *Manager) SetClientEnabled(v bool) {
 
 // SetClientFailoverPolicy changes local policy without validating an unrelated
 // draft VPS configuration or replacing the running manager and its status.
-func (m *Manager) SetClientFailoverPolicy(fallbacks []string, standby bool) {
+func (m *Manager) SetClientFailoverPolicy(fallbacks []string, standby bool, doubleTunnelID string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.cfg.Client.FallbackTunnelIDs = append([]string{}, fallbacks...)
 	m.cfg.Client.Standby = standby
+	m.cfg.Client.DoubleTunnelID = doubleTunnelID
 }
 
 // SetEnabled toggles the profile availability flag used by the server selector.

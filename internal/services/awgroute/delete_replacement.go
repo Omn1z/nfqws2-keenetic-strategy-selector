@@ -117,7 +117,8 @@ func (svc *Service) awgDeleteServerWithReplacementWithOps(id, replacementID stri
 			continue
 		} // Membership is stable while operations are held.
 		srv.Manager.SetRoutingState(entry.Config.Routing, entry.Config.Routing.Active)
-		srv.Manager.SetClientFailoverPolicy(entry.Config.Client.FallbackTunnelIDs, entry.Config.Client.Standby)
+		policy := entry.Config.Client
+		srv.Manager.SetClientFailoverPolicy(policy.FallbackTunnelIDs, policy.Standby, policy.DoubleTunnelID)
 		if entry.AppliedConfig != nil {
 			srv.Manager.SetAppliedConfig(entry.AppliedConfig)
 		}
@@ -240,12 +241,19 @@ func awgReplacementState(before awgPersisted, rules []awg.Zone, sourceID, target
 			}
 		}
 		entry.Config.Client.FallbackTunnelIDs = awgReplacementFallbacks(entry.ID, fallbacks, sourceID, targetID)
+		if entry.Config.Client.DoubleTunnelID == sourceID {
+			entry.Config.Client.DoubleTunnelID = targetID
+			if entry.ID == targetID {
+				entry.Config.Client.DoubleTunnelID = ""
+			}
+		}
 		if entry.AppliedConfig != nil {
 			// Applied snapshots keep remote wire settings. Local policy is live
 			// even during a pending deployment, so update its copies consistently.
 			applied := *entry.AppliedConfig
 			applied.Client.FallbackTunnelIDs = cloneAWGStrings(entry.Config.Client.FallbackTunnelIDs)
 			applied.Client.Standby = entry.Config.Client.Standby
+			applied.Client.DoubleTunnelID = entry.Config.Client.DoubleTunnelID
 			applied.Routing = entry.Config.Routing
 			entry.AppliedConfig = &applied
 		}
@@ -259,8 +267,10 @@ func awgReplacementState(before awgPersisted, rules []awg.Zone, sourceID, target
 
 func awgValidateReplacementGraph(servers []awgPersistedServer) error {
 	graph := make(map[string][]string, len(servers))
+	transports := make(map[string]string, len(servers))
 	for _, entry := range servers {
 		graph[entry.ID] = entry.Config.Client.FallbackTunnelIDs
+		transports[entry.ID] = entry.Config.Client.DoubleTunnelID
 	}
 	marks := map[string]int{}
 	var visit func(string) bool
@@ -280,6 +290,9 @@ func awgValidateReplacementGraph(servers []awgPersistedServer) error {
 	for id := range graph {
 		if !visit(id) {
 			return fmt.Errorf("перенос создаёт цикл резервных подключений; измените список резервов перед удалением")
+		}
+		if doubleTunnelCycle(transports, id) {
+			return fmt.Errorf("перенос создаёт цикл двойных туннелей; измените внешний туннель перед удалением")
 		}
 	}
 	return nil

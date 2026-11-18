@@ -53,6 +53,9 @@ type ClientStatus struct {
 	RetryCount            int    `json:"retry_count"`
 	RecoveryError         string `json:"recovery_error,omitempty"`
 	engineID              string // PID/start time; never reuse health across daemon replacement
+	transportMarked       bool
+	transportOuterIface   string
+	transportVerified     bool
 }
 
 // AWGConn is one AWG2 tunnel's live state, shaped for the dashboard (state +
