@@ -54,7 +54,9 @@ jobs:
         run: sh scripts/build.sh "${GITHUB_REF_NAME:-dev}"
       - name: Audit frontend dependencies
         working-directory: frontend
-        run: npm audit
+        run: |
+          node --test scripts/audit-security.test.mjs
+          npm run audit:security
       - name: Include upstream license
         run: |
           cp internal/services/tgws/LICENSE.upstream dist/TGWS-LICENSE.txt

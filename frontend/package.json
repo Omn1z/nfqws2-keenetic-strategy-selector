@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite",
     "test": "node scripts/test.mjs",
+    "audit:security": "node scripts/audit-security.mjs",
     "build": "tsc --noEmit && vite build",
     "typecheck": "tsc --noEmit"
   },
