@@ -8,6 +8,7 @@ import (
 	"compress/gzip"
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -367,10 +368,12 @@ func (svc *Service) awgClientUpManagerOS(am *awg.Manager) error {
 				if saveErr := am.SetConfig(&next); saveErr != nil {
 					return saveErr
 				}
-				svc.awgSave()
 			}
 			cfg = next
 			_ = writeFile0600(awgClientConfPath(iface), awg.ClientConf(&cfg, p))
+		}
+		if saveErr := svc.awgSaveErr(); saveErr != nil {
+			return errors.Join(err, saveErr)
 		}
 		if err != nil {
 			return err

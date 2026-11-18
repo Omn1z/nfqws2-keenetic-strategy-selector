@@ -18,7 +18,14 @@ import (
 // Sealing is anti-tamper: the user can't open the file and edit individual
 // values; the GCM/MD5 envelope refuses any byte-edited archive on restore.
 func (a *App) BackupBuild(w io.Writer) (string, int, error) {
-	n, err := backup.Build(a.backupRoots(), w)
+	var n int
+	build := func() (err error) { n, err = backup.Build(a.backupRoots(), w); return err }
+	var err error
+	if a.store != nil {
+		err = a.store.WithExclusive(build)
+	} else {
+		err = build()
+	}
 	if err != nil {
 		return "", 0, err
 	}
@@ -29,14 +36,25 @@ func (a *App) BackupBuild(w io.Writer) (string, int, error) {
 
 // BackupRestore applies a sealed archive back onto disk. Files are written
 // to the absolute paths recorded in the archive, but only if they fall under
-// one of the allowed roots (same set Build captured). The caller is expected
-// to trigger a selector restart after success so the new files take effect.
+// one of the allowed roots (same set Build captured). Writers are fenced until
+// the running AWG and DNS managers have reloaded the committed files, including
+// after a partially committed restore. A later restart cannot resave old RAM.
 func (a *App) BackupRestore(r io.Reader) (int, error) {
-	restore := func() (int, error) { return backup.Restore(a.backupRoots(), r) }
+	restore := func() (int, error) {
+		if a.store == nil {
+			return backup.Restore(a.backupRoots(), r)
+		}
+		var n int
+		disk := func() (err error) { n, err = backup.Restore(a.backupRoots(), r); return err }
+		err := a.WithDNSConfigRestore(func() error {
+			return a.store.WithExclusive(disk)
+		})
+		return n, err
+	}
 	var n int
 	var err error
 	if a.awgroute != nil {
-		n, err = a.awgroute.RestoreRoutingDiscoveries(restore)
+		n, err = a.awgroute.RestorePersistedState(restore)
 	} else {
 		n, err = restore()
 	}

@@ -14,10 +14,13 @@ func (s *Service) ClearLogs() LogSnapshot {
 func (s *Service) SetLoggingEnabled(enabled bool) error {
 	s.opMu.Lock()
 	defer s.opMu.Unlock()
+	if err := s.configurationErrorLocked(); err != nil {
+		return err
+	}
 	cfg := s.Config()
 	cfg.LoggingEnabled = enabled
-	if err := s.store.Save(configFile, cfg); err != nil {
-		return err
+	if err := s.persistConfigLocked(cfg); err != nil {
+		return s.persistenceErrorLocked(err)
 	}
 	s.mu.Lock()
 	s.cfg.LoggingEnabled = enabled

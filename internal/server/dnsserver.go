@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
 	"strconv"
@@ -16,6 +17,7 @@ func (s *Server) dnsServerStatus(w http.ResponseWriter, r *http.Request) {
 
 type dnsServerConfigRequest struct {
 	dnsserver.Config
+	BaseHash         string  `json:"base_hash"`
 	CacheTTLSeconds  *int    `json:"cache_ttl_seconds"`
 	FastDNS          *bool   `json:"fast_dns"`
 	SchedulerEnabled *bool   `json:"scheduler_enabled"`
@@ -82,9 +84,16 @@ func (s *Server) dnsServerConfig(w http.ResponseWriter, r *http.Request) {
 		httpErr(w, 400, err)
 		return
 	}
-	cfg := in.merge(s.app.DNSServer().Config())
-	if err := s.app.DNSServer().SetConfig(cfg); err != nil {
-		httpErr(w, 400, err)
+	if in.BaseHash == "" {
+		httpErr(w, http.StatusConflict, dnsserver.ErrConfigConflict)
+		return
+	}
+	if err := s.app.DNSServer().UpdateConfig(in.BaseHash, in.merge); err != nil {
+		status := http.StatusBadRequest
+		if errors.Is(err, dnsserver.ErrConfigConflict) {
+			status = http.StatusConflict
+		}
+		httpErr(w, status, err)
 		return
 	}
 	writeJSON(w, 200, s.app.DNSServer().Status())

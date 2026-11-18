@@ -103,8 +103,12 @@ func (svc *Service) awgRecoverClientOS(am *awg.Manager) error {
 	if !awgShouldAutostartClient(am.RuntimeConfig()) {
 		return fmt.Errorf("туннель выключен")
 	}
-	if _, _, err := am.EnsureRouterPeer(ctx); err != nil {
+	if _, changed, err := am.EnsureRouterPeer(ctx); err != nil {
 		return err
+	} else if changed {
+		if err := svc.awgSaveErr(); err != nil {
+			return err
+		}
 	}
 	if err := svc.awgClientUpManagerOS(am); err != nil {
 		return err

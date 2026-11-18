@@ -90,6 +90,9 @@ type warpPeer struct {
 }
 
 func (svc *Service) AWG2CreateWARP(ctx context.Context, opts WARPCreateOptions) (AWG2Status, error) {
+	if err := svc.awgPersistenceReady(); err != nil {
+		return svc.AWG2StatusView(), err
+	}
 	if !opts.AcceptTOS {
 		return svc.AWG2StatusView(), fmt.Errorf("нужно подтвердить условия Cloudflare перед созданием WARP")
 	}

@@ -106,7 +106,7 @@ func (svc *Service) AWG2SetRecoverySettings(in RecoverySettings) error {
 	// Keep failed writes invisible to status reads and future unrelated saves.
 	candidate := svc.snapshotAWGState()
 	candidate.RecoverySettings = &in
-	if err := svc.store.SaveSecret(awgConfigFile, &candidate); err != nil {
+	if err := svc.persistAWGState(&candidate); err != nil {
 		return err
 	}
 	svc.mu.Lock()

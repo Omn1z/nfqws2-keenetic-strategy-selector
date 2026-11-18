@@ -41,13 +41,16 @@ type deleteReplacementOps struct {
 // backup references in one saved state. A blank replacement keeps the existing
 // explicit waiting-rule deletion behavior.
 func (svc *Service) AWG2DeleteServerWithReplacement(id, replacementID string) error {
+	if err := svc.awgPersistenceReady(); err != nil {
+		return err
+	}
 	if strings.TrimSpace(replacementID) == "" {
 		return svc.AWG2DeleteServer(id)
 	}
 	_, unlock := svc.lockClientOps(true)
 	defer unlock()
 	return svc.awgDeleteServerWithReplacementWithOps(id, replacementID, deleteReplacementOps{
-		persist: func(state *awgPersisted) error { return svc.store.SaveSecret(awgConfigFile, state) },
+		persist: func(state *awgPersisted) error { return svc.persistAWGState(state) },
 		down:    svc.awgClientDownManagerOS,
 		start:   svc.clientLifecycleDriver().recover,
 		apply:   svc.awgApplyConnectionFailoverPolicyOS,

@@ -148,6 +148,9 @@ func (svc *Service) AWG2InstallEngine() (string, error) {
 func (svc *Service) AWG2ClientUp() error {
 	_, unlock := svc.lockClientOps(false)
 	defer unlock()
+	if err := svc.awgPersistenceReady(); err != nil {
+		return err
+	}
 	if err := svc.awgEnsureClientUpForRouting("ручного включения"); err != nil {
 		return err
 	}
@@ -163,6 +166,9 @@ func (svc *Service) awgEnsureClientUpForRouting(reason string) error {
 }
 
 func (svc *Service) awgEnsureClientManagerUpForRouting(am *awg.Manager, reason string) error {
+	if err := svc.awgPersistenceReady(); err != nil {
+		return err
+	}
 	if am == nil {
 		return fmt.Errorf("AWG2-server is not selected")
 	}
@@ -174,8 +180,12 @@ func (svc *Service) awgEnsureClientManagerUpForRouting(am *awg.Manager, reason s
 	}
 	// This helper is only used by explicit client/routing operations. The
 	// supervisor and policy refresh never turn Client.Enabled back on.
+	wasEnabled := am.ClientEnabled()
 	am.SetClientEnabled(true)
-	svc.awgSave()
+	if err := svc.awgSaveErr(); err != nil {
+		am.SetClientEnabled(wasEnabled)
+		return err
+	}
 	iface := awgClientIfaceName(am.RuntimeConfig())
 	if cs := svc.awgClientStatusManagerOS(am); cs != nil && cs.Running && awgClientCurrentEngineOS(am.RuntimeConfig()) {
 		return nil
@@ -189,7 +199,9 @@ func (svc *Service) awgEnsureClientManagerUpForRouting(am *awg.Manager, reason s
 		svc.recordClientAttempt(am, err)
 		return err
 	} else if changed {
-		svc.awgSave()
+		if err := svc.awgSaveErr(); err != nil {
+			return err
+		}
 	}
 	logbuf.Append("awg2", "info", "туннель "+iface+" не поднят — поднимаю автоматически для "+reason)
 	err := svc.awgClientUpManagerOS(am)
@@ -199,8 +211,7 @@ func (svc *Service) awgEnsureClientManagerUpForRouting(am *awg.Manager, reason s
 	}
 	am.SetClientEnabled(true)
 	svc.route.tunnelUpAt.Store(0)
-	svc.awgSave()
-	return nil
+	return svc.awgSaveErr()
 }
 
 // AWG2ClientDown tears down split-routing first (the table points at awg0, which
@@ -208,6 +219,9 @@ func (svc *Service) awgEnsureClientManagerUpForRouting(am *awg.Manager, reason s
 func (svc *Service) AWG2ClientDown() error {
 	_, unlock := svc.lockClientOps(true)
 	defer unlock()
+	if err := svc.awgPersistenceReady(); err != nil {
+		return err
+	}
 	var am *awg.Manager
 	if active := svc.awgActive(); active != nil {
 		am = active
@@ -216,7 +230,9 @@ func (svc *Service) AWG2ClientDown() error {
 	}
 	svc.awgTeardownRouting()
 	svc.route.tunnelUpAt.Store(0)
-	svc.awgSave()
+	if err := svc.awgSaveErr(); err != nil {
+		return err
+	}
 	err := svc.awgClientDownManagerOS(am)
 	svc.awgApplyMultiHostRoutesOS()
 	return err
@@ -437,6 +453,9 @@ func (svc *Service) serverSnapshot() []*managedServer {
 func (svc *Service) AWG2ApplyRouting() error {
 	_, unlock := svc.lockClientOps(false)
 	defer unlock()
+	if err := svc.awgPersistenceReady(); err != nil {
+		return err
+	}
 	if err := svc.awgApplyRoutingOS(); err != nil {
 		return err
 	}
@@ -446,7 +465,9 @@ func (svc *Service) AWG2ApplyRouting() error {
 	}
 	cfg := am.RuntimeConfig()
 	am.SetRoutingActive(cfg.Routing.Mode != "off")
-	svc.awgSave()
+	if err := svc.awgSaveErr(); err != nil {
+		return err
+	}
 	svc.awgApplyMultiHostRoutesOS()
 	return nil
 }
@@ -456,13 +477,18 @@ func (svc *Service) AWG2ApplyRouting() error {
 func (svc *Service) AWG2CommitRouting() error {
 	_, unlock := svc.lockClientOps(false)
 	defer unlock()
+	if err := svc.awgPersistenceReady(); err != nil {
+		return err
+	}
 	if err := svc.awgCommitRoutingOS(); err != nil {
 		return err
 	}
 	if am := svc.awgActive(); am != nil {
 		am.SetRoutingActive(true)
 	}
-	svc.awgSave()
+	if err := svc.awgSaveErr(); err != nil {
+		return err
+	}
 	svc.awgApplyMultiHostRoutesOS()
 	return nil
 }
@@ -472,16 +498,25 @@ func (svc *Service) AWG2CommitRouting() error {
 func (svc *Service) AWG2TeardownRouting() error {
 	_, unlock := svc.lockClientOps(false)
 	defer unlock()
+	if err := svc.awgPersistenceReady(); err != nil {
+		return err
+	}
 	if am := svc.awgActive(); am != nil {
 		am.SetRoutingActive(false)
 	}
-	svc.awgSave()
+	if err := svc.awgSaveErr(); err != nil {
+		return err
+	}
 	err := svc.awgTeardownRoutingOS()
 	svc.awgApplyMultiHostRoutesOS()
 	return err
 }
 
-func (svc *Service) awgRepairRouting() { svc.awgRepairRoutingOS() }
+func (svc *Service) awgRepairRouting() {
+	if svc.awgPersistenceReady() == nil {
+		svc.awgRepairRoutingOS()
+	}
+}
 
 // awgTeardownRouting is the internal teardown (e.g. on client-down/shutdown). It
 // does NOT clear the committed flag, so routing restores when the tunnel returns.

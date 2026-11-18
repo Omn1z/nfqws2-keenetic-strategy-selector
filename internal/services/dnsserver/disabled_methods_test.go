@@ -3,7 +3,6 @@ package dnsserver
 import (
 	"encoding/json"
 	"fmt"
-	"os"
 	"reflect"
 	"strings"
 	"testing"
@@ -274,16 +273,11 @@ func TestDisabledMethodsFailedSaveLeavesRuntimeAndPersistedPolicyUntouched(t *te
 	if err != nil {
 		t.Fatal(err)
 	}
-	// A directory at the store's temporary-file path makes saving fail on all
-	// platforms without changing permissions or the valid configuration file.
-	blockedTemp := s.store.Path(configFile + ".tmp")
-	if err := os.Mkdir(blockedTemp, 0700); err != nil {
-		t.Fatal(err)
-	}
-	defer os.Remove(blockedTemp)
+	restorePrimary := blockDNSConfigSave(t, s)
 	if err := s.SetMethodEnabled(before.Config.DefaultUpstream.Address, "nfqws", false); err == nil {
 		t.Fatal("method change succeeded despite failed persistence")
 	}
+	restorePrimary()
 	after := s.Status()
 	if activeDNSRun(s) != run || !reflect.DeepEqual(after.Config, before.Config) || !reflect.DeepEqual(after.Stats, before.Stats) || !reflect.DeepEqual(after.Cache, before.Cache) {
 		t.Fatal("failed save changed runtime policy, listeners, statistics or cache")

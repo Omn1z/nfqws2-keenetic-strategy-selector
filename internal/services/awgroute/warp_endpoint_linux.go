@@ -120,7 +120,6 @@ func (svc *Service) awgTryWARPEndpoint(ctx context.Context, am *awg.Manager, cfg
 		if err := am.SetConfig(&next); err != nil {
 			return cfg, false, err
 		}
-		svc.awgSave()
 	}
 	logbuf.Append("awg2", "info", "WARP endpoint selected: "+selectedEndpoint)
 	return next, true, nil

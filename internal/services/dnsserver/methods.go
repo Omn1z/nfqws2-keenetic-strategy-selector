@@ -148,6 +148,9 @@ func (s *Service) SetMethodEnabled(upstream, route string, enabled bool) error {
 	}
 	s.opMu.Lock()
 	defer s.opMu.Unlock()
+	if err := s.configurationErrorLocked(); err != nil {
+		return err
+	}
 	cfg := s.Config()
 	key := schedulerKey(method[0].Route, method[0].Upstream)
 	methods := make([]DisabledMethod, 0, len(cfg.DisabledMethods)+1)
@@ -171,8 +174,8 @@ func (s *Service) SetMethodEnabled(upstream, route string, enabled bool) error {
 		return fmt.Errorf("не более %d выключенных методов DNS", maxDisabledMethods)
 	}
 	cfg.DisabledMethods = methods
-	if err := s.store.Save(configFile, cfg); err != nil {
-		return err
+	if err := s.persistConfigLocked(cfg); err != nil {
+		return s.persistenceErrorLocked(err)
 	}
 	s.mu.Lock()
 	if s.active != nil {

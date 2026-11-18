@@ -45,17 +45,20 @@ type Endpoints struct {
 	DNS string `json:"dns"`
 }
 type Status struct {
-	ShadowDNS  ShadowDNSStatus  `json:"shadow_dns"`
-	Filtering  FilteringStatus  `json:"filtering"`
-	Config     Config           `json:"config"`
-	Running    bool             `json:"running"`
-	ListenHost string           `json:"listen_host"`
-	Endpoints  Endpoints        `json:"endpoints"`
-	LastError  string           `json:"last_error"`
-	Stats      Stats            `json:"stats"`
-	Cache      CacheStatus      `json:"cache"`
-	FastDNS    FastDNSStatus    `json:"fast_dns"`
-	Routes     []dnsroute.Route `json:"routes"`
+	ConfigHash    string           `json:"config_hash"`
+	ConfigError   string           `json:"config_error,omitempty"`
+	ConfigWarning string           `json:"config_warning,omitempty"`
+	ShadowDNS     ShadowDNSStatus  `json:"shadow_dns"`
+	Filtering     FilteringStatus  `json:"filtering"`
+	Config        Config           `json:"config"`
+	Running       bool             `json:"running"`
+	ListenHost    string           `json:"listen_host"`
+	Endpoints     Endpoints        `json:"endpoints"`
+	LastError     string           `json:"last_error"`
+	Stats         Stats            `json:"stats"`
+	Cache         CacheStatus      `json:"cache"`
+	FastDNS       FastDNSStatus    `json:"fast_dns"`
+	Routes        []dnsroute.Route `json:"routes"`
 }
 type serviceRun struct {
 	cancel    context.CancelFunc
@@ -68,9 +71,12 @@ type Service struct {
 	opMu          sync.Mutex
 	mu            sync.RWMutex
 	store         *store.Store
+	saveConfig    func(Config) error // optional per-instance persistence fault seam
 	backend       Backend
 	resolveHost   func(string) (string, error)
 	cfg           Config
+	configLoadErr error
+	configWarning string
 	host          string
 	lastError     string
 	stats         Stats
@@ -84,29 +90,24 @@ type Service struct {
 
 func New(st *store.Store, backend Backend, resolveHost func(string) (string, error)) *Service {
 	cfg := Default()
-	loaded := Config{LoggingEnabled: true, CacheTTLSeconds: cfg.CacheTTLSeconds, FastDNS: cfg.FastDNS, SchedulerEnabled: true}
 	s := &Service{store: st, backend: backend, resolveHost: resolveHost, cfg: cfg, logs: NewLogBuffer(), scheduler: NewScheduler()}
 	s.openwrt = openwrtdns.New(st.Path(""))
-	if err := st.Load(configFile, &loaded); err == nil {
-		legacy := loaded.DNSPort == 0
-		if legacy {
-			loaded.DNSPort = cfg.DNSPort
+	if loaded, legacy, recovered, err := s.loadStoredConfig(); err == nil {
+		s.cfg = loaded
+		if recovered {
+			s.configWarning = "Настройки DNS восстановлены из резервной копии"
 		}
-		if err := loaded.NormalizeValidate(); err == nil {
-			s.cfg = loaded
-			if legacy {
-				if err := st.Save(configFile, loaded); err != nil {
-					s.lastError = err.Error()
-				}
+		if legacy {
+			if err := st.Save(configFile, loaded); err != nil {
+				s.lastError = err.Error()
 			}
-		} else {
-			s.lastError = "неверная сохранённая конфигурация: " + err.Error()
 		}
 	} else if os.IsNotExist(err) {
 		if err := st.Save(configFile, cfg); err != nil {
 			s.lastError = err.Error()
 		}
 	} else {
+		s.configLoadErr = err
 		s.lastError = err.Error()
 	}
 	var filterErr error
@@ -127,6 +128,12 @@ func (s *Service) Config() Config { s.mu.RLock(); defer s.mu.RUnlock(); return c
 func (s *Service) Status() Status {
 	s.mu.RLock()
 	st := Status{Config: cloneConfig(s.cfg), Running: s.active != nil, ListenHost: s.host, LastError: s.lastError, Stats: s.stats}
+	st.ConfigWarning = s.configWarning
+	if s.configLoadErr != nil {
+		st.ConfigError = s.configLoadErr.Error()
+	} else {
+		st.ConfigHash = ConfigEditDigest(s.cfg)
+	}
 	st.Cache = s.cacheStatusLocked()
 	st.ShadowDNS = initialShadowStatus(s.cfg.ShadowDNS)
 	if s.active != nil {
@@ -166,6 +173,14 @@ func (s *Service) SetConfig(cfg Config) error {
 }
 
 func (s *Service) setConfigLocked(cfg Config) (result error) {
+	if err := s.configurationErrorLocked(); err != nil {
+		return err
+	}
+	err := s.applyConfigLocked(cfg, s.persistConfigLocked)
+	return s.persistenceErrorLocked(err)
+}
+
+func (s *Service) applyConfigLocked(cfg Config, persist func(Config) error) (result error) {
 	cfg = cloneConfig(cfg)
 	if err := cfg.NormalizeValidate(); err != nil {
 		return err
@@ -179,7 +194,7 @@ func (s *Service) setConfigLocked(cfg Config) (result error) {
 	}
 	s.mu.RLock()
 	run := s.active
-	unchanged := cfg.Enabled && s.lastError == "" && s.controlCancel != nil && host == s.host && reflect.DeepEqual(cfg, s.cfg) &&
+	unchanged := cfg.Enabled && (s.lastError == "" || persist == nil) && s.controlCancel != nil && host == s.host && reflect.DeepEqual(cfg, s.cfg) &&
 		run != nil && run.resolver.lifetime.Err() == nil && run.listeners.ctx.Err() == nil
 	s.mu.RUnlock()
 	if unchanged {
@@ -196,7 +211,11 @@ func (s *Service) setConfigLocked(cfg Config) (result error) {
 			result = fmt.Errorf("%w; %s", result, openWrtRestoreNotice)
 		}
 	}()
-	if err := s.filtering.ConfigurePersist(cfg.Filtering, func() error { return s.store.Save(configFile, cfg) }); err != nil {
+	var persistCurrent func() error
+	if persist != nil {
+		persistCurrent = func() error { return persist(cfg) }
+	}
+	if err := s.filtering.ConfigurePersist(cfg.Filtering, persistCurrent); err != nil {
 		return err
 	}
 	s.stopLocked()

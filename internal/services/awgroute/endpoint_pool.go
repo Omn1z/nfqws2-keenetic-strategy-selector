@@ -300,7 +300,7 @@ func (svc *Service) AWG2SetEndpointBackups(id string, endpoints []string) error 
 	if svc.store == nil {
 		return fmt.Errorf("хранилище настроек AWG недоступно")
 	}
-	return svc.setEndpointBackupsWithOps(id, endpoints, func(state awgPersisted) error { return svc.store.SaveSecret(awgConfigFile, &state) })
+	return svc.setEndpointBackupsWithOps(id, endpoints, func(state awgPersisted) error { return svc.persistAWGState(&state) })
 }
 
 func (svc *Service) setEndpointBackupsWithOps(id string, endpoints []string, save func(awgPersisted) error) error {

@@ -16,6 +16,7 @@ import FailoverPane, { ConnectionFailoverBadge } from "./FailoverPane";
 import GeneralPane from "./GeneralPane";
 import RecoveryStatus from "./RecoveryStatus";
 import { EndpointSelectionStatus } from "./EndpointBackupsPane";
+import ConfigPersistenceNotice from "./ConfigPersistenceNotice";
 import PeerShareModal from "./PeerShareModal";
 import RoutingPane from "./RoutingPane";
 import DevicesRoutingPane from "./DevicesRoutingPane";
@@ -506,6 +507,7 @@ export default function AWG2() {
         }
       >
         <p className="text-xs text-muted">Разворачивает VPN-сервер на вашем VPS по SSH или подключает роутер к существующему профилю AmneziaWG, WireGuard или WARP.</p>
+        <ConfigPersistenceNotice error={st.persistence_error} recovered={st.config_recovered} />
         {dep && dep.steps?.length > 0 && (
           <div className="mt-3 rounded-lg border border-line bg-line-soft p-2.5">
             <div className="mb-1 text-[11px] font-semibold text-ink-soft">Последний деплой ({dep.method}{dep.wan_iface ? `, WAN ${dep.wan_iface}` : ""}):</div>

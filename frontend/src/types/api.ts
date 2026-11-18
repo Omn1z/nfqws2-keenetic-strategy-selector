@@ -492,6 +492,9 @@ export interface DnsServerFastDNSStatus {
   last_error?: string;
 }
 export interface DnsServerStatus {
+  config_hash?: string;
+  config_error?: string;
+  config_warning?: string;
   config: DnsServerConfig;
   running: boolean;
   listen_host: string;
@@ -832,6 +835,8 @@ export interface AwgDeployServerResult {
   id: string; label: string; ok: boolean; result: AwgDeployResult; error?: string;
 }
 export interface Awg2Status {
+  persistence_error?: string;
+  config_recovered?: boolean;
   /** Global recovery schedule, independent of the profile selected for editing. */
   recovery_settings?: AwgRecoverySettings;
   deployment_pending?: boolean;

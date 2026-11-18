@@ -20,6 +20,7 @@ import { DomainGroups } from "./DomainGroups";
 import { collectRuleGroups, groupRules, type RuleGroupForm } from "./ruleGroups";
 import { ShadowDns } from "./ShadowDns";
 import { collectShadow, dnsRouteLabel, shadowForm, type ShadowForm } from "./shadowDnsForm";
+import { dnsConfigDraft, dnsConfigDirty, dnsConfigPayload, syncDnsConfigDraft, type DnsConfigDraft } from "./dnsConfigDraft";
 import type { DnsServerConfig, DnsServerStatus, DnsServerTestResult } from "@/types/api";
 
 type RouteMode = "auto" | "vpn_only";
@@ -91,12 +92,14 @@ export default function DnsServer() {
   const [testing, setTesting] = useState(false);
   const [importing, setImporting] = useState(false);
   const [test, setTest] = useState<DnsServerTestResult | null>(null);
-  const loaded = useRef(false);
+  const draft = useRef<DnsConfigDraft<Form> | null>(null);
   const polling = useRef(false);
   const mutation = useRef(0);
   const acting = useRef(false);
 
-  const apply = (v: DnsServerStatus) => { setLive(v); setForm(toForm(v.config)); loaded.current = true; setLoadError(""); };
+  const assignDraft = (next: DnsConfigDraft<Form>) => { draft.current = next; setForm(next.value); };
+  const apply = (v: DnsServerStatus, replaceDraft: boolean) => { setLive(v); assignDraft(replaceDraft ? dnsConfigDraft(toForm(v.config), v.config_hash || "") : syncDnsConfigDraft(draft.current, toForm(v.config), v.config_hash || "")); setLoadError(""); };
+  const resetDraft = () => { if (live && !live.config_error) assignDraft(dnsConfigDraft(toForm(live.config), live.config_hash || "")); };
   const refresh = async () => {
     if (polling.current || acting.current) return;
     polling.current = true;
@@ -104,8 +107,10 @@ export default function DnsServer() {
     try {
       const v = await api<DnsServerStatus>("GET", "/api/dnsserver");
       if (revision !== mutation.current) return;
-      setLive(v); setLoadError("");
-      if (!loaded.current) { setForm(toForm(v.config)); loaded.current = true; }
+      setLive(v);
+      if (v.config_error) { setLoadError("Сохранённые настройки DNS не загружены: " + v.config_error); return; }
+      setLoadError("");
+      assignDraft(syncDnsConfigDraft(draft.current, toForm(v.config), v.config_hash || ""));
     } catch (e) { if (revision === mutation.current) setLoadError((e as Error).message); }
     finally { polling.current = false; }
   };
@@ -114,13 +119,14 @@ export default function DnsServer() {
   const action = async (path: string, body: unknown, message: string) => {
     if (acting.current) return;
     acting.current = true; mutation.current++; setBusy(true);
-    try { apply(await api<DnsServerStatus>("POST", `/api/dnsserver/${path}`, body)); setTest(null); toast(message, "ok"); return true; }
+    try { apply(await api<DnsServerStatus>("POST", `/api/dnsserver/${path}`, body), path === "config" || path === "import"); setTest(null); toast(message, "ok"); return true; }
     catch (e) { toast((e as Error).message, "err"); return false; }
     finally { acting.current = false; setBusy(false); setOpenWrtRefresh((value) => value + 1); }
   };
   const save = async () => {
-    if (!form) return;
-    try { await action("config", collect(form), "Настройки DNS сохранены"); }
+    if (!draft.current) return;
+    if (live?.config_error) { toast("Запись остановлена: сначала восстановите сохранённые настройки DNS.", "err"); return; }
+    try { await action("config", dnsConfigPayload(draft.current, collect), "Настройки DNS сохранены"); }
     catch (e) { toast((e as Error).message, "err"); }
   };
   const clearCache = async () => {
@@ -149,10 +155,14 @@ export default function DnsServer() {
     } catch (e) { toast((e as Error).message, "err"); }
     finally { acting.current = false; setFilterUpdating(false); }
   };
-  const set = <K extends keyof Form>(key: K, value: Form[K]) => setForm((f) => f ? { ...f, [key]: value } : f);
-  const setRouteMode = (mode: RouteMode) => setForm((f) => f ? {
-    ...f, route_mode: mode, awg_fallback: mode === "vpn_only" && f.awg_fallback === "off" ? "auto" : f.awg_fallback,
-  } : f);
+  const set = <K extends keyof Form>(key: K, value: Form[K]) => {
+    const current = draft.current;
+    if (current) assignDraft({ ...current, value: { ...current.value, [key]: value } });
+  };
+  const setRouteMode = (mode: RouteMode) => {
+    const current = draft.current;
+    if (current) assignDraft({ ...current, value: { ...current.value, route_mode: mode, awg_fallback: mode === "vpn_only" && current.value.awg_fallback === "off" ? "auto" : current.value.awg_fallback } });
+  };
   const lookup = async () => {
     if (acting.current) return;
     setTesting(true); setTest(null);
@@ -161,9 +171,11 @@ export default function DnsServer() {
     finally { setTesting(false); }
   };
 
-  if (!live || !form) return <Card title="DNS Server"><p className="text-xs text-muted">{loadError || "Загрузка…"}</p>{loadError && <Button className="mt-3" onClick={refresh}>Повторить</Button>}</Card>;
+  if (!live || !form) return <><Card title="DNS Server"><p className="text-xs text-muted" role={loadError ? "alert" : undefined}>{loadError || "Загрузка…"}</p>{loadError && <Button className="mt-3" onClick={refresh}>Повторить</Button>}{live?.config_error && <Button className="ml-2 mt-3" onClick={() => setImporting(true)}>Восстановить из экспорта</Button>}</Card>{importing && <DnsSettingsImport dirty={false} saving={busy} onClose={() => setImporting(false)} onImport={async request => (await action("import", request, "Настройки DNS восстановлены")) ?? false} />}</>;
 
-  const dirty = JSON.stringify(form) !== JSON.stringify(toForm(live.config));
+  const dirty = dnsConfigDirty(draft.current);
+  const stale = dirty && !!live.config_hash && draft.current?.baseHash !== live.config_hash;
+  const configurationBlocked = !!live.config_error;
   const tunnels = (live.routes ?? []).filter((r) => r.id.startsWith("awg:"));
   const selectedTunnelExists = tunnels.some((r) => r.id.slice(4) === form.awg_fallback);
   const selectedTunnelAvailable = form.awg_fallback === "auto"
@@ -176,11 +188,14 @@ export default function DnsServer() {
       <Card title="DNS Server" sub="локальный DNS с группами доменов" head={<div className="flex flex-wrap items-center gap-2"><Button mini disabled={busy || testing || filterUpdating} onClick={() => setImporting(true)}>Импорт настроек</Button><DnsSettingsExportButton disabled={busy || testing || filterUpdating} /><Badge kind={live.running ? "ok" : live.config.enabled ? "bad" : "neutral"}>{live.running ? "работает" : live.config.enabled ? "ошибка запуска" : "выключен"}</Badge></div>}>
         <p className="mb-3 text-xs text-muted">Устройства отправляют обычные DNS-запросы на роутер по UDP или TCP. Выберите специальный DoH или пул серверов и назначьте ему группу доменов. Сервис по умолчанию выключен.</p>
         <div className="flex flex-wrap items-center gap-4">
-          <Switch checked={live.config.enabled} disabled={busy || dirty || testing} onChange={(on) => action(on ? "start" : "stop", {}, on ? "DNS-сервер включён" : "DNS-сервер выключен")} label="DNS-сервер включён" />
-          {dirty && <><Button mini variant="primary" disabled={busy || testing} onClick={save}>Сохранить изменения</Button><Button mini disabled={busy || testing} onClick={() => setForm(toForm(live.config))}>Отменить</Button></>}
+          <Switch checked={live.config.enabled} disabled={busy || dirty || testing || configurationBlocked} onChange={(on) => action(on ? "start" : "stop", {}, on ? "DNS-сервер включён" : "DNS-сервер выключен")} label="DNS-сервер включён" />
+          {dirty && <><Button mini variant="primary" disabled={busy || testing || stale || configurationBlocked} onClick={save}>Сохранить изменения</Button><Button mini disabled={busy || testing || configurationBlocked} onClick={resetDraft}>Отменить</Button></>}
           {!dirty && live.running && <span className="text-xs text-muted">Адрес в локальной сети: {live.listen_host}</span>}
         </div>
         <DnsSettingsExportNote dirty={dirty} />
+        {stale && <p role="alert" className="mt-3 text-xs text-warn">Сохранённые настройки изменились в другой вкладке или при восстановлении. Ваш черновик сохранён в этой вкладке. Чтобы не затереть новые данные, отмените черновик и загрузите актуальные настройки.</p>}
+        {configurationBlocked && <p role="alert" className="mt-3 text-xs text-bad">Запись остановлена для защиты данных: {live.config_error}</p>}
+        {live.config_warning && <p role="status" className="mt-3 text-xs text-warn">{live.config_warning}</p>}
         {live.last_error && <p role="alert" className="mt-3 text-xs text-bad [overflow-wrap:anywhere]">{live.last_error}</p>}
         {loadError && <p role="alert" className="mt-3 text-xs text-warn">Не удалось обновить состояние: {loadError}</p>}
       </Card>
@@ -289,8 +304,8 @@ export default function DnsServer() {
           <p className="mt-2 text-xs text-muted">Время хранения — верхний предел от 1 до 86400 секунд. Если TTL ответа DNS-провайдера истекает раньше, запись удаляется раньше.</p>
           <p className="mt-1 text-xs text-muted">A, AAAA и HTTPS хранятся как отдельные записи. Параметры DNS-запроса также могут различать записи кэша, даже для одного домена.</p>
           <div className="mt-4 flex flex-wrap items-center gap-3">
-            <Button variant="primary" disabled={busy || testing || !dirty} onClick={save}>{busy && !clearing ? "Сохранение…" : "Сохранить настройки"}</Button>
-            {dirty && <Button disabled={busy || testing} onClick={() => setForm(toForm(live.config))}>Отменить изменения</Button>}
+            <Button variant="primary" disabled={busy || testing || !dirty || stale || configurationBlocked} onClick={save}>{busy && !clearing ? "Сохранение…" : "Сохранить настройки"}</Button>
+            {dirty && <Button disabled={busy || testing || configurationBlocked} onClick={resetDraft}>Отменить изменения</Button>}
             <span className="text-xs text-muted">{dirty ? "Есть несохранённые изменения." : "Все настройки сохранены."} {live.running ? "Сохранение перезапустит DNS-сервер." : "Сохранение не включает сервис."}</span>
           </div>
         </Card>

@@ -23,10 +23,12 @@ type (
 )
 
 func (a *App) AWG2StatusView() AWG2Status { return a.awgroute.AWG2StatusView() }
-func (a *App) AWG2AddServer(name string) AWG2Status {
-	status := a.awgroute.AWG2AddServer(name)
-	a.syncAWGTransportBypass()
-	return status
+func (a *App) AWG2AddServer(name string) (AWG2Status, error) {
+	status, err := a.awgroute.AWG2AddServer(name)
+	if err == nil {
+		a.syncAWGTransportBypass()
+	}
+	return status, err
 }
 func (a *App) AWG2SelectServer(id string) error { return a.awgroute.AWG2SelectServer(id) }
 func (a *App) AWG2RenameServer(id, name string) error {

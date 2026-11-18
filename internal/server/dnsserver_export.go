@@ -23,6 +23,10 @@ type dnsServerSettingsExport struct {
 }
 
 func (s *Server) dnsServerExport(w http.ResponseWriter, r *http.Request) {
+	if err := s.app.DNSServer().ConfigError(); err != nil {
+		httpErr(w, http.StatusServiceUnavailable, err)
+		return
+	}
 	cfg := s.app.DNSServer().Config()
 	writeDNSServerSettingsExport(w, cfg, time.Now(), dnsExportConnections(cfg, s.app.DNSServerPublicConnections()))
 }

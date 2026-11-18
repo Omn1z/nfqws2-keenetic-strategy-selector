@@ -70,8 +70,9 @@ type App struct {
 	arpblock  *arpblock.Service
 	dnsServer *dnsserver.Service
 
-	dnsMu      sync.Mutex
-	dnsServers []dns.Server // configured DoH/DoT servers (DNS tab + run matrix)
+	dnsMu        sync.Mutex
+	dnsServers   []dns.Server // configured DoH/DoT servers (DNS tab + run matrix)
+	dnsConfigErr error        // protected by dnsMu; unreadable lists must not become defaults
 
 	geoAuto geoAutoState // background geosite.dat / geoip.dat updater (Geo tab)
 

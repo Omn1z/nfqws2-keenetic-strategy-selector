@@ -24,6 +24,9 @@ type ConnectionFailoverStatus struct {
 }
 
 func (svc *Service) clientShouldRun(am *awg.Manager) bool {
+	if svc.awgPersistenceReady() != nil {
+		return false
+	}
 	if am == nil {
 		return false
 	}
@@ -146,7 +149,7 @@ func (svc *Service) connectionRoutingEligibility() map[string]bool {
 // is a union, so a reserve shared by several primaries survives until every
 // demanding primary has authenticated again. Intent remains persisted as-is.
 func (svc *Service) reconcileStandbyClients() {
-	if svc.clientOpContext().Err() != nil {
+	if svc.clientOpContext().Err() != nil || svc.awgPersistenceReady() != nil {
 		return
 	}
 	servers := svc.serverSnapshot()
@@ -372,7 +375,7 @@ func (svc *Service) setConnectionFailoverWithOps(id string, in FailoverConfig, a
 			candidate.Servers[i].Config.Client.FallbackTunnelIDs = fallbacks
 		}
 	}
-	if err := svc.store.SaveSecret(awgConfigFile, &candidate); err != nil {
+	if err := svc.persistAWGState(&candidate); err != nil {
 		return err
 	}
 	cfg := srv.Manager.Config()

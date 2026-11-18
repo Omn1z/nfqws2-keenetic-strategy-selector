@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"net"
-	"os"
 	"reflect"
 	"strings"
 	"sync"
@@ -198,14 +197,11 @@ func TestDNSDiagnosticsLegacyLoggingDefaultAndExplicitDisable(t *testing.T) {
 func TestDNSDiagnosticsFailedSaveKeepsLoggingAndDNS(t *testing.T) {
 	s, _, client := newDNSServiceFixture(t, 8)
 	run := activeDNSRun(s)
-	// Occupy the store's atomic-write temporary path with a directory to cause
-	// a portable write failure without changing real filesystem permissions.
-	if err := os.Mkdir(s.store.Path(configFile+".tmp"), 0o700); err != nil {
-		t.Fatal(err)
-	}
+	restorePrimary := blockDNSConfigSave(t, s)
 	if err := s.SetLoggingEnabled(false); err == nil {
 		t.Fatal("logging toggle unexpectedly ignored a persistence failure")
 	}
+	restorePrimary()
 	if !s.Config().LoggingEnabled || !s.Logs(0).Enabled || activeDNSRun(s) != run {
 		t.Fatal("failed save changed active logging or restarted DNS")
 	}

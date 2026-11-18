@@ -29,6 +29,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 )
@@ -66,17 +67,31 @@ func Build(roots []string, w io.Writer) (files int, err error) {
 	var zbuf bytes.Buffer
 	zw := zip.NewWriter(&zbuf)
 	for _, root := range roots {
+		if internalStorePath(root) {
+			continue
+		}
 		st, err := os.Stat(root)
-		if err != nil || !st.IsDir() {
+		if os.IsNotExist(err) {
+			continue
+		}
+		if err != nil {
+			return 0, err
+		}
+		if !st.IsDir() {
 			// File-level: capture single files too (e.g. /etc/amnezia/amneziawg/awg0.conf).
-			if err == nil && !st.IsDir() {
-				if err := addOneFile(zw, root, root, st); err == nil {
-					files++
-				}
+			if err := addOneFile(zw, root, root, st); err != nil {
+				return 0, err
 			}
+			files++
 			continue
 		}
 		err = filepath.Walk(root, func(p string, fi os.FileInfo, walkErr error) error {
+			if internalStorePath(p) {
+				if fi != nil && fi.IsDir() {
+					return filepath.SkipDir
+				}
+				return nil
+			}
 			if walkErr != nil || fi.IsDir() {
 				return walkErr
 			}
@@ -177,6 +192,65 @@ func archiveName(p string) (string, error) {
 //
 // Error ladder: ErrNotBackup → ErrCorrupt → ErrTampered → I/O.
 func Restore(allowedRoots []string, r io.Reader) (int, error) {
+	return restoreWithOps(allowedRoots, r, restoreFileOps{})
+}
+
+type restoreFileOps struct {
+	syncFile  func(*os.File) error
+	closeFile func(*os.File) error
+	rename    func(string, string) error
+	syncDir   func(string) error
+}
+
+func (ops restoreFileOps) fileSync(f *os.File) error {
+	if ops.syncFile != nil {
+		return ops.syncFile(f)
+	}
+	return f.Sync()
+}
+func (ops restoreFileOps) fileClose(f *os.File) error {
+	if ops.closeFile != nil {
+		return ops.closeFile(f)
+	}
+	return f.Close()
+}
+func (ops restoreFileOps) move(src, dst string) error {
+	if ops.rename != nil {
+		return ops.rename(src, dst)
+	}
+	return os.Rename(src, dst)
+}
+func (ops restoreFileOps) directorySync(dir string) error {
+	if ops.syncDir != nil {
+		return ops.syncDir(dir)
+	}
+	f, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	// Windows cannot fsync directory handles opened by os.Open. File data is
+	// still synced; Linux/Entware also durably commits the rename itself.
+	if runtime.GOOS == "windows" {
+		return f.Close()
+	}
+	err = f.Sync()
+	return errors.Join(err, f.Close())
+}
+
+func internalStorePath(path string) bool {
+	for _, part := range strings.FieldsFunc(filepath.ToSlash(path), func(r rune) bool { return r == '/' || r == '\\' }) {
+		if strings.EqualFold(part, ".store") {
+			return true
+		}
+	}
+	return false
+}
+
+// Prepare every allowed entry before committing any of them. A corrupt ZIP
+// member must not truncate either its destination or an earlier valid file.
+// Commits are atomic per file; the returned count includes committed files if
+// a later rename or directory sync fails. Lifecycle callers reload that state.
+func restoreWithOps(allowedRoots []string, r io.Reader, ops restoreFileOps) (int, error) {
 	buf, err := io.ReadAll(io.LimitReader(r, maxArchive+1))
 	if err != nil {
 		return 0, err
@@ -209,43 +283,173 @@ func Restore(allowedRoots []string, r io.Reader) (int, error) {
 	if err != nil {
 		return 0, fmt.Errorf("backup: zip внутри архива битый: %w", err)
 	}
-	count := 0
+	type stagedFile struct{ temporary, destination string }
+	var staged []stagedFile
+	defer func() {
+		for _, file := range staged {
+			_ = os.Remove(file.temporary)
+		}
+	}()
+	seen := map[string]bool{}
+	remaining := int64(maxArchive)
 	for _, ze := range zr.File {
 		if strings.HasSuffix(ze.Name, "/") {
 			continue
 		}
 		dstAbs, err := restorePath(ze.Name)
 		if err != nil {
-			return count, fmt.Errorf("backup: невалидный путь в архиве: %s", ze.Name)
+			return 0, fmt.Errorf("backup: невалидный путь в архиве: %s", ze.Name)
 		}
-		if !isUnderAny(dstAbs, allowedRoots) {
+		if internalStorePath(dstAbs) || !isUnderAny(dstAbs, allowedRoots) {
 			// Quietly skip anything not under an allowed root — protects
 			// against a tampered archive trying to drop files into /etc or
 			// /root after surviving the auth check (shouldn't happen with
 			// our key, but defense-in-depth is cheap).
 			continue
 		}
-		if err := os.MkdirAll(filepath.Dir(dstAbs), 0o755); err != nil {
-			return count, err
+		if seen[dstAbs] {
+			return 0, fmt.Errorf("backup: повторный путь в архиве: %s", ze.Name)
+		}
+		seen[dstAbs] = true
+		if ze.UncompressedSize64 > uint64(remaining) {
+			return 0, fmt.Errorf("backup: распакованные файлы превышают %dMB", maxArchive/(1024*1024))
+		}
+		// Older builds recorded a leaf symlink's mode but archived the bytes
+		// read from its target. Recover those bytes as a private regular file;
+		// archive entries never create links or follow an existing destination.
+		legacySymlink := ze.Mode()&os.ModeSymlink != 0
+		if !ze.Mode().IsRegular() && !legacySymlink {
+			return 0, fmt.Errorf("backup: не обычный файл: %s", ze.Name)
+		}
+		if err := rejectSymlinkParents(dstAbs, allowedRoots); err != nil {
+			return 0, err
+		}
+		if err := ensureRestoreDirectory(filepath.Dir(dstAbs), ops); err != nil {
+			return 0, err
 		}
 		rc, err := ze.Open()
 		if err != nil {
+			return 0, err
+		}
+		f, err := os.CreateTemp(filepath.Dir(dstAbs), ".n2s-restore-*")
+		if err != nil {
+			_ = rc.Close()
+			return 0, err
+		}
+		staged = append(staged, stagedFile{f.Name(), dstAbs})
+		written, copyErr := io.Copy(f, io.LimitReader(rc, remaining+1))
+		readCloseErr := rc.Close()
+		if written > remaining {
+			copyErr = fmt.Errorf("backup: распакованные файлы превышают %dMB", maxArchive/(1024*1024))
+		}
+		remaining -= written
+		mode := ze.Mode().Perm() & 0o777
+		if mode == 0 || legacySymlink {
+			mode = 0o600
+		}
+		// Do not broaden access to an existing private file when importing an
+		// archive created by an older restore that forced all modes to 0644.
+		if info, err := os.Stat(dstAbs); err == nil && info.Mode().Perm()&0o077 == 0 {
+			mode &^= 0o077
+		}
+		if filepath.Base(dstAbs) == "awg.json" {
+			mode = 0o600
+		}
+		if copyErr == nil && readCloseErr == nil {
+			err = f.Chmod(mode)
+		} else {
+			err = errors.Join(copyErr, readCloseErr)
+		}
+		if err == nil {
+			err = ops.fileSync(f)
+		}
+		err = errors.Join(err, ops.fileClose(f))
+		if err != nil {
+			return 0, err
+		}
+	}
+	count := 0
+	for _, file := range staged {
+		if err := rejectSymlinkParents(file.destination, allowedRoots); err != nil {
 			return count, err
 		}
-		f, err := os.OpenFile(dstAbs, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
-		if err != nil {
-			rc.Close()
-			return count, err
-		}
-		_, err = io.Copy(f, rc)
-		rc.Close()
-		f.Close()
-		if err != nil {
+		if err := ops.move(file.temporary, file.destination); err != nil {
 			return count, err
 		}
 		count++
+		if err := ops.directorySync(filepath.Dir(file.destination)); err != nil {
+			return count, fmt.Errorf("backup: записано файлов %d, синхронизация каталога не подтверждена: %w", count, err)
+		}
 	}
 	return count, nil
+}
+
+func ensureRestoreDirectory(dir string, ops restoreFileOps) error {
+	var missing []string
+	for current := dir; ; current = filepath.Dir(current) {
+		info, err := os.Stat(current)
+		if err == nil {
+			if !info.IsDir() {
+				return fmt.Errorf("backup: путь не является каталогом")
+			}
+			break
+		}
+		if !os.IsNotExist(err) {
+			return err
+		}
+		missing = append(missing, current)
+		if filepath.Dir(current) == current {
+			return err
+		}
+	}
+	for i := len(missing) - 1; i >= 0; i-- {
+		if err := os.Mkdir(missing[i], 0o755); err != nil && !os.IsExist(err) {
+			return err
+		}
+		if err := ops.directorySync(filepath.Dir(missing[i])); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func rejectSymlinkParents(destination string, roots []string) error {
+	info, err := os.Lstat(destination)
+	if err == nil && info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("backup: файл назначения является символической ссылкой")
+	}
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	for _, root := range roots {
+		root, err := filepath.Abs(root)
+		if err != nil {
+			continue
+		}
+		relative, err := filepath.Rel(root, destination)
+		if err != nil || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) {
+			continue
+		}
+		// An explicitly allowed root may itself be a symlink. Descendants
+		// must not redirect a lexical allow-listed path outside that root.
+		parent := filepath.Dir(destination)
+		for parent != root && len(parent) > len(root) {
+			info, err := os.Lstat(parent)
+			if err == nil && info.Mode()&os.ModeSymlink != 0 {
+				return fmt.Errorf("backup: каталог назначения является символической ссылкой")
+			}
+			if err != nil && !os.IsNotExist(err) {
+				return err
+			}
+			next := filepath.Dir(parent)
+			if next == parent {
+				break
+			}
+			parent = next
+		}
+		return nil
+	}
+	return fmt.Errorf("backup: путь вне разрешённых каталогов")
 }
 
 func restorePath(name string) (string, error) {

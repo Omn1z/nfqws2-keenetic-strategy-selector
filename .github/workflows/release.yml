@@ -33,6 +33,7 @@ jobs:
         run: go test -race ./internal/services/dnsroute ./internal/services/dnsserver ./internal/services/tgws ./internal/tools/tlsroots
       - name: Check service controls and routing history concurrency
         run: |
+          go test -race ./internal/tools/store ./internal/tools/backup
           go test -race ./internal/app -run 'Nfqws2|BackupRestore'
           go test -race ./internal/services/awgroute -run 'Discover|Learned|Learning|RoutingHistory|TraceCache|TraceAppendObserves'
       - name: Test installation hooks

@@ -74,10 +74,11 @@ func (s *Service) ImportConfig(cfg Config, expectedHash string) error {
 		return fmt.Errorf("укажите base_hash из предварительной проверки")
 	}
 	previous := s.Config()
+	recoveringConfig := s.configurationErrorLocked() != nil
 	s.mu.RLock()
 	wasRunning := s.active != nil
 	previousHost := s.host
-	healthy := !previous.Enabled || s.active != nil && s.controlCancel != nil && host == s.host && s.lastError == "" && s.active.resolver.lifetime.Err() == nil && s.active.listeners.ctx.Err() == nil
+	healthy := !recoveringConfig && (!previous.Enabled || s.active != nil && s.controlCancel != nil && host == s.host && s.lastError == "" && s.active.resolver.lifetime.Err() == nil && s.active.listeners.ctx.Err() == nil)
 	s.mu.RUnlock()
 	// Retrying the exact successfully committed document after a lost ACK is
 	// read-only. It must neither restart DNS nor reject the original preview.
@@ -94,8 +95,23 @@ func (s *Service) ImportConfig(cfg Config, expectedHash string) error {
 			return err
 		}
 	}
-	if err := s.setConfigLocked(cfg); err != nil {
-		return err
+	var applyErr error
+	if recoveringConfig {
+		applyErr = s.applyConfigLocked(cfg, func(normalized Config) error { return s.store.RecoverConfig(configFile, normalized) })
+		if applyErr == nil {
+			s.mu.Lock()
+			s.configLoadErr = nil
+			s.configWarning = "Сохранённые настройки DNS заменены проверенным импортом"
+			s.mu.Unlock()
+		}
+	} else {
+		applyErr = s.setConfigLocked(cfg)
+	}
+	if applyErr != nil {
+		if recoveringConfig {
+			return s.persistenceErrorLocked(applyErr)
+		}
+		return applyErr
 	}
 	s.mu.RLock()
 	running, startupError := s.active != nil, s.lastError
@@ -107,6 +123,9 @@ func (s *Service) ImportConfig(cfg Config, expectedHash string) error {
 		startupError = "DNS не запущен"
 	}
 	failure := fmt.Errorf("не удалось применить импорт DNS: %s", startupError)
+	if recoveringConfig {
+		return fmt.Errorf("%w; импорт сохранён, повреждённые исходные данные сохранены для восстановления", failure)
+	}
 	if rollback := s.setConfigLocked(previous); rollback != nil {
 		return fmt.Errorf("%w; восстановление предыдущих настроек: %v", failure, rollback)
 	}

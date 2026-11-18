@@ -276,6 +276,13 @@ func (svc *Service) tryClientOps() (func(), bool) {
 	if svc.clients.stopping.Load() || svc.clients.waiters.Load() > 0 || !svc.clients.ops.TryLock() {
 		return nil, false
 	}
+	// A failed reload quarantines background work while existing daemons and
+	// rules keep carrying traffic. Check after locking so a restore cannot
+	// interleave between the fence and a watchdog/firewall mutation.
+	if svc.awgPersistenceReady() != nil {
+		svc.clients.ops.Unlock()
+		return nil, false
+	}
 	_, unlock := svc.clientOpLocked()
 	return unlock, true
 }
@@ -456,6 +463,9 @@ func (svc *Service) StopAWG() {
 }
 
 func (svc *Service) checkClients() {
+	if svc.awgPersistenceReady() != nil {
+		return
+	}
 	// Observe primaries before deciding which cold reserves are needed. A
 	// second reconciliation handles a timeout discovered in this same pass.
 	if unlock, ok := svc.tryClientOps(); ok {
@@ -486,6 +496,9 @@ func (svc *Service) checkClients() {
 
 // Called with ops held; membership and desired flags are re-read after locking.
 func (svc *Service) checkClient(srv *managedServer) {
+	if svc.awgPersistenceReady() != nil {
+		return
+	}
 	svc.mu.RLock()
 	present := svc.servers[srv.ID] == srv
 	svc.mu.RUnlock()

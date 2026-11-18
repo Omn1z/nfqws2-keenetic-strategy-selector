@@ -38,6 +38,18 @@ func decodeDNSConfigRequest(t *testing.T, payload map[string]any) dnsServerConfi
 	return in
 }
 
+func TestDNSConfigMissingRevisionRejectsOldTabBeforeTouchingApp(t *testing.T) {
+	r := httptest.NewRequest(http.MethodPost, "/api/dnsserver/config", strings.NewReader(`{"rules":[]}`))
+	w := httptest.NewRecorder()
+	(&Server{}).dnsServerConfig(w, r)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("old tab status=%d, want409", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "актуальные настройки") {
+		t.Fatal("conflict did not explain safe recovery")
+	}
+}
+
 func TestDNSConfigOldPOSTPreservesIndependentSettings(t *testing.T) {
 	current := dnsserver.Default()
 	current.RouteMode = dnsserver.RouteModeVPNOnly

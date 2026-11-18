@@ -292,20 +292,35 @@ func (svc *Service) TraceCounters() TraceCounters {
 func (svc *Service) TraceSetEnabled(on bool) bool {
 	_, unlock := svc.lockClientOps(false)
 	defer unlock()
+	if svc.awgPersistenceReady() != nil {
+		return traceEnabled()
+	}
+	previousRecording := traceEnabled()
 	traceSetEnabled(on)
 	settings := svc.currentRoutingSettings()
+	previousSettings := settings
+	var undo []func()
 	changed := settings.TraceEnabled != on
 	settings.TraceEnabled = on
 	svc.rememberRoutingSettings(settings)
 	for _, srv := range svc.serverSnapshot() {
 		routing := srv.Manager.Config().Routing
+		manager := srv.Manager
+		undo = append(undo, func() { manager.SetRoutingState(routing, routing.Active) })
 		if routingSettingsFrom(routing) != settings {
 			srv.Manager.SetRoutingState(settings.apply(routing), routing.Active)
 			changed = true
 		}
 	}
 	if changed {
-		svc.awgSave()
+		if err := svc.awgSaveErr(); err != nil {
+			traceSetEnabled(previousRecording)
+			svc.rememberRoutingSettings(previousSettings)
+			for _, restore := range undo {
+				restore()
+			}
+			return previousRecording
+		}
 	}
 	return on
 }

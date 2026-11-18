@@ -1342,6 +1342,10 @@ func (s *Server) cancelBlockCheck(w http.ResponseWriter, r *http.Request) {
 // ---------- DNS (DoH/DoT servers) ----------
 
 func (s *Server) getDNS(w http.ResponseWriter, r *http.Request) {
+	if err := s.app.DNSConfigError(); err != nil {
+		httpErr(w, http.StatusServiceUnavailable, err)
+		return
+	}
 	writeJSON(w, 200, s.app.DNSServers())
 }
 
@@ -1484,7 +1488,12 @@ func (s *Server) awg2AddServer(w http.ResponseWriter, r *http.Request) {
 		Name string `json:"name"`
 	}
 	_ = readJSON(r, &in) // body is optional
-	writeJSON(w, 200, s.app.AWG2AddServer(in.Name))
+	status, err := s.app.AWG2AddServer(in.Name)
+	if err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, status)
 }
 
 func (s *Server) awg2Import(w http.ResponseWriter, r *http.Request) {

@@ -14,6 +14,9 @@ import (
 func (svc *Service) AWG2Import(text, name string) (AWG2Status, error) {
 	_, unlock := svc.lockClientOps(false)
 	defer unlock()
+	if err := svc.awgPersistenceReady(); err != nil {
+		return svc.AWG2StatusView(), err
+	}
 	cfg, err := awg.ImportClientConf(text)
 	if err != nil {
 		return svc.AWG2StatusView(), err
@@ -23,6 +26,12 @@ func (svc *Service) AWG2Import(text, name string) (AWG2Status, error) {
 
 	id := "awg-" + storeutil.NewID()
 	srv := &managedServer{ID: id, Name: strings.TrimSpace(name), Manager: awg.NewManager(cfg)}
+	candidate := svc.snapshotAWGState()
+	candidate.ActiveID = id
+	candidate.Servers = append(candidate.Servers, awgPersistedServer{ID: id, Name: srv.Name, Config: srv.Manager.Config()})
+	if err := svc.persistAWGState(&candidate); err != nil {
+		return svc.AWG2StatusView(), err
+	}
 
 	svc.mu.Lock()
 	if svc.servers == nil {
@@ -36,6 +45,5 @@ func (svc *Service) AWG2Import(text, name string) (AWG2Status, error) {
 	svc.syncActiveAWGIface()
 
 	svc.route.tunnelUpAt.Store(0)
-	svc.awgSave()
 	return svc.AWG2StatusView(), nil
 }

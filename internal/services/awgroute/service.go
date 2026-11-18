@@ -39,6 +39,9 @@ type Service struct {
 	// recoverySettings applies to every local tunnel, independently of the
 	// connection selected for editing and of the router's routing policy.
 	recoverySettings *RecoverySettings
+	persistenceErr   error
+	lastSaveErr      error
+	configRecovered  bool
 	// routingDNSGate prevents replies from crossing a partially replaced policy.
 	// Its lifecycle is owned by the OS routing apply and the DNS observer.
 	routingDNSGate        routingDNSGate
@@ -217,12 +220,19 @@ func (svc *Service) RepairRouting() {
 
 // StartClientSupervisor starts retries after the app has initialized the other
 // services which may mutate routing during startup.
-func (svc *Service) StartClientSupervisor() { svc.startClientSupervisor() }
+func (svc *Service) StartClientSupervisor() {
+	if svc.awgPersistenceReady() == nil {
+		svc.startClientSupervisor()
+	}
+}
 
 // TeardownRouting removes the live split-routing without clearing the committed
 // flag (so it restores when the tunnel returns). Called on shutdown.
 func (svc *Service) TeardownRouting() {
 	svc.StopAWG()
+	if svc.awgPersistenceReady() != nil {
+		return
+	}
 	_, unlock := svc.lockClientOps(false)
 	defer unlock()
 	svc.awgTeardownRouting()
