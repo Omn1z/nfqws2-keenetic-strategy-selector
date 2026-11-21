@@ -303,6 +303,10 @@ func (svc *Service) awgClientUpManagerOS(am *awg.Manager) (startErr error) {
 	if !cfg.Enabled {
 		return fmt.Errorf("AWG2-сервер выключен")
 	}
+	outer := svc.doubleTunnelOuter(am)
+	if cfg.Client.DoubleTunnelMode == awg.DoubleTunnelPermanent && outer == nil {
+		return fmt.Errorf("постоянный двойной туннель ожидает внешнее подключение")
+	}
 	if info := svc.awgEngineInfoOS(); !info.Installed {
 		return fmt.Errorf("движок AWG2 не установлен — нажмите «Установить движок»")
 	} else if !info.TunOK {
@@ -336,7 +340,7 @@ func (svc *Service) awgClientUpManagerOS(am *awg.Manager) (startErr error) {
 	var endpointIP string
 	var port int
 	host, portStr, _ := net.SplitHostPort(strings.TrimSpace(cfg.Endpoint))
-	if outer := svc.doubleTunnelOuter(am); outer != nil {
+	if outer != nil {
 		endpointIP = svc.resolvePolicyHostIP(host)
 		port, _ = strconv.Atoi(portStr)
 		if endpointIP == "" || port == 0 {
@@ -484,21 +488,16 @@ func (svc *Service) awgClientStatusManagerOS(am *awg.Manager) *ClientStatus {
 	if am == nil {
 		return nil
 	}
-	cfg := am.RuntimeConfig()
-	st := awgClientStatusIfaceOS(awgClientIface(cfg))
+	client := am.RuntimeClientStatus()
+	st := awgClientStatusIfaceOS(awgClientIface(awg.ServerConfig{ClientIface: client.ClientIface}))
 	if st == nil {
 		return nil
 	}
 	if st.MTU == 0 {
-		st.MTU = awgTunnelMTU(cfg)
+		st.MTU = client.MTU
 	}
 	if st.Address == "" {
-		for _, p := range cfg.Peers {
-			if p.IsRouter {
-				st.Address = p.Address
-				break
-			}
-		}
+		st.Address = client.Address
 	}
 	svc.clientRecoveryStatus(am, st)
 	svc.rememberClientEndpointStatus(am, st)
@@ -511,15 +510,15 @@ func awgClientStatusIfaceOS(iface string) *ClientStatus {
 
 func awgClientStatusIfaceContextOS(opCtx context.Context, iface string) *ClientStatus {
 	st := &ClientStatus{}
-	ctx, cancel := context.WithTimeout(opCtx, 2*time.Second)
-	defer cancel()
-	if exec.CommandContext(ctx, "ip", "link", "show", iface).Run() == nil {
+	if _, err := net.InterfaceByName(iface); err == nil {
 		st.IfacePresent = true
 	}
 	if _, err := os.Stat(awgSockPath(iface)); err != nil {
 		return st
 	}
-	resp, err := uapiRequestIfaceContext(opCtx, iface, "get=1\n\n")
+	ctx, cancel := context.WithTimeout(opCtx, 1500*time.Millisecond)
+	defer cancel()
+	resp, err := uapiRequestIfaceContext(ctx, iface, "get=1\n\n")
 	if err != nil || !strings.Contains(resp, "public_key=") {
 		st.engineID = awgClientProcessIdentityOS(iface)
 		if st.engineID != "" {

@@ -100,7 +100,7 @@ func (svc *Service) endpointPoolLocked(am *awg.Manager, pool []string) clientEnd
 	signature := strings.Join(pool, "\x00")
 	if state.signature != signature {
 		state = clientEndpointPool{signature: signature}
-		if index := endpointChoice(pool, am.RuntimeConfig().Endpoint); index >= 0 {
+		if index := endpointChoice(pool, am.RuntimeClientStatus().Endpoint); index >= 0 {
 			state.index = index
 		}
 	}
@@ -195,7 +195,13 @@ func (svc *Service) endpointPoolAllowsFallback(am *awg.Manager) bool {
 
 func (svc *Service) endpointFallbackTunnelIDs(primary string, ruleFallbacks []string) []string {
 	fallbacks := svc.connectionFallbackTunnelIDs(primary, ruleFallbacks)
+	if len(fallbacks) == 0 {
+		return nil
+	}
 	for _, srv := range svc.serverSnapshot() {
+		if srv.ID == primary && svc.blocksOrdinaryReserves(srv.Manager) {
+			return nil
+		}
 		if srv.ID == primary && !svc.endpointPoolAllowsFallback(srv.Manager) {
 			// A restart can inherit an authenticated reserve already carrying
 			// traffic. Keep that path until primary verification completes, but

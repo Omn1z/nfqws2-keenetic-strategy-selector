@@ -74,6 +74,18 @@ func TestRuntimeLocalClientIdentityUsesCommittedEndpointAndDesiredLocalFlags(t *
 	if allocations := testing.AllocsPerRun(100, func() { got = manager.RuntimeLocalClientIdentity() }); allocations != 0 {
 		t.Fatal("DNS client identity cloned a large routing config")
 	}
+	var overview ConnectionOverview
+	var client LocalClientStatus
+	if allocations := testing.AllocsPerRun(100, func() {
+		overview = manager.ConnectionOverview()
+		client = manager.RuntimeClientStatus()
+	}); allocations != 0 {
+		t.Fatal("status views cloned a large routing config")
+	}
+	if overview.ConfiguredEndpoint != "desired.example:443" || overview.Endpoint != got.Endpoint ||
+		!overview.DeploymentPending || client.Endpoint != got.Endpoint || client.ClientIface != got.ClientIface {
+		t.Fatal("status views mixed desired and applied connection settings")
+	}
 	next := manager.Config()
 	next.Client.Standby, next.Client.FallbackTunnelIDs = true, []string{"backup"}
 	next.Routing.Mode, next.Routing.Active = "full", true

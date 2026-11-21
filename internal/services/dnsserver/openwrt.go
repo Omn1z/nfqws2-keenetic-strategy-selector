@@ -2,6 +2,7 @@ package dnsserver
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"strconv"
@@ -14,6 +15,7 @@ import (
 type openWrtDNSManager interface {
 	Status(context.Context) (openwrtdns.State, error)
 	Apply(context.Context, string, string, openwrtdns.Endpoint, string) error
+	Rebind(context.Context, string, string) error
 	Restore(context.Context, string) error
 	CurrentBinding() (*openwrtdns.Binding, error)
 }
@@ -38,6 +40,9 @@ func (s *Service) ApplyOpenWrtDNS(ctx context.Context, iface, instance, revision
 	}
 	if !state.Supported {
 		return fmt.Errorf("автонастройка DNS доступна только на OpenWrt")
+	}
+	if state.Conflict != "" {
+		return errors.New(state.Conflict)
 	}
 	s.mu.RLock()
 	running, host, port := s.active != nil, s.host, s.cfg.DNSPort
@@ -69,6 +74,15 @@ func (s *Service) RestoreOpenWrtDNS(ctx context.Context, revision string) error 
 	transaction, cancel := context.WithTimeout(context.WithoutCancel(ctx), 45*time.Second)
 	defer cancel()
 	return s.openwrt.Restore(transaction, revision)
+}
+
+func (s *Service) RebindOpenWrtDNS(ctx context.Context, instance, revision string) error {
+	s.opMu.Lock()
+	defer s.opMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return s.openwrt.Rebind(ctx, instance, revision)
 }
 
 func checkOpenWrtDNSListener(ctx context.Context, endpoint openwrtdns.Endpoint) error {

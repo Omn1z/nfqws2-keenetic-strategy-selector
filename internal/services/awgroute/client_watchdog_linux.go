@@ -27,21 +27,28 @@ func (d systemClientDriver) recoverWithExistingPeer(am *awg.Manager) error {
 	return d.svc.awgRestartLocalClientOS(am)
 }
 
+func (d systemClientDriver) clientDataUnanswered(am *awg.Manager) bool {
+	client := am.RuntimeClientStatus()
+	return client.HasPeer && probeClientDataTimeout(d.svc.clientOpContext(), clientIfaceName(client.ClientIface), client.AllowedIPs)
+}
+
 var clientEnginePIDs sync.Map // iface -> pid; executable and argv rechecked on use
 
 func awgClientCurrentEngineOS(cfg awg.ServerConfig) bool {
+	return awgClientCurrentEngineIfaceOS(awgClientIfaceName(cfg))
+}
+
+func awgClientCurrentEngineIfaceOS(iface string) bool {
 	installed, err := os.Stat(awgGoBin())
 	if err != nil {
 		return false
 	}
-	iface := awgClientIfaceName(cfg)
 	check := func(pid string) bool {
 		cmd, err := os.ReadFile(filepath.Join("/proc", pid, "cmdline"))
 		if err != nil {
 			return false
 		}
-		args := strings.Split(string(cmd), "\x00")
-		if len(args) < 2 || filepath.Base(args[0]) != "amneziawg-go" || args[1] != iface {
+		if !clientCommandMatches(cmd, iface) {
 			return false
 		}
 		live, err := os.Stat(filepath.Join("/proc", pid, "exe"))
@@ -233,17 +240,9 @@ func (svc *Service) awgRestoreLegacyClientRoutesOS(am *awg.Manager) (restoreErr 
 		return err
 	}
 	iface := awgClientIfaceName(cfg)
-	if err := awgRunCheck("ip route replace default dev " + iface + " table " + awgTable); err != nil {
+	if err := svc.awgInstallLegacyPolicyRoutes(cfg, true); err != nil {
 		return err
 	}
-	_, _ = awgRun("while ip rule del fwmark " + awgMarkRule + " table " + awgTable + " 2>/dev/null; do :; done")
-	if err := awgRunCheck("ip rule add fwmark " + awgMarkRule + " table " + awgTable); err != nil {
-		return err
-	}
-	_, _ = awgRun("ip -6 route replace default dev " + iface + " table " + awgTable)
-	_, _ = awgRun("ip -6 rule del fwmark " + awgMarkRule + " table " + awgTable + " 2>/dev/null")
-	_, _ = awgRun("ip -6 rule add fwmark " + awgMarkRule + " table " + awgTable)
-	awgApplyKillswitch(cfg.Routing.Killswitch)
 	svc.route.mu.Lock()
 	dnsOn := svc.route.dnsProxy != nil
 	refreshing := svc.route.stopRefresh != nil
@@ -252,7 +251,8 @@ func (svc *Service) awgRestoreLegacyClientRoutesOS(am *awg.Manager) (restoreErr 
 	if !dnsOn {
 		dnsOn = svc.awgEnsureDNSProxy(&cfg)
 	}
-	if err := awgWriteHook(awgEffectiveMode(cfg.Routing), endpointIP, dev, awgActiveTunnelMTU(cfg), dnsOn, awgTunnelV6Reaches(), cfg.Routing.Zones, svc.awgClientEndpointIPs(am)...); err != nil {
+	permanent := cfg.Client.DoubleTunnelMode == awg.DoubleTunnelPermanent
+	if err := awgWriteHook(iface, awgEffectiveMode(cfg.Routing), endpointIP, dev, awgActiveTunnelMTU(cfg), dnsOn, permanent || awgTunnelV6Reaches(), permanent, cfg.Routing.Zones, svc.awgLegacyHookEndpoints(am, cfg)...); err != nil {
 		return err
 	}
 	if !refreshing {

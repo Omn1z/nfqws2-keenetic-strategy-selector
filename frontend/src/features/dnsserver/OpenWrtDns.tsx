@@ -3,6 +3,7 @@ import { api } from "@/lib/api";
 import { Badge } from "@/components/ui/Badge";
 import { Button } from "@/components/ui/Button";
 import { Card } from "@/components/ui/Card";
+import { confirmDialog } from "@/components/ui/Confirm";
 import { Field, Select } from "@/components/ui/form";
 import { toast } from "@/components/ui/Toast";
 import type { OpenWrtDnsState } from "@/types/api";
@@ -19,11 +20,13 @@ type Props = {
   onBusyChange: (busy: boolean) => boolean;
 };
 
+type Operation = "apply" | "restore" | "rebind";
+
 export function OpenWrtDns({ dirty, running, busy, endpoint, configurationKey, onSupportedChange, onBusyChange }: Props) {
   const [state, setState] = useState<OpenWrtDnsState | null>(null);
   const [selection, setSelection] = useState<OpenWrtDnsSelection>({ interface: "", instance: "" });
   const [loading, setLoading] = useState(true);
-  const [pending, setPending] = useState<"apply" | "restore" | null>(null);
+  const [pending, setPending] = useState<Operation | null>(null);
   const [error, setError] = useState("");
   const [writeError, setWriteError] = useState("");
   const mounted = useRef(false);
@@ -61,20 +64,34 @@ export function OpenWrtDns({ dirty, running, busy, endpoint, configurationKey, o
     return () => { read.current?.abort(); };
   }, [configurationKey]);
 
-  const change = async (operation: "apply" | "restore") => {
+  const candidate = state?.instances?.find((instance) => instance.id === state?.rebind_instance);
+  const canRebind = !!candidate && candidate.id === selection.instance && !!state?.revision && !busy;
+
+  const change = async (operation: Operation) => {
     if (working.current || loading || error || !state) return;
     const blocked = operation === "apply"
       ? !!openWrtDnsApplyBlock(state, selection, { dirty, running, busy })
-      : !openWrtDnsRestoreAllowed(state, busy);
+      : operation === "restore" ? !openWrtDnsRestoreAllowed(state, busy) : !canRebind;
     if (blocked || !callbacks.current.onBusyChange(true)) return;
     working.current = true; setPending(operation); setWriteError("");
     read.current?.abort();
     try {
-      const body = operation === "apply" ? { ...selection, revision: state.revision } : { revision: state.revision };
+      if (operation === "rebind" && !(await confirmDialog({
+        title: `Подтвердить ${candidate?.label || selection.instance}?`,
+        body: "Убедитесь, что это тот же экземпляр dnsmasq, который обслуживал привязку. Панель обновит ссылку на него в резервной копии DNS.",
+        confirmLabel: "Подтвердить экземпляр",
+      }))) return;
+      const input = operation === "apply" ? selection : operation === "rebind" ? { instance: selection.instance } : {};
+      const body = { ...input, revision: state.revision };
       const result = await api<OpenWrtDnsState>("POST", `/api/dnsserver/openwrt/${operation}`, body, { timeoutMs: 60_000 });
       if (mounted.current) {
         receive(result);
-        toast(operation === "apply" ? "DNS OpenWrt подключён к DNS Server" : "Прежние настройки DNS OpenWrt восстановлены", "ok");
+        const messages = {
+          apply: "DNS OpenWrt подключён к DNS Server",
+          restore: "Прежние настройки DNS OpenWrt восстановлены",
+          rebind: "Привязка DNS OpenWrt подтверждена",
+        };
+        toast(messages[operation], "ok");
       }
     } catch (e) {
       if (mounted.current) setWriteError(`${(e as Error).message} Проверьте состояние ниже перед повторной попыткой.`);
@@ -110,15 +127,17 @@ export function OpenWrtDns({ dirty, running, busy, endpoint, configurationKey, o
         </Select></Field>
       </div>
       <p className="mt-2 text-xs text-muted">На выбранном интерфейсе будет включён пользовательский DNS с IP этого роутера. Пересылка dnsmasq применяется ко всем сетям, которые обслуживает выбранный экземпляр. Отдельные DNS-правила для доменов сохраняются.</p>
-      {state.binding && <p className="mt-3 text-xs text-muted">Текущее подключение: <b>{state.binding.interface}</b> · {state.binding.instance} → <code>{openWrtDnsEndpoint(state.binding.endpoint)}</code></p>}
+      {state.binding && <p className="mt-3 text-xs text-muted">{state.conflict ? "Сохранённая привязка" : "Текущее подключение"} <b>{state.binding.interface}</b> · {state.binding.instance} → <code>{openWrtDnsEndpoint(state.binding.endpoint)}</code></p>}
       <p className="mt-2 text-xs text-muted">Перед применением сохраняется резервная копия изменяемых настроек. Кнопка восстановления вернёт их прежние значения.</p>
       {state.managed && <p className="mt-2 text-xs text-muted">При отключении DNS Server или смене его IP/порта прежние настройки OpenWrt восстанавливаются автоматически. После смены адреса включите DNS Server и повторно примените подключение здесь.</p>}
       {state.conflict && <p role="alert" className="mt-3 text-xs text-warn [overflow-wrap:anywhere]">{state.conflict}</p>}
+      {candidate && <p className="mt-2 text-xs text-muted">Действующая пересылка найдена в {candidate.label || candidate.id}{candidate.networks?.length ? ` · ${candidate.networks.join(", ")}` : ""}. Выберите этот экземпляр, если он обслуживал сохранённую привязку.</p>}
       {(state.warnings ?? []).map((warning, index) => <p key={index} className="mt-2 text-xs text-warn [overflow-wrap:anywhere]">{warning}</p>)}
       {blocked && !busy && !state.conflict && <p className="mt-3 text-xs text-muted">{blocked}</p>}
       <div className="mt-4 flex flex-wrap gap-2">
         <Button variant="primary" disabled={unavailable || !!blocked} onClick={() => { void change("apply"); }}>{pending === "apply" ? "Подключение…" : state.managed ? "Применить подключение" : "Подключить DNS Server"}</Button>
         {state.managed && <Button disabled={unavailable || !openWrtDnsRestoreAllowed(state, busy)} onClick={() => { void change("restore"); }}>{pending === "restore" ? "Восстановление…" : "Восстановить прежний DNS"}</Button>}
+        {candidate && <Button disabled={unavailable || !canRebind} onClick={() => { void change("rebind"); }}>{pending === "rebind" ? "Подтверждение…" : "Подтвердить экземпляр"}</Button>}
       </div>
     </>}
     {writeError && <p role="alert" className="mt-3 text-xs text-bad [overflow-wrap:anywhere]">{writeError}</p>}

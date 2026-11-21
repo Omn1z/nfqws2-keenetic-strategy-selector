@@ -9,7 +9,7 @@ export function initialOpenWrtDnsSelection(state: OpenWrtDnsState, previous?: Op
   const knownInstance = (id?: string) => instances.some((entry) => entry.id === id) ? id : undefined;
   return {
     interface: knownInterface(previous?.interface) ?? knownInterface(state.binding?.interface) ?? knownInterface("wan") ?? interfaces[0]?.id ?? "",
-    instance: knownInstance(previous?.instance) ?? knownInstance(state.binding?.instance) ?? (instances.length === 1 ? instances[0].id : ""),
+    instance: knownInstance(state.binding?.instance) ?? knownInstance(previous?.instance) ?? (instances.length === 1 ? instances[0].id : ""),
   };
 }
 

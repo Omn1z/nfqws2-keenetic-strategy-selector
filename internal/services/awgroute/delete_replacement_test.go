@@ -83,10 +83,10 @@ func TestDeleteReplacementPreservesGlobalRulePropertiesAndPendingRules(t *testin
 
 func TestDeleteReplacementMapsConnectionFallbacksAndStartsFormerStandby(t *testing.T) {
 	svc := pendingRuleFixture(t, "source", "target", "other", "last")
-	svc.servers["source"].Manager.SetClientFailoverPolicy([]string{"other", "last"}, false, "")
-	svc.servers["target"].Manager.SetClientFailoverPolicy([]string{"source", "other"}, true, "source")
-	svc.servers["other"].Manager.SetClientFailoverPolicy(nil, true, "source")
-	svc.servers["last"].Manager.SetClientFailoverPolicy(nil, true, "")
+	svc.servers["source"].Manager.SetClientFailoverPolicy([]string{"other", "last"}, false, "", "")
+	svc.servers["target"].Manager.SetClientFailoverPolicy([]string{"source", "other"}, true, "source", awg.DoubleTunnelLastResort)
+	svc.servers["other"].Manager.SetClientFailoverPolicy(nil, true, "source", awg.DoubleTunnelPreferred)
+	svc.servers["last"].Manager.SetClientFailoverPolicy(nil, true, "", "")
 	rule := awg.Zone{Name: "active source", TunnelID: "source", Route: "tunnel", Domains: []string{"*"}, Enabled: true}
 	if err := svc.awgSaveRoutingRules(svc.currentRoutingSettings().apply(awg.RoutingConfig{Zones: []awg.Zone{rule}})); err != nil {
 		t.Fatal(err)
@@ -119,7 +119,7 @@ func TestDeleteReplacementMapsConnectionFallbacksAndStartsFormerStandby(t *testi
 		if cfg.Client.Standby || !cfg.Client.Enabled || !cfg.Routing.Active || !reflect.DeepEqual(cfg.Client.FallbackTunnelIDs, []string{"other", "last"}) || !state.clientShouldRun(state.servers["target"].Manager) {
 			t.Fatal("former standby did not become an eligible primary with deduplicated backup priority")
 		}
-		if other := state.servers["other"].Manager.RuntimeLocalClientIdentity(); other.DoubleTunnelID != "target" || cfg.Client.DoubleTunnelID != "" {
+		if other := state.servers["other"].Manager.RuntimeLocalClientIdentity(); other.DoubleTunnelID != "target" || other.DoubleTunnelMode != awg.DoubleTunnelPreferred || cfg.Client.DoubleTunnelID != "" {
 			t.Fatal("replacement did not transfer external transport references or created a self-reference")
 		}
 		if applied := state.servers["target"].Manager.AppliedConfig(); applied == nil || applied.Client.DoubleTunnelID != cfg.Client.DoubleTunnelID || !reflect.DeepEqual(applied.Client.FallbackTunnelIDs, cfg.Client.FallbackTunnelIDs) || !reflect.DeepEqual(applied.Routing.Zones, cfg.Routing.Zones) || applied.Client.PeerID != oldTarget.Client.PeerID || applied.Client.Enabled != oldTarget.Client.Enabled {
@@ -140,7 +140,7 @@ func TestDeleteReplacementDoesNotActivateUncommittedSourceRules(t *testing.T) {
 	svc.servers["source"].Manager.SetRoutingActive(false)
 	target := svc.servers["target"].Manager
 	target.SetRoutingActive(false)
-	target.SetClientFailoverPolicy(nil, true, "")
+	target.SetClientFailoverPolicy(nil, true, "", "")
 	ops := deleteReplacementTestOps(svc)
 	ops.start = func(*awg.Manager) error { t.Fatal("uncommitted rules started a tunnel"); return nil }
 	if err := runDeleteReplacement(t, svc, "source", "target", ops); err != nil {
@@ -195,8 +195,8 @@ func TestDeleteReplacementRejectsMissingSameIDAndCyclesWithoutSideEffects(t *tes
 			if targetID == "target" {
 				// A -> middle -> target was acyclic. Merging A into target
 				// would produce target -> middle -> target.
-				svc.servers["source"].Manager.SetClientFailoverPolicy([]string{"middle"}, false, "")
-				svc.servers["middle"].Manager.SetClientFailoverPolicy([]string{"target"}, false, "")
+				svc.servers["source"].Manager.SetClientFailoverPolicy([]string{"middle"}, false, "", "")
+				svc.servers["middle"].Manager.SetClientFailoverPolicy([]string{"target"}, false, "", "")
 			}
 			before := svc.snapshotAWGState()
 			ops := deleteReplacementTestOps(svc)

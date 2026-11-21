@@ -101,15 +101,20 @@ func (c ServerConfig) clone() ServerConfig {
 	} else {
 		cp.Peers = append([]Peer{}, c.Peers...)
 	}
-	cp.Routing.Zones = make([]Zone, len(c.Routing.Zones))
-	for i, z := range c.Routing.Zones {
+	cp.Routing.Zones = cloneRoutingZones(c.Routing.Zones)
+	return cp
+}
+
+func cloneRoutingZones(zones []Zone) []Zone {
+	out := make([]Zone, len(zones))
+	for i, z := range zones {
 		z.Domains = append([]string{}, z.Domains...)
 		z.IPs = append([]string{}, z.IPs...)
 		z.SourceIPs = append([]string{}, z.SourceIPs...)
 		z.FallbackTunnelIDs = append([]string{}, z.FallbackTunnelIDs...)
-		cp.Routing.Zones[i] = z
+		out[i] = z
 	}
-	return cp
+	return out
 }
 
 // Config returns a deep copy of the current config (secrets included).
@@ -150,6 +155,7 @@ type LocalClientIdentity struct {
 	Standby                bool
 	FallbackTunnelIDs      []string
 	DoubleTunnelID         string
+	DoubleTunnelMode       DoubleTunnelMode
 	CanStart               bool
 	RoutingMode            string
 	RoutingActive          bool
@@ -160,6 +166,9 @@ type LocalClientIdentity struct {
 func (m *Manager) RuntimeLocalClientIdentity() LocalClientIdentity {
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	if m.cfg == nil {
+		return LocalClientIdentity{}
+	}
 	endpoint := m.cfg.Endpoint
 	wire := m.cfg
 	if m.applied != nil {
@@ -171,10 +180,19 @@ func (m *Manager) RuntimeLocalClientIdentity() LocalClientIdentity {
 		Enabled: m.cfg.Enabled, ClientEnabled: m.cfg.Client.Enabled,
 		Endpoint: endpoint, ClientIface: m.cfg.ClientIface,
 		Standby: m.cfg.Client.Standby, FallbackTunnelIDs: append([]string{}, m.cfg.Client.FallbackTunnelIDs...),
-		DoubleTunnelID: m.cfg.Client.DoubleTunnelID,
-		CanStart:       strings.TrimSpace(endpoint) != "" && (wire.Install == "imported" || wire.DeployedAt > 0),
-		RoutingMode:    m.cfg.Routing.Mode, RoutingActive: m.cfg.Routing.Active,
+		DoubleTunnelID: m.cfg.Client.DoubleTunnelID, DoubleTunnelMode: m.cfg.Client.DoubleTunnelMode.Effective(),
+		CanStart:    strings.TrimSpace(endpoint) != "" && (wire.Install == "imported" || wire.DeployedAt > 0),
+		RoutingMode: m.cfg.Routing.Mode, RoutingActive: m.cfg.Routing.Active,
 	}
+}
+
+func (m *Manager) ClientDoubleTunnelMode() DoubleTunnelMode {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.cfg == nil {
+		return DoubleTunnelLastResort
+	}
+	return m.cfg.Client.DoubleTunnelMode.Effective()
 }
 
 // SetAppliedConfig installs a last-successful deployment snapshot. The service
@@ -211,21 +229,22 @@ func (m *Manager) PendingApply() bool {
 func (m *Manager) RuntimeConfig() ServerConfig {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	cfg := m.runtimeConfigLocked()
+	cfg := m.runtimeConfigLocked().clone()
 	cfg.Endpoint = m.selectedClientEndpointLocked(cfg.Endpoint)
 	return cfg
 }
 
+// runtimeConfigLocked combines the applied wire snapshot with local settings.
+// Its slices belong to the manager. Clone before returning it to other callers.
 func (m *Manager) runtimeConfigLocked() ServerConfig {
-	desired := m.cfg.clone()
 	if m.applied == nil {
-		return desired
+		return *m.cfg
 	}
-	cfg := m.applied.clone()
-	cfg.Enabled = desired.Enabled
-	cfg.Client = desired.Client
-	cfg.ClientIface = desired.ClientIface
-	cfg.Routing = desired.Routing
+	cfg := *m.applied
+	cfg.Enabled = m.cfg.Enabled
+	cfg.Client = m.cfg.Client
+	cfg.ClientIface = m.cfg.ClientIface
+	cfg.Routing = m.cfg.Routing
 	return cfg
 }
 
@@ -303,12 +322,13 @@ func (m *Manager) SetClientEnabled(v bool) {
 
 // SetClientFailoverPolicy changes local policy without validating an unrelated
 // draft VPS configuration or replacing the running manager and its status.
-func (m *Manager) SetClientFailoverPolicy(fallbacks []string, standby bool, doubleTunnelID string) {
+func (m *Manager) SetClientFailoverPolicy(fallbacks []string, standby bool, doubleTunnelID string, mode DoubleTunnelMode) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.cfg.Client.FallbackTunnelIDs = append([]string{}, fallbacks...)
 	m.cfg.Client.Standby = standby
 	m.cfg.Client.DoubleTunnelID = doubleTunnelID
+	m.cfg.Client.DoubleTunnelMode = mode
 }
 
 // SetEnabled toggles the profile availability flag used by the server selector.

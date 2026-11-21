@@ -44,7 +44,7 @@ type ClientStatus struct {
 	EndpointPoolExhausted bool   `json:"endpoint_pool_exhausted,omitempty"`
 	Address               string `json:"address"`
 	MTU                   int    `json:"mtu"`
-	Connected             bool   `json:"connected"` // handshake within ~180s
+	Connected             bool   `json:"connected"`
 	Error                 string `json:"error,omitempty"`
 	StatusUnavailable     bool   `json:"status_unavailable,omitempty"`
 	Recovering            bool   `json:"recovering"`
@@ -56,6 +56,7 @@ type ClientStatus struct {
 	transportMarked       bool
 	transportOuterIface   string
 	transportVerified     bool
+	pathUnavailable       bool
 }
 
 // AWGConn is one AWG2 tunnel's live state, shaped for the dashboard (state +
@@ -88,13 +89,13 @@ func (svc *Service) DashboardConns() []AWGConn {
 	svc.mu.RUnlock()
 
 	for _, srv := range entries {
-		cfg := srv.Manager.RuntimeConfig()
-		endpoint := strings.TrimSpace(cfg.Endpoint)
+		profile := srv.Manager.RuntimeClientStatus()
+		endpoint := strings.TrimSpace(profile.Endpoint)
 		cs := svc.awgClientStatusManagerOS(srv.Manager) // nil off-router
 		if endpoint == "" && (cs == nil || !cs.Running) {
 			continue
 		}
-		c := AWGConn{ID: srv.ID, Label: awgServerLabel(srv, cfg), Endpoint: endpoint, State: "off"}
+		c := AWGConn{ID: srv.ID, Label: awgServerLabel(srv, profile.Endpoint, profile.Host), Endpoint: endpoint, State: "off"}
 		if cs != nil {
 			c.Connected, c.Running = cs.Connected, cs.Running
 			c.LastHandshake, c.RxBytes, c.TxBytes = cs.LastHandshake, cs.RxBytes, cs.TxBytes
@@ -109,15 +110,10 @@ func (svc *Service) DashboardConns() []AWGConn {
 			}
 		}
 		if c.MTU == 0 {
-			c.MTU = awgTunnelMTU(cfg)
+			c.MTU = profile.MTU
 		}
 		if c.Address == "" {
-			for _, p := range cfg.Peers {
-				if p.IsRouter {
-					c.Address = p.Address
-					break
-				}
-			}
+			c.Address = profile.Address
 		}
 		out = append(out, c)
 	}
@@ -188,6 +184,13 @@ func (svc *Service) awgEnsureClientManagerUpForRouting(am *awg.Manager, reason s
 	if err := svc.awgSaveErr(); err != nil {
 		am.SetClientEnabled(wasEnabled)
 		return err
+	}
+	if am.RuntimeLocalClientIdentity().DoubleTunnelMode == awg.DoubleTunnelPermanent {
+		svc.reconcileStandbyClients()
+		if svc.clientShouldRun(am) {
+			svc.checkPermanentDoubleTunnel(am)
+		}
+		return nil
 	}
 	iface := awgClientIfaceName(am.RuntimeConfig())
 	if cs := svc.awgClientStatusManagerOS(am); cs != nil && cs.Running && awgClientCurrentEngineOS(am.RuntimeConfig()) {
@@ -337,7 +340,8 @@ func (svc *Service) tunnelUpForManagedServer(srv *managedServer) bool {
 		return false
 	}
 	cs := svc.clientLifecycleDriver().status(srv.Manager)
-	return cs != nil && cs.Connected
+	return cs != nil && cs.Connected && !cs.pathUnavailable &&
+		(srv.Manager.RuntimeLocalClientIdentity().DoubleTunnelMode != awg.DoubleTunnelPermanent || cs.transportMarked && cs.transportVerified)
 }
 
 func (svc *Service) TunnelUpForServer(id string) bool {
@@ -377,7 +381,7 @@ func (svc *Service) Servers() []ServerInfo {
 		}
 		out = append(out, ServerInfo{
 			ID:          srv.ID,
-			Label:       awgServerLabel(srv, cfg),
+			Label:       awgServerLabel(srv, cfg.Endpoint, cfg.Conn.Host),
 			ClientIface: awgClientIfaceName(cfg),
 			Connected:   svc.tunnelUpForManagedServer(srv),
 		})

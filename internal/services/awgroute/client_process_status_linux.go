@@ -3,6 +3,7 @@
 package awgroute
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -22,26 +23,31 @@ func awgClientProcessIdentity(procRoot, iface string) string {
 		if err != nil {
 			return ""
 		}
-		args := strings.Split(string(cmd), "\x00")
-		if len(args) < 2 || filepath.Base(args[0]) != "amneziawg-go" || args[1] != iface {
+		if !clientCommandMatches(cmd, iface) {
 			return ""
 		}
 		stat, err := os.ReadFile(filepath.Join(procRoot, pid, "stat"))
 		if err != nil {
 			return ""
 		}
-		end := strings.LastIndexByte(string(stat), ')')
+		end := bytes.LastIndexByte(stat, ')')
 		if end < 0 {
 			return ""
 		}
-		fields := strings.Fields(string(stat[end+1:]))
-		if len(fields) <= 19 || fields[0] == "Z" || fields[0] == "X" {
-			return ""
+		index := 0
+		for field := range strings.FieldsSeq(string(stat[end+1:])) {
+			if index == 0 && (field == "Z" || field == "X") {
+				return ""
+			}
+			if index == 19 {
+				if _, err := strconv.ParseUint(field, 10, 64); err == nil {
+					return pid + "/" + field
+				}
+				return ""
+			}
+			index++
 		}
-		if _, err := strconv.ParseUint(fields[19], 10, 64); err != nil {
-			return ""
-		}
-		return pid + "/" + fields[19]
+		return ""
 	}
 	if cached, ok := clientEnginePIDs.Load(iface); ok {
 		if id := check(cached.(string)); id != "" {
@@ -59,4 +65,15 @@ func awgClientProcessIdentity(procRoot, iface string) string {
 		}
 	}
 	return ""
+}
+
+func clientCommandMatches(cmd []byte, iface string) bool {
+	nul := []byte{0}
+	exe, rest, ok := bytes.Cut(cmd, nul)
+	if !ok {
+		return false
+	}
+	arg, _, _ := bytes.Cut(rest, nul)
+	base := exe[bytes.LastIndexByte(exe, '/')+1:]
+	return string(base) == "amneziawg-go" && string(arg) == iface
 }

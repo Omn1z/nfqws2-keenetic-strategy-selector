@@ -87,7 +87,7 @@ func (svc *Service) awgMultiPolicyIntact(rules []awgMultiRule, tunnels []awgMult
 			return false
 		}
 		_, linkErr := os.Stat("/sys/class/net/" + t.Iface)
-		routeExpected = append(routeExpected, awgMultiRouteExpectation{Table: t.Table, Iface: t.Iface, EndpointIP: t.EndpointIP, EndpointIPs: t.EndpointIPs, Online: linkErr == nil, Killswitch: t.Killswitch})
+		routeExpected = append(routeExpected, awgMultiRouteExpectation{Table: t.Table, Iface: t.Iface, EndpointIP: t.EndpointIP, EndpointIPs: t.EndpointIPs, Online: linkErr == nil && !t.WaitForTransport, Killswitch: t.Killswitch})
 	}
 	routes, err := awgRun("ip -4 route show table all")
 	if err != nil {

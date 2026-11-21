@@ -44,16 +44,20 @@ func (svc *Service) dnsRouteCandidates(running func(string) bool) []DNSRouteInfo
 		byID[srv.ID] = srv
 	}
 	driver := svc.clientLifecycleDriver()
-	connected := func(id string) bool {
+	status := func(id string) *ClientStatus {
 		if !usable(id) {
-			return false
+			return nil
 		}
 		if !known[id] {
 			statuses[id] = driver.status(byID[id].Manager)
 			known[id] = true
 		}
-		st := statuses[id]
-		return st != nil && st.Connected
+		return statuses[id]
+	}
+	connected := func(id string) bool {
+		st := status(id)
+		return st != nil && st.Connected && !st.pathUnavailable &&
+			(identities[id].DoubleTunnelMode != awg.DoubleTunnelPermanent || st.transportMarked && st.transportVerified)
 	}
 	// Keep logical IDs stable: an explicitly selected DNS profile follows its
 	// connection reserves without forcing users to edit DNS settings as well.
@@ -66,29 +70,22 @@ func (svc *Service) dnsRouteCandidates(running func(string) bool) []DNSRouteInfo
 		}
 		cfg := awg.ServerConfig{Endpoint: identity.Endpoint, ClientIface: identity.ClientIface}
 		iface := awgClientIfaceName(cfg)
-		if usable(srv.ID) && len(identity.FallbackTunnelIDs) > 0 {
-			seen := map[string]bool{}
-			var selectConnected func(string) string
-			selectConnected = func(id string) string {
-				if seen[id] {
-					return ""
+		selected := srv.ID
+		if usable(srv.ID) && len(identity.FallbackTunnelIDs) > 0 && !svc.blocksOrdinaryReserves(srv.Manager) {
+			fallbacks := connectionFallbackTunnelIDs(identities, srv.ID, nil)
+			for _, candidate := range svc.orderedFallbackCandidates(srv.ID, fallbacks) {
+				if connected(candidate) {
+					selected = candidate
+					iface = awgClientIfaceName(awg.ServerConfig{ClientIface: identities[candidate].ClientIface})
+					break
 				}
-				seen[id] = true
-				if connected(id) {
-					return id
-				}
-				for _, fallback := range identities[id].FallbackTunnelIDs {
-					if selected := selectConnected(fallback); selected != "" {
-						return selected
-					}
-				}
-				return ""
-			}
-			if selected := selectConnected(srv.ID); selected != "" {
-				iface = awgClientIfaceName(awg.ServerConfig{ClientIface: identities[selected].ClientIface})
 			}
 		}
-		out = append(out, DNSRouteInfo{ID: srv.ID, Name: awgServerLabel(srv, cfg), Interface: iface, Available: usable(srv.ID) && running(iface)})
+		available := usable(srv.ID) && running(iface)
+		if identities[selected].DoubleTunnelMode == awg.DoubleTunnelPermanent {
+			available = available && connected(selected)
+		}
+		out = append(out, DNSRouteInfo{ID: srv.ID, Name: awgServerLabel(srv, identity.Endpoint, ""), Interface: iface, Available: available})
 	}
 	return out
 }

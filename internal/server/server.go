@@ -276,6 +276,7 @@ func (s *Server) routes() {
 	m.HandleFunc("POST /api/dnsserver/shadow/diagnostics", s.dnsServerShadowDiagnostics)
 	m.HandleFunc("GET /api/dnsserver/openwrt", s.dnsServerOpenWrt)
 	m.HandleFunc("POST /api/dnsserver/openwrt/apply", s.dnsServerOpenWrtApply)
+	m.HandleFunc("POST /api/dnsserver/openwrt/rebind", s.dnsServerOpenWrtRebind)
 	m.HandleFunc("POST /api/dnsserver/openwrt/restore", s.dnsServerOpenWrtRestore)
 	m.HandleFunc("GET /api/dnsserver/export", s.dnsServerExport)
 	m.HandleFunc("POST /api/dnsserver/import/preview", s.dnsServerImportPreview)

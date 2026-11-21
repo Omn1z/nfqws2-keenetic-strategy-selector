@@ -1,4 +1,15 @@
-import type { Awg2ServerSummary, AwgConnectionTestResult } from "@/types/api";
+import type { Awg2ServerSummary, AwgConnectionTestResult, AwgDoubleTunnelMode } from "@/types/api";
+
+export const doubleTunnelModes: ReadonlyArray<{ value: AwgDoubleTunnelMode; label: string; hint: string }> = [
+  { value: "permanent", label: "Постоянный", hint: "Основной AWG всегда подключается через выбранный внешний VPN." },
+  { value: "preferred", label: "Резервный", hint: "При сбое прямого подключения роутер сначала пробует двойной туннель. Обычные резервы используются, если он недоступен." },
+  { value: "last_resort", label: "Последний шанс", hint: "Двойной туннель используется после исчерпания прямых адресов и обычных резервов." },
+  { value: "automatic", label: "Автоматически", hint: "После сбоя роутер сначала пробует двойной туннель и затем проверяет обычные резервы. Готовый резерв заменяет двойной путь." },
+];
+
+export function normalizeDoubleTunnelMode(mode: string | undefined): AwgDoubleTunnelMode {
+  return doubleTunnelModes.find((option) => option.value === mode)?.value ?? "last_resort";
+}
 
 export function backupIDs(primary: string, ids: readonly string[]): string[] {
   return [...new Set(ids.map((id) => id.trim()).filter((id) => id && id !== primary))];

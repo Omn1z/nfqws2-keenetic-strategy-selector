@@ -12,20 +12,22 @@ import (
 // FailoverConfig is local connection policy, independent of the remote wire
 // configuration and of the profile currently selected in the editor.
 type FailoverConfig struct {
-	FallbackTunnelIDs []string `json:"fallback_tunnel_ids"`
-	Standby           bool     `json:"standby"`
-	DoubleTunnelID    *string  `json:"double_tunnel_id,omitempty"`
+	FallbackTunnelIDs []string              `json:"fallback_tunnel_ids"`
+	Standby           bool                  `json:"standby"`
+	DoubleTunnelID    *string               `json:"double_tunnel_id,omitempty"`
+	DoubleTunnelMode  *awg.DoubleTunnelMode `json:"double_tunnel_mode,omitempty"`
 }
 
 type ConnectionFailoverStatus struct {
-	FallbackTunnelIDs  []string `json:"fallback_tunnel_ids"`
-	Standby            bool     `json:"standby"`
-	Activated          bool     `json:"activated"`
-	ActiveTunnelID     string   `json:"active_tunnel_id"`
-	DoubleTunnelID     string   `json:"double_tunnel_id,omitempty"`
-	DoubleTunnelActive bool     `json:"double_tunnel_active"`
-	DoubleTunnelIP     string   `json:"double_tunnel_ip,omitempty"`
-	DoubleTunnelError  string   `json:"double_tunnel_error,omitempty"`
+	FallbackTunnelIDs  []string             `json:"fallback_tunnel_ids"`
+	Standby            bool                 `json:"standby"`
+	Activated          bool                 `json:"activated"`
+	ActiveTunnelID     string               `json:"active_tunnel_id"`
+	DoubleTunnelID     string               `json:"double_tunnel_id,omitempty"`
+	DoubleTunnelMode   awg.DoubleTunnelMode `json:"double_tunnel_mode"`
+	DoubleTunnelActive bool                 `json:"double_tunnel_active"`
+	DoubleTunnelIP     string               `json:"double_tunnel_ip,omitempty"`
+	DoubleTunnelError  string               `json:"double_tunnel_error,omitempty"`
 }
 
 func (svc *Service) clientShouldRun(am *awg.Manager) bool {
@@ -55,12 +57,12 @@ func clientNeedsFallback(r clientRecovery, now time.Time) bool {
 	if !r.Recovering {
 		return false
 	}
-	return r.Attempts > 1 || r.Attempts > 0 && !r.VerifyUntil.IsZero() && !now.Before(r.VerifyUntil) ||
+	return r.pathUnavailable || r.Attempts > 1 || r.Attempts > 0 && !r.VerifyUntil.IsZero() && !now.Before(r.VerifyUntil) ||
 		!r.ProbeAt.IsZero() && !now.Before(r.probeDeadline())
 }
 
 func clientAuthenticated(st *ClientStatus, now time.Time) bool {
-	if st == nil || !st.Running || (st.transportMarked && !st.transportVerified) {
+	if st == nil || !st.Running || st.pathUnavailable || (st.transportMarked && !st.transportVerified) {
 		return false
 	}
 	return st.Connected || st.LastHandshake > 0 && now.Unix() >= st.LastHandshake && now.Unix()-st.LastHandshake < int64(clientStaleAfter/time.Second)
@@ -77,9 +79,32 @@ func (svc *Service) clientLifecycleDriver() clientDriver {
 // expanded with stable order; the visited set also tolerates a damaged saved
 // graph without hanging a routing refresh.
 func (svc *Service) connectionFallbackTunnelIDs(primary string, ruleFallbacks []string) []string {
-	byID := map[string]*managedServer{}
+	svc.mu.RLock()
+	owner := svc.servers[primary]
+	svc.mu.RUnlock()
+	primaryIdentity := awg.LocalClientIdentity{}
+	if owner != nil {
+		primaryIdentity = owner.Manager.RuntimeLocalClientIdentity()
+	}
+	if primaryIdentity.DoubleTunnelMode == awg.DoubleTunnelPermanent || len(ruleFallbacks) == 0 && len(primaryIdentity.FallbackTunnelIDs) == 0 {
+		return nil
+	}
+	identities := map[string]awg.LocalClientIdentity{primary: primaryIdentity}
 	for _, srv := range svc.serverSnapshot() {
-		byID[srv.ID] = srv
+		if srv.ID != primary {
+			identities[srv.ID] = srv.Manager.RuntimeLocalClientIdentity()
+		}
+	}
+	return connectionFallbackTunnelIDs(identities, primary, ruleFallbacks)
+}
+
+func connectionFallbackTunnelIDs(identities map[string]awg.LocalClientIdentity, primary string, ruleFallbacks []string) []string {
+	owner := identities[primary]
+	if owner.DoubleTunnelMode == awg.DoubleTunnelPermanent {
+		return nil
+	}
+	if len(owner.FallbackTunnelIDs) == 0 && len(ruleFallbacks) == 0 {
+		return nil
 	}
 	seen := map[string]bool{primary: true}
 	out := []string{}
@@ -91,8 +116,8 @@ func (svc *Service) connectionFallbackTunnelIDs(primary string, ruleFallbacks []
 		}
 		seen[id] = true
 		out = append(out, id)
-		if srv := byID[id]; srv != nil {
-			for _, next := range srv.Manager.RuntimeLocalClientIdentity().FallbackTunnelIDs {
+		if identity := identities[id]; identity.DoubleTunnelMode != awg.DoubleTunnelPermanent {
+			for _, next := range identity.FallbackTunnelIDs {
 				appendID(next)
 			}
 		}
@@ -100,10 +125,8 @@ func (svc *Service) connectionFallbackTunnelIDs(primary string, ruleFallbacks []
 	for _, id := range ruleFallbacks {
 		appendID(id)
 	}
-	if srv := byID[primary]; srv != nil {
-		for _, id := range srv.Manager.RuntimeLocalClientIdentity().FallbackTunnelIDs {
-			appendID(id)
-		}
+	for _, id := range owner.FallbackTunnelIDs {
+		appendID(id)
 	}
 	return out
 }
@@ -138,8 +161,10 @@ func (svc *Service) connectionRoutingEligibility() map[string]bool {
 		}
 		// A disabled intermediate cannot carry traffic, but its ordered child
 		// reserves remain candidates, just as in the flattened selection graph.
-		for _, child := range c.FallbackTunnelIDs {
-			include(child)
+		if c.DoubleTunnelMode != awg.DoubleTunnelPermanent {
+			for _, child := range c.FallbackTunnelIDs {
+				include(child)
+			}
 		}
 	}
 	for id, c := range identities {
@@ -158,130 +183,261 @@ func (svc *Service) reconcileStandbyClients() {
 		return
 	}
 	servers := svc.serverSnapshot()
-	byID := map[string]*managedServer{}
+	plan := newFailoverPlanner(svc, servers)
 	for _, srv := range servers {
-		byID[srv.ID] = srv
+		if !plan.identities[srv.ID].Standby {
+			plan.check(srv)
+		}
 	}
-	driver := svc.clientLifecycleDriver()
-	statuses := map[*awg.Manager]*ClientStatus{}
-	status := func(am *awg.Manager) *ClientStatus {
-		if current, known := statuses[am]; known {
-			return current
-		}
-		current := driver.status(am)
-		statuses[am] = current
-		return current
-	}
-	now := time.Now()
-	svc.clients.mu.Lock()
-	states := make(map[*awg.Manager]clientRecovery, len(svc.clients.states))
-	for am, state := range svc.clients.states {
-		states[am] = state
-	}
-	svc.clients.mu.Unlock()
-	wanted := map[*awg.Manager]bool{}
-	wantedTransports := map[*awg.Manager]*awg.Manager{}
-	inheritedTransports := map[*awg.Manager]*awg.Manager{}
-	exhausted := func(am *awg.Manager) bool {
-		r := states[am]
-		if !svc.endpointPoolAllowsFallback(am) {
-			return false
-		}
-		if !r.directExhausted && clientNeedsFallback(r, now) && !now.Before(r.VerifyUntil) {
-			r.directExhausted = true
-			states[am] = r
-		}
-		return r.directExhausted
-	}
-	rules := svc.awgRoutingRules()
-	for _, primary := range servers {
-		am := primary.Manager
-		cfg := am.RuntimeLocalClientIdentity()
-		if cfg.Standby || !svc.clientShouldRun(am) {
-			continue
-		}
-		primaryStatus := status(am)
-		nested := primaryStatus != nil && primaryStatus.transportMarked
-		if !nested && clientAuthenticated(primaryStatus, now) {
-			continue
-		}
-		outer := byID[cfg.DoubleTunnelID]
-		doubleEligible := outer != nil && outer != primary && (nested || exhausted(am))
-		reserveAvailable := false
-		needsReserve := doubleEligible || nested || (clientNeedsFallback(states[am], now) && svc.endpointPoolAllowsFallback(am))
-		lists := [][]string{svc.connectionFallbackTunnelIDs(primary.ID, nil)}
-		for _, rule := range rules {
-			if rule.Enabled && !rule.WaitingForConnection && rule.RouteValue() == "tunnel" && rule.TunnelID == primary.ID && len(rule.FallbackTunnelIDs) > 0 {
-				lists = append(lists, svc.connectionFallbackTunnelIDs(primary.ID, rule.FallbackTunnelIDs))
-			}
-		}
-		for _, candidates := range lists {
-			for _, id := range candidates {
-				reserve := byID[id]
-				if reserve == nil {
-					continue
-				}
-				identity := reserve.Manager.RuntimeLocalClientIdentity()
-				if !identity.Enabled || !identity.ClientEnabled || !identity.CanStart {
-					continue
-				}
-				connected := clientAuthenticated(status(reserve.Manager), now)
-				if !needsReserve {
-					// A service restart forgets the in-memory recovery/demand
-					// maps. Keep an already authenticated reserve carrying
-					// traffic while its primary is initially verified; do not
-					// wake a new cold reserve before the normal failure grace.
-					if connected {
-						wanted[reserve.Manager] = true
-						break
-					}
-					continue
-				}
-				wanted[reserve.Manager] = true
-				if connected || (!nested && doubleEligible && !exhausted(reserve.Manager)) {
-					reserveAvailable = true
-				}
-				if connected || !clientNeedsFallback(states[reserve.Manager], now) || !svc.endpointPoolAllowsFallback(reserve.Manager) {
-					break
-				}
-			}
-		}
-		if doubleEligible && !reserveAvailable {
-			outerIdentity := outer.Manager.RuntimeLocalClientIdentity()
-			if outerIdentity.Enabled && outerIdentity.ClientEnabled && outerIdentity.CanStart {
-				wanted[outer.Manager] = true
-				wantedTransports[am] = outer.Manager
-				if nested && primaryStatus.transportOuterIface == awgClientIfaceName(outer.Manager.RuntimeConfig()) {
-					inheritedTransports[am] = outer.Manager
-				}
-			}
+	// A cold reserve can itself require double tunneling. Its outer link is
+	// demanded before the watchdog tries to open the reserve's VPN socket.
+	for _, srv := range servers {
+		if plan.ordinary[srv.Manager] && plan.identities[srv.ID].Standby {
+			plan.check(srv)
 		}
 	}
 	svc.clients.mu.Lock()
-	svc.clients.standbyActive = wanted
-	for am, recovery := range states {
-		svc.clients.states[am] = recovery
+	svc.clients.standbyActive = plan.wanted
+	for am, r := range plan.exhaustedStates {
+		svc.clients.states[am] = r
 	}
-	svc.setWantedDoubleTunnelsLocked(wantedTransports, inheritedTransports)
+	svc.clients.doubleTunnels = plan.double
 	svc.clients.mu.Unlock()
 	for _, srv := range servers {
-		if !srv.Manager.RuntimeLocalClientIdentity().Standby || wanted[srv.Manager] {
+		if !plan.identities[srv.ID].Standby || plan.wanted[srv.Manager] {
 			continue
 		}
-		st := status(srv.Manager)
-		if st != nil && (st.Running || st.IfacePresent) {
-			var err error
-			if down, ok := driver.(interface{ down(*awg.Manager) error }); ok {
-				err = down.down(srv.Manager)
-			} else if svc.clients.driver == nil {
-				err = svc.awgClientDownManagerOS(srv.Manager)
-			}
-			if err != nil {
+		am := srv.Manager
+		if st := plan.status(am); st != nil && (st.Running || st.IfacePresent) {
+			if err := svc.stopFailoverClient(plan.driver, am); err != nil {
 				logbuf.Append("awg2", "warn", "отключение резервного туннеля: "+err.Error())
 			}
 		}
-		svc.forgetClientRecovery(srv.Manager)
+		svc.forgetClientRecovery(am)
 	}
+}
+
+type failoverPlanner struct {
+	svc             *Service
+	driver          clientDriver
+	now             time.Time
+	settings        RecoverySettings
+	byID            map[string]*managedServer
+	identities      map[string]awg.LocalClientIdentity
+	statuses        map[*awg.Manager]*ClientStatus
+	exhaustedStates map[*awg.Manager]clientRecovery
+	wanted          map[*awg.Manager]bool
+	ordinary        map[*awg.Manager]bool
+	double          map[*awg.Manager]doubleTunnelState
+	rules           map[string][][]string
+	readRules       bool
+}
+
+func newFailoverPlanner(svc *Service, servers []*managedServer) *failoverPlanner {
+	p := &failoverPlanner{
+		svc: svc, driver: svc.clientLifecycleDriver(), now: time.Now(), settings: svc.currentRecoverySettings(),
+		byID: make(map[string]*managedServer, len(servers)), identities: make(map[string]awg.LocalClientIdentity, len(servers)),
+		statuses: map[*awg.Manager]*ClientStatus{}, exhaustedStates: map[*awg.Manager]clientRecovery{},
+		wanted: map[*awg.Manager]bool{}, ordinary: map[*awg.Manager]bool{}, double: map[*awg.Manager]doubleTunnelState{},
+	}
+	for _, srv := range servers {
+		p.byID[srv.ID] = srv
+		p.identities[srv.ID] = srv.Manager.RuntimeLocalClientIdentity()
+	}
+	return p
+}
+
+func (p *failoverPlanner) status(am *awg.Manager) *ClientStatus {
+	st, known := p.statuses[am]
+	if !known {
+		st = p.driver.status(am)
+		p.statuses[am] = st
+	}
+	return st
+}
+
+func (p *failoverPlanner) recovery(am *awg.Manager) clientRecovery {
+	if r, ok := p.exhaustedStates[am]; ok {
+		return r
+	}
+	p.svc.clients.mu.Lock()
+	r := p.svc.clients.states[am]
+	p.svc.clients.mu.Unlock()
+	return r
+}
+
+func (p *failoverPlanner) doubleState(am *awg.Manager) doubleTunnelState {
+	p.svc.clients.mu.Lock()
+	defer p.svc.clients.mu.Unlock()
+	return p.svc.clients.doubleTunnels[am]
+}
+
+func (p *failoverPlanner) exhausted(am *awg.Manager) bool {
+	if !p.svc.endpointPoolAllowsFallback(am) {
+		return false
+	}
+	r := p.recovery(am)
+	if !r.directExhausted && clientNeedsFallback(r, p.now) && !p.now.Before(r.VerifyUntil) {
+		r.directExhausted = true
+		p.exhaustedStates[am] = r
+	}
+	return r.directExhausted
+}
+
+func (p *failoverPlanner) check(primary *managedServer) {
+	am, id := primary.Manager, primary.ID
+	cfg := p.identities[id]
+	if !cfg.Enabled || !cfg.ClientEnabled || !cfg.CanStart {
+		return
+	}
+	current := p.doubleState(am)
+	outer := p.byID[cfg.DoubleTunnelID]
+	if outer == primary || p.identities[cfg.DoubleTunnelID].DoubleTunnelMode == awg.DoubleTunnelPermanent {
+		outer = nil
+	}
+	if current.mode != cfg.DoubleTunnelMode || current.configured != outer {
+		// Keep the installed transport until checkDoubleTunnel tears it down
+		// or switches it. Trial windows belong only to the saved policy.
+		current = doubleTunnelState{outer: current.outer, mode: cfg.DoubleTunnelMode, configured: outer}
+	}
+	current.wanted = nil
+	st := p.status(am)
+	nested := st != nil && st.transportMarked
+	connected := clientAuthenticated(st, p.now)
+	if cfg.DoubleTunnelMode == awg.DoubleTunnelPermanent {
+		if connected {
+			current.trialStarted = time.Time{}
+		} else if current.trialStarted.IsZero() {
+			current.trialStarted = p.now
+		}
+		p.demandDouble(outer, st, &current)
+		p.double[am] = current
+		return
+	}
+	if !nested && connected {
+		return
+	}
+	directFailed := clientNeedsFallback(p.recovery(am), p.now)
+	if outer != nil && current.prioritizesDouble() && (nested || directFailed || !current.trialStarted.IsZero()) {
+		p.planEarlyDouble(primary, outer, st, &current, nested && connected)
+		p.double[am] = current
+		return
+	}
+	doubleEligible := outer != nil && (nested || p.exhausted(am))
+	reserves := p.demandReserves(primary, nested || doubleEligible || directFailed && p.svc.endpointPoolAllowsFallback(am))
+	if doubleEligible && !reserves.connected && (nested || !reserves.pending) {
+		p.demandDouble(outer, st, &current)
+	}
+	if current.wanted != nil || current.outer != nil {
+		p.double[am] = current
+	}
+}
+
+func (p *failoverPlanner) planEarlyDouble(primary, outer *managedServer, st *ClientStatus, current *doubleTunnelState, ready bool) {
+	if current.trialStarted.IsZero() {
+		current.trialStarted = p.now
+	}
+	// The outer and inner each get one handshake window. A failed local
+	// start or a proven path outage can advance to ordinary reserves sooner.
+	nestedFailed := st != nil && st.transportMarked && st.pathUnavailable || current.outer != nil && current.err != "" && !current.next.IsZero()
+	current.ordinaryAllowed = current.ordinaryAllowed || p.doubleTrialElapsed(*current) || nestedFailed ||
+		(current.mode == awg.DoubleTunnelAutomatic && ready) || !p.canStartOuter(outer)
+	var reserves failoverReserveState
+	if current.ordinaryAllowed && (!ready || current.mode == awg.DoubleTunnelAutomatic) {
+		reserves = p.demandReserves(primary, true)
+	}
+	if current.mode == awg.DoubleTunnelAutomatic && reserves.connectionConnected {
+		return
+	}
+	if !p.now.Before(current.directUntil) {
+		p.demandDouble(outer, st, current)
+	}
+}
+
+func (p *failoverPlanner) doubleTrialElapsed(state doubleTunnelState) bool {
+	return !state.trialStarted.IsZero() && !p.now.Before(state.trialStarted.Add(2*p.settings.handshakeTimeout()))
+}
+
+func (p *failoverPlanner) canStartOuter(outer *managedServer) bool {
+	if outer == nil {
+		return false
+	}
+	cfg := p.identities[outer.ID]
+	return cfg.Enabled && cfg.ClientEnabled && cfg.CanStart
+}
+
+func (p *failoverPlanner) demandDouble(outer *managedServer, st *ClientStatus, current *doubleTunnelState) {
+	if !p.canStartOuter(outer) {
+		return
+	}
+	p.wanted[outer.Manager] = true
+	current.wanted = outer.Manager
+	if current.outer == nil && st != nil && st.transportMarked && st.transportOuterIface == p.identities[outer.ID].ClientIface {
+		current.outer = outer.Manager
+	}
+}
+
+type failoverReserveState struct {
+	connected           bool
+	connectionConnected bool
+	pending             bool
+}
+
+func (p *failoverPlanner) demandReserves(primary *managedServer, startNew bool) failoverReserveState {
+	if !p.readRules {
+		p.rules, p.readRules = p.svc.awgRuleFailovers(), true
+	}
+	out := p.demandReserveList(connectionFallbackTunnelIDs(p.identities, primary.ID, nil), startNew)
+	out.connectionConnected = out.connected
+	for _, fallbacks := range p.rules[primary.ID] {
+		if len(fallbacks) == 0 {
+			continue
+		}
+		state := p.demandReserveList(connectionFallbackTunnelIDs(p.identities, primary.ID, fallbacks), startNew)
+		out.connected = out.connected || state.connected
+		out.pending = out.pending || state.pending
+	}
+	return out
+}
+
+func (p *failoverPlanner) demandReserveList(ids []string, startNew bool) failoverReserveState {
+	for _, id := range ids {
+		reserve := p.byID[id]
+		cfg := p.identities[id]
+		if reserve == nil || !cfg.Enabled || !cfg.ClientEnabled || !cfg.CanStart {
+			continue
+		}
+		permanent := cfg.DoubleTunnelMode == awg.DoubleTunnelPermanent
+		if permanent && !p.canStartOuter(p.byID[cfg.DoubleTunnelID]) {
+			continue
+		}
+		connected := clientAuthenticated(p.status(reserve.Manager), p.now)
+		// A service restart forgets demand. Retain a warm reserve during
+		// primary verification, but do not wake a cold one before it fails.
+		if connected || startNew {
+			p.wanted[reserve.Manager], p.ordinary[reserve.Manager] = true, true
+		}
+		if connected {
+			return failoverReserveState{connected: true}
+		}
+		if startNew && permanent && !p.doubleTrialElapsed(p.doubleState(reserve.Manager)) {
+			return failoverReserveState{pending: true}
+		}
+		if startNew && !permanent && !p.exhausted(reserve.Manager) {
+			return failoverReserveState{pending: true}
+		}
+	}
+	return failoverReserveState{}
+}
+
+func (svc *Service) stopFailoverClient(driver clientDriver, am *awg.Manager) error {
+	if down, ok := driver.(interface{ down(*awg.Manager) error }); ok {
+		return down.down(am)
+	}
+	if svc.clients.driver == nil {
+		return svc.awgClientDownManagerOS(am)
+	}
+	return nil
 }
 
 func (svc *Service) connectionFailoverStatus(srv *managedServer, statuses map[string]*ClientStatus) *ConnectionFailoverStatus {
@@ -290,12 +446,12 @@ func (svc *Service) connectionFailoverStatus(srv *managedServer, statuses map[st
 	activated := svc.clients.standbyActive[srv.Manager]
 	svc.clients.mu.Unlock()
 	status := &ConnectionFailoverStatus{FallbackTunnelIDs: append([]string{}, cfg.FallbackTunnelIDs...), Standby: cfg.Standby, Activated: cfg.Standby && activated}
-	svc.doubleTunnelFailoverStatus(srv.Manager, cfg.DoubleTunnelID, statuses[srv.ID], status)
+	svc.doubleTunnelFailoverStatus(srv.Manager, cfg, statuses[srv.ID], status)
 	byID := map[string]*managedServer{}
 	for _, candidate := range svc.serverSnapshot() {
 		byID[candidate.ID] = candidate
 	}
-	for _, id := range fallbackCandidates(srv.ID, svc.endpointFallbackTunnelIDs(srv.ID, nil)) {
+	for _, id := range svc.orderedFallbackCandidates(srv.ID, svc.endpointFallbackTunnelIDs(srv.ID, nil)) {
 		candidate := byID[id]
 		if candidate != nil && svc.clientShouldRun(candidate.Manager) && clientAuthenticated(statuses[id], time.Now()) {
 			status.ActiveTunnelID = id
@@ -313,9 +469,13 @@ func (svc *Service) awgPolicyRoutingRules() []awg.Zone {
 	if len(rules) != 0 {
 		return rules
 	}
+	if owner := svc.legacyFullRoutingOwner(); owner != nil && owner.Manager.RuntimeLocalClientIdentity().DoubleTunnelMode == awg.DoubleTunnelPermanent {
+		return rules
+	}
 	for _, srv := range svc.serverSnapshot() {
-		cfg := srv.Manager.RuntimeConfig()
-		if cfg.Enabled && cfg.Client.Enabled && cfg.Routing.Active && cfg.Routing.Mode == "full" && len(cfg.Client.FallbackTunnelIDs) > 0 {
+		cfg := srv.Manager.RuntimeLocalClientIdentity()
+		if cfg.Enabled && cfg.ClientEnabled && cfg.RoutingActive && cfg.RoutingMode == "full" &&
+			cfg.DoubleTunnelMode != awg.DoubleTunnelPermanent && len(cfg.FallbackTunnelIDs) > 0 {
 			return []awg.Zone{{Name: "Весь трафик", TunnelID: srv.ID, Route: "tunnel", Domains: []string{"*"}, Enabled: true}}
 		}
 	}
@@ -333,7 +493,7 @@ func (svc *Service) effectiveConnectedServer(primary string) *managedServer {
 	if owner == nil || !owner.Manager.Enabled() || !owner.Manager.ClientEnabled() {
 		return nil
 	}
-	for _, id := range fallbackCandidates(primary, svc.endpointFallbackTunnelIDs(primary, nil)) {
+	for _, id := range svc.orderedFallbackCandidates(primary, svc.endpointFallbackTunnelIDs(primary, nil)) {
 		if srv := byID[id]; srv != nil && svc.tunnelUpForManagedServer(srv) {
 			return srv
 		}
@@ -415,15 +575,38 @@ func (svc *Service) setConnectionFailoverWithOps(id string, in FailoverConfig, a
 		return fmt.Errorf("цикл резервных подключений недопустим")
 	}
 	outer := transports[id]
+	mode := srv.Manager.RuntimeLocalClientIdentity().DoubleTunnelMode
+	if in.DoubleTunnelMode != nil {
+		mode = *in.DoubleTunnelMode
+		if !mode.Valid() {
+			return fmt.Errorf("неизвестный режим двойного туннеля")
+		}
+	}
 	if in.DoubleTunnelID != nil {
 		outer = strings.TrimSpace(*in.DoubleTunnelID)
+		if outer == "" {
+			mode = awg.DoubleTunnelLastResort
+		}
 	}
 	if outer != "" && byID[outer] == nil {
 		return fmt.Errorf("внешнее подключение для двойного туннеля не найдено")
 	}
+	if outer == "" && mode == awg.DoubleTunnelPermanent && srv.Manager.RuntimeLocalClientIdentity().DoubleTunnelMode != mode {
+		return fmt.Errorf("выберите внешний туннель для постоянного двойного туннелирования")
+	}
 	transports[id] = outer
 	if doubleTunnelCycle(transports, id) {
 		return fmt.Errorf("цикл двойных туннелей недопустим")
+	}
+	if mode == awg.DoubleTunnelPermanent && outer != "" {
+		for other, transport := range transports {
+			if other != id && transport == id {
+				return fmt.Errorf("подключение с постоянным двойным туннелем нельзя использовать как внешний транспорт")
+			}
+		}
+	}
+	if transport := byID[outer]; transport != nil && transport.Manager.RuntimeLocalClientIdentity().DoubleTunnelMode == awg.DoubleTunnelPermanent {
+		return fmt.Errorf("подключение с постоянным двойным туннелем нельзя использовать как внешний транспорт")
 	}
 	// Save before publishing the candidate so failed storage never appears as
 	// an acknowledged change in status or another subsequent save.
@@ -433,14 +616,19 @@ func (svc *Service) setConnectionFailoverWithOps(id string, in FailoverConfig, a
 			candidate.Servers[i].Config.Client.Standby = in.Standby
 			candidate.Servers[i].Config.Client.FallbackTunnelIDs = fallbacks
 			candidate.Servers[i].Config.Client.DoubleTunnelID = outer
+			candidate.Servers[i].Config.Client.DoubleTunnelMode = mode
 		}
 	}
 	if err := svc.persistAWGState(&candidate); err != nil {
 		return err
 	}
-	srv.Manager.SetClientFailoverPolicy(fallbacks, in.Standby, outer)
+	srv.Manager.SetClientFailoverPolicy(fallbacks, in.Standby, outer, mode)
+	svc.route.tunnelUpAt.Store(0)
 	svc.BumpZonesRevision()
 	svc.reconcileStandbyClients()
+	if mode == awg.DoubleTunnelPermanent && svc.clientShouldRun(srv.Manager) {
+		svc.checkPermanentDoubleTunnel(srv.Manager)
+	}
 	return apply()
 }
 

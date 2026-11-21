@@ -11,11 +11,7 @@ import (
 	"nfqws2strategy/internal/tools/logbuf"
 )
 
-const (
-	clientWatchInterval = 3 * time.Second
-	clientStaleAfter    = 3 * time.Minute
-	clientProbeGrace    = 20 * time.Second
-)
+const clientWatchInterval = 3 * time.Second
 
 // ops serializes local interface/config/policy mutations. Read-only status and
 // DNS traffic never take it. A down/delete/shutdown cancels the current operation
@@ -60,143 +56,10 @@ func (d systemClientDriver) restoreRoutes(am *awg.Manager) error {
 	return d.svc.awgRestoreClientRoutesOS(am)
 }
 func (d systemClientDriver) currentEngine(am *awg.Manager) bool {
-	return awgClientCurrentEngineOS(am.RuntimeConfig())
+	return awgClientCurrentEngineIfaceOS(clientIfaceName(am.RuntimeClientStatus().ClientIface))
 }
 func (d systemClientDriver) endpointHints(am *awg.Manager, pool []string) map[string]bool {
 	return d.svc.awgEndpointHintsOS(am, pool)
-}
-
-type clientRecovery struct {
-	Seen            bool
-	RX              int64
-	Handshake       int64
-	HealthyAt       time.Time
-	ProbeAt         time.Time
-	ProbeUntil      time.Time
-	VerifyUntil     time.Time
-	RetryAt         time.Time
-	FailureSince    time.Time
-	AttemptAt       time.Time
-	Attempts        int
-	Recovering      bool
-	Error           string
-	RoutesPending   bool
-	LastStatus      ClientStatus
-	LastStatusAt    time.Time
-	UnavailableAt   time.Time
-	UnavailableID   string
-	directExhausted bool
-}
-
-type clientRecoveryAction int
-
-const (
-	clientWait clientRecoveryAction = iota
-	clientProbe
-	clientReconnect
-)
-
-// observe only treats authenticated progress as recovery. An old handshake is
-// normal on an idle WireGuard peer: first request a keepalive, then allow
-// several handshake transmissions before replacing the interface.
-func (r *clientRecovery) observe(st ClientStatus, now time.Time) clientRecoveryAction {
-	return r.observeWithSettings(st, now, DefaultRecoverySettings())
-}
-
-func (r *clientRecovery) observeWithSettings(st ClientStatus, now time.Time, settings RecoverySettings) clientRecoveryAction {
-	if st.StatusUnavailable && st.Running && st.engineID != "" {
-		return r.observeUnavailable(st, now, settings)
-	}
-	if !r.UnavailableAt.IsZero() && r.Attempts == 0 {
-		r.ProbeAt, r.ProbeUntil = time.Time{}, time.Time{}
-		r.Recovering, r.Error = false, ""
-		r.FailureSince = time.Time{}
-	}
-	r.UnavailableAt, r.UnavailableID = time.Time{}, ""
-	defer func() {
-		st.Connected = st.Connected || r.authenticatedStatus(&st, now)
-		r.LastStatus, r.LastStatusAt = st, now
-	}()
-	sameGeneration := r.LastStatus.engineID == st.engineID && (r.LastStatus.Endpoint == "" || st.Endpoint == "" || r.LastStatus.Endpoint == st.Endpoint)
-	if r.Seen && !sameGeneration {
-		r.HealthyAt = time.Time{}
-	}
-	progress := r.Seen && sameGeneration && (st.RxBytes > r.RX || st.LastHandshake > r.Handshake)
-	r.Seen, r.RX, r.Handshake = true, st.RxBytes, st.LastHandshake
-	fresh := st.LastHandshake > 0 && now.Unix()-st.LastHandshake >= 0 && now.Unix()-st.LastHandshake < int64(clientStaleAfter/time.Second)
-	if st.Running && (fresh || progress) {
-		healthyAt := r.HealthyAt
-		if fresh && time.Unix(st.LastHandshake, 0).After(healthyAt) {
-			healthyAt = time.Unix(st.LastHandshake, 0)
-		}
-		if progress {
-			healthyAt = now
-		}
-		*r = clientRecovery{Seen: true, RX: st.RxBytes, Handshake: st.LastHandshake, HealthyAt: healthyAt, RoutesPending: r.RoutesPending, directExhausted: st.transportMarked && r.directExhausted}
-		return clientWait
-	}
-	if now.Before(r.RetryAt) {
-		return clientWait
-	}
-	if !st.Running {
-		r.beginFailure(now)
-		return clientReconnect
-	}
-	if now.Before(r.VerifyUntil) {
-		return clientWait
-	}
-	if !r.HealthyAt.IsZero() && now.Sub(r.HealthyAt) < clientStaleAfter {
-		return clientWait
-	}
-	if r.Attempts > 0 {
-		r.beginFailure(now)
-		return clientReconnect
-	}
-	if r.ProbeAt.IsZero() {
-		r.beginFailure(now)
-		r.ProbeAt, r.Recovering = now, true
-		r.ProbeUntil = now.Add(settings.handshakeTimeout())
-		r.Error = "проверка туннеля без свежего handshake"
-		return clientProbe
-	}
-	if now.Before(r.probeDeadline()) {
-		return clientWait
-	}
-	return clientReconnect
-}
-
-// A stalled status socket is not proof that its live daemon has died. Give
-// that exact process one bounded verification window; failed reads neither
-// renew authenticated health nor restart the window on every poll.
-func (r *clientRecovery) observeUnavailable(st ClientStatus, now time.Time, settings RecoverySettings) clientRecoveryAction {
-	if r.UnavailableAt.IsZero() || r.UnavailableID != st.engineID {
-		r.UnavailableAt, r.UnavailableID = now, st.engineID
-		r.ProbeAt = now
-		r.ProbeUntil = now.Add(settings.handshakeTimeout())
-	}
-	r.beginFailure(now)
-	r.Recovering = true
-	r.Error = "временно недоступен статус работающего туннеля"
-	if now.Before(r.RetryAt) || now.Before(r.ProbeUntil) {
-		return clientWait
-	}
-	return clientReconnect
-}
-
-func (r *clientRecovery) beginFailure(now time.Time) {
-	if r.FailureSince.IsZero() {
-		r.FailureSince = now
-	}
-}
-
-func (r clientRecovery) probeDeadline() time.Time {
-	if !r.ProbeUntil.IsZero() {
-		return r.ProbeUntil
-	}
-	if !r.ProbeAt.IsZero() {
-		return r.ProbeAt.Add(clientProbeGrace)
-	}
-	return time.Time{}
 }
 
 func waitClientContext(ctx context.Context, d time.Duration) bool {
@@ -207,52 +70,6 @@ func waitClientContext(ctx context.Context, d time.Duration) bool {
 		return false
 	case <-t.C:
 		return true
-	}
-}
-
-func (r *clientRecovery) attempted(now time.Time, err error) {
-	r.attemptedWithSettings(now, err, DefaultRecoverySettings())
-}
-
-func (r *clientRecovery) attemptedWithSettings(now time.Time, err error, settings RecoverySettings) {
-	r.beginFailure(now)
-	r.AttemptAt = now
-	r.Attempts++
-	r.Recovering = true
-	r.RoutesPending = true
-	r.VerifyUntil = time.Time{}
-	if err != nil {
-		r.Error = err.Error()
-	} else {
-		r.Error = "ожидание handshake после переподключения"
-		r.VerifyUntil = now.Add(settings.handshakeTimeout())
-	}
-	r.scheduleRetry(settings)
-}
-
-func (r *clientRecovery) scheduleRetry(settings RecoverySettings) {
-	if r.AttemptAt.IsZero() {
-		return
-	}
-	base := r.AttemptAt
-	if !r.VerifyUntil.IsZero() {
-		base = r.VerifyUntil
-	}
-	r.RetryAt = base.Add(settings.retryDelay(base.Sub(r.FailureSince)))
-}
-
-func (r *clientRecovery) updateSettings(settings RecoverySettings) {
-	if !r.Recovering {
-		return
-	}
-	if !r.ProbeAt.IsZero() && r.Attempts == 0 {
-		r.ProbeUntil = r.ProbeAt.Add(settings.handshakeTimeout())
-	}
-	if !r.AttemptAt.IsZero() {
-		if !r.VerifyUntil.IsZero() {
-			r.VerifyUntil = r.AttemptAt.Add(settings.handshakeTimeout())
-		}
-		r.scheduleRetry(settings)
 	}
 }
 
@@ -350,7 +167,7 @@ func (svc *Service) recordClientAttempt(am *awg.Manager, err error) {
 	svc.clients.states[am] = r
 	endpoint := svc.endpointPoolLocked(am, pool)
 	endpoint.started = true
-	if index := endpointChoice(pool, am.RuntimeConfig().Endpoint); index >= 0 {
+	if index := endpointChoice(pool, am.RuntimeClientStatus().Endpoint); index >= 0 {
 		endpoint.index = index
 	}
 	svc.clients.endpoints[am] = endpoint
@@ -371,6 +188,11 @@ func (svc *Service) clientRecoveryStatus(am *awg.Manager, st *ClientStatus) {
 	// Read-only polls do not extend this window, and counters/handshake must
 	// still belong to the generation the supervisor actually observed.
 	st.Connected = st.Connected || r.authenticatedStatus(st, now)
+	st.pathUnavailable = r.pathUnavailable && sameClientGeneration(r.LastStatus, *st) &&
+		st.LastHandshake <= r.Handshake && st.RxBytes <= r.RX
+	if st.pathUnavailable {
+		st.Connected = false
+	}
 	svc.doubleTunnelHealth(am, st)
 	svc.endpointStatus(am, st)
 	st.Recovering, st.RetryCount, st.RecoveryError = r.Recovering, r.Attempts, r.Error
@@ -390,34 +212,6 @@ func (svc *Service) clientRecoveryStatus(am *awg.Manager, st *ClientStatus) {
 	if !next.IsZero() {
 		st.RetryAt = next.Unix()
 	}
-}
-
-func (r clientRecovery) authenticatedStatus(st *ClientStatus, now time.Time) bool {
-	if st == nil || !st.Running || st.StatusUnavailable || !r.Seen || r.Recovering || st.LastHandshake <= 0 ||
-		st.LastHandshake != r.Handshake || st.RxBytes < r.RX || r.HealthyAt.IsZero() {
-		return false
-	}
-	if r.LastStatus.engineID != st.engineID || r.LastStatus.Endpoint != "" && st.Endpoint != "" && r.LastStatus.Endpoint != st.Endpoint {
-		return false
-	}
-	age := now.Sub(r.HealthyAt)
-	return age >= 0 && age < clientStaleAfter
-}
-
-func (r clientRecovery) restoreUnavailableStatus(st *ClientStatus, now time.Time, settings RecoverySettings) {
-	if !st.StatusUnavailable || !st.Running || !r.LastStatus.Running || st.engineID == "" || st.engineID != r.LastStatus.engineID {
-		return
-	}
-	age := now.Sub(r.LastStatusAt)
-	if r.LastStatusAt.IsZero() || age < 0 || age >= settings.handshakeTimeout() {
-		return
-	}
-	old := r.LastStatus
-	st.LastHandshake, st.RxBytes, st.TxBytes = old.LastHandshake, old.RxBytes, old.TxBytes
-	st.Endpoint, st.Address, st.MTU = old.Endpoint, old.Address, old.MTU
-	st.transportMarked, st.transportOuterIface = old.transportMarked, old.transportOuterIface
-	healthAge := now.Sub(r.HealthyAt)
-	st.Connected = old.Connected && !r.HealthyAt.IsZero() && healthAge >= 0 && healthAge < clientStaleAfter
 }
 
 func (svc *Service) startClientSupervisor() {
@@ -556,7 +350,7 @@ func (svc *Service) checkClient(srv *managedServer) {
 		}
 	}
 	if wasRecovering && !r.Recovering {
-		logbuf.Append("awg2", "info", "автовосстановление "+awgClientIfaceName(am.Config())+": handshake/приём данных восстановлен")
+		logbuf.Append("awg2", "info", "автовосстановление "+clientIfaceName(am.RuntimeClientStatus().ClientIface)+": handshake/приём данных восстановлен")
 		svc.clients.mu.Lock()
 		hook := svc.clients.onRecovered
 		svc.clients.mu.Unlock()
@@ -567,14 +361,15 @@ func (svc *Service) checkClient(srv *managedServer) {
 	switch action {
 	case clientProbe:
 		if err := driver.probe(am); err != nil {
-			logbuf.Append("awg2", "warn", "проверка "+awgClientIfaceName(am.Config())+": "+err.Error())
+			logbuf.Append("awg2", "warn", "проверка "+clientIfaceName(am.RuntimeClientStatus().ClientIface)+": "+err.Error())
 		}
+	case clientProbeData:
+		svc.checkStalledClientData(am, driver, observed)
 	case clientReconnect:
-		if svc.doubleTunnelOuter(am) != nil {
-			svc.restartDoubleTunnel(am, driver, nil)
+		if svc.reconnectDoubleTunnel(am, driver) {
 			return
 		}
-		iface := awgClientIfaceName(am.Config())
+		iface := clientIfaceName(am.RuntimeClientStatus().ClientIface)
 		logbuf.Append("awg2", "warn", fmt.Sprintf("автовосстановление %s: попытка %d (handshake=%d)", iface, r.Attempts+1, st.LastHandshake))
 		if err := svc.clientOpContext().Err(); err != nil {
 			return
@@ -600,5 +395,29 @@ func (svc *Service) checkClient(srv *managedServer) {
 		if err != nil {
 			logbuf.Append("awg2", "warn", fmt.Sprintf("автовосстановление %s: %v; следующая попытка через %s", iface, err, settings.retryDelay(time.Since(r.FailureSince))))
 		}
+	}
+}
+
+func (svc *Service) checkStalledClientData(am *awg.Manager, driver clientDriver, before ClientStatus) {
+	prober, ok := driver.(interface {
+		clientDataUnanswered(*awg.Manager) bool
+	})
+	if !ok || !prober.clientDataUnanswered(am) || svc.clientOpContext().Err() != nil {
+		return
+	}
+	after := driver.status(am)
+	if after == nil {
+		return
+	}
+	svc.clients.mu.Lock()
+	recovery := svc.clients.states[am]
+	confirmed := recovery.confirmDataOutage(before, *after, time.Now())
+	if confirmed {
+		svc.clients.states[am] = recovery
+	}
+	svc.clients.mu.Unlock()
+	if confirmed {
+		svc.route.tunnelUpAt.Store(0)
+		logbuf.Append("awg2", "warn", "проверка "+clientIfaceName(am.RuntimeClientStatus().ClientIface)+": "+recovery.Error)
 	}
 }

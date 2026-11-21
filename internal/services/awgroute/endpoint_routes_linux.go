@@ -18,7 +18,7 @@ func (svc *Service) awgClientEndpointIPs(am *awg.Manager) []string {
 	if am == nil {
 		return nil
 	}
-	candidates := append(am.ClientEndpointCandidates(), am.RuntimeConfig().Endpoint)
+	candidates := append(am.ClientEndpointCandidates(), am.RuntimeClientStatus().Endpoint)
 	var ips []string
 	for _, endpoint := range candidates {
 		if ip := svc.cachedPolicyEndpointIP(hostOf(endpoint)); ip != "" {
@@ -46,7 +46,7 @@ func (svc *Service) awgPinClientEndpoints(am *awg.Manager) error {
 	}
 	ctx, cancel := context.WithTimeout(svc.clientOpContext(), 15*time.Second)
 	defer cancel()
-	host := hostOf(am.RuntimeConfig().Endpoint)
+	host := hostOf(am.RuntimeClientStatus().Endpoint)
 	selected := svc.cachedPolicyEndpointIP(host)
 	if selected == "" {
 		selected = svc.policyHostIPWithLookup(host, func(name string) string { return resolveHostIPContext(ctx, name) })

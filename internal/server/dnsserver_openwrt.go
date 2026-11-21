@@ -63,3 +63,25 @@ func (s *Server) dnsServerOpenWrtRestore(w http.ResponseWriter, r *http.Request)
 	}
 	s.dnsServerOpenWrt(w, r)
 }
+
+func (s *Server) dnsServerOpenWrtRebind(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Instance string `json:"instance"`
+		Revision string `json:"revision"`
+	}
+	if err := readJSON(r, &in); err != nil {
+		httpErr(w, http.StatusBadRequest, err)
+		return
+	}
+	if strings.TrimSpace(in.Revision) == "" || strings.TrimSpace(in.Instance) == "" {
+		httpErr(w, http.StatusBadRequest, fmt.Errorf("обновите состояние DNS OpenWrt и выберите экземпляр dnsmasq"))
+		return
+	}
+	s.portsMu.Lock()
+	defer s.portsMu.Unlock()
+	if err := s.app.DNSServer().RebindOpenWrtDNS(r.Context(), in.Instance, in.Revision); err != nil {
+		httpErr(w, http.StatusBadRequest, err)
+		return
+	}
+	s.dnsServerOpenWrt(w, r)
+}

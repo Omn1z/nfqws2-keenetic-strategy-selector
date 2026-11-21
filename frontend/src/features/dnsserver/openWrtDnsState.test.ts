@@ -40,6 +40,16 @@ test("OpenWrt DNS requires saved running configuration and current revision befo
   assert.match(openWrtDnsApplyBlock(null, selection, flags), /обновите/);
 });
 
+test("OpenWrt DNS refresh follows the saved dnsmasq binding after anonymous instances move", () => {
+  const managed = {
+    ...state,
+    managed: true,
+    instances: [{ id: "@dnsmasq[0]", label: "Первый" }, { id: "@dnsmasq[1]", label: "Второй" }],
+    binding: { interface: "wan", instance: "@dnsmasq[1]", endpoint: { host: "192.168.1.1", port: 5355 } },
+  };
+  assert.equal(initialOpenWrtDnsSelection(managed, { interface: "wan", instance: "@dnsmasq[0]" }).instance, "@dnsmasq[1]");
+});
+
 test("OpenWrt DNS restore remains available when DNS is stopped but cannot overwrite an external change", () => {
   const managed = { ...state, managed: true };
   assert.equal(openWrtDnsRestoreAllowed(managed, false), true);

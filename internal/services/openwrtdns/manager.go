@@ -50,16 +50,17 @@ type Instance struct {
 	Enabled  bool     `json:"enabled"`
 }
 type State struct {
-	Supported  bool        `json:"supported"`
-	Reason     string      `json:"reason,omitempty"`
-	Interfaces []Interface `json:"interfaces"`
-	Instances  []Instance  `json:"instances"`
-	Managed    bool        `json:"managed"`
-	Pending    bool        `json:"pending,omitempty"`
-	Binding    *Binding    `json:"binding,omitempty"`
-	Conflict   string      `json:"conflict,omitempty"`
-	Warnings   []string    `json:"warnings"`
-	Revision   string      `json:"revision"`
+	Supported      bool        `json:"supported"`
+	Reason         string      `json:"reason,omitempty"`
+	Interfaces     []Interface `json:"interfaces"`
+	Instances      []Instance  `json:"instances"`
+	Managed        bool        `json:"managed"`
+	Pending        bool        `json:"pending,omitempty"`
+	Binding        *Binding    `json:"binding,omitempty"`
+	Conflict       string      `json:"conflict,omitempty"`
+	RebindInstance string      `json:"rebind_instance,omitempty"`
+	Warnings       []string    `json:"warnings"`
+	Revision       string      `json:"revision"`
 }
 type snapshot struct {
 	Version          int               `json:"version"`
@@ -69,6 +70,7 @@ type snapshot struct {
 	Pending          bool              `json:"pending,omitempty"`
 	Before           map[string]option `json:"before,omitempty"`
 	InstanceIdentity string            `json:"instanceIdentity,omitempty"`
+	InstanceScope    string            `json:"instanceScope,omitempty"`
 }
 type runner func(context.Context, string, ...string) (string, error)
 type Manager struct {
@@ -104,6 +106,9 @@ func (m *Manager) Managed() (bool, error) {
 type inspection struct {
 	network, dhcp configuration
 	backup        *snapshot
+	stored        *snapshot
+	rebind        *snapshot
+	bindingErr    error
 	current       map[string]option
 	pending       bool
 	revision      string
@@ -118,36 +123,33 @@ func (m *Manager) inspect(ctx context.Context) (inspection, error) {
 		}
 		result.pending = result.pending || strings.TrimSpace(out) != ""
 	}
-	for _, target := range []struct {
-		name string
-		into *configuration
-	}{{"network", &result.network}, {"dhcp", &result.dhcp}} {
-		out, err := m.run(ctx, "uci", "-q", "-N", "export", target.name)
-		if err != nil {
-			return result, fmt.Errorf("чтение UCI %s: %w", target.name, err)
-		}
-		*target.into, err = parseExport(out, target.name)
-		if err != nil {
-			return result, err
-		}
-	}
 	var err error
-	result.backup, err = m.readSnapshot()
+	result.network, result.dhcp, err = m.readConfiguration(ctx)
 	if err != nil {
 		return result, err
 	}
-	if result.backup != nil {
-		if err = checkInstanceIdentity(result.dhcp, result.backup); err != nil {
-			return result, err
+	result.stored, err = m.readSnapshot()
+	if err != nil {
+		return result, err
+	}
+	result.backup = result.stored
+	if result.stored != nil {
+		resolved, err := resolveInstance(result.dhcp, result.stored)
+		if err == nil {
+			result.backup = resolved
+			result.current, err = managedOptions(result.network, result.dhcp, resolved.Binding)
 		}
-		result.current, err = managedOptions(result.network, result.dhcp, result.backup.Binding)
-		if err != nil {
-			return result, err
+		result.bindingErr = err
+		if errors.Is(err, errUnmatchedInstance) && !result.pending {
+			result.rebind = legacyRebindCandidate(result.network, result.dhcp, result.stored)
 		}
 	}
-	encoded, _ := json.Marshal(result.backup)
-	sum := sha256.Sum256([]byte(result.network.Raw + "\x00" + result.dhcp.Raw + "\x00" + string(encoded)))
-	result.revision = hex.EncodeToString(sum[:])
+	encoded, _ := json.Marshal(result.stored)
+	revision := sha256.New()
+	_, _ = revision.Write(result.network.digest[:])
+	_, _ = revision.Write(result.dhcp.digest[:])
+	_, _ = revision.Write(encoded)
+	result.revision = hex.EncodeToString(revision.Sum(nil))
 	return result, nil
 }
 
@@ -164,7 +166,7 @@ func (m *Manager) Status(ctx context.Context) (State, error) {
 		return state, err
 	}
 	state.Revision = view.revision
-	if view.pending {
+	if view.pending && view.bindingErr == nil {
 		if view.backup == nil || !view.backup.Pending || m.guardChanges(ctx, view.current) != nil {
 			state.Conflict = "В UCI есть несохранённые изменения network или dhcp. Сначала примените или отмените их."
 		}
@@ -174,7 +176,13 @@ func (m *Manager) Status(ctx context.Context) (State, error) {
 		state.Pending = view.backup.Pending
 		binding := view.backup.Binding
 		state.Binding = &binding
-		if conflict(view.current, view.backup) != nil {
+		if view.bindingErr != nil {
+			state.Conflict = view.bindingErr.Error()
+			if view.rebind != nil {
+				state.RebindInstance = view.rebind.Binding.Instance
+				state.Conflict = "Настройки сохранённого экземпляра dnsmasq изменились. Подтвердите экземпляр с действующей привязкой DNS."
+			}
+		} else if conflict(view.current, view.backup) != nil {
 			state.Conflict = "Управляемые DNS-параметры изменены вне приложения. Автоматическая перезапись остановлена."
 		}
 		if view.backup.Pending {
@@ -270,33 +278,6 @@ func listPrefix(value, want option) bool {
 	return value.Kind == "list" && want.Kind == "list" && len(value.Values) <= len(want.Values) && reflect.DeepEqual(value.Values, want.Values[:len(value.Values)])
 }
 
-func instanceIdentity(s section) string {
-	values := map[string]option{}
-	for key, value := range s.Options {
-		if key != "server" && key != "noresolv" {
-			values[key] = value
-		}
-	}
-	encoded, _ := json.Marshal(values)
-	sum := sha256.Sum256(encoded)
-	return hex.EncodeToString(sum[:])
-}
-func checkInstanceIdentity(c configuration, s *snapshot) error {
-	if !strings.HasPrefix(s.Binding.Instance, "@") {
-		return nil
-	}
-	selected, ok := c.find(s.Binding.Instance, "dnsmasq")
-	if !ok || instanceIdentity(selected) != s.InstanceIdentity {
-		return fmt.Errorf("анонимный экземпляр dnsmasq изменён или переставлен; автоматическая перезапись остановлена")
-	}
-	for _, other := range c.Sections {
-		if other.Type == "dnsmasq" && other.ID != selected.ID && instanceIdentity(other) == s.InstanceIdentity {
-			return fmt.Errorf("невозможно однозначно определить анонимный экземпляр dnsmasq")
-		}
-	}
-	return nil
-}
-
 func (m *Manager) Apply(ctx context.Context, iface, instance string, endpoint Endpoint, revision string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -317,6 +298,9 @@ func (m *Manager) Apply(ctx context.Context, iface, instance string, endpoint En
 	view, err := m.inspect(ctx)
 	if err != nil {
 		return err
+	}
+	if view.bindingErr != nil {
+		return view.bindingErr
 	}
 	if view.pending {
 		return fmt.Errorf("сначала примените или отмените несохранённые изменения UCI network/dhcp")
@@ -355,28 +339,58 @@ func (m *Manager) Apply(ctx context.Context, iface, instance string, endpoint En
 		}
 	}
 	applied := map[string]option{"network." + iface + ".peerdns": {Kind: "option", Values: []string{"0"}}, "network." + iface + ".dns": {Kind: "list", Values: []string{net.ParseIP(endpoint.Host).String()}}, "dhcp." + instance + ".noresolv": {Kind: "option", Values: []string{"1"}}, "dhcp." + instance + ".server": {Kind: "list", Values: servers}}
-	if view.backup != nil && reflect.DeepEqual(current, applied) && view.backup.Binding == binding {
-		return nil
-	}
 	next := &snapshot{Version: 1, Binding: binding, Original: original, Applied: applied, Pending: true, Before: current}
-	if strings.HasPrefix(instance, "@") {
-		next.InstanceIdentity = instanceIdentity(d)
-		if err = checkInstanceIdentity(view.dhcp, next); err != nil {
-			return err
+	if err = next.captureInstance(view.dhcp); err != nil {
+		return err
+	}
+	if view.backup != nil && reflect.DeepEqual(current, applied) && view.backup.Binding == binding {
+		next.Pending = false
+		next.Before = nil
+		if reflect.DeepEqual(next, view.stored) {
+			return nil
 		}
+		return m.writeSnapshot(next)
 	}
 	if err = m.writeSnapshot(next); err != nil {
 		return err
 	}
 	if err = m.replaceAndReload(ctx, current, applied, binding, next.InstanceIdentity); err != nil {
-		return m.rollback(err, current, next, view.backup)
+		return m.rollback(err, current, next, view.stored)
 	}
 	next.Pending = false
 	next.Before = nil
 	if err = m.writeSnapshot(next); err != nil {
-		return m.rollback(err, current, next, view.backup)
+		return m.rollback(err, current, next, view.stored)
 	}
 	return nil
+}
+
+func (m *Manager) Rebind(ctx context.Context, instance, revision string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if !m.supported {
+		return fmt.Errorf("автонастройка DNS поддерживается только на OpenWrt")
+	}
+	unlock, err := lockTransaction(ctx, m.filename)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	view, err := m.inspect(ctx)
+	if err != nil {
+		return err
+	}
+	if revision == "" || revision != view.revision {
+		return fmt.Errorf("настройки OpenWrt изменились; обновите состояние и повторите")
+	}
+	if view.rebind == nil || view.rebind.Binding.Instance != instance {
+		return fmt.Errorf("подтверждение сохранённой DNS-привязки недоступно для этого экземпляра")
+	}
+	rebound := *view.rebind
+	if err := rebound.captureInstance(view.dhcp); err != nil {
+		return err
+	}
+	return m.writeSnapshot(&rebound)
 }
 
 func (m *Manager) Restore(ctx context.Context, revision string) error {
@@ -401,6 +415,9 @@ func (m *Manager) Restore(ctx context.Context, revision string) error {
 	if view.backup == nil {
 		return nil
 	}
+	if view.bindingErr != nil {
+		return view.bindingErr
+	}
 	if view.pending {
 		if !view.backup.Pending {
 			return fmt.Errorf("сначала примените или отмените несохранённые изменения UCI network/dhcp")
@@ -416,6 +433,9 @@ func (m *Manager) Restore(ctx context.Context, revision string) error {
 		return err
 	}
 	saved := *view.backup
+	if err = saved.captureInstance(view.dhcp); err != nil {
+		return err
+	}
 	pending := saved
 	pending.Pending = true
 	pending.Before = view.current
@@ -424,10 +444,10 @@ func (m *Manager) Restore(ctx context.Context, revision string) error {
 		return err
 	}
 	if err = m.replaceAndReload(ctx, view.current, saved.Original, saved.Binding, saved.InstanceIdentity); err != nil {
-		return m.rollback(err, view.current, &pending, &saved)
+		return m.rollback(err, view.current, &pending, view.stored)
 	}
 	if err = os.Remove(m.filename); err != nil && !os.IsNotExist(err) {
-		return m.rollback(err, view.current, &pending, &saved)
+		return m.rollback(err, view.current, &pending, view.stored)
 	}
 	return nil
 }
@@ -462,6 +482,15 @@ func (m *Manager) replaceAndReload(ctx context.Context, current, desired map[str
 		if err := m.guardChanges(ctx, desired); err != nil {
 			return err
 		}
+		if strings.HasPrefix(binding.Instance, "@") {
+			dhcp, err := m.readPackage(ctx, "dhcp")
+			if err != nil {
+				return err
+			}
+			if err := checkInstanceIdentity(dhcp, binding, identity); err != nil {
+				return err
+			}
+		}
 		if _, err := m.run(ctx, "uci", "-q", "commit", pkg); err != nil {
 			return fmt.Errorf("сохранение %s: %w", pkg, err)
 		}
@@ -483,25 +512,15 @@ func (m *Manager) rollback(cause error, before map[string]option, pending, previ
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	// Read the actual partial transaction; no unrelated option is restored.
-	var network, dhcp configuration
-	for _, v := range []struct {
-		name string
-		to   *configuration
-	}{{"network", &network}, {"dhcp", &dhcp}} {
-		out, err := m.run(ctx, "uci", "-q", "-N", "export", v.name)
-		if err != nil {
-			return errors.Join(cause, fmt.Errorf("откат не завершён: %w", err))
-		}
-		*v.to, err = parseExport(out, v.name)
-		if err != nil {
-			return errors.Join(cause, err)
-		}
+	network, dhcp, err := m.readConfiguration(ctx)
+	if err != nil {
+		return errors.Join(cause, fmt.Errorf("откат не завершён: %w", err))
 	}
 	current, err := managedOptions(network, dhcp, pending.Binding)
 	if err != nil {
 		return errors.Join(cause, err)
 	}
-	if err = checkInstanceIdentity(dhcp, pending); err != nil {
+	if err = checkInstanceIdentity(dhcp, pending.Binding, pending.InstanceIdentity); err != nil {
 		return errors.Join(cause, err)
 	}
 	recovery := *pending
@@ -552,7 +571,7 @@ func (m *Manager) readSnapshot() (*snapshot, error) {
 	return &s, nil
 }
 func validateSnapshot(s *snapshot) error {
-	if s.Version != 1 || !validID(s.Binding.Interface) || !validInstance(s.Binding.Instance) || validateEndpoint(s.Binding.Endpoint) != nil || (strings.HasPrefix(s.Binding.Instance, "@") && len(s.InstanceIdentity) != 64) {
+	if s.Version != 1 || !validID(s.Binding.Interface) || !validInstance(s.Binding.Instance) || validateEndpoint(s.Binding.Endpoint) != nil || (strings.HasPrefix(s.Binding.Instance, "@") && len(s.InstanceIdentity) != 64) || (s.InstanceScope != "" && len(s.InstanceScope) != 64) {
 		return fmt.Errorf("неверная привязка DNS в резервной копии")
 	}
 	expected := []string{"network." + s.Binding.Interface + ".peerdns", "network." + s.Binding.Interface + ".dns", "dhcp." + s.Binding.Instance + ".noresolv", "dhcp." + s.Binding.Instance + ".server"}

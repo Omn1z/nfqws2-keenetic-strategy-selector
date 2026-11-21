@@ -125,22 +125,23 @@ func splitAllowed(s string) []string {
 // response.
 func ParseUAPIGet(resp string) UAPIStat {
 	var st UAPIStat
-	for _, ln := range strings.Split(resp, "\n") {
-		kv := strings.SplitN(strings.TrimSpace(ln), "=", 2)
-		if len(kv) != 2 {
+	for line := range strings.SplitSeq(resp, "\n") {
+		key, value, ok := strings.Cut(strings.TrimSpace(line), "=")
+		if !ok {
 			continue
 		}
-		switch kv[0] {
+		switch key {
 		case "last_handshake_time_sec":
-			st.LastHandshake = uapiInt(kv[1])
+			st.LastHandshake = uapiInt(value)
 		case "rx_bytes":
-			st.RxBytes = uapiInt(kv[1])
+			st.RxBytes = uapiInt(value)
 		case "tx_bytes":
-			st.TxBytes = uapiInt(kv[1])
+			st.TxBytes = uapiInt(value)
 		case "endpoint":
-			st.Endpoint = kv[1]
+			// Status snapshots outlive this response, which can include key material.
+			st.Endpoint = strings.Clone(value)
 		case "fwmark":
-			mark, _ := strconv.ParseUint(kv[1], 0, 32)
+			mark, _ := strconv.ParseUint(value, 0, 32)
 			st.FWMark = uint32(mark)
 		}
 	}

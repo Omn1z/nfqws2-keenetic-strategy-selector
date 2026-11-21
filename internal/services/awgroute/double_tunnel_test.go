@@ -33,7 +33,7 @@ func TestDoubleTunnelWaitsForDirectReservesAndConfirmsData(t *testing.T) {
 	outer.SetClientEnabled(true)
 	setTestFailover(t, reserve, true)
 	setTestFailover(t, outer, true)
-	primary.SetClientFailoverPolicy([]string{entries[1].ID}, false, entries[2].ID)
+	primary.SetClientFailoverPolicy([]string{entries[1].ID}, false, entries[2].ID, "")
 	if err := primary.SetEndpointBackups([]string{"192.0.2.2"}); err != nil {
 		t.Fatal(err)
 	}
@@ -108,8 +108,8 @@ func TestDoubleTunnelAdoptsInheritedTransportAndProtectsOuter(t *testing.T) {
 	primary, outer, next := entries[0].Manager, entries[1].Manager, entries[2].Manager
 	next.SetEnabled(true)
 	next.SetClientEnabled(true)
-	primary.SetClientFailoverPolicy(nil, false, entries[1].ID)
-	outer.SetClientFailoverPolicy(nil, false, entries[2].ID)
+	primary.SetClientFailoverPolicy(nil, false, entries[1].ID, "")
+	outer.SetClientFailoverPolicy(nil, false, entries[2].ID, "")
 	now := time.Now()
 	driver.states[primary] = ClientStatus{Running: true, Connected: true, LastHandshake: now.Unix(),
 		transportMarked: true, transportOuterIface: outer.RuntimeConfig().ClientIface, engineID: "inner/1"}
@@ -139,5 +139,154 @@ func TestDoubleTunnelAdoptsInheritedTransportAndProtectsOuter(t *testing.T) {
 	svc.checkClient(entries[0])
 	if svc.doubleTunnelOuter(primary) != nil || d.attempts[primary] != 1 {
 		t.Fatal("failed nested tunnel did not retry the primary via WAN")
+	}
+}
+
+func TestPermanentDoubleTunnelWaitsWithoutDirectOrOrdinaryTraffic(t *testing.T) {
+	svc, driver, entries := failoverTestService(t)
+	primary, reserve, outer := entries[0].Manager, entries[1].Manager, entries[2].Manager
+	outer.SetEnabled(true)
+	outer.SetClientEnabled(true)
+	primary.SetClientFailoverPolicy([]string{entries[1].ID}, false, entries[2].ID, awg.DoubleTunnelPermanent)
+	setTestFailover(t, reserve, true)
+	setTestFailover(t, outer, true)
+	now := time.Now()
+	oldDirect := ClientStatus{Running: true, Connected: true, LastHandshake: now.Unix(), engineID: "old-direct"}
+	driver.states[primary], driver.states[reserve] = oldDirect, oldDirect
+	d := &doubleTunnelTestDriver{failoverTestDriver: driver, svc: svc}
+	svc.clients.driver = d
+	_, unlock := svc.lockClientOps(false)
+	defer unlock()
+
+	svc.reconcileStandbyClients()
+	if !svc.clientShouldRun(outer) || svc.clientShouldRun(reserve) || svc.TunnelUpForServer(entries[0].ID) {
+		t.Fatal("permanent selected a direct tunnel or an ordinary reserve")
+	}
+	for _, route := range svc.dnsRouteCandidates(func(string) bool { return true }) {
+		if route.ID == entries[0].ID && route.Available {
+			t.Fatal("permanent DNS route exposed an old direct incarnation")
+		}
+	}
+	svc.checkClient(entries[0])
+	svc.checkClient(entries[0])
+	if d.downCalls[primary] != 1 || d.attempts[primary] != 0 {
+		t.Fatal("permanent did not stop the direct instance and wait for the outer")
+	}
+	d.states[outer] = ClientStatus{Running: true, Connected: true, LastHandshake: now.Unix()}
+	d.onRecover = func(am *awg.Manager) error {
+		if am == primary && svc.doubleTunnelOuter(am) != outer {
+			t.Fatal("permanent started without the configured outer")
+		}
+		if am == primary {
+			d.states[primary] = ClientStatus{Running: true, Connected: true, LastHandshake: now.Unix(),
+				engineID: "nested", transportMarked: true, transportOuterIface: outer.RuntimeLocalClientIdentity().ClientIface}
+		}
+		return nil
+	}
+	svc.checkClient(entries[0])
+	svc.checkClient(entries[0])
+	if !svc.TunnelUpForServer(entries[0].ID) || d.attempts[primary] != 1 {
+		t.Fatal("permanent did not use the verified double tunnel")
+	}
+	d.states[outer] = ClientStatus{}
+	svc.checkClient(entries[0])
+	if svc.TunnelUpForServer(entries[0].ID) || d.attempts[primary] != 1 {
+		t.Fatal("loss of permanent outer left direct traffic available")
+	}
+	primary.SetClientFailoverPolicy([]string{entries[1].ID}, false, "", awg.DoubleTunnelPermanent)
+	svc.reconcileStandbyClients()
+	svc.checkClient(entries[0])
+	if d.downCalls[primary] != 2 || d.attempts[primary] != 1 {
+		t.Fatal("removing the configured outer left the previously marked client running")
+	}
+}
+
+func TestEarlyDoubleTunnelModesKeepOrReleaseTheNestedPath(t *testing.T) {
+	for _, mode := range []awg.DoubleTunnelMode{awg.DoubleTunnelPreferred, awg.DoubleTunnelAutomatic} {
+		t.Run(string(mode), func(t *testing.T) {
+			svc, driver, entries := failoverTestService(t)
+			primary, reserve, outer := entries[0].Manager, entries[1].Manager, entries[2].Manager
+			outer.SetEnabled(true)
+			outer.SetClientEnabled(true)
+			primary.SetClientFailoverPolicy([]string{entries[1].ID}, false, entries[2].ID, mode)
+			if err := primary.SetEndpointBackups([]string{"192.0.2.2"}); err != nil {
+				t.Fatal(err)
+			}
+			setTestFailover(t, reserve, true)
+			setTestFailover(t, outer, true)
+			d := &doubleTunnelTestDriver{failoverTestDriver: driver, svc: svc}
+			svc.clients.driver = d
+			_, unlock := svc.lockClientOps(false)
+			defer unlock()
+			svc.clients.states = map[*awg.Manager]clientRecovery{primary: {Recovering: true, pathUnavailable: true}}
+			svc.reconcileStandbyClients()
+			if svc.endpointPoolAllowsFallback(primary) || !svc.clientShouldRun(outer) || svc.clientShouldRun(reserve) {
+				t.Fatal("nested attempt did not precede untried alternate IPs and ordinary reserves")
+			}
+			svc.checkClient(entries[0])
+			if d.attempts[primary] != 0 {
+				t.Fatal("a direct retry started before the cold outer had a chance")
+			}
+			now := time.Now()
+			d.states[outer] = ClientStatus{Running: true, Connected: true, LastHandshake: now.Unix()}
+			d.onRecover = func(am *awg.Manager) error {
+				if am == primary && svc.doubleTunnelOuter(am) == outer {
+					d.states[am] = ClientStatus{Running: true, Connected: true, LastHandshake: now.Unix(),
+						engineID: "nested", transportMarked: true, transportOuterIface: outer.RuntimeLocalClientIdentity().ClientIface}
+				}
+				return nil
+			}
+			svc.checkClient(entries[0])
+			svc.checkClient(entries[0])
+			svc.reconcileStandbyClients()
+			automatic := mode == awg.DoubleTunnelAutomatic
+			if !svc.TunnelUpForServer(entries[0].ID) || svc.clientShouldRun(reserve) != automatic {
+				t.Fatal("ordinary reserves were not started at the right point")
+			}
+			d.states[reserve] = ClientStatus{Running: true, Connected: true, LastHandshake: now.Unix()}
+			svc.reconcileStandbyClients()
+			svc.checkClient(entries[0])
+			selected := primary
+			if automatic {
+				selected = reserve
+			}
+			if got := svc.effectiveConnectedServer(entries[0].ID); got == nil || got.Manager != selected {
+				t.Fatal("mode switched to the wrong connection")
+			}
+			if svc.clientShouldRun(outer) == automatic {
+				t.Fatal("mode kept or dropped the outer connection incorrectly")
+			}
+		})
+	}
+}
+
+func TestPermanentStandbyDoesNotBlockLaterReserves(t *testing.T) {
+	svc, driver, entries := failoverTestService(t)
+	primary, permanent, reserve, outer := entries[0].Manager, entries[1].Manager, entries[2].Manager, entries[3].Manager
+	reserve.SetEnabled(true)
+	setTestFailover(t, primary, false, entries[1].ID, entries[2].ID)
+	permanent.SetClientFailoverPolicy(nil, true, entries[3].ID, awg.DoubleTunnelPermanent)
+	setTestFailover(t, reserve, true)
+	setTestFailover(t, outer, true)
+	svc.clients.states = map[*awg.Manager]clientRecovery{primary: {Recovering: true, Attempts: 2}}
+	svc.clients.driver = &doubleTunnelTestDriver{failoverTestDriver: driver, svc: svc}
+	_, unlock := svc.lockClientOps(false)
+	defer unlock()
+
+	svc.reconcileStandbyClients()
+	if svc.clientShouldRun(permanent) || !svc.clientShouldRun(reserve) {
+		t.Fatal("a permanent reserve with a disabled outer blocked the next usable reserve")
+	}
+	outer.SetClientEnabled(true)
+	svc.reconcileStandbyClients()
+	if !svc.clientShouldRun(permanent) || !svc.clientShouldRun(outer) || svc.clientShouldRun(reserve) {
+		t.Fatal("an enabled permanent reserve was not given a verification window")
+	}
+	state := svc.clients.doubleTunnels[permanent]
+	state.trialStarted = time.Now().Add(-3 * svc.currentRecoverySettings().handshakeTimeout())
+	svc.clients.doubleTunnels[permanent] = state
+	svc.reconcileStandbyClients()
+	if !svc.clientShouldRun(reserve) || !svc.clientShouldRun(outer) {
+		t.Fatal("an unresponsive permanent reserve blocked the next reserve or stopped recovering")
 	}
 }

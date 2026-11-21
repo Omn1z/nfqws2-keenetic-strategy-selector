@@ -100,11 +100,14 @@ func (m *Manager) clientEndpointCandidatesLocked() []string {
 }
 
 func (m *Manager) selectedClientEndpointLocked(primary string) string {
-	if m.clientEndpointIdentity != m.clientEndpointIdentityLocked() {
+	if m.clientEndpoint == "" || m.clientEndpointIdentity != m.clientEndpointIdentityLocked() {
 		return primary
 	}
+	if m.clientEndpoint == strings.TrimSpace(primary) {
+		return m.clientEndpoint
+	}
 	for _, candidate := range m.clientEndpointCandidatesLocked() {
-		if m.clientEndpoint != "" && candidate == m.clientEndpoint {
+		if candidate == m.clientEndpoint {
 			return candidate
 		}
 	}

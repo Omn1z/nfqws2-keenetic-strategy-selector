@@ -253,13 +253,17 @@ func normalizeWARPEndpoint(endpoint string) string {
 }
 
 func isWARPConfig(cfg awg.ServerConfig) bool {
-	if cfg.Install != "imported" {
+	return isWARPConnection(cfg.Install, cfg.PublicKey, cfg.Endpoint)
+}
+
+func isWARPConnection(install, publicKey, endpoint string) bool {
+	if install != "imported" {
 		return false
 	}
-	if strings.TrimSpace(cfg.PublicKey) == warpPeerPublicKey {
+	if strings.TrimSpace(publicKey) == warpPeerPublicKey {
 		return true
 	}
-	host, _, ok := splitHostPortDefault(cfg.Endpoint, 2408)
+	host, _, ok := splitHostPortDefault(endpoint, 2408)
 	return ok && warpHostLooksLikeIngress(host)
 }
 

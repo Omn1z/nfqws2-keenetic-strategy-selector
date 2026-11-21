@@ -26,20 +26,27 @@ func (m *Manager) reloadInstance(ctx context.Context, instance string) (string, 
 	return name, nil
 }
 
+func (m *Manager) readPackage(ctx context.Context, pkg string) (configuration, error) {
+	out, err := m.run(ctx, "uci", "-q", "-N", "export", pkg)
+	if err != nil {
+		return configuration{}, fmt.Errorf("чтение UCI %s: %w", pkg, err)
+	}
+	return parseExport(out, pkg)
+}
+
+func (m *Manager) readConfiguration(ctx context.Context) (configuration, configuration, error) {
+	network, err := m.readPackage(ctx, "network")
+	if err != nil {
+		return configuration{}, configuration{}, err
+	}
+	dhcp, err := m.readPackage(ctx, "dhcp")
+	return network, dhcp, err
+}
+
 func (m *Manager) verifyApplied(ctx context.Context, desired map[string]option, binding Binding, identity string) error {
-	var network, dhcp configuration
-	for _, v := range []struct {
-		name string
-		to   *configuration
-	}{{"network", &network}, {"dhcp", &dhcp}} {
-		out, err := m.run(ctx, "uci", "-q", "-N", "export", v.name)
-		if err != nil {
-			return err
-		}
-		*v.to, err = parseExport(out, v.name)
-		if err != nil {
-			return err
-		}
+	network, dhcp, err := m.readConfiguration(ctx)
+	if err != nil {
+		return err
 	}
 	current, err := managedOptions(network, dhcp, binding)
 	if err != nil {
@@ -48,7 +55,7 @@ func (m *Manager) verifyApplied(ctx context.Context, desired map[string]option, 
 	if !reflect.DeepEqual(current, desired) {
 		return fmt.Errorf("проверка DNS после применения не пройдена: параметры изменены параллельно")
 	}
-	if err = checkInstanceIdentity(dhcp, &snapshot{Binding: binding, InstanceIdentity: identity}); err != nil {
+	if err = checkInstanceIdentity(dhcp, binding, identity); err != nil {
 		return err
 	}
 	return m.guardChanges(ctx, desired)

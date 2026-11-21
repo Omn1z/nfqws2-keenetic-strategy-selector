@@ -102,6 +102,10 @@ func (svc *Service) testConnection(ctx context.Context, id string, driver connec
 		out.Error = "проверка AWG доступна только на роутере Linux"
 		return out
 	}
+	if cfg.Client.DoubleTunnelMode == awg.DoubleTunnelPermanent && (!before.Running || !before.transportMarked) {
+		out.Error = "постоянный двойной туннель ожидает внешнее подключение"
+		return out
+	}
 	if !before.Running {
 		defer func() {
 			if err := driver.down(am); err != nil {

@@ -118,5 +118,13 @@ test("double tunnel picker, active path and egress IP use an independent transpo
   assert.match(html, /двойной туннель · через Cloudflare/);
   assert.match(picker, /<option value="outer" selected="">Cloudflare · WARP<\/option>/);
   assert.doesNotMatch(picker, /<option value="(primary|cycle|chain)"/);
+  assert.match(html, /<option value="last_resort" selected="">Последний шанс<\/option>/);
+  assert.match(html, /<option value="preferred">Резервный<\/option>/);
+  assert.match(html, /<option value="automatic">Автоматически<\/option>/);
   assert.match(html, /Выходной IP двойного туннеля .+198\.51\.100\.2/);
+
+  st.config.client.double_tunnel_mode = "permanent";
+  const permanent = renderToStaticMarkup(<FailoverPane st={st} acceptStatus={() => {}} reload={async () => {}} onBusyChange={() => {}} externalBusy={false} />);
+  assert.match(permanent, /<option value="permanent" selected="">Постоянный<\/option>/);
+  assert.match(permanent, /Основной AWG всегда подключается через выбранный внешний VPN/);
 });

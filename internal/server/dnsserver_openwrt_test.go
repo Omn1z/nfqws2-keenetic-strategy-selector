@@ -12,6 +12,7 @@ func TestOpenWrtDNSRoutesRequireAuthenticationAndCorrectMethods(t *testing.T) {
 	for _, tc := range []struct{ method, path string }{
 		{http.MethodGet, "/api/dnsserver/openwrt"},
 		{http.MethodPost, "/api/dnsserver/openwrt/apply"},
+		{http.MethodPost, "/api/dnsserver/openwrt/rebind"},
 		{http.MethodPost, "/api/dnsserver/openwrt/restore"},
 	} {
 		if publicAPI(tc.path) {
@@ -26,7 +27,7 @@ func TestOpenWrtDNSRoutesRequireAuthenticationAndCorrectMethods(t *testing.T) {
 
 func TestOpenWrtDNSMutationRequiresFreshRevisionBeforeAppAccess(t *testing.T) {
 	s := &Server{}
-	for _, handler := range []http.HandlerFunc{s.dnsServerOpenWrtApply, s.dnsServerOpenWrtRestore} {
+	for _, handler := range []http.HandlerFunc{s.dnsServerOpenWrtApply, s.dnsServerOpenWrtRestore, s.dnsServerOpenWrtRebind} {
 		for _, body := range []string{`{}`, `{"revision":" "}`, `not json`} {
 			w := httptest.NewRecorder()
 			handler(w, httptest.NewRequest(http.MethodPost, "/", strings.NewReader(body)))

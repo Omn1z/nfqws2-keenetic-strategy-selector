@@ -5,6 +5,7 @@ package awgroute
 import "nfqws2strategy/internal/services/awg"
 
 func awgClientCurrentEngineOS(cfg awg.ServerConfig) bool { return true }
+func awgClientCurrentEngineIfaceOS(iface string) bool    { return true }
 
 func clientSupervisorSupported() bool                               { return false }
 func (svc *Service) awgProbeClientOS(am *awg.Manager) error         { return svc.awgClientUpManagerOS(am) }

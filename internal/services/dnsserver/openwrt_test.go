@@ -21,6 +21,9 @@ func (m *testOpenWrtManager) Status(context.Context) (openwrtdns.State, error) {
 func (m *testOpenWrtManager) Apply(context.Context, string, string, openwrtdns.Endpoint, string) error {
 	return nil
 }
+func (m *testOpenWrtManager) Rebind(context.Context, string, string) error {
+	return nil
+}
 func (m *testOpenWrtManager) CurrentBinding() (*openwrtdns.Binding, error) {
 	return m.binding, m.readErr
 }

@@ -5,6 +5,7 @@ import (
 	"strconv"
 	"strings"
 
+	"nfqws2strategy/internal/services/awg"
 	"nfqws2strategy/internal/tools/logbuf"
 )
 
@@ -65,7 +66,10 @@ func normalizeFallbackTunnelIDs(primary string, fallbacks []string, exists func(
 // the WAN. An empty result means every configured candidate is disabled or
 // invalid and the rule must not install a direct route.
 func selectFallbackTunnelID(primary string, fallbacks []string, usable, connected func(string) bool) string {
-	candidates := fallbackCandidates(primary, fallbacks)
+	return selectOrderedFallbackTunnelID(fallbackCandidates(primary, fallbacks), primary, usable, connected)
+}
+
+func selectOrderedFallbackTunnelID(candidates []string, primary string, usable, connected func(string) bool) string {
 	for _, id := range candidates {
 		if usable == nil || usable(id) {
 			if connected != nil && connected(id) {
@@ -73,12 +77,49 @@ func selectFallbackTunnelID(primary string, fallbacks []string, usable, connecte
 			}
 		}
 	}
+	// A preference can put a connected reserve first, but the primary's
+	// policy is still the correct place for traffic when nothing is healthy.
+	if len(candidates) != 0 && candidates[0] != primary && (usable == nil || usable(primary)) {
+		return primary
+	}
 	for _, id := range candidates {
 		if usable == nil || usable(id) {
 			return id
 		}
 	}
 	return ""
+}
+
+func (svc *Service) blocksOrdinaryReserves(am *awg.Manager) bool {
+	svc.clients.mu.Lock()
+	state := svc.clients.doubleTunnels[am]
+	svc.clients.mu.Unlock()
+	return state.prioritizesDouble() && !state.trialStarted.IsZero() && !state.ordinaryAllowed
+}
+
+func (svc *Service) orderedFallbackCandidates(primary string, fallbacks []string) []string {
+	candidates := fallbackCandidates(primary, fallbacks)
+	if len(candidates) < 2 {
+		return candidates
+	}
+	svc.mu.RLock()
+	owner := svc.servers[primary]
+	svc.mu.RUnlock()
+	if owner == nil {
+		return candidates
+	}
+	svc.clients.mu.Lock()
+	state := svc.clients.doubleTunnels[owner.Manager]
+	svc.clients.mu.Unlock()
+	if state.mode == awg.DoubleTunnelAutomatic && state.ordinaryAllowed && state.outer != nil && state.wanted == state.outer {
+		copy(candidates, candidates[1:])
+		candidates[len(candidates)-1] = primary
+	}
+	return candidates
+}
+
+func (svc *Service) selectRoutingFallback(primary string, fallbacks []string, usable, connected func(string) bool) string {
+	return selectOrderedFallbackTunnelID(svc.orderedFallbackCandidates(primary, fallbacks), primary, usable, connected)
 }
 
 // fallbackRoutingSignature describes both LAN rule targets and logical
@@ -111,30 +152,38 @@ func (svc *Service) fallbackRoutingSignature() (string, bool) {
 	}
 	var b strings.Builder
 	hasFallback := false
-	for i, z := range svc.awgPolicyRoutingRules() {
-		fallbacks := svc.endpointFallbackTunnelIDs(z.TunnelID, z.FallbackTunnelIDs)
-		if !z.Enabled || z.WaitingForConnection || z.RouteValue() != "tunnel" || len(fallbacks) == 0 {
-			continue
-		}
-		hasFallback = true
-		selected := selectFallbackTunnelID(z.TunnelID, fallbacks, usable, isConnected)
-		b.WriteString(strconv.Itoa(i))
-		b.WriteByte('=')
-		b.WriteString(selected)
-		b.WriteByte(';')
-	}
+	ruleFailovers := svc.awgRuleFailovers()
 	for _, srv := range ordered {
 		if srv == nil {
 			continue
 		}
 		identity := srv.Manager.RuntimeLocalClientIdentity()
-		if len(identity.FallbackTunnelIDs) == 0 && identity.DoubleTunnelID == "" {
+		groups := ruleFailovers[srv.ID]
+		if len(groups) == 0 && identity.RoutingActive && identity.RoutingMode == "full" {
+			groups = [][]string{nil}
+		}
+		for i, backups := range groups {
+			fallbacks := svc.endpointFallbackTunnelIDs(srv.ID, backups)
+			if len(fallbacks) == 0 {
+				continue
+			}
+			hasFallback = true
+			selected := svc.selectRoutingFallback(srv.ID, fallbacks, usable, isConnected)
+			b.WriteString("rule:")
+			b.WriteString(strconv.Quote(srv.ID))
+			b.WriteByte(':')
+			b.WriteString(strconv.Itoa(i))
+			b.WriteByte('=')
+			b.WriteString(strconv.Quote(selected))
+			b.WriteByte(';')
+		}
+		if len(identity.FallbackTunnelIDs) == 0 && identity.DoubleTunnelID == "" && identity.DoubleTunnelMode != awg.DoubleTunnelPermanent {
 			continue
 		}
 		hasFallback = true
 		selected := ""
 		if identity.Enabled && identity.ClientEnabled {
-			for _, id := range fallbackCandidates(srv.ID, svc.endpointFallbackTunnelIDs(srv.ID, nil)) {
+			for _, id := range svc.orderedFallbackCandidates(srv.ID, svc.endpointFallbackTunnelIDs(srv.ID, nil)) {
 				if isConnected(id) {
 					selected = id
 					break

@@ -733,6 +733,8 @@ export interface AwgRulesImportResult {
   routing_revision: number;
   routing: AwgRoutingConfig;
 }
+export type AwgDoubleTunnelMode = "permanent" | "preferred" | "last_resort" | "automatic";
+
 export interface AwgClientConfig {
   enabled: boolean;
   peer_id: string;
@@ -740,11 +742,13 @@ export interface AwgClientConfig {
   endpoint_backups?: string[];
   fallback_tunnel_ids?: string[];
   double_tunnel_id?: string;
+  double_tunnel_mode?: AwgDoubleTunnelMode;
   standby?: boolean;
 }
 export interface AwgConnectionFailoverStatus {
   fallback_tunnel_ids: string[];
   double_tunnel_id?: string;
+  double_tunnel_mode?: AwgDoubleTunnelMode;
   double_tunnel_active?: boolean;
   double_tunnel_ip?: string;
   double_tunnel_error?: string;
@@ -1128,10 +1132,11 @@ export interface OpenWrtDnsState {
   supported: boolean;
   reason?: string;
   interfaces: { id: string; label: string }[];
-  instances: { id: string; label: string }[];
+  instances: { id: string; label: string; networks?: string[] }[];
   managed: boolean;
   pending?: boolean;
   binding?: { interface: string; instance: string; endpoint: { host: string; port: number } };
+  rebind_instance?: string;
   conflict?: string;
   warnings: string[];
   revision: string;

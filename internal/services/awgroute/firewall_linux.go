@@ -51,6 +51,7 @@ func awgApplyKillswitch(on bool) {
 	} else {
 		_, _ = awgRun("ip route del blackhole default table " + awgTable + " metric 1000 2>/dev/null")
 	}
+	_, _ = awgRun("ip -6 route del blackhole default table " + awgTable + " metric " + legacyPermanentIPv6Metric + " 2>/dev/null")
 }
 
 // awgFirewallHook renders the netfilter.d hook that (re)installs the AWG2 marking
@@ -63,6 +64,10 @@ func awgApplyKillswitch(on bool) {
 // fails to shrink client→server segments and oversized uploads (large cookies,
 // speed-test POSTs) blackhole → pages "load then stall/RESET".
 func awgFirewallHook(mode, endpointIP, wandev string, mtu int, dnsRedirect, tunnelV6 bool, zones []awg.Zone, endpointIPs ...string) string {
+	return awgFirewallHookForInterface(awgIface, mode, endpointIP, wandev, mtu, dnsRedirect, tunnelV6, false, zones, endpointIPs...)
+}
+
+func awgFirewallHookForInterface(iface, mode, endpointIP, wandev string, mtu int, dnsRedirect, tunnelV6, permanent bool, zones []awg.Zone, endpointIPs ...string) string {
 	if mtu <= 0 {
 		mtu = 1280
 	}
@@ -125,7 +130,9 @@ func awgFirewallHook(mode, endpointIP, wandev string, mtu int, dnsRedirect, tunn
 	s.WriteString("# AWG2 split-routing firewall hook — managed by nfqws2-strategy. DO NOT EDIT.\n")
 	s.WriteString("# Keenetic re-runs netfilter.d/* after every firewall rebuild (which flushes\n")
 	s.WriteString("# foreign iptables chains); this restores the AWG2 marking + FORWARD/NAT/MSS.\n")
-	s.WriteString("ip link show " + awgIface + " >/dev/null 2>&1 || exit 0\n")
+	if !permanent {
+		s.WriteString("ip link show " + iface + " >/dev/null 2>&1 || exit 0\n")
+	}
 	s.WriteString("ipset create " + awgSetInc + " hash:net family inet -exist 2>/dev/null\n")
 	s.WriteString("ipset create " + awgSetExc + " hash:net family inet -exist 2>/dev/null\n")
 	s.WriteString("ipset create " + awgSetSNI + " hash:ip family inet timeout " + strconv.Itoa(awgSNITTL) + " -exist 2>/dev/null\n")
@@ -376,19 +383,19 @@ func awgFirewallHook(mode, endpointIP, wandev string, mtu int, dnsRedirect, tunn
 	s.WriteString(restoreFallback("ip6tables", v6doc.String()))
 	s.WriteString("fi\n")
 	mssRule := func(direction string) string {
-		return "-" + direction + " " + awgIface + " -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss " + mss
+		return "-" + direction + " " + iface + " -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss " + mss
 	}
-	s.WriteString(ap("iptables", "nat", "POSTROUTING", "-o "+awgIface+" -j MASQUERADE"))
+	s.WriteString(ap("iptables", "nat", "POSTROUTING", "-o "+iface+" -j MASQUERADE"))
 	s.WriteString(ap("iptables", "mangle", "FORWARD", mssRule("o")))
 	s.WriteString(ap("iptables", "mangle", "FORWARD", mssRule("i")))
-	s.WriteString(ins("iptables", "filter", "FORWARD", "-i "+awgIface+" -j ACCEPT"))
-	s.WriteString(ins("iptables", "filter", "FORWARD", "-o "+awgIface+" -j ACCEPT"))
-	s.WriteString(ap("ip6tables", "nat", "POSTROUTING", "-o "+awgIface+" -j MASQUERADE"))
+	s.WriteString(ins("iptables", "filter", "FORWARD", "-i "+iface+" -j ACCEPT"))
+	s.WriteString(ins("iptables", "filter", "FORWARD", "-o "+iface+" -j ACCEPT"))
+	s.WriteString(ap("ip6tables", "nat", "POSTROUTING", "-o "+iface+" -j MASQUERADE"))
 	s.WriteString(ap("ip6tables", "mangle", "FORWARD", mssRule("o")))
 	s.WriteString(ap("ip6tables", "mangle", "FORWARD", mssRule("i")))
-	s.WriteString(ins("ip6tables", "filter", "FORWARD", "-i "+awgIface+" -j ACCEPT"))
-	s.WriteString(ins("ip6tables", "filter", "FORWARD", "-o "+awgIface+" -j ACCEPT"))
-	s.WriteString(awgFW4ForwardRulesShell([]string{awgIface}))
+	s.WriteString(ins("ip6tables", "filter", "FORWARD", "-i "+iface+" -j ACCEPT"))
+	s.WriteString(ins("ip6tables", "filter", "FORWARD", "-o "+iface+" -j ACCEPT"))
+	s.WriteString(awgFW4ForwardRulesShell([]string{iface}))
 	for _, ln := range strings.Split(strings.TrimSpace(v6FilterExtras.String()), "\n") {
 		if strings.TrimSpace(ln) != "" {
 			s.WriteString("ip6tables -t filter " + ln + " 2>/dev/null || true\n")
@@ -414,14 +421,14 @@ func awgFirewallHook(mode, endpointIP, wandev string, mtu int, dnsRedirect, tunn
 
 // awgWriteHook writes the netfilter.d hook for the given mode/endpoint and runs
 // it once immediately (applying the rules now, not just on the next ndm rebuild).
-func awgWriteHook(mode, endpointIP, wandev string, mtu int, dnsRedirect, tunnelV6 bool, zones []awg.Zone, endpointIPs ...string) error {
+func awgWriteHook(iface, mode, endpointIP, wandev string, mtu int, dnsRedirect, tunnelV6, permanent bool, zones []awg.Zone, endpointIPs ...string) error {
 	if err := os.MkdirAll(filepath.Dir(awgHookPath), 0o755); err != nil {
 		return err
 	}
-	if err := os.WriteFile(awgHookPath, []byte(awgFirewallHook(mode, endpointIP, wandev, mtu, dnsRedirect, tunnelV6, zones, endpointIPs...)), 0o755); err != nil {
+	if err := os.WriteFile(awgHookPath, []byte(awgFirewallHookForInterface(iface, mode, endpointIP, wandev, mtu, dnsRedirect, tunnelV6, permanent, zones, endpointIPs...)), 0o755); err != nil {
 		return err
 	}
-	awgEnsureFW4IncludeOS([]string{awgIface})
+	awgEnsureFW4IncludeOS([]string{iface})
 	if out, err := awgRun("sh " + awgHookPath); err != nil {
 		logbuf.Append("awg2", "warn", "firewall-хук: "+strs.LastLines(out, 2))
 		return awgCmdErr("firewall hook", out, err)

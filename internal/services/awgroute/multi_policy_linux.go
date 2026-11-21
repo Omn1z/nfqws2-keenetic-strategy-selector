@@ -27,14 +27,15 @@ const (
 )
 
 type awgMultiTunnel struct {
-	ID          string
-	Iface       string
-	EndpointIP  string
-	EndpointIPs []string
-	Table       int
-	Mark        string
-	MTU         int
-	Killswitch  bool
+	ID               string
+	Iface            string
+	EndpointIP       string
+	EndpointIPs      []string
+	Table            int
+	Mark             string
+	MTU              int
+	Killswitch       bool
+	WaitForTransport bool
 }
 
 type awgMultiRule struct {
@@ -139,11 +140,12 @@ func (svc *Service) awgBuildMultiPolicyWithResolve(resolve bool) ([]awgMultiRule
 			return t
 		}
 		cfg := srv.Manager.RuntimeConfig()
+		permanent := cfg.Client.DoubleTunnelMode == awg.DoubleTunnelPermanent
 		if !routingEnabled[srv.ID] {
 			return nil
 		}
 		iface := awgClientIfaceName(cfg)
-		if !validAWGClientIfaceName(iface) || strings.TrimSpace(cfg.Endpoint) == "" {
+		if !validAWGClientIfaceName(iface) || !permanent && strings.TrimSpace(cfg.Endpoint) == "" {
 			return nil
 		}
 		// Build desired policy without changing client intent. The supervisor
@@ -157,7 +159,7 @@ func (svc *Service) awgBuildMultiPolicyWithResolve(resolve bool) ([]awgMultiRule
 			endpointIP = svc.resolvePolicyHostIP(hostOf(cfg.Endpoint))
 			svc.rememberPolicyDNS(hostOf(cfg.Endpoint), []string{endpointIP})
 		}
-		if endpointIP == "" && resolve {
+		if endpointIP == "" && resolve && !permanent {
 			logbuf.Append("awg2", "warn", "multi-routing: endpoint is not resolved for "+iface)
 			return nil
 		}
@@ -170,14 +172,15 @@ func (svc *Service) awgBuildMultiPolicyWithResolve(resolve bool) ([]awgMultiRule
 		}
 		slot := len(tunnelOrder) + 1
 		t := &awgMultiTunnel{
-			ID:          srv.ID,
-			Iface:       iface,
-			EndpointIP:  endpointIP,
-			EndpointIPs: canonicalEndpointIPs(append(svc.awgClientEndpointIPs(srv.Manager), endpointIP)...),
-			Table:       awgMultiTableBase + slot,
-			Mark:        awgMultiMark(slot),
-			MTU:         awgActiveTunnelMTU(cfg),
-			Killswitch:  cfg.Routing.Killswitch,
+			ID:               srv.ID,
+			Iface:            iface,
+			EndpointIP:       endpointIP,
+			EndpointIPs:      canonicalEndpointIPs(append(svc.awgClientEndpointIPs(srv.Manager), endpointIP)...),
+			Table:            awgMultiTableBase + slot,
+			Mark:             awgMultiMark(slot),
+			MTU:              awgActiveTunnelMTU(cfg),
+			Killswitch:       cfg.Routing.Killswitch || permanent,
+			WaitForTransport: permanent && !isConnected(srv),
 		}
 		tunnelByID[srv.ID] = t
 		tunnelOrder = append(tunnelOrder, srv.ID)
@@ -212,7 +215,7 @@ func (svc *Service) awgBuildMultiPolicyWithResolve(resolve bool) ([]awgMultiRule
 			selectedID := primaryID
 			fallbacks := svc.endpointFallbackTunnelIDs(primaryID, z.FallbackTunnelIDs)
 			if len(fallbacks) > 0 {
-				selectedID = selectFallbackTunnelID(primaryID, fallbacks,
+				selectedID = svc.selectRoutingFallback(primaryID, fallbacks,
 					func(id string) bool {
 						candidate := servers[id]
 						if candidate == nil {
@@ -356,7 +359,11 @@ func (svc *Service) awgInstallMultiRoutes(tunnels []awgMultiTunnel) error {
 		}
 		// A different enabled tunnel may still be offline or starting. Keep its
 		// policy slot/killswitch, without making a healthy tunnel's restore fail.
-		if _, err := os.Stat("/sys/class/net/" + t.Iface); err == nil {
+		if t.WaitForTransport {
+			// A direct incarnation may still exist while the permanent
+			// policy is being installed. Its table must route to blackhole.
+			_, _ = awgRun("ip route del default dev " + t.Iface + " table " + strconv.Itoa(t.Table) + " 2>/dev/null")
+		} else if _, err := os.Stat("/sys/class/net/" + t.Iface); err == nil {
 			if err := awgRunCheck("ip route replace default dev " + t.Iface + " table " + strconv.Itoa(t.Table)); err != nil && firstErr == nil {
 				firstErr = fmt.Errorf("ip tunnel route %s: %w", t.Iface, err)
 			}
@@ -821,6 +828,7 @@ func (svc *Service) awgBuildMultiTunnelsOnly() []awgMultiTunnel {
 			continue
 		}
 		cfg := srv.Manager.RuntimeConfig()
+		permanent := cfg.Client.DoubleTunnelMode == awg.DoubleTunnelPermanent
 		if !routingEnabled[srv.ID] {
 			continue
 		}
@@ -828,7 +836,7 @@ func (svc *Service) awgBuildMultiTunnelsOnly() []awgMultiTunnel {
 			continue
 		}
 		iface := awgClientIfaceName(cfg)
-		if !validAWGClientIfaceName(iface) || strings.TrimSpace(cfg.Endpoint) == "" {
+		if !validAWGClientIfaceName(iface) || !permanent && strings.TrimSpace(cfg.Endpoint) == "" {
 			continue
 		}
 		endpointIP := svc.cachedPolicyEndpointIP(hostOf(cfg.Endpoint))
@@ -837,14 +845,15 @@ func (svc *Service) awgBuildMultiTunnelsOnly() []awgMultiTunnel {
 		}
 		slot := len(tunnelOrder) + 1
 		tunnelByID[srv.ID] = &awgMultiTunnel{
-			ID:          srv.ID,
-			Iface:       iface,
-			EndpointIP:  endpointIP,
-			EndpointIPs: canonicalEndpointIPs(append(svc.awgClientEndpointIPs(srv.Manager), endpointIP)...),
-			Table:       awgMultiTableBase + slot,
-			Mark:        awgMultiMark(slot),
-			MTU:         awgActiveTunnelMTU(cfg),
-			Killswitch:  cfg.Routing.Killswitch,
+			ID:               srv.ID,
+			Iface:            iface,
+			EndpointIP:       endpointIP,
+			EndpointIPs:      canonicalEndpointIPs(append(svc.awgClientEndpointIPs(srv.Manager), endpointIP)...),
+			Table:            awgMultiTableBase + slot,
+			Mark:             awgMultiMark(slot),
+			MTU:              awgActiveTunnelMTU(cfg),
+			Killswitch:       cfg.Routing.Killswitch || permanent,
+			WaitForTransport: permanent && !svc.tunnelUpForManagedServer(srv),
 		}
 		tunnelOrder = append(tunnelOrder, srv.ID)
 	}

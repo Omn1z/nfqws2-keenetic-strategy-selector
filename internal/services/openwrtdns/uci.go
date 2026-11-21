@@ -1,6 +1,7 @@
 package openwrtdns
 
 import (
+	"crypto/sha256"
 	"fmt"
 	"strconv"
 	"strings"
@@ -17,19 +18,20 @@ type section struct {
 }
 type configuration struct {
 	Sections []section
-	Raw      string
+	digest   [sha256.Size]byte
 }
 
 // Generated cfgXXXX IDs change when an anonymous section is committed. Export
 // without generated names and use the type's ordinal selector instead.
 func parseExport(raw, pkg string) (configuration, error) {
-	result := configuration{Raw: raw}
+	var result configuration
 	if len(raw) > 4<<20 {
 		return result, fmt.Errorf("слишком большая конфигурация UCI")
 	}
+	result.digest = sha256.Sum256([]byte(raw))
 	seen := map[string]bool{}
 	ordinals := map[string]int{}
-	for _, line := range strings.Split(raw, "\n") {
+	for line := range strings.SplitSeq(raw, "\n") {
 		words, err := uciWords(line)
 		if err != nil {
 			return result, err
@@ -46,13 +48,16 @@ func parseExport(raw, pkg string) (configuration, error) {
 			if (len(words) != 2 && len(words) != 3) || !validID(words[1]) {
 				return result, fmt.Errorf("неверная или повторяющаяся секция UCI")
 			}
-			id := "@" + words[1] + "[" + strconv.Itoa(ordinals[words[1]]) + "]"
+			ordinal := ordinals[words[1]]
 			ordinals[words[1]]++
+			var id string
 			if len(words) == 3 {
 				if !validID(words[2]) {
 					return result, fmt.Errorf("неверное имя секции UCI")
 				}
 				id = words[2]
+			} else {
+				id = "@" + words[1] + "[" + strconv.Itoa(ordinal) + "]"
 			}
 			if seen[id] {
 				return result, fmt.Errorf("повторяющаяся секция UCI")

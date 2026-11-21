@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"nfqws2strategy/internal/services/awg"
 	"nfqws2strategy/internal/tools/logbuf"
 )
 
@@ -117,24 +118,9 @@ func (svc *Service) awgApplyRoutingOS() (applyErr error) {
 	if err := svc.awgPinClientEndpoints(am); err != nil {
 		return fmt.Errorf("маршрут до endpoint: %w", err)
 	}
-	if err := awgRunCheck("ip route replace default dev " + awgIface + " table " + awgTable); err != nil {
-		return fmt.Errorf("ip tunnel route: %w", err)
+	if err := svc.awgInstallLegacyPolicyRoutes(cfg, true); err != nil {
+		return fmt.Errorf("маршрут AWG: %w", err)
 	}
-	_, _ = awgRun("while ip rule del fwmark " + awgMarkRule + " table " + awgTable + " 2>/dev/null; do :; done")
-	if err := awgRunCheck("ip rule add fwmark " + awgMarkRule + " table " + awgTable); err != nil {
-		return fmt.Errorf("ip rule: %w", err)
-	}
-	// 3-v6) IPv6 mirror: separate table state (same id is fine — v4 and v6 are
-	// independent), default-route into awg0, fwmark rule. AmneziaWG tunnels both
-	// families when MTU/peer allow, so this is enough for IPv6 sites to ride the
-	// existing per-source MARK or just the global blanket. Failures here are
-	// non-fatal (kernel may lack v6 forwarding), so we don't roll back v4.
-	_, _ = awgRun("ip -6 route replace default dev " + awgIface + " table " + awgTable)
-	_, _ = awgRun("ip -6 rule del fwmark " + awgMarkRule + " table " + awgTable + " 2>/dev/null")
-	_, _ = awgRun("ip -6 rule add fwmark " + awgMarkRule + " table " + awgTable)
-	// 3b) killswitch (Эксклюзивный маршрут): a blackhole fallback in the tunnel table
-	// so marked traffic is DROPPED (not leaked to the direct WAN) when awg0 is down.
-	awgApplyKillswitch(r.Killswitch)
 	// 4) domain-mask DNS proxy (optional, domain_source=="dnsproxy"). Start it
 	// BEFORE the hook so the hook's DNS REDIRECT is only installed once the proxy
 	// is actually listening (never blackhole LAN DNS).
@@ -149,7 +135,8 @@ func (svc *Service) awgApplyRoutingOS() (applyErr error) {
 	// 5) firewall hook (marking chain + FORWARD/NAT/MSS [+ DNS REDIRECT]) — a Keenetic
 	// ndm netfilter.d hook so it survives the firewall rebuilds that flush foreign
 	// iptables chains; awgWriteHook also applies it immediately.
-	if err := awgWriteHook(awgEffectiveMode(r), endpointIP, wandev, awgActiveTunnelMTU(cfg), dnsOn, awgTunnelV6Reaches(), r.Zones, svc.awgClientEndpointIPs(am)...); err != nil {
+	permanent := cfg.Client.DoubleTunnelMode == awg.DoubleTunnelPermanent
+	if err := awgWriteHook(awgClientIfaceName(cfg), awgEffectiveMode(r), endpointIP, wandev, awgActiveTunnelMTU(cfg), dnsOn, permanent || awgTunnelV6Reaches(), permanent, r.Zones, svc.awgLegacyHookEndpoints(am, cfg)...); err != nil {
 		return fmt.Errorf("firewall-хук: %w", err)
 	}
 	// 6) disable Keenetic's NAT accelerators — their fast-path silently drops our
@@ -213,21 +200,17 @@ func (svc *Service) awgRefreshRoutingOS() (applyErr error) {
 		return err
 	}
 	awgResetSNISet()
-	if err := awgRunCheck("ip route replace default dev " + awgIface + " table " + awgTable); err != nil {
+	if err := svc.awgInstallLegacyPolicyRoutes(cfg, false); err != nil {
 		return err
 	}
-	_, _ = awgRun("while ip rule del fwmark " + awgMarkRule + " table " + awgTable + " 2>/dev/null; do :; done")
-	if err := awgRunCheck("ip rule add fwmark " + awgMarkRule + " table " + awgTable); err != nil {
-		return err
-	}
-	awgApplyKillswitch(r.Killswitch)
 	traceSetEnabled(r.TraceEnabled)
 	dnsOn := svc.awgEnsureDNSProxy(&cfg)
 	if awgDNSProxyWanted(&cfg, svc.awgZoneMatchers(&cfg)) && !dnsOn {
 		return fmt.Errorf("DNS route learner failed to start")
 	}
 	svc.awgEnsureSNISniff(&cfg) // start/stop/refresh the SNI sniffer to match the new zones
-	if err := awgWriteHook(awgEffectiveMode(r), endpointIP, wandev, awgActiveTunnelMTU(cfg), dnsOn, awgTunnelV6Reaches(), r.Zones, svc.awgClientEndpointIPs(am)...); err != nil {
+	permanent := cfg.Client.DoubleTunnelMode == awg.DoubleTunnelPermanent
+	if err := awgWriteHook(awgClientIfaceName(cfg), awgEffectiveMode(r), endpointIP, wandev, awgActiveTunnelMTU(cfg), dnsOn, permanent || awgTunnelV6Reaches(), permanent, r.Zones, svc.awgLegacyHookEndpoints(am, cfg)...); err != nil {
 		return fmt.Errorf("firewall-хук: %w", err)
 	}
 	svc.route.mu.Lock()
@@ -323,7 +306,10 @@ func (svc *Service) awgStartRefresh() {
 					unlock()
 					continue
 				}
-				h := awgHookInputsHash(awgEffectiveMode(c.Routing), endpointIP+"|"+strings.Join(svc.awgClientEndpointIPs(am), ","), wandev, awgActiveTunnelMTU(c), dnsOn, awgTunnelV6Reaches(), c.Routing.Killswitch, svc.zonesRevision.Load())
+				permanent := c.Client.DoubleTunnelMode == awg.DoubleTunnelPermanent
+				tunnelV6 := permanent || awgTunnelV6Reaches()
+				endpoints := svc.awgLegacyHookEndpoints(am, c)
+				h := awgHookInputsHash(awgEffectiveMode(c.Routing)+"|"+strconv.FormatBool(permanent), endpointIP+"|"+strings.Join(endpoints, ","), wandev, awgActiveTunnelMTU(c), dnsOn, tunnelV6, c.Routing.Killswitch, svc.zonesRevision.Load())
 				_, hookMissing := os.Stat(awgHookPath)
 				// Watchdog hot path: avoid route.mu entirely. lastHookHash is an
 				// atomic.Pointer[string] swapped by the most recent re-assert;
@@ -371,8 +357,11 @@ func (svc *Service) awgStartRefresh() {
 					continue
 				}
 				refreshErr := svc.awgPinClientEndpoints(am)
+				if permanent && refreshErr == nil {
+					refreshErr = svc.awgApplyPermanentLegacyRoutes(c)
+				}
 				if refreshErr == nil && (hookMissing != nil || !same) {
-					refreshErr = awgWriteHook(awgEffectiveMode(c.Routing), endpointIP, wandev, awgActiveTunnelMTU(c), dnsOn, awgTunnelV6Reaches(), c.Routing.Zones, svc.awgClientEndpointIPs(am)...)
+					refreshErr = awgWriteHook(awgClientIfaceName(c), awgEffectiveMode(c.Routing), endpointIP, wandev, awgActiveTunnelMTU(c), dnsOn, tunnelV6, permanent, c.Routing.Zones, endpoints...)
 				} else if refreshErr == nil {
 					if out, err := awgRun("sh " + awgHookPath); err != nil {
 						refreshErr = awgCmdErr("routing firewall refresh", out, err)
@@ -381,10 +370,12 @@ func (svc *Service) awgStartRefresh() {
 				// re-assert the tunnel default route + killswitch: if awg0 flapped, the
 				// kernel drops routes on its device, so re-add the table-998 default and
 				// keep the killswitch blackhole in the state the user chose.
-				if err := awgRunCheck("ip route replace default dev " + awgIface + " table " + awgTable); err != nil && refreshErr == nil {
-					refreshErr = err
+				if !permanent {
+					if err := awgRunCheck("ip route replace default dev " + awgClientIfaceName(c) + " table " + awgTable); err != nil && refreshErr == nil {
+						refreshErr = err
+					}
+					awgApplyKillswitch(c.Routing.Killswitch)
 				}
-				awgApplyKillswitch(c.Routing.Killswitch)
 				svc.awgEnsureSNISniff(&c) // re-assert the SNI sniffer (idempotent; restarts if a socket died)
 				ticks++
 				// Check sets every ~15 min in the effective include/exclude mode.

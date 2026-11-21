@@ -118,7 +118,7 @@ func (svc *Service) awgDeleteServerWithReplacementWithOps(id, replacementID stri
 		} // Membership is stable while operations are held.
 		srv.Manager.SetRoutingState(entry.Config.Routing, entry.Config.Routing.Active)
 		policy := entry.Config.Client
-		srv.Manager.SetClientFailoverPolicy(policy.FallbackTunnelIDs, policy.Standby, policy.DoubleTunnelID)
+		srv.Manager.SetClientFailoverPolicy(policy.FallbackTunnelIDs, policy.Standby, policy.DoubleTunnelID, policy.DoubleTunnelMode)
 		if entry.AppliedConfig != nil {
 			srv.Manager.SetAppliedConfig(entry.AppliedConfig)
 		}
@@ -144,7 +144,7 @@ func (svc *Service) awgDeleteServerWithReplacementWithOps(id, replacementID stri
 	svc.route.tunnelUpAt.Store(0)
 
 	runtimeErr := saveWarning
-	if transferActive && svc.clientShouldRun(target.Manager) {
+	if transferActive && svc.clientShouldRun(target.Manager) && target.Manager.RuntimeLocalClientIdentity().DoubleTunnelMode != awg.DoubleTunnelPermanent {
 		status := svc.clientLifecycleDriver().status(target.Manager)
 		if status == nil || !status.Running || !svc.clientLifecycleDriver().currentEngine(target.Manager) {
 			err := ops.start(target.Manager)
@@ -254,6 +254,7 @@ func awgReplacementState(before awgPersisted, rules []awg.Zone, sourceID, target
 			applied.Client.FallbackTunnelIDs = cloneAWGStrings(entry.Config.Client.FallbackTunnelIDs)
 			applied.Client.Standby = entry.Config.Client.Standby
 			applied.Client.DoubleTunnelID = entry.Config.Client.DoubleTunnelID
+			applied.Client.DoubleTunnelMode = entry.Config.Client.DoubleTunnelMode
 			applied.Routing = entry.Config.Routing
 			entry.AppliedConfig = &applied
 		}
@@ -268,9 +269,11 @@ func awgReplacementState(before awgPersisted, rules []awg.Zone, sourceID, target
 func awgValidateReplacementGraph(servers []awgPersistedServer) error {
 	graph := make(map[string][]string, len(servers))
 	transports := make(map[string]string, len(servers))
+	permanent := make(map[string]bool, len(servers))
 	for _, entry := range servers {
 		graph[entry.ID] = entry.Config.Client.FallbackTunnelIDs
 		transports[entry.ID] = entry.Config.Client.DoubleTunnelID
+		permanent[entry.ID] = entry.Config.Client.DoubleTunnelMode == awg.DoubleTunnelPermanent
 	}
 	marks := map[string]int{}
 	var visit func(string) bool
@@ -293,6 +296,9 @@ func awgValidateReplacementGraph(servers []awgPersistedServer) error {
 		}
 		if doubleTunnelCycle(transports, id) {
 			return fmt.Errorf("перенос создаёт цикл двойных туннелей; измените внешний туннель перед удалением")
+		}
+		if permanent[transports[id]] {
+			return fmt.Errorf("подключение с постоянным двойным туннелем нельзя использовать как внешний транспорт")
 		}
 	}
 	return nil

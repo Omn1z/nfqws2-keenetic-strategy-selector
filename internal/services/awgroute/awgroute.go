@@ -270,7 +270,11 @@ func validAWGClientIfaceName(iface string) bool {
 }
 
 func awgClientIfaceName(cfg awg.ServerConfig) string {
-	if iface := strings.TrimSpace(cfg.ClientIface); validAWGClientIfaceName(iface) {
+	return clientIfaceName(cfg.ClientIface)
+}
+
+func clientIfaceName(name string) string {
+	if iface := strings.TrimSpace(name); validAWGClientIfaceName(iface) {
 		return iface
 	}
 	return "awg0"
@@ -423,7 +427,7 @@ func (svc *Service) AWG2StatusView() AWG2Status {
 			PersistenceError: persistenceError, ConfigRecovered: recovered,
 		}
 	}
-	full := am.Config()
+	profile := am.ConnectionOverview()
 	return AWG2Status{
 		Config:            am.Redacted(),
 		ActiveID:          svc.activeServerID(),
@@ -432,16 +436,16 @@ func (svc *Service) AWG2StatusView() AWG2Status {
 		RoutingConfig:     routing,
 		RoutingState:      svc.RoutingDNSReadiness(),
 		ConnectionRefs:    svc.connectionRefSnapshot(),
-		HasPassword:       strings.TrimSpace(full.Conn.Password) != "",
-		HasKey:            strings.TrimSpace(full.Conn.KeyPEM) != "",
-		HasServerKey:      strings.TrimSpace(full.PrivateKey) != "",
-		Deployed:          full.DeployedAt > 0,
+		HasPassword:       profile.HasPassword,
+		HasKey:            profile.HasKey,
+		HasServerKey:      profile.HasServerKey,
+		Deployed:          profile.Deployed,
 		LastDeploy:        am.LastDeploy(),
 		Status:            am.LastStatus(),
-		Endpoint:          am.RuntimeConfig().Endpoint,
+		Endpoint:          profile.Endpoint,
 		Engine:            svc.AWG2EngineInfo(),
 		Client:            svc.awgClientStatus(),
-		DeploymentPending: am.PendingApply(),
+		DeploymentPending: profile.DeploymentPending,
 		RecoverySettings:  recovery,
 		PersistenceError:  persistenceError, ConfigRecovered: recovered,
 	}
@@ -467,27 +471,26 @@ func (svc *Service) awgServerSummaries() []AWG2ServerSummary {
 		statuses[srv.ID] = driver.status(srv.Manager)
 	}
 	for _, srv := range entries {
-		cfg := srv.Manager.Config()
-		runtime := srv.Manager.RuntimeConfig()
+		profile := srv.Manager.ConnectionOverview()
 		st := srv.Manager.LastStatus()
 		sum := AWG2ServerSummary{
 			ID:                 srv.ID,
-			Label:              awgServerLabel(srv, cfg),
-			Host:               strings.TrimSpace(cfg.Conn.Host),
-			Endpoint:           strings.TrimSpace(runtime.Endpoint),
-			ClientIface:        awgClientIfaceName(cfg),
-			Enabled:            cfg.Enabled,
-			Imported:           cfg.Install == "imported",
-			Protocol:           runtime.Protocol,
-			ProtocolVersion:    runtime.EffectiveProtocolVersion(),
-			TrafficObfuscation: runtime.UseObfuscation(),
-			DeploymentPending:  srv.Manager.PendingApply(),
-			IsWARP:             isWARPConfig(runtime),
+			Label:              awgServerLabel(srv, profile.ConfiguredEndpoint, profile.Host),
+			Host:               profile.Host,
+			Endpoint:           strings.TrimSpace(profile.Endpoint),
+			ClientIface:        clientIfaceName(profile.ClientIface),
+			Enabled:            profile.Enabled,
+			Imported:           profile.Install == "imported",
+			Protocol:           profile.Protocol,
+			ProtocolVersion:    profile.ProtocolVersion,
+			TrafficObfuscation: profile.TrafficObfuscation,
+			DeploymentPending:  profile.DeploymentPending,
+			IsWARP:             isWARPConnection(profile.RuntimeInstall, profile.ServerPublicKey, profile.Endpoint),
 			Active:             srv.ID == activeID,
-			Deployed:           cfg.DeployedAt > 0,
-			HasPassword:        strings.TrimSpace(cfg.Conn.Password) != "",
-			HasKey:             strings.TrimSpace(cfg.Conn.KeyPEM) != "",
-			HasServerKey:       strings.TrimSpace(cfg.PrivateKey) != "",
+			Deployed:           profile.Deployed,
+			HasPassword:        profile.HasPassword,
+			HasKey:             profile.HasKey,
+			HasServerKey:       profile.HasServerKey,
 			Failover:           svc.connectionFailoverStatus(srv, statuses),
 		}
 		if st != nil {
@@ -507,15 +510,15 @@ func (svc *Service) awgServerSummaries() []AWG2ServerSummary {
 	return out
 }
 
-func awgServerLabel(srv *managedServer, cfg awg.ServerConfig) string {
+func awgServerLabel(srv *managedServer, endpoint, host string) string {
 	if strings.TrimSpace(srv.Name) != "" {
 		return strings.TrimSpace(srv.Name)
 	}
-	if strings.TrimSpace(cfg.Endpoint) != "" {
-		return strings.TrimSpace(cfg.Endpoint)
+	if endpoint = strings.TrimSpace(endpoint); endpoint != "" {
+		return endpoint
 	}
-	if strings.TrimSpace(cfg.Conn.Host) != "" {
-		return strings.TrimSpace(cfg.Conn.Host)
+	if host = strings.TrimSpace(host); host != "" {
+		return host
 	}
 	if srv.ID == "awg0" {
 		return "AWG2"
@@ -524,12 +527,7 @@ func awgServerLabel(srv *managedServer, cfg awg.ServerConfig) string {
 }
 
 func (svc *Service) awgRoutingRules() []awg.Zone {
-	type item struct {
-		z        awg.Zone
-		fallback int
-	}
-	items := []item{}
-	fallback := 1
+	rules := []awg.Zone{}
 	appendRule := func(z awg.Zone, ownerID string) {
 		z.TunnelID = strings.TrimSpace(z.TunnelID)
 		if z.TunnelID == "" && !z.WaitingForConnection {
@@ -559,12 +557,10 @@ func (svc *Service) awgRoutingRules() []awg.Zone {
 		if z.Route != "tunnel" && z.Route != "direct" {
 			z.Route = z.RouteValue()
 		}
-		items = append(items, item{z: z, fallback: fallback})
-		fallback++
+		rules = append(rules, z)
 	}
 	for _, srv := range svc.serverSnapshot() {
-		cfg := srv.Manager.Config()
-		for _, z := range cfg.Routing.Zones {
+		for _, z := range srv.Manager.RoutingZones() {
 			appendRule(z, srv.ID)
 		}
 	}
@@ -575,8 +571,8 @@ func (svc *Service) awgRoutingRules() []awg.Zone {
 		z.WaitingForConnection = true
 		appendRule(z, "")
 	}
-	sort.SliceStable(items, func(i, j int) bool {
-		oi, oj := items[i].z.Order, items[j].z.Order
+	sort.SliceStable(rules, func(i, j int) bool {
+		oi, oj := rules[i].Order, rules[j].Order
 		if oi > 0 && oj > 0 {
 			return oi < oj
 		}
@@ -586,17 +582,14 @@ func (svc *Service) awgRoutingRules() []awg.Zone {
 		if oj > 0 {
 			return false
 		}
-		return items[i].fallback < items[j].fallback
+		return false
 	})
-	out := make([]awg.Zone, 0, len(items))
-	for i, it := range items {
-		z := it.z
-		if z.Order <= 0 {
-			z.Order = i + 1
+	for i := range rules {
+		if rules[i].Order <= 0 {
+			rules[i].Order = i + 1
 		}
-		out = append(out, z)
 	}
-	return out
+	return rules
 }
 
 func (svc *Service) defaultRoutingTunnelID() string {
@@ -905,6 +898,11 @@ func (svc *Service) AWG2SetServerEnabled(id string, enabled bool) error {
 			operationErr = svc.awgTeardownRoutingOS()
 		}
 		operationErr = errors.Join(operationErr, svc.awgClientDownManagerOS(srv.Manager))
+	} else if cfg.Client.DoubleTunnelMode == awg.DoubleTunnelPermanent {
+		svc.reconcileStandbyClients()
+		if svc.clientShouldRun(srv.Manager) {
+			svc.checkPermanentDoubleTunnel(srv.Manager)
+		}
 	} else if awgCanStartLocalClient(cfg) && svc.clientShouldRun(srv.Manager) {
 		operationErr = svc.awgClientUpManagerOS(srv.Manager)
 		svc.recordClientAttempt(srv.Manager, operationErr)
@@ -1026,7 +1024,7 @@ func (svc *Service) awgDeleteServerWithOps(id string, teardown func() error, dow
 			outer = ""
 		}
 		if len(filtered) != len(cfg.Client.FallbackTunnelIDs) || outer != cfg.Client.DoubleTunnelID {
-			other.Manager.SetClientFailoverPolicy(filtered, cfg.Client.Standby, outer)
+			other.Manager.SetClientFailoverPolicy(filtered, cfg.Client.Standby, outer, cfg.Client.DoubleTunnelMode)
 		}
 		cfg.Routing.Zones = part[other.ID]
 		activeState := cfg.Routing.Active
@@ -1271,7 +1269,7 @@ func (svc *Service) AWG2DeployServers(ids []string) []AWG2DeployServerResult {
 		}
 		cfg := srv.Manager.Config()
 		res, err := svc.deployServer(srv)
-		item := AWG2DeployServerResult{ID: srv.ID, Label: awgServerLabel(srv, cfg), OK: err == nil && res.OK, Result: res}
+		item := AWG2DeployServerResult{ID: srv.ID, Label: awgServerLabel(srv, cfg.Endpoint, cfg.Conn.Host), OK: err == nil && res.OK, Result: res}
 		if err != nil {
 			item.Error = err.Error()
 		}
@@ -1321,7 +1319,7 @@ func (svc *Service) deployServer(srv *managedServer) (awg.DeployResult, error) {
 	}
 	ctx, cancel := context.WithTimeout(ctx, 300*time.Second)
 	defer cancel()
-	logbuf.Append("awg2", "info", "деплой AWG2-сервера "+awgServerLabel(srv, cfg)+"…")
+	logbuf.Append("awg2", "info", "деплой AWG2-сервера "+awgServerLabel(srv, cfg.Endpoint, cfg.Conn.Host)+"…")
 	res, err := srv.Manager.Deploy(ctx, func(s awg.Step) {
 		lvl := "info"
 		if !s.OK {

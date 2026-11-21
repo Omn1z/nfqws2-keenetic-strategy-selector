@@ -217,7 +217,8 @@ func TestSaveDoubleTunnelValidatesReferencesAndPreservesOmittedSetting(t *testin
 		}
 	}
 	outer := " two "
-	if err := svc.setConnectionFailoverWithOps("one", FailoverConfig{DoubleTunnelID: &outer}, apply); err != nil {
+	preferred := awg.DoubleTunnelPreferred
+	if err := svc.setConnectionFailoverWithOps("one", FailoverConfig{DoubleTunnelID: &outer, DoubleTunnelMode: &preferred}, apply); err != nil {
 		t.Fatal(err)
 	}
 	first := "one"
@@ -230,12 +231,22 @@ func TestSaveDoubleTunnelValidatesReferencesAndPreservesOmittedSetting(t *testin
 	if got := svc.loadAWGState().Servers[0].Config.Client.DoubleTunnelID; got != "two" {
 		t.Fatalf("omitted field changed the saved transport to %q", got)
 	}
+	if got := svc.loadAWGState().Servers[0].Config.Client.DoubleTunnelMode; got != preferred {
+		t.Fatalf("omitted field changed the saved mode to %q", got)
+	}
+	unknown := awg.DoubleTunnelMode("unknown")
+	if err := svc.setConnectionFailoverWithOps("one", FailoverConfig{DoubleTunnelMode: &unknown}, apply); err == nil {
+		t.Fatal("accepted an unknown double tunnel mode")
+	}
 	clear := ""
 	if err := svc.setConnectionFailoverWithOps("one", FailoverConfig{DoubleTunnelID: &clear}, apply); err != nil {
 		t.Fatal(err)
 	}
 	if got := entries[0].Manager.RuntimeLocalClientIdentity().DoubleTunnelID; got != "" {
 		t.Fatalf("cleared transport remained active in the manager: %q", got)
+	}
+	if got := entries[0].Manager.ClientDoubleTunnelMode(); got != awg.DoubleTunnelLastResort {
+		t.Fatalf("cleared transport retained mode %q", got)
 	}
 }
 
@@ -260,6 +271,10 @@ func TestFullModeFailoverCompilesCatchAllWithoutChangingSavedRules(t *testing.T)
 	rules := svc.awgPolicyRoutingRules()
 	if len(rules) != 1 || rules[0].TunnelID != "one" || !rules[0].IsCatchAll() || len(svc.awgRoutingRules()) != 0 {
 		t.Fatal("legacy full mode did not inherit connection-level failover")
+	}
+	primary.SetClientFailoverPolicy([]string{"two"}, false, "off", awg.DoubleTunnelPermanent)
+	if rules := svc.awgPolicyRoutingRules(); len(rules) != 0 {
+		t.Fatalf("permanent full mode must retain the legacy IPv4 and IPv6 policy, got %d synthetic rules", len(rules))
 	}
 }
 

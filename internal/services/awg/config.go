@@ -109,10 +109,35 @@ type ClientConfig struct {
 	Enabled bool   `json:"enabled"` // bring awg0 up (boot + now)
 	PeerID  string `json:"peer_id"` // which Peer represents this router
 	// Standby keeps the saved connection offline until a primary needs it.
-	Standby           bool     `json:"standby"`
-	FallbackTunnelIDs []string `json:"fallback_tunnel_ids,omitempty"`
-	DoubleTunnelID    string   `json:"double_tunnel_id,omitempty"` // external transport for this peer after ordinary failover
-	EndpointBackups   []string `json:"endpoint_backups,omitempty"` // ordered IPs of this same server; local client policy only
+	Standby           bool             `json:"standby"`
+	FallbackTunnelIDs []string         `json:"fallback_tunnel_ids,omitempty"`
+	DoubleTunnelID    string           `json:"double_tunnel_id,omitempty"`
+	DoubleTunnelMode  DoubleTunnelMode `json:"double_tunnel_mode,omitempty"`
+	EndpointBackups   []string         `json:"endpoint_backups,omitempty"` // ordered IPs of this same server; local client policy only
+}
+
+// DoubleTunnelMode controls when to carry this peer's transport over another
+// VPN. Configurations written before modes were introduced use last resort.
+type DoubleTunnelMode string
+
+const (
+	DoubleTunnelLastResort DoubleTunnelMode = "last_resort"
+	DoubleTunnelPermanent  DoubleTunnelMode = "permanent"
+	DoubleTunnelPreferred  DoubleTunnelMode = "preferred"
+	DoubleTunnelAutomatic  DoubleTunnelMode = "automatic"
+)
+
+func (m DoubleTunnelMode) Effective() DoubleTunnelMode {
+	switch m {
+	case DoubleTunnelPermanent, DoubleTunnelPreferred, DoubleTunnelAutomatic:
+		return m
+	default:
+		return DoubleTunnelLastResort
+	}
+}
+
+func (m DoubleTunnelMode) Valid() bool {
+	return m == m.Effective()
 }
 
 // Zone (rendered in the UI as «Правило») is a named match-list for split

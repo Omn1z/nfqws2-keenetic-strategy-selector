@@ -499,6 +499,163 @@ func TestRestoreConflictPreservesUserChanges(t *testing.T) {
 	}
 }
 
+func TestLegacyBindingReidentifiesMovedInstanceWithoutTouchingNewOrdinalOwner(t *testing.T) {
+	m, f := newFixture(t)
+	ctx := context.Background()
+	bound := f.find("dhcp", "@dnsmasq[0]")
+	original := cloneSections([]section{*bound})[0]
+	applyFixture(t, m)
+	saved, err := m.readSnapshot()
+	if err != nil || saved == nil {
+		t.Fatalf("read snapshot: %v", err)
+	}
+	saved.InstanceScope = ""
+	if err = m.writeSnapshot(saved); err != nil {
+		t.Fatal(err)
+	}
+	earlierRevision := revision(t, m)
+	other := section{ID: "@dnsmasq[0]", Type: "dnsmasq", Options: map[string]option{
+		"interface": list("iot"), "server": list("9.9.9.9"),
+	}}
+	originalOther := cloneSections([]section{other})[0]
+	moved := f.configs["dhcp"][0]
+	moved.ID = "@dnsmasq[1]"
+	f.configs["dhcp"] = append([]section{other, moved}, f.configs["dhcp"][1:]...)
+	f.calls = nil
+	state, err := m.Status(ctx)
+	if err != nil || !state.Managed || state.Binding == nil || state.Binding.Instance != moved.ID || state.Conflict != "" {
+		t.Fatalf("moved binding not reported: %+v, %v", state, err)
+	}
+	if f.writes() != 0 || state.Revision == earlierRevision {
+		t.Fatal("inspection wrote UCI or failed to invalidate the old revision")
+	}
+	if err = m.Apply(ctx, "wan", other.ID, saved.Binding.Endpoint, state.Revision); err == nil || f.writes() != 0 {
+		t.Fatal("request for the old ordinal rewrote DNS")
+	}
+	if err = m.Apply(ctx, "wan", moved.ID, saved.Binding.Endpoint, state.Revision); err != nil || f.writes() != 0 {
+		t.Fatalf("metadata-only migration should not write UCI: %v", err)
+	}
+	updated, err := m.readSnapshot()
+	if err != nil || updated == nil || updated.Binding.Instance != moved.ID || updated.InstanceScope == "" {
+		t.Fatalf("moved legacy snapshot was not upgraded: %+v, %v", updated, err)
+	}
+	if err = m.Restore(ctx, revision(t, m)); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(f.find("dhcp", other.ID).Options, originalOther.Options) ||
+		!reflect.DeepEqual(f.find("dhcp", moved.ID).Options, original.Options) {
+		t.Fatal("restore targeted the wrong anonymous section")
+	}
+}
+
+func TestAnonymousBindingAllowsTuningChangesWithoutOverwritingThem(t *testing.T) {
+	m, f := newFixture(t)
+	applyFixture(t, m)
+	bound := f.find("dhcp", "@dnsmasq[0]")
+	bound.Options["cachesize"] = scalar("500")
+	bound.Options["logqueries"] = scalar("1")
+	state, err := m.Status(context.Background())
+	if err != nil || !state.Managed || state.Conflict != "" {
+		t.Fatalf("tuning changes should preserve ownership: %+v, %v", state, err)
+	}
+	if err := m.Restore(context.Background(), state.Revision); err != nil {
+		t.Fatal(err)
+	}
+	if bound.scalar("cachesize") != "500" || bound.scalar("logqueries") != "1" ||
+		!reflect.DeepEqual(bound.Options["server"], list("8.8.8.8", "/corp.example/192.168.4.1", "/lan/", "/#/9.9.9.9")) {
+		t.Fatal("restore lost the original forwarding or changed external tuning")
+	}
+}
+
+func TestAnonymousBindingConflictsKeepStatusReadableAndRefuseWrites(t *testing.T) {
+	for _, scenario := range []string{"scope changed", "changed forwarding and tuning", "ambiguous identity", "changed legacy identity"} {
+		t.Run(scenario, func(t *testing.T) {
+			m, f := newFixture(t)
+			ctx := context.Background()
+			applyFixture(t, m)
+			bound := f.find("dhcp", "@dnsmasq[0]")
+			switch scenario {
+			case "scope changed":
+				bound.Options["interface"] = list("iot")
+			case "changed forwarding and tuning":
+				bound.Options["server"] = list("9.9.9.9")
+				bound.Options["cachesize"] = scalar("500")
+			case "ambiguous identity":
+				other := cloneSections([]section{*bound})[0]
+				other.ID = "@dnsmasq[1]"
+				f.configs["dhcp"] = append(f.configs["dhcp"], other)
+			case "changed legacy identity":
+				bound.Options["cachesize"] = scalar("500")
+				saved, err := m.readSnapshot()
+				if err != nil || saved == nil {
+					t.Fatalf("read snapshot: %v", err)
+				}
+				saved.InstanceScope = ""
+				if err = m.writeSnapshot(saved); err != nil {
+					t.Fatal(err)
+				}
+			}
+			f.calls = nil
+			state, err := m.Status(ctx)
+			if err != nil || !state.Managed || state.Binding == nil || state.Conflict == "" ||
+				state.Revision == "" || len(state.Instances) == 0 || len(state.Interfaces) == 0 {
+				t.Fatalf("conflict should be visible without hiding status: %+v, %v", state, err)
+			}
+			if scenario != "changed legacy identity" && state.RebindInstance != "" {
+				t.Fatalf("unsafe confirmation offered: %+v", state)
+			}
+			if err = m.Apply(ctx, "wan", "@dnsmasq[0]", state.Binding.Endpoint, state.Revision); err == nil {
+				t.Fatal("apply did not respect identity conflict")
+			}
+			if err = m.Restore(ctx, state.Revision); err == nil || f.writes() != 0 {
+				t.Fatalf("restore did not respect identity conflict: %v", err)
+			}
+		})
+	}
+}
+
+func TestLegacyInstanceRebindRequiresExplicitUniqueCurrentSelection(t *testing.T) {
+	m, f := newFixture(t)
+	ctx := context.Background()
+	applyFixture(t, m)
+	saved, err := m.readSnapshot()
+	if err != nil || saved == nil {
+		t.Fatalf("read snapshot: %v", err)
+	}
+	saved.InstanceScope = ""
+	if err = m.writeSnapshot(saved); err != nil {
+		t.Fatal(err)
+	}
+	bound := f.find("dhcp", "@dnsmasq[0]")
+	bound.Options["cachesize"] = scalar("500")
+	state, err := m.Status(ctx)
+	if err != nil || state.RebindInstance != bound.ID || state.Conflict == "" {
+		t.Fatalf("missing explicit confirmation candidate: %+v, %v", state, err)
+	}
+	f.calls = nil
+	if m.Rebind(ctx, "@dnsmasq[1]", state.Revision) == nil || m.Rebind(ctx, bound.ID, "stale") == nil {
+		t.Fatal("accepted a different selector or stale revision")
+	}
+	f.deltas["network"] = []string{"network.wan.metric='10'"}
+	if m.Rebind(ctx, bound.ID, state.Revision) == nil {
+		t.Fatal("confirmed against pending changes")
+	}
+	f.deltas["network"] = nil
+	if err = m.Rebind(ctx, bound.ID, state.Revision); err != nil || f.writes() != 0 {
+		t.Fatalf("metadata-only confirmation made a UCI change: %v", err)
+	}
+	after, err := m.Status(ctx)
+	if err != nil || after.Conflict != "" || after.RebindInstance != "" || after.Revision == state.Revision {
+		t.Fatalf("confirmed binding still has a conflict: %+v, %v", after, err)
+	}
+	if err := m.Restore(ctx, after.Revision); err != nil {
+		t.Fatal(err)
+	}
+	if bound.scalar("cachesize") != "500" || !reflect.DeepEqual(bound.Options["server"], list("8.8.8.8", "/corp.example/192.168.4.1", "/lan/", "/#/9.9.9.9")) {
+		t.Fatal("restore did not preserve current tuning and original DNS")
+	}
+}
+
 func TestUnmanagedAndUnsupportedNeverInvokeUCI(t *testing.T) {
 	m, f := newFixture(t)
 	if err := m.Restore(context.Background(), ""); err != nil {
