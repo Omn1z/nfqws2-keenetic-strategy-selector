@@ -13,7 +13,7 @@ import { PageHeader, StatsStrip, compactCard } from "@/components/ui/FeaturePage
 import { Switch } from "@/components/ui/Switch";
 import { Skeleton } from "@/components/ui/Skeleton";
 import { fieldCls } from "@/components/ui/form";
-import type { Device, Trace, Pcap, PcapStart, InstallResult } from "@/types/api";
+import type { Device, Trace, Pcap, PcapStart, DiagnosticPackage, NeedDiagnosticPackage, InstallResult } from "@/types/api";
 import { deviceRows, deviceSummary, hasDeviceFailures } from "./devicesView";
 
 const diagnosticCard = cn(compactCard, "[&_[data-slot=card-title]]:min-w-0 [&_[data-slot=card-title]]:[overflow-wrap:anywhere]");
@@ -71,7 +71,7 @@ export default function Devices() {
   const [pcap, setPcap] = useState<Pcap | null>(null);
   const [pcapping, setPcapping] = useState(false);
   const [pcapStarting, setPcapStarting] = useState(false);
-  const [installIP, setInstallIP] = useState<string | null>(null);
+  const [install, setInstall] = useState<{ ip: string; mode: "trace" | "pcap"; pkg: DiagnosticPackage } | null>(null);
   const [installing, setInstalling] = useState(false);
   const { setPendingTargets } = useStore();
 
@@ -99,7 +99,7 @@ export default function Devices() {
       setTrace(t);
       if (t.status !== "running") {
         setTracing(false);
-        toast(`Трассировка ${t.ip} завершена — проблем: ${problems(t)}`, problems(t) ? "warn" : "ok");
+        toast(t.status === "cancelled" ? "Трассировка остановлена" : t.status === "error" ? String(t.error) : `Трассировка ${t.ip} завершена — проблем: ${problems(t)}`, t.status === "error" ? "err" : problems(t) ? "warn" : "ok");
       }
     } catch (e) { setTracing(false); toast((e as Error).message, "err"); }
   }, 1000, tracing);
@@ -111,7 +111,7 @@ export default function Devices() {
       setPcap(p);
       if (p.status !== "running") {
         setPcapping(false);
-        toast(p.status === "error" ? `Захват ${p.ip}: ${p.error}` : `Захват ${p.ip} готов — ${p.packets} пакетов`, p.status === "error" ? "err" : "ok");
+        toast(p.status === "cancelled" ? "Захват остановлен" : p.status === "error" ? `Захват ${p.ip}: ${p.error}` : `Захват ${p.ip} готов — ${p.packets} пакетов`, p.status === "error" ? "err" : "ok");
       }
     } catch (e) { setPcapping(false); toast((e as Error).message, "err"); }
   }, 1000, pcapping);
@@ -123,7 +123,11 @@ export default function Devices() {
   const startTrace = async (ip: string) => {
     if (tracing || traceStarting) return;
     setTraceStarting(true);
-    try { const t = await api<Trace>("POST", `/api/devices/${encodeURIComponent(ip)}/trace`, { seconds: 30 }); setTrace(t); setTracing(true); toast(`Трассировка ${ip} запущена на 30 с`, "ok"); }
+    try {
+      const t = await api<Trace | NeedDiagnosticPackage>("POST", `/api/devices/${encodeURIComponent(ip)}/trace`, { seconds: 30 });
+      if ("need_install" in t) { setInstall({ ip, mode: "trace", pkg: t.package }); return; }
+      setTrace(t); setTracing(true); toast(`Трассировка ${ip} запущена на 30 с`, "ok");
+    }
     catch (e) { toast((e as Error).message, "err"); }
     finally { setTraceStarting(false); }
   };
@@ -133,26 +137,28 @@ export default function Devices() {
     setPcapStarting(true);
     try {
       const r = await api<PcapStart>("POST", `/api/devices/${encodeURIComponent(ip)}/pcap`, { seconds: 30 });
-      if ("need_install" in r) { setInstallIP(ip); return; }
+      if ("need_install" in r) { setInstall({ ip, mode: "pcap", pkg: r.package }); return; }
       setPcap(r); setPcapping(true); toast(`Захват ${ip} запущен на ${r.seconds} с`, "ok");
     } catch (e) { toast((e as Error).message, "err"); }
     finally { setPcapStarting(false); }
   };
   const confirmInstall = async () => {
-    const ip = installIP;
-    if (!ip) return;
+    if (!install) return;
+    const { ip, mode, pkg } = install;
     setInstalling(true);
     try {
-      const r = await api<InstallResult>("POST", "/api/system/install", { package: "tcpdump" });
-      if (!r.ok) { toast(`Не удалось установить tcpdump: ${r.error ?? ""}`, "err"); return; }
-      toast("tcpdump установлен", "ok");
-      setInstallIP(null);
-      await beginPcap(ip);
+      const r = await api<InstallResult>("POST", "/api/system/install", { package: pkg });
+      if (!r.ok) { toast(r.error || `Не удалось установить ${pkg}`, "err"); return; }
+      toast(`Пакет ${pkg} установлен`, "ok");
+      setInstall(null);
+      if (mode === "trace") await startTrace(ip); else await beginPcap(ip);
     } catch (e) { toast((e as Error).message, "err"); }
     finally { setInstalling(false); }
   };
   const downloadPcap = (p: Pcap) =>
     downloadFile(`/api/pcap/${p.id}/download`, `pcap-${p.ip}-${p.id.slice(0, 6)}.pcap`).catch((e) => toast((e as Error).message, "err"));
+  const cancelCapture = (mode: "trace" | "pcap", id: string) =>
+    api("POST", `/api/${mode}/${encodeURIComponent(id)}/cancel`).catch((e) => toast((e as Error).message, "err"));
 
   const rows = deviceRows(devices, filter, failOnly);
   const summary = deviceSummary(devices);
@@ -167,17 +173,17 @@ export default function Devices() {
         { label: "С проблемами", value: loaded ? summary.failingHosts : "—", hint: loaded ? `Не отвечают: ${summary.failing}` : "Без ответа / SYN_SENT", tone: summary.failingHosts ? "bad" : "neutral" },
         { label: "Установлено", value: loaded ? summary.established : "—", hint: loaded ? `Всего сессий: ${summary.total}` : "Соединения устройств", tone: "ok" },
         { label: "Суммарный трафик", value: loaded && summary.bytes !== null ? human(summary.bytes) : "—", hint: summary.bytes === null ? "Данные трафика недоступны" : "Отправлено + получено" },
-        { label: "Диагностика", value: tracing || pcapping ? "Идёт запись" : installIP ? "Нужен tcpdump" : "30 с", hint: tracing && pcapping ? "Трассировка и .pcap" : tracing ? "Трассировка соединений" : pcapping ? "Захват .pcap" : "Трассировка / захват .pcap" },
+        { label: "Диагностика", value: tracing || pcapping ? "Идёт запись" : install ? "Нужен пакет" : "30 с", hint: tracing && pcapping ? "Трассировка и .pcap" : tracing ? "Трассировка соединений" : pcapping ? "Захват .pcap" : "Трассировка / захват .pcap" },
       ]} />
       {trace && (
         <Card
           className={diagnosticCard}
           title={`Трассировка ${trace.ip}`}
-          sub={tracing ? "идёт запись…" : trace.status === "error" ? `ошибка: ${trace.error}` : "готово"}
+          sub={tracing ? "идёт запись…" : trace.status === "cancelled" ? "остановлено" : trace.status === "error" ? `ошибка: ${trace.error}` : trace.limited ? "достигнут лимит записей" : "готово"}
           head={
             <div className="flex max-w-full flex-wrap items-center gap-2.5">
               {trace.status !== "running" && <Button mini onClick={() => downloadTrace(trace)}>Скачать лог</Button>}
-              <Button mini variant="ghost" onClick={() => { setTrace(null); setTracing(false); }}>Закрыть</Button>
+              {tracing && trace.cancellable ? <Button mini variant="ghost" onClick={() => cancelCapture("trace", trace.id)}>Остановить</Button> : <Button mini variant="ghost" onClick={() => { setTrace(null); setTracing(false); }}>Закрыть</Button>}
             </div>
           }
         >
@@ -213,11 +219,11 @@ export default function Devices() {
         <Card
           className={diagnosticCard}
           title={`Захват пакетов ${pcap.ip}`}
-          sub={pcapping ? "идёт захват…" : pcap.status === "error" ? `ошибка: ${pcap.error}` : "готово"}
+          sub={pcapping ? "идёт захват…" : pcap.status === "cancelled" ? "остановлено" : pcap.status === "error" ? `ошибка: ${pcap.error}` : pcap.limited ? "достигнут лимит 2 МиБ" : "готово"}
           head={
             <div className="flex max-w-full flex-wrap items-center gap-2.5">
               {pcap.status === "done" && pcap.size_bytes > 0 && <Button mini onClick={() => downloadPcap(pcap)}>Скачать .pcap</Button>}
-              <Button mini variant="ghost" onClick={() => { setPcap(null); setPcapping(false); }}>Закрыть</Button>
+              {pcapping && pcap.cancellable ? <Button mini variant="ghost" onClick={() => cancelCapture("pcap", pcap.id)}>Остановить</Button> : <Button mini variant="ghost" onClick={() => { setPcap(null); setPcapping(false); }}>Закрыть</Button>}
             </div>
           }
         >
@@ -299,19 +305,19 @@ export default function Devices() {
         </div>
       </Card>
 
-      {installIP && (
+      {install && (
         <Modal
-          title="Нужен пакет tcpdump"
-          onClose={() => { if (!installing) setInstallIP(null); }}
+          title={`Установить ${install.pkg}?`}
+          onClose={() => { if (!installing) setInstall(null); }}
           actions={
             <>
-              <Button variant="ghost" onClick={() => setInstallIP(null)} disabled={installing}>Отмена</Button>
+              <Button variant="ghost" onClick={() => setInstall(null)} disabled={installing}>Отмена</Button>
               <Button variant="primary" onClick={confirmInstall} disabled={installing}>{installing ? "Установка…" : "Установить"}</Button>
             </>
           }
         >
-          <p>Для захвата пакетов нужен <b>tcpdump</b> — на роутере он не установлен. Поставить его через системный менеджер пакетов (~1–2 МБ)?</p>
-          <p className="mt-2 text-muted">Установка единоразовая. После неё захват для <b className="font-mono [overflow-wrap:anywhere]">{installIP}</b> запустится автоматически.</p>
+          <p>{install.pkg === "tcpdump" ? "Для записи пакетов устройства требуется tcpdump." : "Модуль диагностики добавляет трассировку соединений и запись пакетов устройства."}</p>
+          <p className="mt-2 text-muted">После установки начнётся {install.mode === "trace" ? "трассировка" : "захват пакетов"} для <b className="font-mono [overflow-wrap:anywhere]">{install.ip}</b>.</p>
         </Modal>
       )}
     </div>

@@ -1,0 +1,53 @@
+
+// TestRouterStagedQueueEvictsOldest exercises overload without a live tunnel or
+// sockets. Pending traffic must stay bounded and the newest batches must win.
+func TestRouterStagedQueueEvictsOldest(t *testing.T) {
+	d := new(Device)
+	d.net.bind = &fakeBindSized{conn.IdealBatchSize}
+	d.tun.device = &fakeTUNDeviceSized{conn.IdealBatchSize}
+	d.PopulatePools()
+	peer := &Peer{device: d}
+	peer.queue.staged = make(chan *QueueOutboundElementsContainer, QueueStagedSize)
+	total := 2*QueueStagedSize + 3
+	for i := 0; i < total; i++ {
+		elem := d.NewOutboundElement()
+		elem.buffer[0] = byte(i)
+		batch := d.GetOutboundElementsContainer()
+		batch.elems = append(batch.elems, elem)
+		peer.StagePackets(batch)
+	}
+	if len(peer.queue.staged) != QueueStagedSize {
+		t.Fatalf("pending batches = %d, want %d", len(peer.queue.staged), QueueStagedSize)
+	}
+	for i := total-QueueStagedSize; i < total; i++ {
+		batch := <-peer.queue.staged
+		if len(batch.elems) != 1 || batch.elems[0].buffer[0] != byte(i) {
+			t.Fatalf("pending batch %d was not preserved in order", i)
+		}
+		for _, elem := range batch.elems {
+			d.PutMessageBuffer(elem.buffer)
+			d.PutOutboundElement(elem)
+		}
+		d.PutOutboundElementsContainer(batch)
+	}
+	peer.FlushStagedPackets()
+	if len(peer.queue.staged) != 0 { t.Fatal("staged batches remain after flush") }
+}
+
+// TestRouterResidentBatchBuffers measures the full-size buffers held by two
+// socket readers and the TUN reader. It never creates a network interface.
+func TestRouterResidentBatchBuffers(t *testing.T) {
+	runtime.GC()
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	count := 3 * conn.IdealBatchSize
+	buffers := make([]*[MaxMessageSize]byte, count)
+	for i := range buffers {
+		buffers[i] = new([MaxMessageSize]byte)
+		for page := 0; page < MaxMessageSize; page += 4096 { buffers[i][page] = 1 }
+	}
+	runtime.ReadMemStats(&after)
+	t.Logf("batch=%d readers=3 buffers=%d payload_bytes=%d heap_delta_bytes=%d",
+		conn.IdealBatchSize, count, count*MaxMessageSize, after.HeapAlloc-before.HeapAlloc)
+	runtime.KeepAlive(buffers)
+}

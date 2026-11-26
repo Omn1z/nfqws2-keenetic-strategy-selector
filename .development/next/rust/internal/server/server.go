@@ -1,0 +1,2007 @@
+// Package server exposes the REST API and the embedded web UI.
+package server
+
+import (
+	"bytes"
+	"compress/gzip"
+	"context"
+	"encoding/json"
+	"errors"
+	"io"
+	"log"
+	"net/http"
+	"os"
+	"strconv"
+	"strings"
+	"sync"
+	"syscall"
+	"time"
+
+	"nfqws2strategy/internal/app"
+	"nfqws2strategy/internal/services/arpspoof"
+	"nfqws2strategy/internal/services/awg"
+	"nfqws2strategy/internal/services/awgroute"
+	"nfqws2strategy/internal/services/portforward"
+	"nfqws2strategy/internal/services/strategy/core/catalog"
+	"nfqws2strategy/internal/services/tgws"
+	"nfqws2strategy/internal/tools/dns"
+	"nfqws2strategy/internal/tools/logbuf"
+)
+
+type Server struct {
+	app     *app.App
+	mux     *http.ServeMux
+	portsMu sync.Mutex // serialize DNS edits with combined port changes
+}
+
+func New(a *app.App) *Server {
+	s := &Server{app: a, mux: http.NewServeMux()}
+	s.routes()
+	return s
+}
+
+func (s *Server) Handler() http.Handler { return s.logging(s.authGate(s.mux)) }
+
+const sessionCookie = "n2s_sess"
+
+// authGate blocks protected /api/* endpoints unless a valid session cookie is
+// present. Static assets and the login/status endpoints stay public.
+func (s *Server) authGate(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.app.AuthEnabled() && strings.HasPrefix(r.URL.Path, "/api/") && !publicAPI(r.URL.Path) {
+			c, _ := r.Cookie(sessionCookie)
+			if c == nil || !s.app.ValidSession(c.Value) {
+				writeJSON(w, http.StatusUnauthorized, apiError{Error: "unauthorized"})
+				return
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func publicAPI(p string) bool {
+	return p == "/api/auth/status" || p == "/api/auth/login"
+}
+
+func (s *Server) authStatus(w http.ResponseWriter, r *http.Request) {
+	authed := false
+	if c, _ := r.Cookie(sessionCookie); c != nil {
+		authed = s.app.ValidSession(c.Value)
+	}
+	writeJSON(w, 200, map[string]any{"enabled": s.app.AuthEnabled(), "authed": authed, "version": s.app.Cfg.Version})
+}
+
+func (s *Server) authLogin(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		User     string `json:"user"`
+		Password string `json:"password"`
+	}
+	if err := readJSON(r, &in); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	tok, ok := s.app.Login(in.User, in.Password)
+	if !ok {
+		writeJSON(w, http.StatusUnauthorized, apiError{Error: "неверный логин или пароль"})
+		return
+	}
+	http.SetCookie(w, &http.Cookie{Name: sessionCookie, Value: tok, Path: "/", HttpOnly: true, SameSite: http.SameSiteLaxMode, MaxAge: 7 * 24 * 3600})
+	writeJSON(w, 200, map[string]string{"status": "ok"})
+}
+
+func (s *Server) authLogout(w http.ResponseWriter, r *http.Request) {
+	if c, _ := r.Cookie(sessionCookie); c != nil {
+		s.app.Logout(c.Value)
+	}
+	http.SetCookie(w, &http.Cookie{Name: sessionCookie, Value: "", Path: "/", MaxAge: -1})
+	writeJSON(w, 200, map[string]string{"status": "ok"})
+}
+
+func (s *Server) authConfig(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Enabled bool `json:"enabled"`
+	}
+	if err := readJSON(r, &in); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	if err := s.app.SetAuthEnabled(in.Enabled); err != nil {
+		httpErr(w, 500, err)
+		return
+	}
+	writeJSON(w, 200, map[string]bool{"enabled": in.Enabled})
+}
+
+func (s *Server) restartServices(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Services []string `json:"services"`
+	}
+	if err := readJSON(r, &in); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"results": s.app.RestartServices(in.Services)})
+}
+
+func (s *Server) getSystemSettings(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, 200, map[string]any{
+		"auth_enabled":      s.app.AuthEnabled(),
+		"auth_forced_off":   s.app.AuthForcedOff(),
+		"logging_enabled":   s.app.LoggingEnabled(),
+		"http_logs_enabled": s.app.HTTPLogsEnabled(),
+		"trace_mode":        s.app.TraceMode(),
+	})
+}
+
+func (s *Server) setSystemSettings(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		AuthEnabled     *bool   `json:"auth_enabled"`
+		LoggingEnabled  *bool   `json:"logging_enabled"`
+		HTTPLogsEnabled *bool   `json:"http_logs_enabled"`
+		TraceMode       *string `json:"trace_mode"`
+	}
+	if err := readJSON(r, &in); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	if in.AuthEnabled != nil && !s.app.AuthForcedOff() {
+		if err := s.app.SetAuthEnabled(*in.AuthEnabled); err != nil {
+			httpErr(w, 500, err)
+			return
+		}
+	}
+	if in.LoggingEnabled != nil {
+		if err := s.app.SetLoggingEnabled(*in.LoggingEnabled); err != nil {
+			httpErr(w, 500, err)
+			return
+		}
+	}
+	if in.HTTPLogsEnabled != nil {
+		if err := s.app.SetHTTPLogsEnabled(*in.HTTPLogsEnabled); err != nil {
+			httpErr(w, 500, err)
+			return
+		}
+	}
+	if in.TraceMode != nil {
+		if err := s.app.SetTraceMode(*in.TraceMode); err != nil {
+			httpErr(w, 500, err)
+			return
+		}
+	}
+	s.getSystemSettings(w, r)
+}
+
+// backupDownload streams a sealed backup straight to the client — no disk
+// write on the router. No body needed: the seal key lives inside the binary.
+func (s *Server) backupDownload(w http.ResponseWriter, r *http.Request) {
+	// Build into a buffer first so we can fail with JSON before sending the
+	// binary stream (otherwise the browser shows a broken download).
+	var buf bytes.Buffer
+	name, _, err := s.app.BackupBuild(&buf)
+	if err != nil {
+		httpErr(w, 500, err)
+		return
+	}
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Content-Length", strconv.Itoa(buf.Len()))
+	w.Header().Set("Content-Disposition", `attachment; filename="`+name+`"`)
+	_, _ = io.Copy(w, &buf)
+}
+
+// backupRestore accepts a multipart upload (file), validates MD5 + GCM,
+// extracts onto disk, then trusts the user to /api/system/restart.
+// Body: multipart/form-data { archive: file }.
+func (s *Server) backupRestore(w http.ResponseWriter, r *http.Request) {
+	// Cap the request body BEFORE multipart parsing so a hostile upload can't
+	// OOM the router. 300 MB ceiling = our 256 MB plaintext cap + multipart
+	// overhead.
+	r.Body = http.MaxBytesReader(w, r.Body, 300*1024*1024)
+	if err := r.ParseMultipartForm(32 << 20); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	file, _, err := r.FormFile("archive")
+	if err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	defer file.Close()
+	n, err := s.app.BackupRestore(file)
+	if err != nil {
+		// 400 for corruption / not-a-backup / tampered — these are user errors.
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"restored": n})
+}
+
+// restartSelector replies immediately, then a few hundred ms later sends SIGTERM
+// to the running selector process. PID 1 (or /data/xmir-init.sh from the init
+// script's keep-alive loop) picks it up and re-execs the binary. The client
+// shows a brief "selector перезапускается" toast and reloads after the gap.
+func (s *Server) restartSelector(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, 200, map[string]string{"status": "restarting"})
+	go func() {
+		time.Sleep(400 * time.Millisecond)
+		// SIGTERM lets the binary's deferred cleanups (logbuf flush, AWG
+		// state save) actually run. xmir-init.sh respawns within ~6s.
+		p, err := os.FindProcess(os.Getpid())
+		if err == nil {
+			_ = p.Signal(syscall.SIGTERM)
+		}
+	}()
+}
+
+func (s *Server) routes() {
+	m := s.mux
+	m.HandleFunc("GET /api/config", s.getConfig)
+
+	m.HandleFunc("GET /api/dashboard", s.getDashboard)
+	m.HandleFunc("GET /api/connections", s.getConnections)
+	m.HandleFunc("GET /api/devices", s.getDevices)
+	m.HandleFunc("POST /api/devices/{ip}/trace", s.startDeviceTrace)
+	m.HandleFunc("GET /api/trace/{id}", s.getTrace)
+	m.HandleFunc("POST /api/devices/{ip}/pcap", s.startPcap)
+	m.HandleFunc("GET /api/pcap/{id}", s.getPcap)
+	m.HandleFunc("GET /api/pcap/{id}/download", s.downloadPcap)
+	m.HandleFunc("POST /api/devices/{ip}/blobcap", s.startBlobCapture)
+	m.HandleFunc("GET /api/blobcap/{id}", s.getBlobCapture)
+	m.HandleFunc("POST /api/blobcap/{id}/save", s.saveCapturedBlob)
+	m.HandleFunc("POST /api/system/install", s.installPackage)
+	m.HandleFunc("GET /api/system/settings", s.getSystemSettings)
+	m.HandleFunc("POST /api/system/settings", s.setSystemSettings)
+	m.HandleFunc("GET /api/system/ports", s.getSystemPorts)
+	m.HandleFunc("POST /api/system/ports", s.setSystemPorts)
+	m.HandleFunc("POST /api/services/restart", s.restartServices)
+	m.HandleFunc("POST /api/system/restart", s.restartSelector)
+	m.HandleFunc("POST /api/system/backup", s.backupDownload)
+	m.HandleFunc("POST /api/system/restore", s.backupRestore)
+	m.HandleFunc("GET /api/port-forwarding", s.getPortForwarding)
+	m.HandleFunc("POST /api/port-forwarding/rules", s.savePortForwardingRule)
+	m.HandleFunc("POST /api/port-forwarding/rules/{id}/enabled", s.setPortForwardingRuleEnabled)
+	m.HandleFunc("DELETE /api/port-forwarding/rules/{id}", s.deletePortForwardingRule)
+	m.HandleFunc("GET /api/arp-spoofing", s.getARPSpoofing)
+	m.HandleFunc("POST /api/arp-spoofing/config", s.saveARPSpoofingConfig)
+	m.HandleFunc("POST /api/arp-spoofing/enabled", s.setARPSpoofingEnabled)
+	m.HandleFunc("POST /api/arp-spoofing/generate", s.generateARPSpoofingMAC)
+	m.HandleFunc("GET /api/arp-block", s.getARPBlock)
+	m.HandleFunc("POST /api/arp-block/isolation", s.setARPBlockIsolation)
+	m.HandleFunc("GET /api/dnsserver", s.dnsServerStatus)
+	m.HandleFunc("POST /api/dnsserver/shadow/renew", s.dnsServerShadowRenew)
+	m.HandleFunc("POST /api/dnsserver/shadow/diagnostics", s.dnsServerShadowDiagnostics)
+	m.HandleFunc("GET /api/dnsserver/openwrt", s.dnsServerOpenWrt)
+	m.HandleFunc("POST /api/dnsserver/openwrt/apply", s.dnsServerOpenWrtApply)
+	m.HandleFunc("POST /api/dnsserver/openwrt/rebind", s.dnsServerOpenWrtRebind)
+	m.HandleFunc("POST /api/dnsserver/openwrt/restore", s.dnsServerOpenWrtRestore)
+	m.HandleFunc("GET /api/dnsserver/export", s.dnsServerExport)
+	m.HandleFunc("POST /api/dnsserver/import/preview", s.dnsServerImportPreview)
+	m.HandleFunc("POST /api/dnsserver/import", s.dnsServerImport)
+	m.HandleFunc("POST /api/dnsserver/config", s.dnsServerConfig)
+	m.HandleFunc("POST /api/dnsserver/start", s.dnsServerStart)
+	m.HandleFunc("POST /api/dnsserver/stop", s.dnsServerStop)
+	m.HandleFunc("POST /api/dnsserver/test", s.dnsServerTest)
+	m.HandleFunc("GET /api/dnsserver/logs", s.dnsServerLogs)
+	m.HandleFunc("POST /api/dnsserver/logs/clear", s.dnsServerClearLogs)
+	m.HandleFunc("POST /api/dnsserver/cache/clear", s.dnsServerClearCache)
+	m.HandleFunc("POST /api/dnsserver/filtering/update", s.dnsServerUpdateFiltering)
+	m.HandleFunc("POST /api/dnsserver/logging", s.dnsServerLogging)
+	m.HandleFunc("GET /api/dnsserver/scheduler", s.dnsServerScheduler)
+	m.HandleFunc("POST /api/dnsserver/scheduler/method", s.dnsServerMethod)
+
+	m.HandleFunc("GET /api/logs", s.getLogs)
+	m.HandleFunc("POST /api/logs/clear", s.clearLogs)
+
+	m.HandleFunc("GET /api/strategies", s.getStrategies)
+	m.HandleFunc("POST /api/strategies", s.saveStrategy)
+	m.HandleFunc("GET /api/strategies/sni", s.getSNI)
+	m.HandleFunc("POST /api/strategies/sni", s.setSNI)
+	m.HandleFunc("POST /api/strategies/export", s.exportStrategy)
+	m.HandleFunc("POST /api/strategies/import", s.importStrategy)
+	m.HandleFunc("DELETE /api/strategies/{id}", s.deleteStrategy)
+
+	m.HandleFunc("GET /api/lists", s.getLists)
+	m.HandleFunc("POST /api/lists", s.saveList)
+	m.HandleFunc("GET /api/lists/{id}", s.getList)
+	m.HandleFunc("DELETE /api/lists/{id}", s.deleteList)
+
+	m.HandleFunc("GET /api/blobs", s.getBlobs)
+	m.HandleFunc("POST /api/blobs", s.uploadBlob)
+	m.HandleFunc("POST /api/blobs/generate", s.generateBlob)
+	m.HandleFunc("GET /api/blobs/export", s.exportBlobs)
+	m.HandleFunc("POST /api/blobs/export", s.exportBlobsSel)
+	m.HandleFunc("POST /api/blobs/zip", s.importBlobsZip)
+	m.HandleFunc("POST /api/blobs/trash/empty", s.emptyTrash)
+	m.HandleFunc("DELETE /api/blobs/trash/{name}", s.purgeBlob)
+	m.HandleFunc("POST /api/blobs/{name}/restore", s.restoreBlob)
+	m.HandleFunc("GET /api/blobs/{name}/validate", s.validateBlob)
+	m.HandleFunc("DELETE /api/blobs/{name}", s.deleteBlob)
+
+	m.HandleFunc("POST /api/runs", s.startRun)
+	m.HandleFunc("GET /api/runs", s.getRuns)
+	m.HandleFunc("GET /api/runs/{id}", s.getRun)
+	m.HandleFunc("POST /api/runs/{id}/cancel", s.cancelRun)
+	m.HandleFunc("POST /api/runs/{id}/threads", s.addRunThreads)
+
+	m.HandleFunc("POST /api/blockcheck", s.startBlockCheck)
+	m.HandleFunc("GET /api/blockcheck/{id}", s.getBlockCheck)
+	m.HandleFunc("POST /api/blockcheck/{id}/cancel", s.cancelBlockCheck)
+
+	m.HandleFunc("GET /api/dns", s.getDNS)
+	m.HandleFunc("POST /api/dns", s.saveDNS)
+	m.HandleFunc("POST /api/dns/reset", s.resetDNS)
+	m.HandleFunc("DELETE /api/dns/{id}", s.deleteDNS)
+
+	m.HandleFunc("GET /api/tgws", s.tgwsStatus)
+	m.HandleFunc("POST /api/tgws/config", s.tgwsConfig)
+	m.HandleFunc("POST /api/tgws/start", s.tgwsStart)
+	m.HandleFunc("POST /api/tgws/stop", s.tgwsStop)
+	m.HandleFunc("POST /api/tgws/secret", s.tgwsSecret)
+
+	m.HandleFunc("GET /api/socks5", s.socks5Status)
+	m.HandleFunc("POST /api/socks5/config", s.socks5Config)
+	m.HandleFunc("POST /api/socks5/start", s.socks5Start)
+	m.HandleFunc("POST /api/socks5/stop", s.socks5Stop)
+
+	m.HandleFunc("GET /api/proxy/awg-fallback", s.proxyAWGFallback)
+	m.HandleFunc("POST /api/proxy/awg-fallback", s.proxyAWGFallbackSet)
+
+	m.HandleFunc("GET /api/awg2", s.awg2Status)
+	m.HandleFunc("POST /api/awg2/servers", s.awg2AddServer)
+	m.HandleFunc("POST /api/awg2/import", s.awg2Import)
+	m.HandleFunc("POST /api/awg2/warp", s.awg2CreateWARP)
+	m.HandleFunc("POST /api/awg2/servers/deploy", s.awg2DeployServers)
+	m.HandleFunc("POST /api/awg2/servers/{id}/select", s.awg2SelectServer)
+	m.HandleFunc("POST /api/awg2/servers/{id}/rename", s.awg2RenameServer)
+	m.HandleFunc("POST /api/awg2/servers/{id}/enabled", s.awg2SetServerEnabled)
+	m.HandleFunc("POST /api/awg2/servers/{id}/failover", s.awg2SetFailover)
+	m.HandleFunc("POST /api/awg2/servers/{id}/endpoint-backups", s.awg2SetEndpointBackups)
+	m.HandleFunc("POST /api/awg2/servers/{id}/test", s.awg2TestConnection)
+	m.HandleFunc("POST /api/awg2/settings/recovery", s.awg2SetRecoverySettings)
+	m.HandleFunc("POST /api/awg2/servers/{id}/deploy", s.awg2DeployServer)
+	m.HandleFunc("DELETE /api/awg2/servers/{id}", s.awg2DeleteServer)
+	m.HandleFunc("POST /api/awg2/config", s.awg2Config)
+	m.HandleFunc("POST /api/awg2/deploy", s.awg2Deploy)
+	m.HandleFunc("POST /api/awg2/status/refresh", s.awg2RefreshStatus)
+	m.HandleFunc("POST /api/awg2/peers", s.awg2AddPeer)
+	m.HandleFunc("DELETE /api/awg2/peers/{id}", s.awg2RemovePeer)
+	m.HandleFunc("GET /api/awg2/peers/{id}/config", s.awg2PeerConfig)
+	m.HandleFunc("POST /api/awg2/install", s.awg2Install)
+	m.HandleFunc("POST /api/awg2/client/up", s.awg2ClientUp)
+	m.HandleFunc("POST /api/awg2/client/down", s.awg2ClientDown)
+	m.HandleFunc("POST /api/awg2/routing/config", s.awg2RoutingConfig)
+	m.HandleFunc("POST /api/awg2/routing/apply", s.awg2RoutingApply)
+	m.HandleFunc("POST /api/awg2/routing/commit", s.awg2RoutingCommit)
+	m.HandleFunc("POST /api/awg2/routing/teardown", s.awg2RoutingTeardown)
+	m.HandleFunc("POST /api/awg2/routing/rules", s.awg2RoutingRules)
+	m.HandleFunc("GET /api/awg2/routing/discovered", s.awg2DiscoveredRoutes)
+	m.HandleFunc("GET /api/awg2/routing/rules/export", s.awg2RulesExport)
+	m.HandleFunc("POST /api/awg2/routing/rules/export", s.awg2RulesExport)
+	m.HandleFunc("POST /api/awg2/routing/rules/import/preview", s.awg2RulesImportPreview)
+	m.HandleFunc("POST /api/awg2/routing/rules/import", s.awg2RulesImport)
+	m.HandleFunc("POST /api/awg2/routing/rules/insert-top", s.awg2RulesInsertTop)
+	m.HandleFunc("POST /api/awg2/routing/rules/copy", s.awg2RulesCopy)
+	m.HandleFunc("GET /api/awg2/trace", s.awg2TraceList)
+	m.HandleFunc("GET /api/awg2/trace/status", s.awg2TraceStatus)
+	m.HandleFunc("POST /api/awg2/trace/enabled", s.awg2TraceSetEnabled)
+	m.HandleFunc("POST /api/awg2/trace/clear", s.awg2TraceClear)
+	m.HandleFunc("POST /api/awg2/speedtest", s.awg2SpeedTest)
+
+	m.HandleFunc("POST /api/apply", s.applyStrategy)
+
+	m.HandleFunc("GET /api/update/check", s.checkUpdate)
+	m.HandleFunc("GET /api/update/status", s.updateStatus)
+	m.HandleFunc("POST /api/update", s.doUpdate)
+
+	m.HandleFunc("GET /api/auth/status", s.authStatus)
+	m.HandleFunc("POST /api/auth/login", s.authLogin)
+	m.HandleFunc("POST /api/auth/logout", s.authLogout)
+	m.HandleFunc("POST /api/auth/config", s.authConfig)
+
+	m.HandleFunc("GET /api/geo", s.getGeo)
+	m.HandleFunc("POST /api/geo", s.uploadGeo)
+	m.HandleFunc("DELETE /api/geo/{name}", s.deleteGeo)
+	m.HandleFunc("POST /api/geo/import", s.importGeo)
+	m.HandleFunc("POST /api/geo/resolve", s.resolveGeo)
+	m.HandleFunc("GET /api/geo/auto", s.getGeoAuto)
+	m.HandleFunc("POST /api/geo/auto", s.setGeoAuto)
+	m.HandleFunc("POST /api/geo/fetch-now", s.fetchGeoNow)
+
+	// NFQWS2 engine: file management (conf/list/lua) + version/update/reload.
+	m.HandleFunc("GET /api/nfqws2/version", s.nfqws2Version)
+	m.HandleFunc("GET /api/nfqws2/status", s.nfqws2ServiceStatus)
+	m.HandleFunc("GET /api/nfqws2/update/check", s.nfqws2CheckUpdate)
+	m.HandleFunc("POST /api/nfqws2/update", s.nfqws2Update)
+	m.HandleFunc("POST /api/nfqws2/reload", s.nfqws2Reload)
+	m.HandleFunc("POST /api/nfqws2/bypass/apply", s.nfqws2ApplyBypass)
+	m.HandleFunc("POST /api/nfqws2/start", s.nfqws2StartSvc)
+	m.HandleFunc("POST /api/nfqws2/stop", s.nfqws2StopSvc)
+	m.HandleFunc("GET /api/nfqws2/files", s.nfqws2Files)
+	m.HandleFunc("POST /api/nfqws2/paths", s.nfqws2Paths)
+	m.HandleFunc("GET /api/nfqws2/file", s.nfqws2GetFile)
+	m.HandleFunc("POST /api/nfqws2/file", s.nfqws2SaveFile)
+	m.HandleFunc("POST /api/nfqws2/file/create", s.nfqws2CreateFile)
+	m.HandleFunc("POST /api/nfqws2/file/upload", s.nfqws2UploadFile)
+	m.HandleFunc("DELETE /api/nfqws2/file", s.nfqws2DeleteFile)
+	m.HandleFunc("GET /api/nfqws2/file/download", s.nfqws2DownloadFile)
+	s.nfqws2AssetRoutes(m)
+	s.serviceStrategiesRoutes(m)
+
+	// Automation: NFQWS2 fallback watchdog + auto-pick (NFQWS2 tab panel).
+	m.HandleFunc("GET /api/nfqws2/automation", s.getAutomation)
+	m.HandleFunc("POST /api/nfqws2/automation", s.setAutomation)
+	m.HandleFunc("POST /api/nfqws2/automation/pick-now", s.triggerAutoPick)
+
+	// Single-file React app: any non-/api path serves the inlined index.html, so
+	// History-API routes (/lists, /runs, …) deep-link and refresh cleanly. /api/*
+	// patterns are more specific and take precedence.
+	m.HandleFunc("/", s.serveIndex)
+}
+
+// ---------- handlers ----------
+
+// serveIndex handles both static panel assets and browser deep links.
+func (s *Server) serveIndex(w http.ResponseWriter, r *http.Request) {
+	// Retired or unknown API endpoints must not look like successful JSON
+	// requests merely because the SPA accepts every browser navigation path.
+	if r.URL.Path == "/api" || strings.HasPrefix(r.URL.Path, "/api/") {
+		http.NotFound(w, r)
+		return
+	}
+	servePanelAsset(w, r)
+}
+
+func (s *Server) getConfig(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, 200, s.app.Cfg)
+}
+
+// ---------- monitoring (dashboard / connections / devices) ----------
+
+func (s *Server) getDashboard(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, 200, s.app.Dashboard(hostFromHeader(r.Host)))
+}
+
+func (s *Server) getConnections(w http.ResponseWriter, r *http.Request) {
+	v, err := s.app.Connections()
+	if err != nil {
+		httpErr(w, 500, err)
+		return
+	}
+	writeJSON(w, 200, v)
+}
+
+func (s *Server) getDevices(w http.ResponseWriter, r *http.Request) {
+	v, err := s.app.DeviceActivity()
+	if err != nil {
+		httpErr(w, 500, err)
+		return
+	}
+	writeJSON(w, 200, v)
+}
+
+func (s *Server) startDeviceTrace(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Seconds int `json:"seconds"`
+	}
+	_ = readJSON(r, &in) // body optional; defaults to 30s
+	t, err := s.app.StartDeviceTrace(r.PathValue("ip"), in.Seconds)
+	if err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, t)
+}
+
+func (s *Server) getTrace(w http.ResponseWriter, r *http.Request) {
+	t, ok := s.app.GetTrace(r.PathValue("id"))
+	if !ok {
+		httpErr(w, 404, errNotFound)
+		return
+	}
+	writeJSON(w, 200, t)
+}
+
+func (s *Server) startPcap(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Seconds int `json:"seconds"`
+	}
+	_ = readJSON(r, &in) // body optional; defaults to 30s
+	p, err := s.app.StartPcap(r.PathValue("ip"), in.Seconds)
+	if err != nil {
+		if errors.Is(err, app.ErrNeedTcpdump) {
+			writeJSON(w, 200, map[string]any{"need_install": true, "package": "tcpdump"})
+			return
+		}
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, p)
+}
+
+func (s *Server) getPcap(w http.ResponseWriter, r *http.Request) {
+	p, ok := s.app.GetPcap(r.PathValue("id"))
+	if !ok {
+		httpErr(w, 404, errNotFound)
+		return
+	}
+	writeJSON(w, 200, p)
+}
+
+func (s *Server) downloadPcap(w http.ResponseWriter, r *http.Request) {
+	path, name, ok := s.app.PcapFile(r.PathValue("id"))
+	if !ok {
+		httpErr(w, 404, errNotFound)
+		return
+	}
+	w.Header().Set("Content-Type", "application/vnd.tcpdump.pcap")
+	w.Header().Set("Content-Disposition", `attachment; filename="`+safeFile(name, true, "file", 80)+`"`)
+	http.ServeFile(w, r, path)
+}
+
+func (s *Server) installPackage(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Package string `json:"package"`
+	}
+	if err := readJSON(r, &in); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	out, err := s.app.InstallPackage(in.Package)
+	if err != nil {
+		writeJSON(w, 200, map[string]any{"ok": false, "output": out, "error": err.Error()})
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": true, "output": out})
+}
+
+// ---------- Port Forwarding ----------
+
+func (s *Server) getPortForwarding(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, 200, s.app.PortForwardingView())
+}
+
+func (s *Server) savePortForwardingRule(w http.ResponseWriter, r *http.Request) {
+	var in portforward.Rule
+	if err := readJSON(r, &in); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	view, err := s.app.SavePortForwardRule(in)
+	if err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, view)
+}
+
+func (s *Server) setPortForwardingRuleEnabled(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Enabled bool `json:"enabled"`
+	}
+	if err := readJSON(r, &in); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	view, err := s.app.SetPortForwardRuleEnabled(r.PathValue("id"), in.Enabled)
+	if err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, view)
+}
+
+func (s *Server) deletePortForwardingRule(w http.ResponseWriter, r *http.Request) {
+	view, err := s.app.DeletePortForwardRule(r.PathValue("id"))
+	if err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, view)
+}
+
+// ---------- ARP Spoofing ----------
+
+func (s *Server) getARPSpoofing(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, 200, s.app.ARPSpoofingView())
+}
+
+func (s *Server) saveARPSpoofingConfig(w http.ResponseWriter, r *http.Request) {
+	var in arpspoof.Config
+	if err := readJSON(r, &in); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	view, err := s.app.SaveARPSpoofingConfig(in)
+	if err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, view)
+}
+
+func (s *Server) setARPSpoofingEnabled(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Enabled bool `json:"enabled"`
+	}
+	if err := readJSON(r, &in); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	view, err := s.app.SetARPSpoofingEnabled(in.Enabled)
+	if err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, view)
+}
+
+func (s *Server) generateARPSpoofingMAC(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Prefix string `json:"prefix"`
+	}
+	if err := readJSON(r, &in); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	mac, err := s.app.GenerateARPSpoofingMAC(in.Prefix)
+	if err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, map[string]string{"mac": mac})
+}
+
+// ---------- logs (in-memory ring, UI "Логи" tab) ----------
+
+func (s *Server) getLogs(w http.ResponseWriter, r *http.Request) {
+	module := r.URL.Query().Get("module")
+	limit := 0
+	if v := r.URL.Query().Get("limit"); v != "" {
+		limit, _ = strconv.Atoi(v)
+	}
+	writeJSON(w, 200, map[string]any{"entries": logbuf.Snapshot(module, limit), "modules": logbuf.Modules()})
+}
+
+func (s *Server) clearLogs(w http.ResponseWriter, r *http.Request) {
+	logbuf.Clear()
+	writeJSON(w, 200, map[string]string{"status": "ok"})
+}
+
+func (s *Server) getStrategies(w http.ResponseWriter, r *http.Request) {
+	items, err := s.app.Strategies()
+	if err != nil {
+		httpErr(w, 500, err)
+		return
+	}
+	writeJSON(w, 200, items)
+}
+
+func (s *Server) saveStrategy(w http.ResponseWriter, r *http.Request) {
+	var in catalog.Strategy
+	if err := readJSON(r, &in); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	out, err := s.app.SaveCustomStrategy(in)
+	if err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, out)
+}
+
+func (s *Server) exportStrategy(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Name string `json:"name"`
+		L7   string `json:"l7"`
+		Args string `json:"args"`
+	}
+	if err := readJSON(r, &in); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	if strings.TrimSpace(in.Args) == "" {
+		httpErr(w, 400, errors.New("empty strategy args"))
+		return
+	}
+	w.Header().Set("Content-Type", "application/zip")
+	w.Header().Set("Content-Disposition", `attachment; filename="`+safeFile(in.Name, false, "strategy", 60)+`.zip"`)
+	_ = s.app.ExportStrategyZip(in.Name, in.L7, in.Args, w)
+}
+
+func (s *Server) importStrategy(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseMultipartForm(32 << 20); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	f, _, err := r.FormFile("file")
+	if err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	defer f.Close()
+	data, err := io.ReadAll(io.LimitReader(f, 32<<20))
+	if err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	st, err := s.app.ImportStrategyZip(data)
+	if err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, st)
+}
+
+// safeFile sanitizes a user-provided name for a Content-Disposition filename.
+// keepDot=true preserves "." (used for filenames like "user.list"); false maps it
+// to "_" (used for strategy names where the extension is fixed by the caller).
+func safeFile(s string, keepDot bool, fallback string, max int) string {
+	var b strings.Builder
+	for _, r := range s {
+		switch {
+		case r >= 'a' && r <= 'z', r >= 'A' && r <= 'Z', r >= '0' && r <= '9', r == '-', r == '_':
+			b.WriteRune(r)
+		case keepDot && r == '.':
+			b.WriteRune(r)
+		default:
+			b.WriteByte('_')
+		}
+	}
+	out := b.String()
+	if out == "" {
+		out = fallback
+	}
+	if len(out) > max {
+		out = out[:max]
+	}
+	return out
+}
+
+func (s *Server) deleteStrategy(w http.ResponseWriter, r *http.Request) {
+	if err := s.app.DeleteCustomStrategy(r.PathValue("id")); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, map[string]string{"status": "ok"})
+}
+
+func (s *Server) getLists(w http.ResponseWriter, r *http.Request) {
+	lists, err := s.app.Lists()
+	if err != nil {
+		httpErr(w, 500, err)
+		return
+	}
+	writeJSON(w, 200, lists)
+}
+
+func (s *Server) getList(w http.ResponseWriter, r *http.Request) {
+	l, err := s.app.GetList(r.PathValue("id"))
+	if err != nil {
+		httpErr(w, 404, err)
+		return
+	}
+	writeJSON(w, 200, l)
+}
+
+func (s *Server) saveList(w http.ResponseWriter, r *http.Request) {
+	var in app.List
+	if err := readJSON(r, &in); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	out, err := s.app.SaveList(&in)
+	if err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, out)
+}
+
+func (s *Server) deleteList(w http.ResponseWriter, r *http.Request) {
+	if err := s.app.DeleteList(r.PathValue("id")); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, map[string]string{"status": "ok"})
+}
+
+func (s *Server) getSNI(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, 200, map[string]any{"domains": s.app.SNIDomains()})
+}
+
+func (s *Server) setSNI(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Domains []string `json:"domains"`
+	}
+	if err := readJSON(r, &in); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	out, err := s.app.SetSNIDomains(in.Domains)
+	if err != nil {
+		httpErr(w, 500, err)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"domains": out})
+}
+
+func (s *Server) getBlobs(w http.ResponseWriter, r *http.Request) {
+	sys, custom := s.app.Blobs()
+	writeJSON(w, 200, map[string]any{"system": sys, "custom": custom, "trash": s.app.TrashedBlobs()})
+}
+
+func (s *Server) uploadBlob(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseMultipartForm(4 << 20); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	f, hdr, err := r.FormFile("file")
+	if err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	defer f.Close()
+	data, err := io.ReadAll(io.LimitReader(f, 4<<20))
+	if err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	path, err := s.app.SaveBlob(hdr.Filename, data)
+	if err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, map[string]string{"name": hdr.Filename, "path": path})
+}
+
+func (s *Server) exportBlobs(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/zip")
+	w.Header().Set("Content-Disposition", `attachment; filename="blobs.zip"`)
+	_ = s.app.ExportBlobsZip(w, nil)
+}
+
+func (s *Server) exportBlobsSel(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Names []string `json:"names"`
+	}
+	if err := readJSON(r, &in); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	w.Header().Set("Content-Type", "application/zip")
+	w.Header().Set("Content-Disposition", `attachment; filename="blobs.zip"`)
+	_ = s.app.ExportBlobsZip(w, in.Names)
+}
+
+func (s *Server) deleteBlob(w http.ResponseWriter, r *http.Request) {
+	if err := s.app.DeleteBlob(r.PathValue("name")); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, map[string]string{"status": "ok"})
+}
+
+func (s *Server) importBlobsZip(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseMultipartForm(32 << 20); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	f, _, err := r.FormFile("file")
+	if err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	defer f.Close()
+	data, err := io.ReadAll(io.LimitReader(f, 32<<20))
+	if err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	n, err := s.app.ImportBlobsZip(data)
+	if err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, map[string]int{"imported": n})
+}
+
+func (s *Server) generateBlob(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		SNI        string   `json:"sni"`
+		ALPN       []string `json:"alpn"`
+		MinVersion int      `json:"min_version"`
+		Name       string   `json:"name"`
+	}
+	if err := readJSON(r, &in); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	path, err := s.app.GenerateBlob(in.SNI, in.ALPN, uint16(in.MinVersion), in.Name)
+	if err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, map[string]string{"name": in.Name, "path": path})
+}
+
+func (s *Server) validateBlob(w http.ResponseWriter, r *http.Request) {
+	valid, detail, err := s.app.ValidateBlob(r.PathValue("name"))
+	if err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"valid": valid, "detail": detail})
+}
+
+func (s *Server) restoreBlob(w http.ResponseWriter, r *http.Request) {
+	if err := s.app.RestoreBlob(r.PathValue("name")); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, map[string]string{"status": "ok"})
+}
+
+func (s *Server) purgeBlob(w http.ResponseWriter, r *http.Request) {
+	if err := s.app.PurgeBlob(r.PathValue("name")); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, map[string]string{"status": "ok"})
+}
+
+func (s *Server) emptyTrash(w http.ResponseWriter, r *http.Request) {
+	if err := s.app.EmptyTrash(); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, map[string]string{"status": "ok"})
+}
+
+func (s *Server) startBlobCapture(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Seconds int `json:"seconds"`
+	}
+	_ = readJSON(r, &in) // body optional; defaults to 20s
+	c, err := s.app.StartBlobCapture(r.PathValue("ip"), in.Seconds)
+	if err != nil {
+		if errors.Is(err, app.ErrNeedTcpdump) {
+			writeJSON(w, 200, map[string]any{"need_install": true, "package": "tcpdump"})
+			return
+		}
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, c)
+}
+
+func (s *Server) getBlobCapture(w http.ResponseWriter, r *http.Request) {
+	c, ok := s.app.GetBlobCapture(r.PathValue("id"))
+	if !ok {
+		httpErr(w, 404, errNotFound)
+		return
+	}
+	writeJSON(w, 200, c)
+}
+
+func (s *Server) saveCapturedBlob(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Index int    `json:"index"`
+		Name  string `json:"name"`
+	}
+	if err := readJSON(r, &in); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	path, err := s.app.SaveCapturedBlob(r.PathValue("id"), in.Index, in.Name)
+	if err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, map[string]string{"name": in.Name, "path": path})
+}
+
+func (s *Server) getGeo(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, 200, s.app.GeoFiles())
+}
+
+func (s *Server) uploadGeo(w http.ResponseWriter, r *http.Request) {
+	form, err := r.MultipartReader()
+	if err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	name, kind, err := s.app.SaveGeoUpload(form, r.URL.Query().Get("kind"))
+	if err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, map[string]string{"name": name, "kind": kind})
+}
+
+func (s *Server) deleteGeo(w http.ResponseWriter, r *http.Request) {
+	if err := s.app.DeleteGeoFile(r.PathValue("name")); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, map[string]string{"status": "ok"})
+}
+
+func (s *Server) importGeo(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Geo      string `json:"geo"`
+		Category string `json:"category"`
+		Limit    int    `json:"limit"`
+		ListID   string `json:"list_id"`
+		ListName string `json:"list_name"`
+	}
+	if err := readJSON(r, &in); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	list, err := s.app.ImportGeo(in.Geo, in.Category, in.Limit, in.ListID, in.ListName)
+	if err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, list)
+}
+
+func (s *Server) resolveGeo(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Geo      string `json:"geo"`
+		Category string `json:"category"`
+		Limit    int    `json:"limit"`
+	}
+	if err := readJSON(r, &in); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	targets, err := s.app.ResolveGeo(in.Geo, in.Category, in.Limit)
+	if err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"targets": targets})
+}
+
+func (s *Server) getGeoAuto(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, 200, s.app.GeoAuto())
+}
+
+func (s *Server) setGeoAuto(w http.ResponseWriter, r *http.Request) {
+	var in app.GeoAutoConfig
+	if err := readJSON(r, &in); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	if err := s.app.SetGeoAuto(&in); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, s.app.GeoAuto())
+}
+
+func (s *Server) fetchGeoNow(w http.ResponseWriter, r *http.Request) {
+	cfg, err := s.app.FetchGeoNow()
+	if err != nil {
+		// Still return the (possibly partially-updated) config so the UI can show LastError.
+		writeJSON(w, 200, cfg)
+		return
+	}
+	writeJSON(w, 200, cfg)
+}
+
+// ---------- NFQWS2 engine file management + version/update/reload ----------
+
+func (s *Server) nfqws2Version(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, 200, s.app.Nfqws2Version())
+}
+
+func (s *Server) nfqws2CheckUpdate(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, 200, s.app.Nfqws2CheckUpdate())
+}
+
+func (s *Server) nfqws2Update(w http.ResponseWriter, r *http.Request) {
+	out, err := s.app.Nfqws2Update()
+	if err != nil {
+		writeJSON(w, 200, map[string]any{"ok": false, "output": out, "error": err.Error()})
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": true, "output": out})
+}
+
+func (s *Server) nfqws2Reload(w http.ResponseWriter, r *http.Request) {
+	if err := s.app.Nfqws2Reload(); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, map[string]string{"status": "reloaded"})
+}
+
+func (s *Server) nfqws2ApplyBypass(w http.ResponseWriter, r *http.Request) {
+	if err := s.app.Nfqws2ApplyBypass(); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, map[string]string{"status": "applied"})
+}
+
+func (s *Server) nfqws2Files(w http.ResponseWriter, r *http.Request) {
+	files, err := s.app.ListNfqws2Files(r.URL.Query().Get("kind"))
+	if err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"files": files})
+}
+
+func (s *Server) nfqws2GetFile(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	kind, name := q.Get("kind"), q.Get("name")
+	content, err := s.app.ReadNfqws2File(kind, name)
+	if err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"kind": kind, "name": name, "content": content})
+}
+
+func (s *Server) nfqws2SaveFile(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Kind    string `json:"kind"`
+		Name    string `json:"name"`
+		Content string `json:"content"`
+	}
+	if err := readJSON(r, &in); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	if err := s.app.SaveNfqws2File(in.Kind, in.Name, in.Content); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, map[string]string{"status": "saved"})
+}
+
+func (s *Server) nfqws2CreateFile(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Kind string `json:"kind"`
+		Name string `json:"name"`
+	}
+	if err := readJSON(r, &in); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	if err := s.app.CreateNfqws2File(in.Kind, in.Name); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, map[string]string{"status": "created"})
+}
+
+func (s *Server) nfqws2UploadFile(w http.ResponseWriter, r *http.Request) {
+	if err := parseAssetMultipart(w, r, 16<<20); err != nil {
+		assetHTTPError(w, err)
+		return
+	}
+	defer r.MultipartForm.RemoveAll()
+	kind := r.FormValue("kind")
+	f, hdr, err := r.FormFile("file")
+	if err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	defer f.Close()
+	data, err := io.ReadAll(io.LimitReader(f, (16<<20)+1))
+	if err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	if len(data) > 16<<20 {
+		assetHTTPError(w, &http.MaxBytesError{Limit: 16 << 20})
+		return
+	}
+	if err := s.app.SaveNfqws2Upload(kind, hdr.Filename, data); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, map[string]string{"name": hdr.Filename, "kind": kind})
+}
+
+func (s *Server) nfqws2DeleteFile(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	if err := s.app.DeleteNfqws2File(q.Get("kind"), q.Get("name")); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, map[string]string{"status": "ok"})
+}
+
+func (s *Server) nfqws2DownloadFile(w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	data, name, err := s.app.Nfqws2FileBytes(q.Get("kind"), q.Get("name"))
+	if err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Content-Disposition", `attachment; filename="`+safeFile(name, true, "file", 80)+`"`)
+	_, _ = w.Write(data)
+}
+
+func (s *Server) startRun(w http.ResponseWriter, r *http.Request) {
+	var req app.RunRequest
+	if err := readJSON(r, &req); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	run, err := s.app.StartRun(req)
+	if err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, run)
+}
+
+func (s *Server) getRuns(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, 200, s.app.Runs())
+}
+
+func (s *Server) getRun(w http.ResponseWriter, r *http.Request) {
+	run, ok := s.app.GetRun(r.PathValue("id"))
+	if !ok {
+		httpErr(w, 404, errNotFound)
+		return
+	}
+	writeJSON(w, 200, run)
+}
+
+func (s *Server) cancelRun(w http.ResponseWriter, r *http.Request) {
+	if err := s.app.CancelRun(r.PathValue("id")); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, map[string]string{"status": "cancelling"})
+}
+
+func (s *Server) addRunThreads(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Threads int `json:"threads"`
+	}
+	if err := readJSON(r, &in); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	threads, err := s.app.AddRunThreads(r.PathValue("id"), in.Threads)
+	if err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, map[string]int{"threads": threads})
+}
+
+func (s *Server) startBlockCheck(w http.ResponseWriter, r *http.Request) {
+	var req app.BlockCheckRequest
+	if err := readJSON(r, &req); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	bc, err := s.app.StartBlockCheck(req)
+	if err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, bc)
+}
+
+func (s *Server) getBlockCheck(w http.ResponseWriter, r *http.Request) {
+	bc, ok := s.app.GetBlockCheck(r.PathValue("id"))
+	if !ok {
+		httpErr(w, 404, errNotFound)
+		return
+	}
+	writeJSON(w, 200, bc)
+}
+
+func (s *Server) cancelBlockCheck(w http.ResponseWriter, r *http.Request) {
+	if err := s.app.CancelBlockCheck(r.PathValue("id")); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, map[string]string{"status": "cancelling"})
+}
+
+// ---------- DNS (DoH/DoT servers) ----------
+
+func (s *Server) getDNS(w http.ResponseWriter, r *http.Request) {
+	if err := s.app.DNSConfigError(); err != nil {
+		httpErr(w, http.StatusServiceUnavailable, err)
+		return
+	}
+	writeJSON(w, 200, s.app.DNSServers())
+}
+
+func (s *Server) saveDNS(w http.ResponseWriter, r *http.Request) {
+	var in dns.Server
+	if err := readJSON(r, &in); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	out, err := s.app.SaveDNSServer(in)
+	if err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, out)
+}
+
+func (s *Server) deleteDNS(w http.ResponseWriter, r *http.Request) {
+	if err := s.app.DeleteDNSServer(r.PathValue("id")); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, map[string]string{"status": "ok"})
+}
+
+func (s *Server) resetDNS(w http.ResponseWriter, r *http.Request) {
+	out, err := s.app.ResetDNSServers()
+	if err != nil {
+		httpErr(w, 500, err)
+		return
+	}
+	writeJSON(w, 200, out)
+}
+
+// ---------- TG WS Proxy ----------
+
+func (s *Server) tgwsStatus(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, 200, s.app.TGWSStatusFor(hostFromHeader(r.Host)))
+}
+
+func (s *Server) tgwsConfig(w http.ResponseWriter, r *http.Request) {
+	var in tgws.Config
+	if err := readJSON(r, &in); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	if err := s.app.TGWSSetConfig(&in); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, s.app.TGWSStatusFor(hostFromHeader(r.Host)))
+}
+
+func (s *Server) tgwsStart(w http.ResponseWriter, r *http.Request) {
+	if err := s.app.TGWSStart(); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, s.app.TGWSStatusFor(hostFromHeader(r.Host)))
+}
+
+func (s *Server) tgwsStop(w http.ResponseWriter, r *http.Request) {
+	if err := s.app.TGWSStop(); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, s.app.TGWSStatusFor(hostFromHeader(r.Host)))
+}
+
+func (s *Server) tgwsSecret(w http.ResponseWriter, r *http.Request) {
+	secret, err := s.app.TGWSNewSecret()
+	if err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, map[string]string{"secret": secret})
+}
+
+// ---------- SOCKS5 Telegram proxy (TGLock-adapted) ----------
+
+func (s *Server) socks5Status(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, 200, s.app.Socks5StatusFor(hostFromHeader(r.Host)))
+}
+
+func (s *Server) socks5Config(w http.ResponseWriter, r *http.Request) {
+	var in tgws.Socks5Config
+	if err := readJSON(r, &in); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	if err := s.app.Socks5SetConfig(&in); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, s.app.Socks5StatusFor(hostFromHeader(r.Host)))
+}
+
+func (s *Server) socks5Start(w http.ResponseWriter, r *http.Request) {
+	if err := s.app.Socks5Start(); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, s.app.Socks5StatusFor(hostFromHeader(r.Host)))
+}
+
+func (s *Server) socks5Stop(w http.ResponseWriter, r *http.Request) {
+	if err := s.app.Socks5Stop(); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, s.app.Socks5StatusFor(hostFromHeader(r.Host)))
+}
+
+// proxyAWGFallback returns the shared AWG2-fallback selection for the blocked
+// Telegram DCs (1/3/5) + the AWG2 servers available to select.
+func (s *Server) proxyAWGFallback(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, 200, s.app.ProxyAWGFallbackView())
+}
+
+func (s *Server) proxyAWGFallbackSet(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Value string `json:"value"`
+	}
+	if err := readJSON(r, &in); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	s.app.SetProxyAWGFallback(in.Value)
+	writeJSON(w, 200, s.app.ProxyAWGFallbackView())
+}
+
+// ---------- AWG2 (AmneziaWG 2.0) ----------
+
+func (s *Server) awg2Status(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, 200, s.app.AWG2StatusView())
+}
+
+func (s *Server) awg2AddServer(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Name string `json:"name"`
+	}
+	_ = readJSON(r, &in) // body is optional
+	status, err := s.app.AWG2AddServer(in.Name)
+	if err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, status)
+}
+
+func (s *Server) awg2Import(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Conf string `json:"conf"`
+		Name string `json:"name"`
+	}
+	if err := readJSON(r, &in); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	st, err := s.app.AWG2Import(in.Conf, in.Name)
+	if err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, st)
+}
+
+func (s *Server) awg2CreateWARP(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Name      string `json:"name"`
+		Endpoint  string `json:"endpoint"`
+		AcceptTOS bool   `json:"accept_tos"`
+	}
+	if err := readJSON(r, &in); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 35*time.Second)
+	defer cancel()
+	st, err := s.app.AWG2CreateWARP(ctx, awgroute.WARPCreateOptions{
+		Name:      in.Name,
+		Endpoint:  in.Endpoint,
+		AcceptTOS: in.AcceptTOS,
+	})
+	if err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, st)
+}
+
+func (s *Server) awg2SelectServer(w http.ResponseWriter, r *http.Request) {
+	if err := s.app.AWG2SelectServer(r.PathValue("id")); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, s.app.AWG2StatusView())
+}
+
+func (s *Server) awg2RenameServer(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Name string `json:"name"`
+	}
+	if err := readJSON(r, &in); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	if err := s.app.AWG2RenameServer(r.PathValue("id"), in.Name); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, s.app.AWG2StatusView())
+}
+
+func (s *Server) awg2SetServerEnabled(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Enabled bool `json:"enabled"`
+	}
+	if err := readJSON(r, &in); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	if err := s.app.AWG2SetServerEnabled(r.PathValue("id"), in.Enabled); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, s.app.AWG2StatusView())
+}
+
+func (s *Server) awg2DeleteServer(w http.ResponseWriter, r *http.Request) {
+	serveAWG2Delete(w, r, s.app.AWG2DeleteServerWithReplacement, s.app.AWG2StatusView)
+}
+
+func (s *Server) awg2Config(w http.ResponseWriter, r *http.Request) {
+	var in awg.ServerConfig
+	if err := readJSON(r, &in); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	if err := s.app.AWG2SetConfig(&in); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, s.app.AWG2StatusView())
+}
+
+func (s *Server) awg2Deploy(w http.ResponseWriter, r *http.Request) {
+	res, err := s.app.AWG2Deploy()
+	if err != nil {
+		writeJSON(w, 200, map[string]any{"ok": false, "result": res, "error": err.Error()})
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": res.OK, "result": res})
+}
+
+func (s *Server) awg2DeployServer(w http.ResponseWriter, r *http.Request) {
+	res, err := s.app.AWG2DeployServer(r.PathValue("id"))
+	if err != nil {
+		writeJSON(w, 200, map[string]any{"ok": false, "result": res, "error": err.Error()})
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": res.OK, "result": res})
+}
+
+func (s *Server) awg2DeployServers(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		IDs []string `json:"ids"`
+	}
+	if err := readJSON(r, &in); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"results": s.app.AWG2DeployServers(in.IDs)})
+}
+
+func (s *Server) awg2RefreshStatus(w http.ResponseWriter, r *http.Request) {
+	st, err := s.app.AWG2RefreshStatus()
+	if err != nil {
+		writeJSON(w, 200, map[string]any{"ok": false, "status": st, "error": err.Error()})
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": true, "status": st})
+}
+
+func (s *Server) awg2AddPeer(w http.ResponseWriter, r *http.Request) {
+	var in awg.Peer
+	if err := readJSON(r, &in); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	p, err := s.app.AWG2AddPeer(in)
+	if err != nil {
+		writeJSON(w, 200, map[string]any{"ok": false, "peer": p, "error": err.Error()})
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": true, "peer": p})
+}
+
+func (s *Server) awg2RemovePeer(w http.ResponseWriter, r *http.Request) {
+	if err := s.app.AWG2RemovePeer(r.PathValue("id")); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, map[string]string{"status": "ok"})
+}
+
+func (s *Server) awg2PeerConfig(w http.ResponseWriter, r *http.Request) {
+	text, name, contentType, err := s.app.AWG2ClientExport(r.PathValue("id"), r.URL.Query().Get("format"))
+	if err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	if contentType == "" {
+		contentType = "text/plain; charset=utf-8"
+	}
+	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("Content-Disposition", `attachment; filename="`+safeFile(name, true, "file", 80)+`"`)
+	_, _ = w.Write([]byte(text))
+}
+
+func (s *Server) awg2Install(w http.ResponseWriter, r *http.Request) {
+	out, err := s.app.AWG2InstallEngine()
+	if err != nil {
+		writeJSON(w, 200, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	writeJSON(w, 200, map[string]any{"ok": true, "detail": out})
+}
+
+func (s *Server) awg2ClientUp(w http.ResponseWriter, r *http.Request) {
+	if err := s.app.AWG2ClientUp(); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, s.app.AWG2StatusView())
+}
+
+func (s *Server) awg2ClientDown(w http.ResponseWriter, r *http.Request) {
+	if err := s.app.AWG2ClientDown(); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, s.app.AWG2StatusView())
+}
+
+func (s *Server) awg2RoutingConfig(w http.ResponseWriter, r *http.Request) {
+	var in awg.RoutingConfig
+	if err := readJSON(r, &in); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	if err := s.app.AWG2SetRouting(in); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, s.app.AWG2StatusView())
+}
+
+func (s *Server) awg2RoutingApply(w http.ResponseWriter, r *http.Request) {
+	if err := s.app.AWG2ApplyRouting(); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, s.app.AWG2StatusView())
+}
+
+func (s *Server) awg2RoutingCommit(w http.ResponseWriter, r *http.Request) {
+	if err := s.app.AWG2CommitRouting(); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, map[string]string{"status": "committed"})
+}
+
+func (s *Server) awg2RoutingTeardown(w http.ResponseWriter, r *http.Request) {
+	if err := s.app.AWG2TeardownRouting(); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, s.app.AWG2StatusView())
+}
+
+func (s *Server) awg2RoutingRules(w http.ResponseWriter, r *http.Request) {
+	var in awg.RoutingConfig
+	if err := readJSON(r, &in); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	if err := s.app.AWG2SetRoutingRules(in); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, s.app.AWG2StatusView())
+}
+
+// awg2RulesInsertTop adds a new rule at the head of the routing.zones array
+// (= highest priority). Backs the Trace-row «Всегда VPN / Всегда мимо» quick
+// actions. Body: {domain, route, name?}.
+func (s *Server) awg2RulesInsertTop(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Domain string `json:"domain"`
+		Route  string `json:"route"`
+		Name   string `json:"name"`
+	}
+	if err := readJSON(r, &in); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	if err := s.app.AWG2InsertTopRule(in.Domain, in.Route, in.Name); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, s.app.AWG2StatusView())
+}
+
+// awg2RulesCopy overwrites the active server's rules with another server's
+// rules. Body: {from_server_id}. Other settings (mode/MTU/killswitch/etc) on
+// the destination stay untouched.
+func (s *Server) awg2RulesCopy(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		FromServerID string `json:"from_server_id"`
+	}
+	if err := readJSON(r, &in); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	n, err := s.app.AWG2CopyRulesFromServer(in.FromServerID)
+	if err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, map[string]any{"copied": n, "status": s.app.AWG2StatusView()})
+}
+
+func (s *Server) awg2TraceStatus(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, 200, s.app.AWG2TraceStatus())
+}
+
+func (s *Server) awg2TraceList(w http.ResponseWriter, r *http.Request) {
+	since, _ := strconv.ParseInt(r.URL.Query().Get("since"), 10, 64)
+	writeJSON(w, 200, map[string]any{
+		"status":  s.app.AWG2TraceStatus(),
+		"entries": s.app.AWG2TraceSnapshot(since),
+	})
+}
+
+func (s *Server) awg2TraceSetEnabled(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Enabled bool `json:"enabled"`
+	}
+	if err := readJSON(r, &in); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	s.app.AWG2TraceSetEnabled(in.Enabled)
+	writeJSON(w, 200, s.app.AWG2TraceStatus())
+}
+
+func (s *Server) awg2TraceClear(w http.ResponseWriter, r *http.Request) {
+	s.app.AWG2TraceClear()
+	writeJSON(w, 200, s.app.AWG2TraceStatus())
+}
+
+// awg2SpeedTest runs the two-sample throughput probe and STREAMS progress as
+// NDJSON. Each progress tick (~250 ms) writes one JSON-encoded SpeedEvent +
+// '\n'. Final line is {phase:"result", result:{...}}. The UI parses lines as
+// they arrive so the user sees live MB/s instead of staring at a frozen button.
+//
+// URL + size + timeout come from the request body so the user can pick a 1GB
+// sample for a more accurate number, or point at their own endpoint.
+func (s *Server) awg2SpeedTest(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		URL       string `json:"url"`
+		Iface     string `json:"iface"`
+		MaxBytes  int64  `json:"max_bytes"`
+		TimeoutMS int    `json:"timeout_ms"`
+	}
+	if err := readJSON(r, &in); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	url, err := awgroute.ValidateSpeedTestURL(in.URL)
+	if err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	iface, err := awgroute.ValidateSpeedTestIface(in.Iface)
+	if err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	if in.MaxBytes <= 0 {
+		in.MaxBytes = 10 * 1024 * 1024
+	}
+	if in.TimeoutMS <= 0 {
+		in.TimeoutMS = 15000
+	}
+	// 1GB at slow direct speeds can take a while; cap context generously.
+	ctx, cancel := context.WithTimeout(r.Context(), time.Duration(in.TimeoutMS)*2*time.Millisecond+10*time.Second)
+	defer cancel()
+
+	w.Header().Set("Content-Type", "application/x-ndjson")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("X-Accel-Buffering", "no") // prevent buffering by reverse proxies
+	w.WriteHeader(200)
+	_ = awgroute.JSONLine(w, map[string]any{"phase": "init", "url": url, "max_bytes": in.MaxBytes})
+
+	result := s.app.AWG2SpeedTest(ctx, awgroute.SpeedTestOptions{
+		URL:      url,
+		Iface:    iface,
+		MaxBytes: in.MaxBytes,
+		Timeout:  time.Duration(in.TimeoutMS) * time.Millisecond,
+		OnEvent: func(evt awgroute.SpeedEvent) {
+			_ = awgroute.JSONLine(w, evt)
+		},
+	})
+	_ = awgroute.JSONLine(w, awgroute.SpeedEvent{Phase: "result", Result: &result})
+}
+
+func (s *Server) nfqws2StartSvc(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, 200, s.app.Nfqws2Start())
+}
+
+func (s *Server) nfqws2ServiceStatus(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, 200, s.app.Nfqws2ServiceStatus())
+}
+
+func (s *Server) nfqws2StopSvc(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, 200, s.app.Nfqws2Stop())
+}
+
+func (s *Server) getAutomation(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, 200, s.app.AutomationStatus())
+}
+
+func (s *Server) setAutomation(w http.ResponseWriter, r *http.Request) {
+	var in app.AutomationConfig
+	if err := readJSON(r, &in); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	st, err := s.app.SetAutomationConfig(in)
+	if err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, 200, st)
+}
+
+func (s *Server) triggerAutoPick(w http.ResponseWriter, r *http.Request) {
+	if err := s.app.TriggerAutoPickNow(); err != nil {
+		httpErr(w, 409, err)
+		return
+	}
+	writeJSON(w, 202, s.app.AutomationStatus())
+}
+
+// hostFromHeader strips the port from a Host header so the tg:// link points at
+// whatever address the user reached the UI on.
+func hostFromHeader(host string) string {
+	if host == "" {
+		return ""
+	}
+	if strings.HasPrefix(host, "[") { // IPv6 literal: [::1]:8090
+		if i := strings.Index(host, "]"); i > 0 {
+			return host[:i+1]
+		}
+		return host
+	}
+	if i := strings.Index(host, ":"); i >= 0 {
+		return host[:i]
+	}
+	return host
+}
+
+func (s *Server) applyStrategy(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		Args    string `json:"args"`
+		Restart bool   `json:"restart"`
+	}
+	if err := readJSON(r, &in); err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	if err := s.app.ApplyStrategyToConfig(in.Args, in.Restart); err != nil {
+		httpErr(w, 500, err)
+		return
+	}
+	writeJSON(w, 200, map[string]string{"status": "applied"})
+}
+
+func (s *Server) checkUpdate(w http.ResponseWriter, r *http.Request) {
+	info, err := s.app.CheckUpdate()
+	if err != nil {
+		writeJSON(w, 200, map[string]any{"current": info.Current, "latest": info.Latest, "available": false, "error": err.Error()})
+		return
+	}
+	writeJSON(w, 200, info)
+}
+
+func (s *Server) doUpdate(w http.ResponseWriter, r *http.Request) {
+	st, err := s.app.StartSelfUpdate()
+	if err != nil {
+		httpErr(w, 400, err)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, st)
+}
+
+func (s *Server) updateStatus(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, 200, s.app.SelfUpdateStatus())
+}
+
+// ---------- helpers ----------
+
+type apiError struct {
+	Error string `json:"error"`
+}
+
+var errNotFound = errors.New("not found")
+
+// gzipWriterPool reuses gzip.Writer instances. A fresh gzip.Writer has a 64 KiB
+// internal buffer + DEFLATE state allocated on every NewWriter call; pooling
+// flips that into reuse across requests.
+var gzipWriterPool = sync.Pool{
+	New: func() interface{} { return gzip.NewWriter(io.Discard) },
+}
+
+// jsonEncoderPool reuses encoder + scratch buffer across API responses.
+// Without pooling, every writeJSON allocated json.NewEncoder (small object)
+// PLUS the encoder's internal buffer (grows to fit the response) on every call —
+// per Dashboard refresh that's 20-50 short-lived allocs. Pool keeps them warm.
+type jsonEncoderEntry struct {
+	buf *bytes.Buffer
+	enc *json.Encoder
+}
+
+var jsonEncoderPool = sync.Pool{
+	New: func() interface{} {
+		buf := bytes.NewBuffer(make([]byte, 0, 4096))
+		enc := json.NewEncoder(buf)
+		enc.SetEscapeHTML(false) // shaves a pass over the output for our trusted callers
+		return &jsonEncoderEntry{buf: buf, enc: enc}
+	},
+}
+
+func writeJSON(w http.ResponseWriter, code int, v any) {
+	e := jsonEncoderPool.Get().(*jsonEncoderEntry)
+	e.buf.Reset()
+	if err := e.enc.Encode(v); err != nil {
+		jsonEncoderPool.Put(e)
+		http.Error(w, "encode error", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(code)
+	_, _ = w.Write(e.buf.Bytes())
+	jsonEncoderPool.Put(e)
+}
+
+func httpErr(w http.ResponseWriter, code int, err error) {
+	writeJSON(w, code, apiError{Error: err.Error()})
+}
+
+func readJSON(r *http.Request, v any) error {
+	defer r.Body.Close()
+	return json.NewDecoder(io.LimitReader(r.Body, 8<<20)).Decode(v)
+}
+
+func (s *Server) logging(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Short-circuit BEFORE the time.Now() syscall when we know we won't log
+		// the request. Previously time.Now ran on every static asset / WS
+		// upgrade / non-API hit — vDSO is fast but adds up at high request
+		// rates (e.g. dashboard streams). Saves a syscall per non-logged
+		// request.
+		path := r.URL.Path
+		if !s.app.HTTPLogsEnabled() || len(path) < 4 || path[:4] != "/api" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		start := time.Now()
+		next.ServeHTTP(w, r)
+		log.Printf("%s %s %s", r.Method, path, time.Since(start).Round(time.Millisecond))
+	})
+}

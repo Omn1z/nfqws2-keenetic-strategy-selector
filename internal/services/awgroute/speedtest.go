@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -51,6 +52,7 @@ type SpeedEvent struct {
 type SpeedTestResult struct {
 	ViaTunnel    SpeedSample `json:"via_tunnel"`
 	ViaDirect    SpeedSample `json:"via_direct"`
+	Comparable   bool        `json:"comparable"`
 	TunnelGainPC int         `json:"tunnel_gain_pc"`
 	Sample       string      `json:"sample"`
 	Err          string      `json:"error,omitempty"`
@@ -62,6 +64,15 @@ type SpeedSample struct {
 	RxBytesPerSec float64 `json:"rx_bytes_per_sec"`
 	HTTPStatus    int     `json:"http_status"`
 	Error         string  `json:"error,omitempty"`
+}
+
+func ValidateSpeedTestURL(raw string) (string, error) {
+	target, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || target.Hostname() == "" || target.User != nil ||
+		(target.Scheme != "http" && target.Scheme != "https") {
+		return "", fmt.Errorf("укажите корректный HTTP или HTTPS URL без логина и пароля")
+	}
+	return target.String(), nil
 }
 
 func ValidateSpeedTestIface(iface string) (string, error) {

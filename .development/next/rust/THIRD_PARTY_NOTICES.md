@@ -1,0 +1,89 @@
+# Third-party notices
+
+## Web interface
+
+The web interface uses Base UI (MIT), CodeMirror and Lezer (MIT), React and other
+dependencies pinned in `frontend/package-lock.json`. Shared controls adapt the
+shadcn/ui Rhea style (MIT). Inter variable font 5.3.0 is bundled locally under the
+SIL Open Font License 1.1. Syntax colors follow the VS Code palette used by
+nfqws-keenetic-web; no remote editor or font assets are loaded.
+
+Complete frontend notices and license texts are in
+`THIRD_PARTY_LICENSES/Frontend-LICENSES.txt` and are appended to the release asset
+`THIRD-PARTY-NOTICES.txt`.
+
+DNS dependencies added for DNS Server. Exact panel dependency versions are recorded in go.mod and go.sum. Existing TG WS Proxy and AmneziaWG notices are distributed separately.
+
+## AdGuard urlfilter v0.23.4
+
+Source: https://github.com/AdguardTeam/urlfilter/tree/v0.23.4
+
+License: GNU General Public License, version 3. The complete license text is in `THIRD_PARTY_LICENSES/AdGuard-urlfilter-GPL-3.0.txt`. The DNS filtering feature uses this library to interpret the official AdGuard DNS filter, including exception and modifier rules.
+
+The AmneziaWG engine uses upstream v3.1.20260828, revision b5928efb6ca19f0153958460c3d141f04abc5c2e, with a separately maintained security dependency lock in internal/services/awg/engine-deps.mod and engine-deps.sum. These builds update the Go toolchain and dependencies without modifying the upstream protocol implementation. The same lock is embedded for VPS userspace provisioning.
+
+## miekg/dns v1.1.73
+
+Source: https://github.com/miekg/dns/tree/v1.1.73
+
+BSD 3-Clause License
+
+Copyright (c) 2009, The Go Authors. Extensions copyright (c) 2011, Miek Gieben.
+All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are met:
+
+1. Redistributions of source code must retain the above copyright notice, this
+   list of conditions and the following disclaimer.
+
+2. Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution.
+
+3. Neither the name of the copyright holder nor the names of its
+   contributors may be used to endorse or promote products derived from
+   this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+## Go supplementary libraries (golang.org/x/*)
+
+Source: https://go.googlesource.com/net/
+
+Copyright 2009 The Go Authors.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are
+met:
+
+   * Redistributions of source code must retain the above copyright
+notice, this list of conditions and the following disclaimer.
+   * Redistributions in binary form must reproduce the above
+copyright notice, this list of conditions and the following disclaimer
+in the documentation and/or other materials provided with the
+distribution.
+   * Neither the name of Google LLC nor the names of its
+contributors may be used to endorse or promote products derived from
+this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+"AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+(INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.

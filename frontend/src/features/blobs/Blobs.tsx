@@ -49,6 +49,12 @@ function CandidateRow({ c, index, onSave, disabled }: { c: ClientHelloCandidate;
   );
 }
 
+function helloCount(capture: BlobCapture) {
+  return capture.metadata_only
+    ? Object.values(capture.observations ?? {}).reduce((total, row) => total + row.headers, 0)
+    : (capture.candidates ?? []).length;
+}
+
 export default function Blobs() {
   const { blobs, reloadBlobs } = useStore();
   const [sel, setSel] = useState<Set<string>>(new Set());
@@ -68,7 +74,7 @@ export default function Blobs() {
   const [capSecs, setCapSecs] = useState(20);
   const [cap, setCap] = useState<BlobCapture | null>(null);
   const [capturing, setCapturing] = useState(false);
-  const [installShow, setInstallShow] = useState(false);
+  const [installPackage, setInstallPackage] = useState<"tcpdump" | "nfqws2-strategy-trace" | null>(null);
   const [installing, setInstalling] = useState(false);
 
   const [blobQ, setBlobQ] = useState("");
@@ -92,7 +98,7 @@ export default function Blobs() {
       setCap(c);
       if (c.status !== "running") {
         setCapturing(false);
-        const n = (c.candidates ?? []).length;
+        const n = helloCount(c);
         toast(c.status === "error" ? `Захват: ${c.error}` : `Поймано ClientHello: ${n}`, c.status === "error" ? "err" : n ? "ok" : "warn");
       }
     } catch (e) { setCapturing(false); toast((e as Error).message, "err"); }
@@ -203,16 +209,21 @@ export default function Blobs() {
     if (!ip) { toast("Выберите устройство", "err"); return; }
     try {
       const r = await api<BlobCaptureStart>("POST", `/api/devices/${encodeURIComponent(ip)}/blobcap`, { seconds: capSecs });
-      if ("need_install" in r) { setInstallShow(true); return; }
+      if ("need_install" in r) {
+        if (r.package === "tcpdump" || r.package === "nfqws2-strategy-trace") setInstallPackage(r.package);
+        else toast("Сервер запросил неизвестный модуль", "err");
+        return;
+      }
       setCap(r); setCapturing(true); toast(`Захват ClientHello на ${ip} (${r.seconds} с)`, "ok");
     } catch (e) { toast((e as Error).message, "err"); }
   };
   const confirmInstall = async () => {
+    if (!installPackage) return;
     setInstalling(true);
     try {
-      const r = await api<InstallResult>("POST", "/api/system/install", { package: "tcpdump" });
-      if (!r.ok) { toast(`Не удалось установить tcpdump: ${r.error ?? ""}`, "err"); return; }
-      toast("tcpdump установлен", "ok"); setInstallShow(false); await beginCapture(capIP);
+      const r = await api<InstallResult>("POST", "/api/system/install", { package: installPackage });
+      if (!r.ok) { toast(`Не удалось установить ${installPackage}: ${r.error ?? ""}`, "err"); return; }
+      toast(`Пакет ${installPackage} установлен`, "ok"); setInstallPackage(null); await beginCapture(capIP);
     } catch (e) { toast((e as Error).message, "err"); }
     finally { setInstalling(false); }
   };
@@ -237,13 +248,10 @@ export default function Blobs() {
         { label: "Пользовательские", value: blobs.custom.length, hint: "Загруженные и созданные файлы" },
         { label: "Системные", value: blobs.system.length, hint: "Файлы из поставки nfqws2" },
         { label: "Корзина", value: blobs.trash.length, hint: "Можно восстановить" },
-        { label: "ClientHello", value: cap ? (cap.candidates ?? []).length : "—", hint: capturing ? "Идёт захват" : cap ? "Кандидаты последней записи" : "Захват ещё не запускался" },
+        { label: "ClientHello", value: cap ? helloCount(cap) : "—", hint: capturing ? "Идёт наблюдение" : cap ? "Последний замер" : "Замеров ещё нет" },
       ]} />
       <div className="grid min-w-0 gap-4 xl:grid-cols-2">
-      <Card title="Создание бинарного блоба" sub="TLS ClientHello" className={compactCard}>
-        <p className="mb-3 text-xs text-muted">
-          Блоб — это сырой <code>ClientHello</code>, который движок подставляет как фейковый пакет. Снимите настоящий с трафика устройства или сгенерируйте по домену.
-        </p>
+      <Card title="TLS ClientHello" className={compactCard}>
         <div role="group" aria-label="Способ создания блоба" className="mb-3 inline-flex max-w-full flex-wrap gap-0.5 rounded-md border border-line bg-line-soft p-0.5">{seg("capture", "С трафика")}{seg("generate", "Генератор")}</div>
 
         {mode === "capture" ? (
@@ -277,7 +285,11 @@ export default function Blobs() {
                     <div className="h-full rounded-full bg-accent transition-[width]" style={{ width: `${Math.min(100, (Date.now() / 1000 - cap.started_at) / cap.seconds * 100)}%` }} />
                   </div>
                 )}
-                {!capturing && cap.status === "done" && (cap.candidates ?? []).length === 0 && (
+                {cap.metadata_only && <p className="my-2 text-xs text-muted">Показаны адреса назначения и число наблюдавшихся заголовков ClientHello. {cap.limited && "Достигнут лимит наблюдения."}</p>}
+                {Object.entries(cap.observations ?? {}).map(([address, row]) => (
+                  <p key={address} className="border-t border-line-soft py-2 font-mono text-xs">{address} · {row.headers} ClientHello · {row.record_bytes} Б по заголовкам TLS</p>
+                ))}
+                {!capturing && cap.status === "done" && helloCount(cap) === 0 && (
                   <p className="text-xs text-muted">Ничего не поймано. Откройте нужный сайт на устройстве и повторите захват.</p>
                 )}
                 <div className="max-h-80 min-w-0 overflow-y-auto">{(cap.candidates ?? []).map((c, i) => <CandidateRow key={`${cap.id}:${i}`} c={c} index={i} disabled={disabled} onSave={(index, name) => { void perform(`candidate:${index}`, () => saveCandidate(index, name)); }} />)}</div>
@@ -381,19 +393,18 @@ export default function Blobs() {
         </Card>
       )}
 
-      {installShow && (
+      {installPackage && (
         <Modal
-          title="Нужен пакет tcpdump"
-          onClose={() => { if (!installing) setInstallShow(false); }}
+          title={`Нужен пакет ${installPackage}`}
+          onClose={() => { if (!installing) setInstallPackage(null); }}
           actions={
             <>
-              <Button variant="ghost" onClick={() => setInstallShow(false)} disabled={installing}>Отмена</Button>
+              <Button variant="ghost" onClick={() => setInstallPackage(null)} disabled={installing}>Отмена</Button>
               <Button variant="primary" onClick={() => { void perform("install", confirmInstall); }} disabled={disabled || installing}>{installing ? "Установка…" : "Установить"}</Button>
             </>
           }
         >
-          <p>Снять ClientHello с трафика можно через <b>tcpdump</b> — на роутере он не установлен. Поставить его через системный менеджер пакетов (~1–2 МБ)?</p>
-          <p className="mt-2 text-muted">Установка единоразовая. После неё захват запустится автоматически.</p>
+          <p>После установки <b>{installPackage}</b> панель повторит запрос диагностики для выбранного устройства.</p>
         </Modal>
       )}
     </div>

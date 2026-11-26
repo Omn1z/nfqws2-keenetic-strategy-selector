@@ -1,0 +1,66 @@
+{
+  "dhcp": "package dhcp\n\nconfig dnsmasq\n\toption cachesize '1000'\n\toption domainneeded '1'\n\toption filter 'x\u003cweb\u003e\u0026\u2028'\n\tlist interface 'lan'\n\tlist interface 'guest'\n\toption noresolv '1'\n\tlist server '192.168.1.1#5356'\n\tlist server '/corp.example/192.168.4.1'\n\tlist server '/lan/'\n\nconfig dhcp 'lan'\n\toption interface 'lan'\n\toption limit '150'\n\toption start '100'\n",
+  "network": "package network\n\nconfig interface 'loopback'\n\toption proto 'static'\n\nconfig interface 'lan'\n\toption device 'br-lan'\n\toption ipaddr '192.168.1.1'\n\toption proto 'static'\n\nconfig interface 'wan'\n\toption device 'eth1'\n\tlist dns '192.168.1.1'\n\toption peerdns '0'\n\toption proto 'dhcp'\n",
+  "revision": "a33c46d644f5ed5b42e144884da94ad492535a5b142fb576cae7e14e5279a1c0",
+  "snapshot": {
+    "version": 1,
+    "binding": {
+      "interface": "wan",
+      "instance": "@dnsmasq[0]",
+      "endpoint": {
+        "host": "192.168.1.1",
+        "port": 5356
+      }
+    },
+    "original": {
+      "dhcp.@dnsmasq[0].noresolv": {},
+      "dhcp.@dnsmasq[0].server": {
+        "kind": "list",
+        "values": [
+          "8.8.8.8",
+          "/corp.example/192.168.4.1",
+          "/lan/",
+          "/#/9.9.9.9"
+        ]
+      },
+      "network.wan.dns": {
+        "kind": "list",
+        "values": [
+          "9.9.9.9",
+          "149.112.112.112"
+        ]
+      },
+      "network.wan.peerdns": {}
+    },
+    "applied": {
+      "dhcp.@dnsmasq[0].noresolv": {
+        "kind": "option",
+        "values": [
+          "1"
+        ]
+      },
+      "dhcp.@dnsmasq[0].server": {
+        "kind": "list",
+        "values": [
+          "192.168.1.1#5356",
+          "/corp.example/192.168.4.1",
+          "/lan/"
+        ]
+      },
+      "network.wan.dns": {
+        "kind": "list",
+        "values": [
+          "192.168.1.1"
+        ]
+      },
+      "network.wan.peerdns": {
+        "kind": "option",
+        "values": [
+          "0"
+        ]
+      }
+    },
+    "instanceIdentity": "3e38943720a2211c3a590345bec57ff0cc3f0b60848b366540d1051ef207ce80",
+    "instanceScope": "efa438b2b8162e82a5a6699d893ab2dbc8780402afe65cb0a2b1eacda6fd2e12"
+  }
+}

@@ -92,7 +92,7 @@ export function AutomationPanel() {
   return (
     <Card
       title="Автоматика"
-      sub="опциональный watchdog NFQWS2 + авто-пик стратегии"
+      sub={st.auto_pick_supported === false ? "Управление службой NFQWS2 по состоянию VPN" : "опциональный watchdog NFQWS2 + авто-пик стратегии"}
       head={
         <div className="flex flex-wrap items-center gap-1.5">
           {st.awg_healthy
@@ -118,7 +118,7 @@ export function AutomationPanel() {
           </p>
         </div>
 
-        <div className="border-t border-line-soft pt-3">
+        {st.auto_pick_supported !== false && <div className="border-t border-line-soft pt-3">
           <div className="mb-1 text-[12px] uppercase tracking-wide text-muted">Авто-пик стратегии</div>
           <Switch
             checked={st.auto_pick}
@@ -152,7 +152,7 @@ export function AutomationPanel() {
           <p className="mt-1 text-[11.5px] text-muted">
             Когда авто-пик выключен, фоновый подбор и расписание не запускаются. «Пик сейчас» запускает подбор вручную.
           </p>
-        </div>
+        </div>}
 
         {(st.last_pick_at || st.last_pick_error) && (
           <div className="border-t border-line-soft pt-3 text-[12.5px]">
@@ -170,14 +170,14 @@ export function AutomationPanel() {
           </div>
         )}
 
-        <div className="flex items-center gap-2 border-t border-line-soft pt-3">
+        {st.auto_pick_supported !== false && <div className="flex items-center gap-2 border-t border-line-soft pt-3">
           <Button mini onClick={pickNow} disabled={busy || st.pick_in_progress || st.nfqws2_manual_off}>
             {st.pick_in_progress ? "сканирую…" : "Пик сейчас"}
           </Button>
           <span className="text-[11.5px] text-muted">
             Скан + применить, занимает 1–3 мин
           </span>
-        </div>
+        </div>}
       </div>
     </Card>
   );

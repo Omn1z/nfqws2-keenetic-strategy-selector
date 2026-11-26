@@ -28,9 +28,10 @@ type Entry struct {
 }
 
 var (
-	mu   sync.Mutex
-	ring []Entry
-	base io.Writer = io.Discard
+	mu          sync.Mutex
+	ring        []Entry
+	base        io.Writer = io.Discard
+	proxyOutput io.Writer = io.Discard
 
 	sinkMu  sync.Mutex
 	partial []byte
@@ -53,12 +54,17 @@ func SetEnabled(on bool) { enabled.Store(on) }
 // Enabled reports whether logging is currently on.
 func Enabled() bool { return enabled.Load() }
 
-// Init sets the underlying writer (the -log file / stderr) and returns a Sink to
-// pass to log.SetOutput. Call log.SetFlags(0) too so the stdlib timestamp isn't
-// duplicated (logbuf adds its own).
-func Init(w io.Writer) io.Writer {
+// Init sets the standard writer and the optional capped file for proxy diagnostics.
+// With no file configured, proxy warnings and errors go to the standard writer.
+// Set the standard logger flags to zero so its timestamp appears only once.
+func Init(w io.Writer, proxyLogPath string) io.Writer {
+	proxyWriter := w
+	if proxyLogPath != "" {
+		proxyWriter = newProxyLog(proxyLogPath)
+	}
 	mu.Lock()
 	base = w
+	proxyOutput = proxyWriter
 	mu.Unlock()
 	return sink{}
 }
@@ -68,6 +74,10 @@ func Init(w io.Writer) io.Writer {
 // impl only honoured it inside the sink path, not on direct Append callers).
 func Append(module, level, msg string) {
 	if !enabled.Load() {
+		return
+	}
+	proxy := isProxyModule(module)
+	if proxy && level != "warn" && level != "error" {
 		return
 	}
 	msg = strings.TrimRight(msg, "\n")
@@ -84,6 +94,9 @@ func Append(module, level, msg string) {
 		ring = ring[len(ring)-maxEntries:]
 	}
 	w := base
+	if proxy {
+		w = proxyOutput
+	}
 	mu.Unlock()
 	fmt.Fprintf(w, "%s [%s] %s\n", now.Format("2006-01-02 15:04:05"), module, msg)
 }
@@ -150,7 +163,8 @@ func (sink) Write(p []byte) (int, error) {
 	sinkMu.Unlock()
 	for _, line := range lines {
 		if strings.TrimSpace(line) != "" {
-			Append(inferModule(line), inferLevel(line), line)
+			module := inferModule(line)
+			Append(module, inferLevel(module, line), line)
 		}
 	}
 	return len(p), nil
@@ -160,6 +174,10 @@ func inferModule(line string) string {
 	switch {
 	case strings.HasPrefix(line, "tgws:"):
 		return "tgws"
+	case strings.HasPrefix(line, "socks5:"):
+		return "socks5"
+	case strings.HasPrefix(line, "proxy:"):
+		return "proxy"
 	case strings.HasPrefix(line, "trace"):
 		return "trace"
 	case strings.HasPrefix(line, "run:"):
@@ -185,8 +203,23 @@ func isHTTPLine(line string) bool {
 	return false
 }
 
-func inferLevel(line string) string {
+func isProxyModule(module string) bool {
+	return module == "tgws" || module == "socks5" || module == "proxy"
+}
+
+func inferLevel(module, line string) string {
 	l := strings.ToLower(line)
+	if isProxyModule(module) {
+		switch {
+		case strings.Contains(l, "autostart:"), strings.Contains(l, "no fallback available"), strings.Contains(l, "mtproto transport error"):
+			return "error"
+		case strings.Contains(l, "session closed"), strings.Contains(l, "fake-tls verify failed -> masking"):
+			// Session-end summaries may contain a normal timeout or closed socket.
+			return "info"
+		case strings.Contains(l, "bad handshake"):
+			return "warn"
+		}
+	}
 	switch {
 	case strings.Contains(l, "panic"), strings.Contains(l, "fatal"), strings.Contains(l, "error"), strings.Contains(l, "fail"):
 		return "error"

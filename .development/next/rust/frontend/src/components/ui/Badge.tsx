@@ -1,0 +1,47 @@
+import type { ReactNode } from "react";
+import { cva } from "class-variance-authority";
+import { cn } from "@/lib/cn";
+
+export type BadgeKind = "ok" | "bad" | "warn" | "neutral";
+
+const badgeVariants = cva("group/badge inline-flex h-5 w-fit shrink-0 items-center justify-center gap-1 overflow-hidden whitespace-nowrap rounded-md border border-transparent px-2 py-0.5 text-xs font-medium", {
+  variants: {
+    kind: {
+      ok: "bg-ok-bg text-ok",
+      bad: "bg-bad-bg text-bad",
+      warn: "bg-warn-bg text-warn",
+      neutral: "bg-secondary text-secondary-foreground",
+    },
+  },
+  defaultVariants: { kind: "neutral" },
+});
+
+export function Badge({ kind, className, children }: { kind?: BadgeKind; className?: string; children: ReactNode }) {
+  return <span data-slot="badge" className={cn(badgeVariants({ kind }), className)}>{children}</span>;
+}
+
+const VERDICT: Record<string, [string, BadgeKind]> = {
+  ok: ["доступен", "ok"],
+  cap16k: ["обрыв 16КБ", "bad"],
+  reset: ["RST", "bad"],
+  timeout: ["таймаут", "bad"],
+  refused: ["отказ", "warn"],
+  dns: ["DNS", "warn"],
+  error: ["ошибка", "bad"],
+  local_error: ["локальная ошибка", "warn"],
+};
+
+export function VerdictBadge({ v }: { v: string }) {
+  const [label, kind] = VERDICT[v] ?? [v || "?", "bad"];
+  return <Badge kind={kind}>{label}</Badge>;
+}
+
+/** Underlined chip highlighting which DNS produced a result (system = muted). */
+export function DnsBadge({ name, id }: { name?: string; id?: string }) {
+  if (!name) return <span>—</span>;
+  return (
+    <span className={cn("whitespace-nowrap text-[11.5px] font-semibold underline underline-offset-2", id ? "text-accent-d decoration-accent" : "text-muted decoration-line")}>
+      {name}
+    </span>
+  );
+}

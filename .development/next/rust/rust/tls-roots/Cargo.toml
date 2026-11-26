@@ -1,0 +1,13 @@
+[package]
+name = "nfqws2-tls-roots"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+rustls = { version = "0.23", default-features = false, features = ["std"] }
+
+[dev-dependencies]
+base64ct = { version = "1", features = ["alloc"] }
+rcgen = { version = "0.14", default-features = false, features = ["ring", "crypto"] }
+tempfile = "3"

@@ -1,0 +1,20 @@
+
+// TestRouterBatchFitsFullGRODatagram protects the receive path when reducing
+// batches: one GRO datagram can still contain all 64 segments.
+func TestRouterBatchFitsFullGRODatagram(t *testing.T) {
+	reads := IdealBatchSize / udpSegmentMaxDatagrams
+	if reads < 1 { t.Fatal("router batch cannot hold a full GRO datagram") }
+	msgs := make([]ipv6.Message, IdealBatchSize)
+	for i := range msgs { msgs[i].Buffers = [][]byte{make([]byte, udpSegmentMaxDatagrams)} }
+	readAt := len(msgs) - reads
+	msgs[readAt].N = udpSegmentMaxDatagrams
+	for i := 0; i < udpSegmentMaxDatagrams; i++ { msgs[readAt].Buffers[0][i] = byte(i) }
+	n, err := splitCoalescedMessages(msgs, readAt, func([]byte) (int, error) { return 1, nil })
+	if err != nil { t.Fatal(err) }
+	if n != udpSegmentMaxDatagrams { t.Fatalf("GRO segments=%d, want %d", n, udpSegmentMaxDatagrams) }
+	for i := 0; i < n; i++ {
+		if msgs[i].N != 1 || msgs[i].Buffers[0][0] != byte(i) {
+			t.Fatalf("GRO segment %d was corrupted", i)
+		}
+	}
+}

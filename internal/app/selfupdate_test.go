@@ -82,14 +82,14 @@ func TestCheckUpdateDoesNotOfferOlderReleaseToVersionedDevelopmentBuild(t *testi
 		}, nil
 	})
 	a := &App{Cfg: &config.Config{Version: "v1.6.0-dev", Repo: "example/project"}}
-	info, err := a.CheckUpdate()
+	info, err := a.checkReleaseUpdate()
 	if err != nil {
 		t.Fatal(err)
 	}
 	if info.Current != "v1.6.0-dev" || info.Latest != "v1.5.0" || info.Available {
 		t.Fatalf("unexpected update info: %+v", info)
 	}
-	if _, err := a.SelfUpdate(); err == nil || !strings.Contains(err.Error(), "already up to date") {
+	if _, err := a.selfUpdateWithProgress(nil); err == nil || !strings.Contains(err.Error(), "already up to date") {
 		t.Fatalf("SelfUpdate should stop before downloading an older release, got %v", err)
 	}
 	if requests != 2 {
@@ -207,7 +207,7 @@ func TestCheckUpdateOfficialPagesFallback(t *testing.T) {
 				}
 			})
 			a := &App{Cfg: &config.Config{Version: "v1.8.3", Repo: officialUpdateRepo}}
-			info, err := a.CheckUpdate()
+			info, err := a.checkReleaseUpdate()
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -256,7 +256,7 @@ func TestCheckUpdateDoesNotUsePagesForCustomReposOrPermanentAPIErrors(t *testing
 				return updateTestResponse(tc.status, tc.body), nil
 			})
 			a := &App{Cfg: &config.Config{Version: "v1.8.3", Repo: tc.repo}}
-			if info, err := a.CheckUpdate(); err == nil || info.Available || requests != 1 {
+			if info, err := a.checkReleaseUpdate(); err == nil || info.Available || requests != 1 {
 				t.Fatalf("unexpected result: %+v, %v, requests=%d", info, err, requests)
 			}
 		})
@@ -275,7 +275,7 @@ func TestCheckUpdateAPISuccessSkipsPages(t *testing.T) {
 		return updateTestResponse(http.StatusOK, `{"tag_name":"v1.8.4","html_url":"https://github.com/official/release"}`), nil
 	})
 	a := &App{Cfg: &config.Config{Version: "v1.8.3", Repo: officialUpdateRepo}}
-	info, err := a.CheckUpdate()
+	info, err := a.checkReleaseUpdate()
 	if err != nil || !info.Available || info.Latest != "v1.8.4" || info.URL != "https://github.com/official/release" || info.assetURL != "" || requests != 1 {
 		t.Fatalf("API success changed: %+v, %v, requests=%d", info, err, requests)
 	}
@@ -300,7 +300,7 @@ func TestPagesFallbackPreservesDevelopmentVersionProtection(t *testing.T) {
 	})
 	for _, current := range []string{"v1.9.0-dev", "v1.8.4", "v1.8.5"} {
 		a := &App{Cfg: &config.Config{Version: current, Repo: officialUpdateRepo}}
-		info, err := a.SelfUpdate()
+		info, err := a.selfUpdateWithProgress(nil)
 		if err == nil || !strings.Contains(err.Error(), "already up to date") || info.Available || info.Current != current || info.Latest != "v1.8.4" {
 			t.Fatalf("fallback bypassed version protection: %+v, %v", info, err)
 		}

@@ -1,4 +1,6 @@
 /dist/
+/target/
+/internal/server/compactweb/
 *.exe
 # Claude Code session/harness artifacts
 /.claude/

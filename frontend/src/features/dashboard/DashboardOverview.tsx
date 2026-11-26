@@ -6,7 +6,7 @@ import { Sparkline } from "@/components/ui/Chart";
 import { DnsStatistics } from "@/features/dnsserver/DnsStatistics";
 import { fmtNum, human } from "@/lib/format";
 import { navigate } from "@/lib/router";
-import type { Dashboard as DashboardData } from "@/types/api";
+import type { Dashboard as DashboardData, StorageUsage } from "@/types/api";
 
 export type Rate = { rx: number; tx: number };
 export interface Sample { conns: number; pps: number; rx: number; tx: number; }
@@ -91,27 +91,27 @@ export function DashboardOverview({ d, rates, awgRates, hist, traceRates, restar
   const awgConnected = awg.filter(connection => connection.state === "connected").length;
   const wanRates = wan.flatMap(iface => rates[iface.iface] ? [rates[iface.iface]] : []);
   const wanRate = wanRates.length ? wanRates.reduce((sum, value) => ({ rx: sum.rx + value.rx, tx: sum.tx + value.tx }), { rx: 0, tx: 0 }) : null;
-  const { connections: tgConnections, traffic: tgTraffic } = d.tgws.stats;
-  const { connections: socksConnections, traffic: socksTraffic } = d.socks5.stats;
-  const showTgws = d.tgws.running || tgConnections.total > 0 || tgTraffic.bytes_up > 0 || tgTraffic.bytes_down > 0;
-  const showSocks5 = d.socks5.running || socksConnections.total > 0 || socksTraffic.bytes_up > 0 || socksTraffic.bytes_down > 0;
+  const tgConnections = d.tgws?.stats.connections, tgTraffic = d.tgws?.stats.traffic;
+  const socksConnections = d.socks5?.stats.connections, socksTraffic = d.socks5?.stats.traffic;
+  const showTgws = tgConnections && tgTraffic && (d.tgws.running || tgConnections.total > 0 || tgTraffic.bytes_up > 0 || tgTraffic.bytes_down > 0);
+  const showSocks5 = socksConnections && socksTraffic && (d.socks5.running || socksConnections.total > 0 || socksTraffic.bytes_up > 0 || socksTraffic.bytes_down > 0);
   const protocol = d.conns.by_proto ?? {};
   const trace = traceRates;
   const m = (value: number) => fmtNum(Math.round(value));
-  const hitRatio = d.dnsserver.stats.queries > 0 ? Math.min(100, d.dnsserver.stats.cache_hits / d.dnsserver.stats.queries * 100) : 0;
+  const hitRatio = d.dnsserver?.stats.queries > 0 ? Math.min(100, d.dnsserver.stats.cache_hits / d.dnsserver.stats.queries * 100) : 0;
   return <div className="dashboard-overview flex min-w-0 flex-col gap-4">
     <div className="flex flex-wrap items-center justify-between gap-2"><h2 className="text-sm font-medium">Сводка</h2>{restart}</div>
     <section aria-label="Ключевые показатели" className="grid grid-cols-2 gap-2 sm:grid-cols-3 xl:grid-cols-5">
-      <Metric label="VPN-туннели" value={<>{awgConnected}<span className="text-sm font-normal text-muted"> / {awg.length}</span></>} hint="подключено / настроено" />
+      {d.awg && <Metric label="VPN-туннели" value={<>{awgConnected}<span className="text-sm font-normal text-muted"> / {awg.length}</span></>} hint="подключено / настроено" />}
       <Metric label="WAN · суммарно" value={wanRate ? `${human(wanRate.rx)}/с ↓` : wan.length ? "…" : "—"} hint={wanRate ? `${human(wanRate.tx)}/с ↑ · ${wan.map(iface => iface.iface).join(", ")}` : wan.length ? "сбор скорости" : "нет данных"} />
       <Metric label="Обход DPI" value={d.nfqws2_running ? "Работает" : "Остановлен"} hint={`NFQWS2 · очередь ${d.main_queue}`} />
-      <Metric label="Запросы DNS" value={fmtNum(d.dnsserver.stats.queries)} hint={`${hitRatio.toFixed(1)}% из кэша · с запуска`} />
+      {d.dnsserver && <Metric label="Запросы DNS" value={fmtNum(d.dnsserver.stats.queries)} hint={`${hitRatio.toFixed(1)}% из кэша · с запуска`} />}
       <Metric label="Соединения" value={fmtNum(d.conns.total)} hint={`из ${fmtNum(d.conntrack.max)} · не отвечают: ${fmtNum(d.conns.failing)}`} className="col-span-2 xl:col-span-1" />
     </section>
 
     <ChannelsTable d={d} rates={rates} awgRates={awgRates} />
 
-    <section aria-label="Статистика DNS Server" className="min-w-0">
+    {d.dnsserver && <section aria-label="Статистика DNS Server" className="min-w-0">
       <div className="mb-3 flex flex-wrap items-center gap-x-3 gap-y-2">
         <h2 className="text-sm font-medium">Статистика DNS и фильтрация</h2><span className="text-xs text-muted [overflow-wrap:anywhere]">{d.dnsserver.endpoint || "локальный DNS"}</span>
         <div className="ml-auto flex flex-wrap items-center gap-2"><Badge kind={d.dnsserver.running ? "ok" : d.dnsserver.enabled ? "bad" : "neutral"}>{d.dnsserver.running ? "работает" : d.dnsserver.enabled ? "ошибка запуска" : "выключен"}</Badge><Button mini onClick={() => navigate("dnsserver")}>Настройки DNS</Button></div>
@@ -119,7 +119,7 @@ export function DashboardOverview({ d, rates, awgRates, hist, traceRates, restar
       <DnsStatistics variant="dashboard" stats={d.dnsserver.stats} cache={d.dnsserver.cache} />
       {d.dnsserver.last_error && <p className="mt-2 text-xs text-bad [overflow-wrap:anywhere]">{d.dnsserver.last_error}</p>}
       {!d.dnsserver.last_error && d.dnsserver.stats.last_error && <p className="mt-2 text-xs text-bad [overflow-wrap:anywhere]">Последняя ошибка: {d.dnsserver.stats.last_error}</p>}
-    </section>
+    </section>}
 
     <div className="grid gap-3 lg:grid-cols-3">
       <Card title="Активные соединения" sub="conntrack" className={DASH_CARD}>
@@ -128,14 +128,14 @@ export function DashboardOverview({ d, rates, awgRates, hist, traceRates, restar
         <DashboardRow label="Не отвечают"><span className={d.conns.failing ? "text-bad" : ""}>{fmtNum(d.conns.failing)}</span></DashboardRow>
         <div className="mt-3"><Sparkline data={hist.map(sample => sample.conns)} label="Соединения · история" value="" /></div>
       </Card>
-      <Card title="Маршрутизация VPN" sub="DNS + SNI" className={DASH_CARD}>
+      {d.trace_counters && <Card title="Маршрутизация VPN" sub="DNS + SNI" className={DASH_CARD}>
         <p className="mb-2 text-xl font-semibold tabular-nums">{trace ? `${m(Math.round(trace.dns) + Math.round(trace.sni))}/мин` : "…"}</p>
         <DashboardRow label="DNS / SNI">{trace ? `${m(trace.dns)} / ${m(trace.sni)}` : "…"}</DashboardRow>
         <DashboardRow label="tunnel / direct">{trace ? `${m(trace.tunnel)} / ${m(trace.direct)}` : "…"}</DashboardRow>
         <DashboardRow label="blocked / cdn-skip"><span className={trace && trace.blocked > 0 ? "text-warn" : ""}>{trace ? `${m(trace.blocked)} / ${m(trace.cdnSkip)}` : "…"}</span></DashboardRow>
         <DashboardRow label="Всего DNS / SNI">{fmtNum(d.trace_counters.dns)} / {fmtNum(d.trace_counters.sni)}</DashboardRow>
         <DashboardRow label="Всего обработано">{fmtNum(d.trace_counters.dns + d.trace_counters.sni)}</DashboardRow>
-      </Card>
+      </Card>}
       <Card title="Трафик WAN" sub="сумма интерфейсов" className={DASH_CARD}>
         {wan.length ? <><Sparkline data={hist.map(sample => sample.rx / 1024)} label="↓ Приём" value={wanRate ? `${human(wanRate.rx)}/с` : "…"} />
           <div className="mt-3"><Sparkline data={hist.map(sample => sample.tx / 1024)} label="↑ Отправка" value={wanRate ? `${human(wanRate.tx)}/с` : "…"} /></div>
@@ -157,7 +157,10 @@ export function DashboardOverview({ d, rates, awgRates, hist, traceRates, restar
           <DashboardRow label="Трафик ↑ / ↓">{socksTraffic.human_up || "0 Б"} / {socksTraffic.human_down || "0 Б"}</DashboardRow>
         </Card>}
       </section>
-      <SystemPanel d={d} />
+      <div className="flex min-w-0 flex-col gap-3">
+        {d.storage && <StorageCard storage={d.storage} />}
+        <SystemPanel d={d} />
+      </div>
     </div>
     <DevicesPanel d={d} />
   </div>;
@@ -170,6 +173,22 @@ export function fmtUptime(seconds: number): string {
 }
 export function fmtKB(kb: number): string {
   return !kb ? "—" : kb < 1024 ? `${kb} KB` : kb < 1024 * 1024 ? `${(kb / 1024).toFixed(1)} MB` : `${(kb / 1024 / 1024).toFixed(2)} GB`;
+}
+
+function StorageCard({ storage }: { storage: StorageUsage }) {
+  const usable = storage.used_bytes + storage.available_bytes;
+  const percent = usable ? Math.ceil(storage.used_bytes / usable * 100) : 0;
+  const fill = percent >= 95 ? "bg-bad" : percent >= 85 ? "bg-warn" : "bg-accent";
+  const format = (bytes: number) => bytes ? fmtKB(bytes / 1024) : "0 Б";
+
+  return <Card title="Накопитель" sub={<code className="[overflow-wrap:anywhere]">{storage.path}</code>} head={<span className="text-xs font-medium tabular-nums">{percent}%</span>} className={DASH_CARD}>
+    <div role="meter" aria-label="Заполнение раздела" aria-valuemin={0} aria-valuemax={100} aria-valuenow={percent} className="mb-2 h-1.5 overflow-hidden rounded-full bg-line-soft">
+      <div className={`h-full rounded-full ${fill}`} style={{ width: `${percent}%` }} />
+    </div>
+    <DashboardRow label="Свободно">{format(storage.available_bytes)}</DashboardRow>
+    <DashboardRow label="Занято">{format(storage.used_bytes)}</DashboardRow>
+    <DashboardRow label="Всего">{format(storage.total_bytes)}</DashboardRow>
+  </Card>;
 }
 
 function SystemPanel({ d }: { d: DashboardData }) {

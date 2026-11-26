@@ -1,0 +1,5 @@
+[package]
+name = "nfqws2-tls-record"
+version = "0.1.0"
+edition = "2021"
+publish = false

@@ -28,8 +28,9 @@ export default function ARPSpoofing() {
 
   const applyDefaults = (v: ARPSpoofView): ARPSpoofConfig => {
     const vendor = v.vendors.find((x) => x.id === v.config.vendor_id) ?? v.vendors[0];
-    const prefix = v.config.prefix || vendor?.prefixes[0] || "";
-    return { ...v.config, vendor_id: vendor?.id ?? "custom", prefix, ifaces: [] };
+    const local = vendor?.id === "local";
+    const prefix = (local && v.config.vendor_id !== "local" ? "" : v.config.prefix) || vendor?.prefixes[0] || "";
+    return { ...v.config, vendor_id: vendor?.id ?? "custom", prefix, ifaces: local ? v.config.ifaces ?? [] : [] };
   };
 
   const load = async () => {
@@ -49,10 +50,11 @@ export default function ARPSpoofing() {
   const vendors = view?.vendors ?? [];
   const vendor = vendors.find((x) => x.id === form.vendor_id) ?? vendors[0];
   const prefixes = vendor?.prefixes ?? [];
+  const local = vendors.some((v) => v.id === "local");
   const autoIfaces = view?.suggested_ifaces?.length ? view.suggested_ifaces : ["AUTO"];
 
   const markDirty = (next: ARPSpoofConfig) => {
-    setForm({ ...next, ifaces: [] });
+    setForm(local ? next : { ...next, ifaces: [] });
     setDirty(true);
   };
 
@@ -77,7 +79,7 @@ export default function ARPSpoofing() {
   const save = async (next = form) => {
     setSaving(true);
     try {
-      const v = await api<ARPSpoofView>("POST", "/api/arp-spoofing/config", { ...next, ifaces: [] });
+      const v = await api<ARPSpoofView>("POST", "/api/arp-spoofing/config", next);
       setView(v);
       setForm(applyDefaults(v));
       setDirty(false);
@@ -106,7 +108,8 @@ export default function ARPSpoofing() {
 
   if (!view) return <Card><span className="text-xs text-muted">Загрузка...</span></Card>;
 
-  const canSave = !saving && (!form.enabled || form.mac.trim() !== "" || form.prefix.trim() !== "");
+  const canSave = !saving && (!form.enabled || form.mac.trim() !== "" || (!local && form.prefix.trim() !== ""));
+  const selected = view.config.ifaces?.[0];
 
   return (
     <Card
@@ -115,7 +118,7 @@ export default function ARPSpoofing() {
       head={
         <div className="flex flex-wrap items-center justify-end gap-2">
           <Badge kind={view.active ? "ok" : view.config.enabled ? "bad" : "neutral"}>{view.active ? "активен" : view.config.enabled ? "ошибка" : "выключен"}</Badge>
-          <Badge kind="neutral">AUTO {autoIfaces.join(", ")}</Badge>
+          <Badge kind="neutral">{selected || `AUTO ${autoIfaces.join(", ")}`}</Badge>
         </div>
       }
     >
@@ -123,12 +126,19 @@ export default function ARPSpoofing() {
         Меняет MAC-адрес LAN-моста роутера. После смены может понадобиться переподключить Wi-Fi на устройствах, чтобы обновились ARP-записи и кеш IPv6 DNS.
       </p>
       <div className="grid gap-3 lg:grid-cols-[minmax(180px,.8fr)_minmax(150px,.6fr)_minmax(220px,1fr)_auto] lg:items-end">
-        <Field label="Вендор">
+        {local ? <Field label="LAN-мост">
+          <Select value={form.ifaces[0] ?? ""} onChange={(e) => markDirty({ ...form, ifaces: e.target.value ? [e.target.value] : [] })}>
+            <option value="">Автоматически</option>
+            {view.suggested_ifaces.map((name) => <option key={name} value={name}>{name}</option>)}
+          </Select>
+        </Field> : <Field label="Вендор">
           <Select value={form.vendor_id} onChange={(e) => setVendor(e.target.value)}>
             {vendors.map((v) => <option key={v.id} value={v.id}>{v.name}</option>)}
           </Select>
-        </Field>
-        <Field label="OUI / prefix">
+        </Field>}
+        {local ? <Field label="Локальный префикс">
+          <Input value={form.prefix} placeholder="02" onChange={(e) => markDirty({ ...form, prefix: e.target.value, mac: "" })} />
+        </Field> : <Field label="OUI / prefix">
           <Select
             value={form.prefix}
             onChange={(e) => markDirty({ ...form, prefix: e.target.value, vendor_id: vendor?.prefixes.includes(e.target.value) ? form.vendor_id : "custom", mac: "" })}
@@ -137,17 +147,17 @@ export default function ARPSpoofing() {
             {prefixes.map((p) => <option key={p} value={p}>{p}</option>)}
             {!prefixes.includes(form.prefix) && form.prefix && <option value={form.prefix}>{form.prefix}</option>}
           </Select>
-        </Field>
+        </Field>}
         <Field label="MAC LAN-моста">
-          <Input value={form.mac} placeholder="64:6E:EA:12:34:56" onChange={(e) => markDirty({ ...form, mac: e.target.value })} />
+          <Input value={form.mac} readOnly={local} placeholder={local ? "Сгенерируйте адрес" : "64:6E:EA:12:34:56"} onChange={(e) => markDirty({ ...form, mac: e.target.value })} />
         </Field>
         <Button onClick={generate} disabled={saving}>Сгенерировать</Button>
       </div>
 
       <div className="mt-3 grid gap-3 lg:grid-cols-[minmax(220px,1fr)_auto] lg:items-end">
-        <Field label="Ручной prefix">
+        {!local && <Field label="Ручной prefix">
           <Input value={form.prefix} placeholder="A4:C6:4F" onChange={(e) => markDirty({ ...form, prefix: e.target.value, vendor_id: "custom", mac: "" })} />
-        </Field>
+        </Field>}
         <div className="flex h-[38px] flex-wrap items-center gap-4">
           <Switch checked={form.enabled} onChange={(enabled) => markDirty({ ...form, enabled })} label="Включено" />
           <Button variant="primary" onClick={() => void save()} disabled={!canSave}>
@@ -158,8 +168,8 @@ export default function ARPSpoofing() {
       </div>
 
       <div className="mt-3 grid gap-2 rounded-lg border border-line bg-line-soft px-3 py-2 text-xs text-ink-soft md:grid-cols-3">
-        <div><span className="font-semibold text-ink">Режим:</span> AUTO</div>
-        <div><span className="font-semibold text-ink">Интерфейсы:</span> {autoIfaces.join(", ")}</div>
+        <div><span className="font-semibold text-ink">Режим:</span> {selected ? "Выбранный мост" : "AUTO"}</div>
+        <div><span className="font-semibold text-ink">Интерфейсы:</span> {selected || autoIfaces.join(", ")}</div>
         <div><span className="font-semibold text-ink">Применено:</span> {compactTime(view.applied_at)}</div>
       </div>
 

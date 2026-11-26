@@ -1,0 +1,7 @@
+#!/bin/sh
+# On direct opkg removal, release the service while its binary and cleanup
+# script still exist. An upgrade or offline image build has no live service.
+set -eu
+[ -z "${IPKG_INSTROOT:-}" ] && [ "${1:-}" = remove ] || exit 0
+[ "$(readlink /opt/usr/bin/n2s)" = /opt/lib/nfqws2-strategy/n2s-compact ] || exit 0
+N2S_COMPACT_PRERM=1 sh /opt/lib/nfqws2-strategy/uninstall.sh

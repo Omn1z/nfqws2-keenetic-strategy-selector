@@ -1,0 +1,326 @@
+package awgroute
+
+import (
+	"container/list"
+	"net"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+// Per-flow trace log: a tag-free, in-memory ring that records each DNS query
+// and SNI sighting the proxy/sniffer process, with the routing decision and a
+// one-line reason. Turned off by default — when off, the hot path is one
+// atomic load + early return (~5ns) so the recording cost only exists while
+// the user is actively debugging. The API surface drains the ring; nothing is
+// persisted to disk, so a selector restart clears it.
+
+const traceRingCap = 5000
+const traceHostTTL = 30 * time.Minute
+const traceCacheCapacity = 4096
+const traceCacheSweepInterval = time.Minute
+
+// TraceEntry is one routed-traffic event. Field names are short because they
+// are serialized to JSON on every API hit (the ring can hold thousands).
+type TraceEntry struct {
+	TS          int64  `json:"ts"`                     // unix-nanoseconds; 0 for empty slot
+	Src         string `json:"src,omitempty"`          // LAN client IP ("" = router-local / SNI without src)
+	Kind        string `json:"kind"`                   // "dns" | "sni" | "flow"
+	Name        string `json:"name"`                   // qname, SNI hostname or flow class
+	Qtype       string `json:"qtype,omitempty"`        // "A" | "AAAA" | "" for non-DNS
+	Dst         string `json:"dst,omitempty"`          // resolved IP / SNI destination / flow destination
+	Decision    string `json:"decision"`               // "tunnel" | "direct" | "blocked" | "cdn-skip"
+	Rule        int    `json:"rule,omitempty"`         // 1-based index of the matched rule (0 = no rule, default route)
+	Reason      string `json:"reason,omitempty"`       // one-line diagnostic
+	Proto       string `json:"proto,omitempty"`        // flow: tcp | udp | icmp | ...
+	Sport       int    `json:"sport,omitempty"`        // flow source port
+	Dport       int    `json:"dport,omitempty"`        // flow destination port
+	State       string `json:"state,omitempty"`        // flow TCP state
+	Event       string `json:"event,omitempty"`        // flow: new | unreplied | replied | gone
+	Packets     int64  `json:"packets,omitempty"`      // original direction packets
+	Bytes       int64  `json:"bytes,omitempty"`        // original direction bytes
+	ReplyBytes  int64  `json:"reply_bytes,omitempty"`  // reply direction bytes
+	Unreplied   bool   `json:"unreplied,omitempty"`    // flow has no reply yet
+	Assured     bool   `json:"assured,omitempty"`      // conntrack saw a confirmed flow
+	TunnelID    string `json:"tunnel_id,omitempty"`    // matched tunnel id, if any
+	TunnelIface string `json:"tunnel_iface,omitempty"` // matched tunnel interface, if any
+}
+
+type traceRing struct {
+	mu      sync.Mutex
+	entries []TraceEntry
+	next    int
+	enabled atomic.Bool
+
+	// Lifetime counters — incremented on every traceAppend (regardless of
+	// whether recording is on, so the dashboard always has a clean rate
+	// signal). Polled-then-delta'd by the UI to compute requests/sec.
+	cntDNS     atomic.Uint64
+	cntSNI     atomic.Uint64
+	cntFlow    atomic.Uint64
+	cntTunnel  atomic.Uint64
+	cntDirect  atomic.Uint64
+	cntBlocked atomic.Uint64
+	cntCDNSkip atomic.Uint64
+}
+
+var awgTrace = func() *traceRing {
+	r := &traceRing{entries: make([]TraceEntry, traceRingCap)}
+	return r
+}()
+
+type traceCacheRecord struct {
+	value   string
+	expires int64
+	order   *list.Element
+}
+
+// Diagnostic caches must stay bounded even when a destination is never seen
+// again. Expiry is checked on every lookup; ordinary traffic also sweeps old
+// entries once a minute, without adding a background goroutine.
+type traceTTLCache struct {
+	mu        sync.Mutex
+	entries   map[string]traceCacheRecord
+	order     list.List
+	nextSweep int64
+}
+
+func (c *traceTTLCache) removeLocked(key string) {
+	if entry, ok := c.entries[key]; ok {
+		c.order.Remove(entry.order)
+		delete(c.entries, key)
+	}
+}
+
+func (c *traceTTLCache) sweepLocked(now int64) {
+	if now < c.nextSweep {
+		return
+	}
+	for key, entry := range c.entries {
+		if entry.expires <= now {
+			c.removeLocked(key)
+		}
+	}
+	c.nextSweep = now + int64(traceCacheSweepInterval)
+}
+
+func (c *traceTTLCache) store(key, value string, now time.Time, ttl time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.sweepLocked(now.UnixNano())
+	if c.entries == nil {
+		c.entries = make(map[string]traceCacheRecord)
+	}
+	entry, exists := c.entries[key]
+	if exists {
+		c.order.MoveToBack(entry.order)
+	} else {
+		if len(c.entries) >= traceCacheCapacity {
+			c.removeLocked(c.order.Front().Value.(string))
+		}
+		entry.order = c.order.PushBack(key)
+	}
+	entry.value, entry.expires = value, now.Add(ttl).UnixNano()
+	c.entries[key] = entry
+}
+
+func (c *traceTTLCache) load(key string, now time.Time) (string, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.sweepLocked(now.UnixNano())
+	entry, ok := c.entries[key]
+	if !ok {
+		return "", false
+	}
+	if entry.expires <= now.UnixNano() {
+		c.removeLocked(key)
+		return "", false
+	}
+	return entry.value, true
+}
+
+var traceHostCache traceTTLCache // ip string -> recently observed hostname
+
+// traceEnabled is the hot-path check. One atomic load. Inlinable.
+func traceEnabled() bool { return awgTrace.enabled.Load() }
+
+// traceSetEnabled flips the toggle. Existing entries survive a disable so the
+// user can still inspect a capture after pausing recording.
+func traceSetEnabled(on bool) { awgTrace.enabled.Store(on) }
+
+// traceAppend records one event. Counters always tick (cheap atomic add) so
+// the dashboard rate signal works even when the ring isn't recording.
+// The ring itself only fills when traceEnabled is on.
+func traceAppend(e TraceEntry) {
+	switch e.Kind {
+	case "dns":
+		awgTrace.cntDNS.Add(1)
+		traceRememberHost(e.Dst, e.Name)
+	case "sni":
+		awgTrace.cntSNI.Add(1)
+		traceRememberHost(e.Dst, e.Name)
+	case "flow":
+		awgTrace.cntFlow.Add(1)
+	}
+	switch e.Decision {
+	case "tunnel":
+		awgTrace.cntTunnel.Add(1)
+	case "direct":
+		awgTrace.cntDirect.Add(1)
+	case "blocked":
+		awgTrace.cntBlocked.Add(1)
+	case "cdn-skip":
+		awgTrace.cntCDNSkip.Add(1)
+	}
+	if !awgTrace.enabled.Load() {
+		return
+	}
+	if e.TS == 0 {
+		e.TS = time.Now().UnixNano()
+	}
+	awgTrace.mu.Lock()
+	awgTrace.entries[awgTrace.next] = e
+	awgTrace.next = (awgTrace.next + 1) % traceRingCap
+	awgTrace.mu.Unlock()
+}
+
+func traceRememberHost(ip, name string) {
+	ip = net.ParseIP(ip).String()
+	if ip == "<nil>" {
+		return
+	}
+	name = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(name)), ".")
+	if name == "" || net.ParseIP(name) != nil {
+		return
+	}
+	traceHostCache.store(ip, name, time.Now(), traceHostTTL)
+}
+
+func traceHostForIP(ip string) string {
+	ip = net.ParseIP(ip).String()
+	if ip == "<nil>" {
+		return ""
+	}
+	name, _ := traceHostCache.load(ip, time.Now())
+	return name
+}
+
+// traceSnapshot returns entries newer than `since` (nanoseconds), in time
+// order (oldest first). Pass 0 for all. Returns a fresh slice — caller owns it.
+func traceSnapshot(since int64) []TraceEntry {
+	awgTrace.mu.Lock()
+	defer awgTrace.mu.Unlock()
+	out := make([]TraceEntry, 0, traceRingCap)
+	start := awgTrace.next
+	for i := 0; i < traceRingCap; i++ {
+		e := awgTrace.entries[(start+i)%traceRingCap]
+		if e.TS == 0 || e.TS <= since {
+			continue
+		}
+		out = append(out, e)
+	}
+	return out
+}
+
+// traceClear empties the ring without flipping the enable flag.
+func traceClear() {
+	awgTrace.mu.Lock()
+	for i := range awgTrace.entries {
+		awgTrace.entries[i] = TraceEntry{}
+	}
+	awgTrace.next = 0
+	awgTrace.mu.Unlock()
+}
+
+// Exported façade used by the HTTP handlers.
+
+// TraceStatus is returned by GET /api/awg2/trace/status.
+type TraceStatus struct {
+	Enabled bool `json:"enabled"`
+	Count   int  `json:"count"`
+	Cap     int  `json:"cap"`
+}
+
+// TraceStatus reports whether recording is on plus the current ring depth.
+func (svc *Service) TraceStatus() TraceStatus {
+	awgTrace.mu.Lock()
+	n := 0
+	for _, e := range awgTrace.entries {
+		if e.TS != 0 {
+			n++
+		}
+	}
+	awgTrace.mu.Unlock()
+	return TraceStatus{Enabled: traceEnabled(), Count: n, Cap: traceRingCap}
+}
+
+// TraceSnapshot returns entries newer than `since` (nanoseconds), oldest first.
+func (svc *Service) TraceSnapshot(since int64) []TraceEntry { return traceSnapshot(since) }
+
+// TraceClear empties the ring.
+func (svc *Service) TraceClear() { traceClear() }
+
+// TraceCounters is the lifetime counter snapshot returned by /api/awg2/trace/stats.
+// Each field is monotonic; the dashboard computes rate as (now - prev) / dt.
+type TraceCounters struct {
+	DNS     uint64 `json:"dns"`
+	SNI     uint64 `json:"sni"`
+	Flow    uint64 `json:"flow"`
+	Tunnel  uint64 `json:"tunnel"`
+	Direct  uint64 `json:"direct"`
+	Blocked uint64 `json:"blocked"`
+	CDNSkip uint64 `json:"cdn_skip"`
+}
+
+// TraceCounters returns the lifetime counters. Atomic loads — no lock needed.
+func (svc *Service) TraceCounters() TraceCounters {
+	return TraceCounters{
+		DNS:     awgTrace.cntDNS.Load(),
+		SNI:     awgTrace.cntSNI.Load(),
+		Flow:    awgTrace.cntFlow.Load(),
+		Tunnel:  awgTrace.cntTunnel.Load(),
+		Direct:  awgTrace.cntDirect.Load(),
+		Blocked: awgTrace.cntBlocked.Load(),
+		CDNSkip: awgTrace.cntCDNSkip.Load(),
+	}
+}
+
+// TraceSetEnabled flips the toggle AND persists it into the shared router
+// policy so the choice survives selection changes and watchdog re-renders. Returns the new
+// state. When turning off, existing entries stay in the ring for inspection.
+func (svc *Service) TraceSetEnabled(on bool) bool {
+	_, unlock := svc.lockClientOps(false)
+	defer unlock()
+	if svc.awgPersistenceReady() != nil {
+		return traceEnabled()
+	}
+	previousRecording := traceEnabled()
+	traceSetEnabled(on)
+	settings := svc.currentRoutingSettings()
+	previousSettings := settings
+	var undo []func()
+	changed := settings.TraceEnabled != on
+	settings.TraceEnabled = on
+	svc.rememberRoutingSettings(settings)
+	for _, srv := range svc.serverSnapshot() {
+		routing := srv.Manager.Config().Routing
+		manager := srv.Manager
+		undo = append(undo, func() { manager.SetRoutingState(routing, routing.Active) })
+		if routingSettingsFrom(routing) != settings {
+			srv.Manager.SetRoutingState(settings.apply(routing), routing.Active)
+			changed = true
+		}
+	}
+	if changed {
+		if err := svc.awgSaveErr(); err != nil {
+			traceSetEnabled(previousRecording)
+			svc.rememberRoutingSettings(previousSettings)
+			for _, restore := range undo {
+				restore()
+			}
+			return previousRecording
+		}
+	}
+	return on
+}

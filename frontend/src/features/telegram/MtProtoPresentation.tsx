@@ -60,7 +60,7 @@ export function MtProtoContent({ live, form, set, onToggle, onSave, onNewSecret,
   const [showLink, setShowLink] = useState(false);
   const [showSecret, setShowSecret] = useState(false);
   return <div className="flex min-w-0 flex-col gap-4">
-    <PageHeader title="Telegram MTProto" description="Прокси на роутере: подключение Telegram по WSS с резервными путями." meta={live.upstream_version ? `TG WS Proxy ${live.upstream_version}` : undefined}
+    <PageHeader title="Telegram MTProto" description="Подключение Telegram через роутер по WSS с резервными путями." meta={live.upstream_version ? `TG WS Proxy ${live.upstream_version}` : undefined}
       actions={<Switch checked={live.config.enabled} onChange={onToggle} label="Прокси включён" />} />
     <MtProtoSummary live={live} />
 
@@ -94,10 +94,10 @@ export function MtProtoContent({ live, form, set, onToggle, onSave, onNewSecret,
           </section>
           <section aria-label="Параметры соединений" className="flex min-w-0 flex-col gap-3 border-t border-line pt-4">
             <div className="grid gap-3 sm:grid-cols-2">
-              <Field label="Размер пула WS" hint="0–16"><Input type="number" min={0} max={16} value={form.pool_size} onChange={event => set("pool_size", event.target.value)} /></Field>
+              <Field label="Размер пула WS"><Input type="number" min={0} value={form.pool_size} onChange={event => set("pool_size", event.target.value)} /></Field>
               <Field label="Буфер сокета (байт)"><Input type="number" min={4096} step={4096} value={form.buffer_size} onChange={event => set("buffer_size", event.target.value)} /></Field>
             </div>
-            <p className="text-[11px] text-muted">Пул WS = 0 — без прямого WS, только резервные маршруты.</p>
+            <p className="text-[11px] text-muted">{live.config.transport === "direct_wss" ? "При размере 0 прямое соединение открывается по запросу клиента. Положительное значение задаёт общий запас соединений с дата-центрами Telegram." : "При размере 0 используются только резервные маршруты. Положительное значение задаёт запас прямых соединений для каждого дата-центра отдельно для обычных данных и медиа."}</p>
             <Field label="DC-редиректы" hint="по строке: DC=IP (например 2=149.154.167.220)"><Textarea rows={3} value={form.dc} placeholder={"2=149.154.167.220\n4=149.154.167.220"} onChange={event => set("dc", event.target.value)} /></Field>
           </section>
           <section aria-label="Протоколы и резервные пути" className="flex min-w-0 flex-col gap-3 border-t border-line pt-4">

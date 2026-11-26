@@ -83,7 +83,7 @@ test("shell blocks, concatenated words, commands, and incomplete quotes stay raw
 });
 
 test("generated quoting preserves actual POSIX shell values and literal expansion characters", (t) => {
-  const shell = process.platform === "win32" ? "C:/Program Files/Git/bin/bash.exe" : "/bin/sh";
+  const shell = process.env.N2S_TEST_SHELL ?? (process.platform === "win32" ? "C:/Program Files/Git/bin/bash.exe" : "/bin/sh");
   if (!existsSync(shell)) { t.skip("POSIX shell unavailable"); return; }
   // Only fixed synthetic fixtures execute here, never the user's config.
   const initial = "NFQWS_EXTRA_ARGS='--literal=$SECRET --old=$MODE_ALL --quoted=\"hello\"'\nPOLICY_NAME='old'\n";

@@ -68,6 +68,10 @@ func awgFirewallHook(mode, endpointIP, wandev string, mtu int, dnsRedirect, tunn
 }
 
 func awgFirewallHookForInterface(iface, mode, endpointIP, wandev string, mtu int, dnsRedirect, tunnelV6, permanent bool, zones []awg.Zone, endpointIPs ...string) string {
+	return renderAWGFirewallHook(lookupMACBatch, iface, mode, endpointIP, wandev, mtu, dnsRedirect, tunnelV6, permanent, zones, endpointIPs...)
+}
+
+func renderAWGFirewallHook(neighbours func() map[string]string, iface, mode, endpointIP, wandev string, mtu int, dnsRedirect, tunnelV6, permanent bool, zones []awg.Zone, endpointIPs ...string) string {
 	if mtu <= 0 {
 		mtu = 1280
 	}
@@ -249,7 +253,7 @@ func awgFirewallHookForInterface(iface, mode, endpointIP, wandev string, mtu int
 	// Read the neighbour table ONCE for all per-source IPv6 emits instead of
 	// forking `ip neigh show <ip>` per source IP per zone. The previous form
 	// could fork 20+ times per hook generation; now it's a single fork.
-	macBatch := lookupMACBatch()
+	macBatch := neighbours()
 	// First-match-wins for v6: same single-pass over sb in array order. Reuses
 	// emitSrcRule with the v6 chain name and a MAC-based source selector
 	// (IPv6 source addresses rotate under SLAAC + temporary addresses; the MAC

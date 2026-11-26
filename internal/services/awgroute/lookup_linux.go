@@ -14,9 +14,13 @@ import "strings"
 // match a MAC and emitSourceRule6 would silently skip the rule. Run both
 // families explicitly.
 func lookupMACBatch() map[string]string {
+	return readMACBatch(awgRun)
+}
+
+func readMACBatch(run func(string) (string, error)) map[string]string {
 	m := make(map[string]string, 64)
 	for _, cmd := range []string{"ip -4 neigh show", "ip -6 neigh show"} {
-		out, err := awgRun(cmd)
+		out, err := run(cmd)
 		if err != nil || out == "" {
 			continue
 		}

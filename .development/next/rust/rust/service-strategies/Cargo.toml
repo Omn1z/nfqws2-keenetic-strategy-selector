@@ -1,0 +1,10 @@
+[package]
+name = "nfqws2-strategies"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+nfqws2-config = { path = "../config" }
+serde_json.workspace = true
+sha2 = "0.11"

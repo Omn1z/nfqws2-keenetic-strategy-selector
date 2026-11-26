@@ -34,6 +34,23 @@ test("MTProto metrics keep every connection, H2, pool, traffic and SNI counter",
   assert.match(legacy, /0 · 0/); assert.match(legacy, /0 \/ 0 \/ 0/); assert.doesNotMatch(legacy, /undefined|NaN/);
 });
 
+test("MTProto pool describes the saved transport and accepts targets above sixteen", () => {
+  const live = fixture();
+  live.native = { installed: true, can_install: false, package: "nfqws2-strategy-tgws", last_error: "", requires_go: [] };
+  const action = () => {};
+  live.config.pool_size = 48;
+  const render = () => renderToStaticMarkup(<MtProtoContent live={live} form={toForm(live.config)} set={action} onToggle={action} onCopy={action} onNewSecret={action} onSave={action} fallback={null} />);
+  assert.match(render(), /только резервные маршруты/);
+  live.config.transport = "direct_wss";
+  const html = render();
+  assert.match(html, /прямое соединение открывается по запросу клиента/);
+  assert.match(html, /общий запас соединений/);
+  assert.doesNotMatch(html, /max="16"/);
+  assert.equal(collect(toForm(live.config)).pool_size,48);
+  assert.match(renderToStaticMarkup(<MtProtoStatistics live={live} />), /2\/5/);
+  assert.doesNotMatch(html, /только резервные маршруты/);
+});
+
 test("MTProto summary distinguishes the observed running process, failed listener and an explicitly stopped proxy", () => {
   const live = fixture();
   assert.match(renderToStaticMarkup(<MtProtoSummary live={live} />), /Работает/);

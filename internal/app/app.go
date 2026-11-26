@@ -37,6 +37,7 @@ type App struct {
 	store *store.Store
 
 	mu             sync.Mutex
+	runHistoryOnce sync.Once          // scans saved runs on first history access or new run
 	custom         []catalog.Strategy // custom strategies
 	sniDomains     []string           // SNI domains to iterate in runs (Strategies tab)
 	runs           map[string]*Run    // in-memory runs (id -> run)
@@ -74,7 +75,8 @@ type App struct {
 	dnsServers   []dns.Server // configured DoH/DoT servers (DNS tab + run matrix)
 	dnsConfigErr error        // protected by dnsMu; unreadable lists must not become defaults
 
-	geoAuto geoAutoState // background geosite.dat / geoip.dat updater (Geo tab)
+	geoAuto    geoAutoState // background geosite.dat / geoip.dat updater (Geo tab)
+	geoFilesMu sync.Mutex   // serializes file publication/deletion with kind metadata edits
 
 	automation *automationRuntime // watchdog + auto-pick (NFQWS2 automation panel)
 }
@@ -90,7 +92,7 @@ func New(cfg *config.Config) (*App, error) {
 	if err != nil {
 		return nil, err
 	}
-	a := &App{Cfg: cfg, store: st, runs: map[string]*Run{}, sessions: auth.NewSessions(sessionTTL)}
+	a := &App{Cfg: cfg, store: st, sessions: auth.NewSessions(sessionTTL)}
 	a.nfqws2 = nfqws2.New(cfg)
 	if a.blobs, err = blobs.New(cfg, st); err != nil {
 		return nil, err
@@ -98,7 +100,6 @@ func New(cfg *config.Config) (*App, error) {
 	_ = a.store.Load(customStrategiesFile, &a.custom)
 	_ = a.store.Load(sniDomainsFile, &a.sniDomains)
 	a.initAuth()
-	a.loadRuns()
 	a.proxy = proxy.New(st)
 	a.portfwd = portforward.New(cfg, st)
 	a.arpspoof = arpspoof.New(cfg, st)
@@ -238,16 +239,19 @@ func (a *App) DeleteList(id string) error {
 
 // ---------- Strategies (builtin + custom) ----------
 
-func (a *App) Strategies() []catalog.Strategy {
+func (a *App) Strategies() ([]catalog.Strategy, error) {
+	out, err := catalog.Builtin()
+	if err != nil {
+		return nil, err
+	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	out := append([]catalog.Strategy{}, catalog.Builtin()...)
-	out = append(out, a.custom...)
-	return out
+	return append(out, a.custom...), nil
 }
 
 func (a *App) GetStrategy(id string) (catalog.Strategy, bool) {
-	for _, s := range a.Strategies() {
+	strategies, _ := a.Strategies()
+	for _, s := range strategies {
 		if s.ID == id {
 			return s, true
 		}

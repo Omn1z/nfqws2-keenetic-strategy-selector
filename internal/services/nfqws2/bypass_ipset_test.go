@@ -42,6 +42,14 @@ func bypassTestShell(t *testing.T) string {
 	}
 	name := filepath.Join(os.Getenv("ProgramFiles"), "Git", "bin", "bash.exe")
 	if _, err := os.Stat(name); err != nil {
+		// Portable Git distributions can ship the same POSIX runtime as sh.exe.
+		if git, err := exec.LookPath("git.exe"); err == nil {
+			sh := filepath.Join(filepath.Dir(filepath.Dir(git)), "usr", "bin", "sh.exe")
+			if _, err := os.Stat(sh); err == nil {
+				t.Setenv("PATH", filepath.Dir(sh)+string(os.PathListSeparator)+os.Getenv("PATH"))
+				return sh
+			}
+		}
 		t.Skip("POSIX shell unavailable")
 	}
 	return name

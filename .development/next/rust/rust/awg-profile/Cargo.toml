@@ -1,0 +1,33 @@
+[package]
+name = "nfqws2-awg-profile"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+base64ct = { version = "1", features = ["alloc"] }
+curve25519-dalek = { version = "4", default-features = false }
+serde.workspace = true
+serde_json.workspace = true
+nfqws2-store = { path = "../store" }
+semver = "1"
+sha2 = "0.11"
+getrandom = "0.2"
+flate2 = "1"
+
+[target.'cfg(unix)'.dependencies]
+socket2 = { version = "0.6", features = ["all"] }
+libc = "0.2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+nfqws2-router-command = { path = "../router-command" }
+nfqws2-tls-roots = { path = "../tls-roots" }
+http-body-util = "0.1"
+hyper = { version = "1", default-features = false, features = ["client", "http1"] }
+hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
+tokio = { version = "1", features = ["macros", "net", "rt", "time"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+tempfile = "3"
+
+[dev-dependencies]
+tempfile = "3"

@@ -17,6 +17,7 @@ type Sample = {
 type Result = {
   via_tunnel: Sample;
   via_direct: Sample;
+  comparable: boolean;
   tunnel_gain_pc: number;
   sample: string;
   error?: string;
@@ -26,9 +27,9 @@ type LiveLane = { bytes: number; rate: number; done?: Sample };
 type UnitMode = "bits" | "bytes";
 
 const PRESETS: { key: string; label: string; bytes: number; url: string; timeoutMs: number }[] = [
-  { key: "10MB",  label: "10 МБ",  bytes: 10 * 1024 * 1024,       url: "http://speedtest.selectel.ru/10MB",   timeoutMs: 15000  },
-  { key: "100MB", label: "100 МБ", bytes: 100 * 1024 * 1024,      url: "http://speedtest.selectel.ru/100MB",  timeoutMs: 60000  },
-  { key: "1GB",   label: "1 ГБ",   bytes: 1024 * 1024 * 1024,     url: "http://speedtest.selectel.ru/1GB",    timeoutMs: 180000 },
+  { key: "10MB",  label: "10 МБ",  bytes: 10 * 1024 * 1024,       url: "https://speedtest.serverius.net/files/100mb.bin",  timeoutMs: 15000  },
+  { key: "100MB", label: "100 МБ", bytes: 100 * 1024 * 1024,      url: "https://speedtest.serverius.net/files/100mb.bin",  timeoutMs: 60000  },
+  { key: "1GB",   label: "1 ГБ",   bytes: 1024 * 1024 * 1024,     url: "https://speedtest.serverius.net/files/1000mb.bin", timeoutMs: 180000 },
 ];
 
 const formatRate = (bytesPerSec: number, mode: UnitMode) => {
@@ -176,7 +177,7 @@ export function SpeedTestPanel({ className, serverLabel, tunnelIface }: SpeedTes
           <Input
             value={customUrl}
             onChange={(e) => setCustomUrl(e.target.value)}
-            placeholder="http://example.org/100MB.bin"
+            placeholder="https://example.org/100MB.bin"
             className="mt-1"
             disabled={busy}
           />
@@ -238,13 +239,15 @@ export function SpeedTestPanel({ className, serverLabel, tunnelIface }: SpeedTes
       {result && (
         <div className="border-t border-line-soft pt-3 text-[13px]">
           {result.error && <p className="mb-2 text-bad">{result.error}</p>}
-          <div className="flex flex-wrap items-center gap-2">
-            <span className="text-muted">Итог</span>
-            <Badge kind={result.tunnel_gain_pc >= 0 ? "ok" : "warn"}>
-              {result.tunnel_gain_pc >= 0 ? `+${result.tunnel_gain_pc}%` : `${result.tunnel_gain_pc}%`}
-            </Badge>
-            <span className="text-muted">{result.tunnel_gain_pc >= 0 ? "туннель быстрее" : "туннель медленнее"}</span>
-          </div>
+          {result.comparable ? (
+            <div className="flex flex-wrap items-center gap-2">
+              <span className="text-muted">Итог</span>
+              <Badge kind={result.tunnel_gain_pc > 0 ? "ok" : result.tunnel_gain_pc < 0 ? "warn" : "neutral"}>
+                {result.tunnel_gain_pc > 0 ? `+${result.tunnel_gain_pc}%` : `${result.tunnel_gain_pc}%`}
+              </Badge>
+              <span className="text-muted">{result.tunnel_gain_pc > 0 ? "туннель быстрее" : result.tunnel_gain_pc < 0 ? "туннель медленнее" : "разница меньше 1%"}</span>
+            </div>
+          ) : !result.error && <p className="text-muted">Для сравнения нужны два успешных замера одинакового объёма.</p>}
           <p className="mt-2 text-[11px] text-muted">Источник: {result.sample}</p>
         </div>
       )}
@@ -276,12 +279,13 @@ function Lane({ title, lane, cap, active, unit }: { title: string; lane: LiveLan
         <span className="truncate text-muted">{title}</span>
         {active && <span className="shrink-0 rounded-full bg-accent/20 px-2 py-0.5 text-[10px] uppercase text-accent-d">идёт</span>}
       </div>
-      <div className="text-[22px] font-bold tabular-nums text-accent-d">{formatRate(lane.rate, unit)}</div>
+      <div className="text-[22px] font-bold tabular-nums text-accent-d">{s?.error && !s.rx_bytes ? "—" : formatRate(lane.rate, unit)}</div>
       <div className="mt-1 text-[11px] text-muted">
         {s
-          ? `${humanBytes(s.rx_bytes)} за ${(s.duration_ms / 1000).toFixed(1)}с · HTTP ${s.http_status}${s.error ? " · " + s.error : ""}`
+          ? `${humanBytes(s.rx_bytes)} за ${(s.duration_ms / 1000).toFixed(1)} с${s.http_status ? ` · HTTP ${s.http_status}` : ""}`
           : active ? `${humanBytes(lane.bytes)} / ${humanBytes(cap)}` : lane.bytes > 0 ? humanBytes(lane.bytes) : "ждёт"}
       </div>
+      {s?.error && <p className="mt-1 text-[11px] text-bad [overflow-wrap:anywhere]">{s.error}</p>}
       <div className="mt-2 h-1.5 w-full overflow-hidden rounded bg-panel-soft">
         <div className="h-full rounded bg-accent transition-[width] duration-200" style={{ width: `${pc}%` }} />
       </div>

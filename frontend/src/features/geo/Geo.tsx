@@ -162,7 +162,7 @@ function GeoFileCard({ file, lists, onChanged }: { file: GeoFile; lists: List[];
 }
 
 export default function Geo() {
-  const { geo, reloadGeo, lists, reloadLists } = useStore();
+  const { geo, reloadGeo, lists, reloadLists } = useStore({ geo: true });
   const [kind, setKind] = useState("geosite");
   const [status, setStatus] = useState("");
   const [uploading, setUploading] = useState(false);

@@ -74,7 +74,19 @@ func awgRun(cmd string) (string, error) {
 // past the deadline. Give each shell its own process group and kill the whole
 // group on cancellation. WaitDelay also bounds a pipe held by an orphan child.
 func awgRunShell(ctx context.Context, command, stdin string) (string, error) {
-	c := exec.CommandContext(ctx, "sh", "-c", command)
+	shell := "sh"
+	args := []string{"-c", command}
+	if command == "sh" && stdin != "" {
+		// Run streamed scripts directly. Keenetic's firmware shell does not
+		// reliably execute scripts from stdin, so use Entware when available.
+		args = nil
+		if _, err := os.Stat("/bin/ndmc"); err == nil {
+			if entware, err := exec.LookPath("/opt/bin/sh"); err == nil {
+				shell = entware
+			}
+		}
+	}
+	c := exec.CommandContext(ctx, shell, args...)
 	c.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	c.WaitDelay = time.Second
 	c.Cancel = func() error {

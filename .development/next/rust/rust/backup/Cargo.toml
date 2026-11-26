@@ -1,0 +1,13 @@
+[package]
+name = "nfqws2-backup"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+ring = "0.17"
+md-5 = "0.10"
+memmap2 = "0.9"
+tempfile = "3"
+zip = { version = "9.1", default-features = false, features = ["deflate-flate2"] }
+flate2 = { version = "1", features = ["rust_backend"] }

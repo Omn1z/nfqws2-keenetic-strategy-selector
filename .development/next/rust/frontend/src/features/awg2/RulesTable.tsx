@@ -1,0 +1,514 @@
+import { Fragment, useState, useEffect, useMemo, useRef, useId } from "react";
+import { api } from "@/lib/api";
+import { cn } from "@/lib/cn";
+import { Badge } from "@/components/ui/Badge";
+import { Button } from "@/components/ui/Button";
+import { Field, Input, Select, Textarea } from "@/components/ui/form";
+import { Switch } from "@/components/ui/Switch";
+import { Modal } from "@/components/ui/Modal";
+import { toast } from "@/components/ui/Toast";
+import { confirmDialog } from "@/components/ui/Confirm";
+import type { Awg2ServerSummary, Awg2Status, AwgZone, AwgRoutingConfig, AwgRulesDocument, AwgConnectionReference, Device } from "@/types/api";
+import RulesTransferModal, { type ImportRoutingRules, type RoutingReadTask } from "./RulesTransferModal";
+import { prepareRuleConnection, ruleWaiting } from "./routingRules";
+import { RoutingDiscoveries, useRoutingDiscoveries } from "./RoutingDiscoveries";
+import { routingDiscoveryIdentity } from "./routingDiscoveriesModel";
+
+/** RulesTable replaces the old zone-form layout with a pi-hole-style table:
+ *  each rule is one row with its priority (= array index), name, match preview,
+ *  route badge, sources, enabled toggle, and inline actions (move up/down,
+ *  duplicate, edit, delete). Order in the array IS the priority — the first
+ *  matching rule wins at lookup time.
+ *
+ *  The legacy `mode: include|exclude` is migrated to `route: tunnel|direct`
+ *  on render; saves always write `route`. */
+
+type Route = "tunnel" | "direct";
+const routeOf = (z: AwgZone): Route =>
+  z.route === "tunnel" || z.route === "direct"
+    ? z.route
+    : z.mode === "exclude"
+    ? "direct"
+    : "tunnel";
+
+const ROUTE_LABEL: Record<Route, string> = { tunnel: "Через VPN", direct: "Мимо VPN" };
+const ROUTE_KIND: Record<Route, "ok" | "warn"> = { tunnel: "ok", direct: "warn" };
+const tunnelLabel = (s?: Awg2ServerSummary) => s ? `${s.label || s.id}${s.client_iface ? ` · ${s.client_iface}` : ""}` : "туннель не выбран";
+const tunnelStatus = (s?: Awg2ServerSummary) => s?.connected ? " · connected" : s && !s.enabled ? " · выключен" : "";
+
+const zoneLines = (z: AwgZone) => [...(z.domains || []), ...(z.ips || [])];
+const splitRaw = (s: string) => s.split("\n");
+const cleanArr = (a: string[]) => (a || []).map((x) => x.trim()).filter(Boolean);
+const isIPish = (s: string) =>
+  /^(\d{1,3}\.){3}\d{1,3}(\/\d{1,2})?$/.test(s) ||
+  (s.includes(":") && /^[0-9a-fA-F:.]+(\/\d{1,3})?$/.test(s));
+
+export const routingDefaultTunnelID = (tunnels: Pick<Awg2ServerSummary, "id" | "enabled" | "connected">[], selectedID: string) =>
+  tunnels.find((s) => s.id === selectedID)?.id || tunnels.find((s) => s.connected && s.enabled)?.id ||
+  tunnels.find((s) => s.enabled)?.id || selectedID || "";
+
+interface Props {
+  r: AwgRoutingConfig;
+  saveRouting: (r: AwgRoutingConfig) => Promise<boolean>;
+  saving: boolean;
+  visible: boolean;
+  st: Awg2Status;
+  reload: () => Promise<void>;
+  runRead: RoutingReadTask;
+  importRules: ImportRoutingRules;
+  hasDraft: boolean;
+}
+
+export default function RulesTable({ r, saveRouting, saving, visible, st, reload, runRead, importRules, hasDraft }: Props) {
+  const [editIdx, setEditIdx] = useState<number | null>(null);
+  const [newZone, setNewZone] = useState<AwgZone | null>(null);
+  const newZoneMarker = useRef(Symbol("new-routing-rule"));
+  const [copyOpen, setCopyOpen] = useState(false);
+  const [transferOpen, setTransferOpen] = useState(false);
+  const [exportWarnings, setExportWarnings] = useState<string[]>([]);
+  const discoveries = useRoutingDiscoveries(visible && !saving);
+
+  const zones = r.zones || [];
+  const tunnels = useMemo(() => (st.servers || []).filter((s) => s.imported || s.deployed || s.endpoint), [st.servers]);
+  const defaultTunnelID = routingDefaultTunnelID(tunnels, st.active_server_id);
+  const tunnelByID = useMemo(() => new Map((st.servers || []).map((s) => [s.id, s] as const)), [st.servers]);
+  const tunnelIDs = useMemo(() => new Set((st.servers || []).map((s) => s.id)), [st.servers]);
+  const connectionRefs = st.connection_refs || {};
+  const refLabel = (id: string) => tunnelByID.get(id)?.label || connectionRefs[id]?.label || id || "подключение не выбрано";
+
+  // The pane owns the save lock and optimistic state. Row actions and the
+  // settings form therefore cannot send competing snapshots of the rules.
+  const applyOp = (op: (zs: AwgZone[]) => AwgZone[]) => {
+    if (saving) return Promise.resolve(false);
+    const nextZones = op(zones).map((z, i) => {
+      return { ...prepareRuleConnection(z, tunnelIDs), order: i + 1 };
+    });
+    const next: AwgRoutingConfig = { ...r, zones: nextZones };
+    return saveRouting(next);
+  };
+
+  const setZ = (i: number, patch: Partial<AwgZone>) => applyOp((zs) => zs.map((z, j) => (j === i ? { ...z, ...patch } : z)));
+  const move = (i: number, dir: -1 | 1) => {
+    const j = i + dir;
+    if (j < 0 || j >= zones.length) return;
+    void applyOp((zs) => { const a = [...zs]; [a[i], a[j]] = [a[j], a[i]]; return a; });
+  };
+  const dup = (i: number) =>
+    applyOp((zs) => {
+      const clone: AwgZone = { ...zs[i], fallback_tunnel_ids: [...(zs[i].fallback_tunnel_ids || [])], name: zs[i].name + " (копия)" };
+      return [...zs.slice(0, i + 1), clone, ...zs.slice(i + 1)];
+    });
+  const del = async (i: number) => {
+    if (!(await confirmDialog({ title: `Удалить правило «${zones[i].name}»?` }))) return;
+    await applyOp((zs) => zs.filter((_, j) => j !== i));
+  };
+  const add = () => {
+    if (saving) return;
+    const fresh: AwgZone = {
+      name: "новое правило",
+      tunnel_id: defaultTunnelID,
+      waiting_for_connection: !defaultTunnelID || !tunnelIDs.has(defaultTunnelID),
+      route: "tunnel",
+      domains: [],
+      include_subdomains: true,
+      ips: [],
+      source_ips: [],
+      enabled: true,
+    };
+    // Editing a new rule must not change live routing. The finished rule is
+    // inserted at the top only when the user explicitly saves the editor.
+    newZoneMarker.current = Symbol("new-routing-rule");
+    // A symbol survives the pane's optimistic object copies but never enters
+    // JSON. It identifies this draft after a failed or timed-out save.
+    setNewZone({ ...fresh, [newZoneMarker.current]: true });
+  };
+  const exportRules = async () => {
+    if (saving) return;
+    try {
+      const routing = { ...r, zones: zones.map((zone) => prepareRuleConnection(zone, tunnelIDs)) };
+      const doc = await runRead(() => api<AwgRulesDocument>("POST", "/api/awg2/routing/rules/export", { routing }, { readOnly: true }));
+      const url = URL.createObjectURL(new Blob([JSON.stringify(doc, null, 2)], { type: "application/json" }));
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `nfqws2-routing-${new Date().toISOString().slice(0, 10)}.json`;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 2000);
+      toast(hasDraft ? "Экспортированы текущие правила, включая несохранённые изменения" : "Правила экспортированы", "ok");
+      setExportWarnings(doc.warnings || []);
+    } catch (e) { toast((e as Error).message, "err"); }
+  };
+
+  return (
+    <div>
+      <div className="mb-3 flex flex-wrap items-center gap-2">
+        <h3 className="text-[14px] font-semibold">Правила маршрутизации</h3>
+        <span className="text-[11px] text-muted">{zones.length} шт. · приоритет сверху вниз</span>
+        <div className="ml-auto flex items-center gap-2">
+          {saving && <span className="text-[11px] text-muted">Обрабатываем…</span>}
+          <Button mini onClick={() => { void exportRules(); }} disabled={saving} title="Экспорт текущих правил и настроек на экране, включая несохранённые правки">Экспорт JSON</Button>
+          <Button mini onClick={() => setTransferOpen(true)} disabled={saving}>Импорт JSON</Button>
+          <Button mini variant="primary" onClick={add} disabled={saving}>+ правило</Button>
+        </div>
+      </div>
+      {hasDraft && <p className="mb-2 text-[11px] text-warn">Экспорт включает текущие несохранённые правки на этой вкладке.</p>}
+      {exportWarnings.map((warning, i) => <p key={i} className="mb-2 text-[11px] text-muted">{warning}</p>)}
+      <p className="mb-2 text-[11px] text-muted">Обнаруженные маршруты доступны у каждого правила только для чтения. Снимок обновляется каждые 5 секунд, пока вкладка открыта.</p>
+      {discoveries.error && <p className="mb-2 text-[11px] text-warn" role="status">Не удалось обновить наблюдения: {discoveries.error}{discoveries.snapshot ? ". Показан последний полученный снимок." : ""}</p>}
+      {discoveries.snapshot?.error && <p className="mb-2 text-[11px] text-warn" role="status">Состояние маршрутизации: {discoveries.snapshot.error}</p>}
+      {discoveries.snapshot && (!discoveries.snapshot.active || !discoveries.snapshot.ready) && <p className="mb-2 text-[11px] text-muted">{discoveries.snapshot.active ? "Маршруты ещё применяются; записи показаны как история." : "Маршрутизация не активна; показана история наблюдений."}</p>}
+
+      <div className="overflow-x-auto rounded border border-line">
+        <table className="w-full text-[11px] md:text-[12px]">
+          <thead className="bg-panel-soft text-[10px] uppercase text-muted md:text-[11px]">
+            <tr>
+              <th className="w-[36px] px-2 py-1.5 text-center">#</th>
+              <th className="px-2 py-1.5 text-left">Имя</th>
+              <th className="px-2 py-1.5 text-left">Туннель</th>
+              <th className="px-2 py-1.5 text-left">Маршрут</th>
+              <th className="px-2 py-1.5 text-left">Что матчит</th>
+              <th className="hidden px-2 py-1.5 text-left md:table-cell">Источники</th>
+              <th className="w-[60px] px-2 py-1.5 text-center">Вкл</th>
+              <th className="w-[180px] px-2 py-1.5 text-right">Действия</th>
+            </tr>
+          </thead>
+          <tbody>
+            {zones.length === 0 && (
+              <tr>
+                <td colSpan={8} className="px-2 py-6 text-center text-muted">
+                  Правил пока нет. Добавьте первое — например, «всё через VPN» (домен <code>*</code>, маршрут «Через VPN»).
+                </td>
+              </tr>
+            )}
+            {zones.map((z, i) => {
+              const route = routeOf(z);
+              const matches = cleanArr(zoneLines(z));
+              const srcs = cleanArr(z.source_ips || []);
+              return (
+                <Fragment key={`${i}:${routingDiscoveryIdentity(z)}`}>
+                <tr className={cn("border-t border-line", i % 2 ? "bg-panel-soft/40" : "")}>
+                  <td className="px-2 py-1.5 text-center font-mono tabular-nums text-muted">{i + 1}</td>
+                  <td className="px-2 py-1.5">
+                    <button type="button" className="text-left font-medium text-ink hover:underline disabled:opacity-50" onClick={() => setEditIdx(i)} disabled={saving}>{z.name || "(без имени)"}</button>
+                  </td>
+                  <td className="px-2 py-1.5 text-[11px] text-ink-soft">
+                    {(() => {
+                      const waiting = ruleWaiting(z, tunnelIDs);
+                      const ids = [z.tunnel_id, ...(z.fallback_tunnel_ids || [])].filter((id): id is string => !!id);
+                      return <span title={ids.map(refLabel).join(" → ")}>
+                        {waiting && <span className="mr-1 text-warn">Ожидает подключения{z.tunnel_id ? ` · ${refLabel(z.tunnel_id)}` : ""}</span>}
+                        {ids.map((id, n) => n === 0 && waiting && id === z.tunnel_id ? null : <span key={`${id}-${n}`}>
+                          {(n > 0 || waiting) && <span className="mx-1 text-muted">→</span>}
+                          {tunnelByID.has(id)
+                            ? <>{tunnelLabel(tunnelByID.get(id))}{tunnelStatus(tunnelByID.get(id))}</>
+                            : <span className="text-warn">{refLabel(id)} · ожидает замены</span>}
+                        </span>)}
+                      </span>;
+                    })()}
+                  </td>
+                  <td className="px-2 py-1.5"><Badge kind={ROUTE_KIND[route]}>{ROUTE_LABEL[route]}</Badge></td>
+                  <td className="px-2 py-1.5 font-mono text-[11px]">
+                    {matches.length === 0 ? <span className="text-muted">—</span> : (
+                      <>
+                        <span className="truncate">{matches.slice(0, 2).join(", ")}</span>
+                        {matches.length > 2 && <span className="text-muted"> +{matches.length - 2}</span>}
+                      </>
+                    )}
+                  </td>
+                  <td className="hidden px-2 py-1.5 font-mono text-[11px] md:table-cell">
+                    {srcs.length === 0 ? <span className="text-muted">вся LAN</span> : (
+                      <>
+                        <span>{srcs.slice(0, 2).join(", ")}</span>
+                        {srcs.length > 2 && <span className="text-muted"> +{srcs.length - 2}</span>}
+                      </>
+                    )}
+                  </td>
+                  <td className="px-2 py-1.5 text-center">
+                    <Switch checked={!!z.enabled} onChange={(v) => setZ(i, { enabled: v })} disabled={saving} aria-label={`Правило маршрутизации «${z.name || i + 1}» включено`} />
+                  </td>
+                  <td className="px-2 py-1.5">
+                    <div className="flex items-center justify-end gap-1">
+                      <Button mini variant="ghost" onClick={() => move(i, -1)} disabled={saving || i === 0} title="Выше">▲</Button>
+                      <Button mini variant="ghost" onClick={() => move(i, +1)} disabled={saving || i === zones.length - 1} title="Ниже">▼</Button>
+                      <Button mini variant="ghost" onClick={() => setEditIdx(i)} disabled={saving} title="Изменить">✎</Button>
+                      <Button mini variant="ghost" onClick={() => dup(i)} disabled={saving} title="Дублировать">⎘</Button>
+                      <Button mini variant="danger" onClick={() => void del(i)} disabled={saving} title="Удалить">✕</Button>
+                    </div>
+                  </td>
+                </tr>
+                <tr className={i % 2 ? "bg-panel-soft/40" : ""}>
+                  <td colSpan={8} className="px-2 pb-2">
+                    <RoutingDiscoveries rule={z} index={i} snapshot={discoveries.snapshot} loading={discoveries.loading} />
+                  </td>
+                </tr>
+                </Fragment>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+
+      <p className="mt-2 text-[11px] text-muted">
+        Приоритет = порядок в таблице. <b>Первое</b> правило, под которое подходит запрос, определяет маршрут.
+        В колонке «Что матчит» можно вписывать вперемешку: домены/маски (<code>youtube.com</code>, <code>*ip*</code>,
+        <code>regexp:^.*\.foo$</code>, <code>geosite:cn</code>, <code>list:user</code>), IPv4 и подсети (<code>104.18.0.0/16</code>).
+        Источники задают, к каким LAN-устройствам правило применяется (пусто = ко всем).
+        В редакторе правила можно добавить <b>Fallback Connection List</b>: подключения проверяются по порядку,
+        а после восстановления основного туннеля приоритет возвращается автоматически.
+      </p>
+
+      {visible && editIdx !== null && zones[editIdx] && (
+        <RuleEditModal
+          zone={zones[editIdx]}
+          tunnels={tunnels}
+          connectionRefs={connectionRefs}
+          onClose={() => { if (!saving) setEditIdx(null); }}
+          saving={saving}
+          onSave={async (patch) => { if (await setZ(editIdx, patch)) setEditIdx(null); }}
+        />
+      )}
+      {visible && newZone && (
+        <RuleEditModal
+          key="new-rule"
+          zone={newZone}
+          tunnels={tunnels}
+          connectionRefs={connectionRefs}
+          isNew
+          onClose={() => { if (!saving) setNewZone(null); }}
+          saving={saving}
+          onSave={async (patch) => {
+            if (saving) return;
+            const completed = { ...newZone, ...patch };
+            // The pane keeps its optimistic draft after an uncertain save.
+            // Retrying edits that same draft row rather than adding a copy.
+            const saved = await applyOp((zs) => {
+              const i = zs.findIndex((z) => (z as AwgZone & Record<symbol, unknown>)[newZoneMarker.current] === true);
+              return i < 0 ? [completed, ...zs] : zs.map((z, j) => j === i ? completed : z);
+            });
+            if (saved) setNewZone(null);
+          }}
+        />
+      )}
+      {visible && copyOpen && (
+        <CopyFromServerModal
+          st={st}
+          onClose={() => setCopyOpen(false)}
+          onCopied={async () => { setCopyOpen(false); await reload(); toast("Правила скопированы", "ok"); }}
+        />
+      )}
+      {visible && transferOpen && <RulesTransferModal tunnels={st.servers || []} currentRuleCount={zones.length} hasDraft={hasDraft}
+        baseRouting={r} saving={saving} runRead={runRead} importRules={importRules} onClose={() => setTransferOpen(false)} />}
+    </div>
+  );
+}
+
+function RuleEditModal({ zone, tunnels, connectionRefs, onClose, onSave, saving, isNew = false }: { zone: AwgZone; tunnels: Awg2ServerSummary[]; connectionRefs: Record<string, AwgConnectionReference>; onClose: () => void; onSave: (patch: Partial<AwgZone>) => void | Promise<void>; saving: boolean; isNew?: boolean }) {
+  const tunnelIDs = new Set(tunnels.map((s) => s.id));
+  const [z, setZ] = useState<AwgZone>({ ...prepareRuleConnection(zone, tunnelIDs), fallback_tunnel_ids: [...(zone.fallback_tunnel_ids || [])], route: routeOf(zone) });
+  const matchID = useId();
+  const [devices, setDevices] = useState<Device[]>([]);
+  const [error, setError] = useState("");
+  const submitting = useRef(false);
+  useEffect(() => {
+    const controller = new AbortController();
+    void (async () => {
+      try {
+        const v = await api<{ devices: Device[] }>("GET", "/api/devices", undefined, { signal: controller.signal });
+        if (!controller.signal.aborted) setDevices((v.devices ?? []).filter((d) => d.ip));
+      } catch { /* ignore */ }
+    })();
+    return () => controller.abort();
+  }, []);
+  const matches = (z.domains || []).join("\n") + ((z.ips || []).length ? "\n" + (z.ips || []).join("\n") : "");
+  const fallbackIDs = cleanArr(z.fallback_tunnel_ids || []).filter((id, i, a) => id !== z.tunnel_id && a.indexOf(id) === i);
+  const fallbackOptions = tunnels.filter((s) => s.id !== z.tunnel_id && !fallbackIDs.includes(s.id));
+  const updateFallback = (ids: string[]) => setZ({ ...z, fallback_tunnel_ids: ids });
+  const waiting = ruleWaiting(z, tunnelIDs);
+  const previousPrimary = z.tunnel_id ? connectionRefs[z.tunnel_id]?.label || z.tunnel_id : "";
+
+  const save = async () => {
+    if (saving || submitting.current) return;
+    const lines = cleanArr(splitRaw(matches));
+    const domains = lines.filter((s) => !isIPish(s));
+    const ips = lines.filter(isIPish);
+    const sourceIPs = cleanArr(splitRaw((z.source_ips || []).join("\n")));
+    if (isNew && lines.length === 0 && sourceIPs.length === 0) {
+      setError("Укажите домен, IP/подсеть или LAN-устройство. Для всей сети явно укажите *.");
+      return;
+    }
+    setError("");
+    submitting.current = true;
+    try { await onSave({
+      name: z.name,
+      tunnel_id: z.tunnel_id || "",
+      waiting_for_connection: waiting,
+      fallback_tunnel_ids: fallbackIDs,
+      route: z.route as Route,
+      mode: z.route === "direct" ? "exclude" : "include", // legacy backward compat
+      domains,
+      include_subdomains: z.include_subdomains,
+      ips,
+      source_ips: sourceIPs,
+      enabled: z.enabled,
+    }); } finally { submitting.current = false; }
+  };
+
+  return (
+    <Modal title={`Правило: ${z.name || "(без имени)"}`} onClose={onClose} actions={
+      <>
+        <Button variant="ghost" onClick={onClose} disabled={saving}>Отмена</Button>
+        <Button variant="primary" onClick={save} disabled={saving}>Сохранить</Button>
+      </>
+    }>
+      <fieldset disabled={saving} className="space-y-3">
+        {error && <p className="text-xs text-bad" role="alert">{error}</p>}
+        <Field label="Имя">
+          <Input value={z.name} onChange={(e) => setZ({ ...z, name: e.target.value })} placeholder="напр. youtube → VPN" />
+        </Field>
+        <Field label="Туннель">
+          <Select value={waiting ? "" : z.tunnel_id || ""} onChange={(e) => setZ({ ...z, tunnel_id: e.target.value || z.tunnel_id || "", waiting_for_connection: !e.target.value, fallback_tunnel_ids: fallbackIDs.filter((id) => id !== e.target.value) })} className="text-[13px]">
+            <option value="">В ожидании — выбрать подключение{previousPrimary && waiting ? ` (ранее: ${previousPrimary})` : ""}</option>
+            {tunnels.map((s) => (
+              <option key={s.id} value={s.id}>{tunnelLabel(s)}{tunnelStatus(s)}</option>
+            ))}
+          </Select>
+        </Field>
+        {waiting && <p className="text-[11px] text-warn">Ожидает подключения. Правило сохраняется с прежней привязкой, пока вы явно не выберете подключение.</p>}
+        <Field label="Маршрут">
+          <div className="inline-flex overflow-hidden rounded-md border border-line">
+            {(["tunnel", "direct"] as Route[]).map((rv) => (
+              <button key={rv} type="button" onClick={() => setZ({ ...z, route: rv })}
+                className={cn("px-3 py-1.5 text-[13px] transition", z.route === rv ? "bg-accent text-primary-foreground" : "bg-panel hover:bg-line-soft")}>
+                {ROUTE_LABEL[rv]}
+              </button>
+            ))}
+          </div>
+        </Field>
+        {z.route === "tunnel" && (
+          <Field label="Fallback Connection List"
+            hint="Порядок слева направо: сначала основной туннель, затем резервные. При потере handshake выбирается первое доступное соединение; после восстановления приоритет возвращается автоматически.">
+            <div className="space-y-1.5 rounded border border-line bg-panel-soft/50 p-2">
+              {fallbackIDs.length === 0 ? <div className="text-[11px] text-muted">Резервные подключения не заданы.</div> : fallbackIDs.map((id, i) => {
+                const s = tunnels.find((item) => item.id === id);
+                return <div key={`${id}-${i}`} className="flex items-center gap-1.5 rounded border border-line bg-panel px-1.5 py-1">
+                  <span className="w-5 text-center text-[11px] text-muted">{i + 1}</span>
+                  <span className="min-w-0 flex-1 truncate text-[12px]">{s ? tunnelLabel(s) : connectionRefs[id]?.label || id}{s ? tunnelStatus(s) : " · подключение отсутствует"}</span>
+                  {!s && <Select value="" aria-label={`Заменить резервное подключение ${connectionRefs[id]?.label || id}`}
+                    onChange={(e) => { if (e.target.value) updateFallback(fallbackIDs.map((old, j) => j === i ? e.target.value : old)); }}
+                    className="max-w-44 text-[11px]">
+                    <option value="">Заменить…</option>
+                    {fallbackOptions.map((candidate) => <option key={candidate.id} value={candidate.id}>{tunnelLabel(candidate)}</option>)}
+                  </Select>}
+                  <Button mini variant="ghost" onClick={() => i > 0 && updateFallback([...fallbackIDs.slice(0, i - 1), fallbackIDs[i], fallbackIDs[i - 1], ...fallbackIDs.slice(i + 1)])} disabled={i === 0} title="Выше">▲</Button>
+                  <Button mini variant="ghost" onClick={() => i < fallbackIDs.length - 1 && updateFallback([...fallbackIDs.slice(0, i), fallbackIDs[i + 1], fallbackIDs[i], ...fallbackIDs.slice(i + 2)])} disabled={i === fallbackIDs.length - 1} title="Ниже">▼</Button>
+                  <Button mini variant="danger" onClick={() => updateFallback(fallbackIDs.filter((_, j) => j !== i))} title="Удалить из списка">✕</Button>
+                </div>;
+              })}
+              {fallbackOptions.length > 0 && (
+                <Select value="" onChange={(e) => { if (e.target.value) updateFallback([...fallbackIDs, e.target.value]); }} className="text-[12px]">
+                  <option value="">+ Добавить резервное подключение…</option>
+                  {fallbackOptions.map((s) => <option key={s.id} value={s.id}>{tunnelLabel(s)}{tunnelStatus(s)}</option>)}
+                </Select>
+              )}
+            </div>
+          </Field>
+        )}
+        <div className="space-y-2 rounded-lg border border-line bg-panel-soft/30 p-3">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <label htmlFor={matchID} className="text-[13px] font-medium text-ink-soft">Что матчит — домены, маски и IP (по строке)</label>
+            <Switch checked={z.include_subdomains !== false} onChange={(v) => setZ({ ...z, include_subdomains: v })}
+              disabled={saving} label="Учитывать все поддомены автоматически" />
+          </div>
+          <p className="text-[11px] text-muted">Префиксы: domain:vk.com (суффикс), full:exact.com (точный при выключенном учёте поддоменов), geosite:cn / geoip:cn, regexp:^.*\.foo$, keyword:foo, list:user.</p>
+          <Textarea id={matchID} rows={6} value={matches}
+            placeholder={"youtube.com\n*ip*\ndomain:vk.com\ngeosite:cn\nregexp:^.*\\.googlevideo\\.com$\n104.18.0.0/16"}
+            onChange={(e) => {
+              const lines = splitRaw(e.target.value);
+              setZ({ ...z, domains: lines, ips: [] });
+            }} />
+          <p className="text-[11px] text-muted">Применяется также к подключённым спискам. При включении обычные имена, full:example.com, domain:example.com и *.example.com учитывают основной домен и все поддомены. При выключении обычные имена совпадают только точно; явные маски, регулярные выражения и IP сохраняют свой смысл.</p>
+        </div>
+        <Field label="Источники LAN (пусто = ко всей сети)"
+          hint="Если задано, правило применяется ТОЛЬКО к пакетам от этих устройств. IPv4 — по адресу; v6-адрес учим из ARP-кэша по MAC, чтобы менялся вместе с SLAAC.">
+          <div className="flex items-start gap-2">
+            <Textarea rows={2} className="flex-1" value={(z.source_ips || []).join("\n")}
+              placeholder={"192.168.31.243\n192.168.31.100"}
+              onChange={(e) => setZ({ ...z, source_ips: splitRaw(e.target.value) })} />
+            <DeviceDrop devices={devices} onPick={(ip) => {
+              const cur = cleanArr(z.source_ips || []);
+              if (!cur.includes(ip)) setZ({ ...z, source_ips: [...cur, ip] });
+            }} />
+          </div>
+        </Field>
+        <div className="flex items-center gap-2"><Switch checked={!!z.enabled} onChange={(v) => setZ({ ...z, enabled: v })} label="Включено" /></div>
+      </fieldset>
+    </Modal>
+  );
+}
+
+function DeviceDrop({ devices, onPick }: { devices: Device[]; onPick: (ip: string) => void }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <span className="relative inline-block">
+      <Button mini onClick={() => setOpen((v) => !v)}>+ из списка</Button>
+      {open && (
+        <div className="absolute right-0 top-full z-10 mt-1 max-h-72 w-72 overflow-y-auto rounded-lg border border-line bg-panel p-1 text-xs shadow-lg">
+          {devices.length === 0 ? <div className="px-2 py-1 text-muted">пусто</div> : devices.map((d) => (
+            <button key={d.mac + d.ip} type="button" onClick={() => { onPick(d.ip); setOpen(false); }}
+              className="block w-full rounded px-2 py-1 text-left hover:bg-line-soft">
+              {d.hostname && <b className="text-ink">{d.hostname} </b>}
+              <span className="font-mono">{d.ip}</span>
+            </button>
+          ))}
+        </div>
+      )}
+    </span>
+  );
+}
+
+function CopyFromServerModal({ st, onClose, onCopied }: { st: Awg2Status; onClose: () => void; onCopied: () => void | Promise<void> }) {
+  const others = useMemo(() => (st.servers || []).filter((s) => s.id !== st.active_server_id), [st]);
+  const [sel, setSel] = useState<string>(others[0]?.id || "");
+  const [busy, setBusy] = useState(false);
+
+  const run = async () => {
+    if (!sel || busy) return;
+    if (!(await confirmDialog({
+      title: "Перезаписать правила?",
+      body: "Текущие глобальные правила будут заменены правилами с выбранного подключения. Остальные настройки не трогаются.",
+      confirmLabel: "Перезаписать",
+      danger: true,
+    }))) return;
+    setBusy(true);
+    try {
+      await api("POST", "/api/awg2/routing/rules/copy", { from_server_id: sel });
+      await onCopied();
+    } catch (e) {
+      toast((e as Error).message, "err");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <Modal title="Скопировать правила с другого сервера" onClose={onClose} actions={
+      <>
+        <Button variant="ghost" onClick={onClose} disabled={busy}>Отмена</Button>
+        <Button variant="primary" onClick={run} disabled={busy || !sel}>{busy ? "Копируем…" : "Перезаписать"}</Button>
+      </>
+    }>
+      {others.length === 0 ? (
+        <p className="text-xs text-muted">Других серверов нет — добавьте/импортируйте ещё один на вкладке «Сервер».</p>
+      ) : (
+        <Field label="Источник">
+          <Select value={sel} onChange={(e) => setSel(e.target.value)} className="text-[13px]">
+            {others.map((s) => (
+              <option key={s.id} value={s.id}>{s.label || s.id} {s.endpoint ? `· ${s.endpoint}` : ""}</option>
+            ))}
+          </Select>
+        </Field>
+      )}
+    </Modal>
+  );
+}

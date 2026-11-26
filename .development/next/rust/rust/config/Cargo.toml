@@ -1,0 +1,12 @@
+[package]
+name = "nfqws2-config"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+idna = "0.5"
+serde.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true

@@ -1,0 +1,89 @@
+Package: nfqws2-strategy-compact
+Version: 2.0.0-ea-1
+Architecture: aarch64-3.10_kn
+Maintainer: NFQWS2 Strategy
+Section: net
+Priority: optional
+Installed-Size: 11604787
+Description: Compact router panel
+Filename: nfqws2-strategy-compact_2.0.0-ea-1_aarch64-3.10_kn.ipk
+Size: 6096257
+SHA256sum: 7a2426fcfe5899ec92f8be87f23eceae852ee4ecd74f58f8f53b96ac7d03437e
+
+Package: nfqws2-strategy-runs
+Version: 2.0.0-ea-1
+Architecture: aarch64-3.10_kn
+Maintainer: NFQWS2 Strategy
+Section: net
+Priority: optional
+Installed-Size: 2423378
+Description: HTTPS checks through the current router configuration and saved run reports
+Depends: nfqws2-strategy-compact (= 2.0.0-ea-1), curl, ca-certificates
+Filename: nfqws2-strategy-runs_2.0.0-ea-1_aarch64-3.10_kn.ipk
+Size: 1336637
+SHA256sum: bd11db65ebcfb4bca3e5a4fdfc59fb86c52b8a3fff602352f3d0f66976056417
+
+Package: nfqws2-strategy-blockcheck
+Version: 2.0.0-ea-1
+Architecture: aarch64-3.10_kn
+Maintainer: NFQWS2 Strategy
+Section: net
+Priority: optional
+Installed-Size: 566034
+Description: BlockCheck (requires firmware ip and iptables commands)
+Depends: nfqws2-strategy-compact (= 2.0.0-ea-1), curl
+Filename: nfqws2-strategy-blockcheck_2.0.0-ea-1_aarch64-3.10_kn.ipk
+Size: 308399
+SHA256sum: 26473d8fc488d8d76667de6cf168a35b5377d990f244f2816872ece307e2b242
+
+Package: nfqws2-strategy-strategies
+Version: 2.0.0-ea-1
+Architecture: aarch64-3.10_kn
+Maintainer: NFQWS2 Strategy
+Section: net
+Priority: optional
+Installed-Size: 711203
+Description: Compact router panel strategies module
+Depends: nfqws2-strategy-compact (= 2.0.0-ea-1)
+Filename: nfqws2-strategy-strategies_2.0.0-ea-1_aarch64-3.10_kn.ipk
+Size: 377633
+SHA256sum: f9d528acf13b634679115f3526cde981ee3434d23e7efc81e982e2b24351dd02
+
+Package: nfqws2-strategy-geo
+Version: 2.0.0-ea-1
+Architecture: aarch64-3.10_kn
+Maintainer: NFQWS2 Strategy
+Section: net
+Priority: optional
+Installed-Size: 374132
+Description: Compact router panel geo module
+Depends: nfqws2-strategy-compact (= 2.0.0-ea-1), curl
+Filename: nfqws2-strategy-geo_2.0.0-ea-1_aarch64-3.10_kn.ipk
+Size: 205364
+SHA256sum: ea515a5139a5097fbba5af410b1873c445781370679c1c544ed0550c1932e1e2
+
+Package: nfqws2-strategy-trace
+Version: 2.0.0-ea-1
+Architecture: aarch64-3.10_kn
+Maintainer: NFQWS2 Strategy
+Section: net
+Priority: optional
+Installed-Size: 572128
+Description: Connection tracing and packet capture
+Depends: nfqws2-strategy-compact (= 2.0.0-ea-1), tcpdump
+Filename: nfqws2-strategy-trace_2.0.0-ea-1_aarch64-3.10_kn.ipk
+Size: 310278
+SHA256sum: affb7a5908daffd2b12d6977fb237c3ce86ea8d378fbfa221cf08e8f76f39e08
+
+Package: nfqws2-strategy-tgws
+Version: 2.0.0-ea-1
+Architecture: aarch64-3.10_kn
+Maintainer: NFQWS2 Strategy
+Section: net
+Priority: optional
+Installed-Size: 2223825
+Description: Telegram MTProto over TLS WebSocket
+Depends: nfqws2-strategy-compact (= 2.0.0-ea-1), ca-certificates
+Filename: nfqws2-strategy-tgws_2.0.0-ea-1_aarch64-3.10_kn.ipk
+Size: 1254661
+SHA256sum: b3e15a24c6b17c3580b6700765cd9e619b4e55844998ea7bf93584b27d67c1c1

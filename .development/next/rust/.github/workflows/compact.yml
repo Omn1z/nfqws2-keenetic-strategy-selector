@@ -1,0 +1,224 @@
+name: Compact panel
+on:
+  push:
+    branches: [rust]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  N2S_FEED_VERSION: 0.1.0-rust.6
+
+jobs:
+  openwrt:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - release: 21.02.7
+            target: armvirt/64
+            sdk: openwrt-sdk-21.02.7-armvirt-64_gcc-8.4.0_musl.Linux-x86_64.tar.xz
+            root: openwrt-21.02.7-armvirt-64-default-rootfs.tar.gz
+            sdk_sha: d4bec0392c0a49b2235fc83d077c3a7cd268dc716bc7b06c1e15eba6dee5be84
+            root_sha: 2414bd4d228e1a4b00ed3c08e04c5864d21d58de66406cafe8f24df682a76e77
+            layout: separate
+          - release: 24.10.0
+            target: armsr/armv8
+            sdk: openwrt-sdk-24.10.0-armsr-armv8_gcc-13.3.0_musl.Linux-x86_64.tar.zst
+            root: openwrt-24.10.0-armsr-armv8-rootfs.tar.gz
+            sdk_sha: f92e564a44927c515d76b48ee6ab27919c8e82b279d38b722150bc41aa69626f
+            root_sha: ae9619d2f74d22779655e12764cbfa26625bd81614364197785a1ed3d3bedb36
+            layout: separate
+          - release: 25.12.0
+            target: armsr/armv8
+            sdk: openwrt-sdk-25.12.0-armsr-armv8_gcc-14.3.0_musl.Linux-x86_64.tar.zst
+            root: openwrt-25.12.0-armsr-armv8-rootfs.tar.gz
+            sdk_sha: 407f30aae17ca93a65260249f1f5f8ae83efc9393360c9a98e575e65c5b8392e
+            root_sha: d5e42b396d7f64697c65a884912107b49e05d2b2f2c00a251f94c44f8deef507
+            layout: shared
+    env:
+      WRT_VERSION: ${{ matrix.release }}
+      WRT_TARGET: ${{ matrix.target }}
+      SDK_ARCHIVE: ${{ matrix.sdk }}
+      ROOT_ARCHIVE: ${{ matrix.root }}
+      SDK_SHA256: ${{ matrix.sdk_sha }}
+      ROOT_SHA256: ${{ matrix.root_sha }}
+      N2S_COMPACT_TOOLS: ${{ matrix.layout }}
+      CC_aarch64_unknown_linux_musl: clang
+      AR_aarch64_unknown_linux_musl: llvm-ar
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Prepare official ARM64 SDK and firmware
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential clang llvm gawk gettext libncurses-dev libssl-dev rsync unzip zstd qemu-user-static binfmt-support nftables
+          rustup target add aarch64-unknown-linux-musl
+          npm --prefix frontend ci
+          cd "$RUNNER_TEMP"
+          base="https://downloads.openwrt.org/releases/$WRT_VERSION/targets/$WRT_TARGET"
+          sdk="$SDK_ARCHIVE"
+          root="$ROOT_ARCHIVE"
+          curl -fsSLO --retry 3 "$base/$sdk"
+          curl -fsSLO --retry 3 "$base/$root"
+          printf '%s  %s\n' "$SDK_SHA256" "$sdk" "$ROOT_SHA256" "$root" | sha256sum -c -
+          mkdir sdk rootfs
+          tar -xf "$sdk" --strip-components=1 -C sdk
+          sudo tar -xzf "$root" -C rootfs
+      - name: Build and install the signed native feed
+        run: |
+          sh scripts/build-openwrt-feed.sh "$RUNNER_TEMP/sdk" 0.1.0-6 "$RUNNER_TEMP/feed"
+          root="$RUNNER_TEMP/rootfs"
+          sudo mkdir -p "$root/fixture" "$root/dev"
+          sudo cp -r "$RUNNER_TEMP/feed" "$root/fixture/"
+          sudo cp scripts/test-openwrt-rootfs.sh "$root/fixture/check.sh"
+          sudo touch "$root/fixture/disposable-openwrt-root" "$root/dev/null"
+          sudo update-binfmts --enable qemu-aarch64
+          sudo unshare --net sh -ec 'ip link set lo up; N2S_TEST_MODULE_API=1 chroot "$1" /bin/sh /fixture/check.sh "$2"' sh "$root" "$N2S_COMPACT_TOOLS"
+      - name: Exercise native fw4 in a private network namespace
+        if: matrix.release == '25.12.0'
+        run: |
+          cargo test --locked -p nfqws2-awg-rules --lib --no-run --message-format=json > "$RUNNER_TEMP/test-targets.jsonl"
+          suite=$(jq -r 'select(.profile.test == true and .executable != null) | .executable' "$RUNNER_TEMP/test-targets.jsonl")
+          test_name=kernel::fw4::native_fw4_round_trip_in_isolated_netns
+          "$suite" --list --ignored | grep -Fx "$test_name: test"
+          sudo "$suite" "$test_name" --ignored --exact
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.11'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Test Rust modules
+        run: |
+          python3 scripts/rust-route-coverage.py --check --missing
+          cargo fetch --locked
+          cargo fmt --all --check
+          cargo clippy --workspace --all-targets --locked --offline -- -D warnings
+          cargo test --workspace --locked --offline
+          cargo build --workspace --release --locked --offline
+      - name: Build compact ARM64 packages
+        run: |
+          rustup target add aarch64-unknown-linux-musl
+          npm --prefix frontend ci
+          npm --prefix frontend test
+          sh scripts/build-compact.sh arm64 aarch64-3.10_kn 0.1.0-1
+      - name: Test module installation and compatibility
+        env:
+          NFQWS2_GEO_BIN: ${{ github.workspace }}/target/release/nfqws2-geo
+        run: |
+          go test ./cmd/... ./internal/... ./rust/geo/tests
+          go test -tags n2s_compact ./cmd/... ./internal/... ./rust/geo/tests
+          python3 scripts/test-compact-feed.py
+          python3 scripts/test-rust-full.py
+          sh packaging/test-compact.sh
+          sh packaging/test-bypass-hooks.sh
+          sh packaging/test-install-deps.sh
+          sh packaging/test-update.sh
+          sh packaging/test-rust-vpn-deploy.sh
+      - name: Build and test the native Rust panel
+        env:
+          CC_aarch64_unknown_linux_musl: clang
+          AR_aarch64_unknown_linux_musl: llvm-ar
+          CC_armv7_unknown_linux_musleabihf: clang
+          AR_armv7_unknown_linux_musleabihf: llvm-ar
+        run: |
+          rustup component add rust-docs rust-src
+          rustup target add armv7-unknown-linux-musleabihf
+          sudo apt-get update
+          sudo apt-get install -y qemu-user
+          cargo test -p nfqws2-strategy --locked --no-default-features --features compact
+          python3 scripts/test-rust-tgws.py target/release/nfqws2-strategy
+          python3 scripts/test-rust-runs.py --panel target/release/nfqws2-strategy
+          cargo build --locked --release -p nfqws2-strategy --no-default-features --features compact
+          python3 scripts/test-rust-panel.py --panel target/release/nfqws2-strategy --runs target/release/nfqws2-runs
+          python3 scripts/test-rust-runs.py --panel target/release/nfqws2-strategy --worker target/release/nfqws2-runs
+          version="$N2S_FEED_VERSION"
+          sh scripts/build-rust-compact.sh arm64 aarch64-3.10_kn "$version"
+          sh scripts/build-rust-compact.sh armv7 armv7-3.2 "$version"
+          python3 scripts/test-compact-feed.py --verify-native "dist/rust-feeds/aarch64-3.10_kn/$version" target/aarch64-unknown-linux-musl/release
+          python3 scripts/test-compact-feed.py --verify-native "dist/rust-feeds/armv7-3.2/$version" target/armv7-unknown-linux-musleabihf/release
+          test "$(qemu-aarch64 target/aarch64-unknown-linux-musl/release/nfqws2-strategy version)" = "$version"
+          test "$(qemu-arm target/armv7-unknown-linux-musleabihf/release/nfqws2-strategy version)" = "$version"
+          N2S_COMPACT_TOOLS=shared sh scripts/build-rust-compact.sh arm64 aarch64-3.10_kn "$version"
+          python3 scripts/test-compact-feed.py --verify-native "dist/rust-feeds/aarch64-3.10_kn/$version+shared" target/aarch64-unknown-linux-musl/release
+          qemu-aarch64 -0 nfqws2-geo target/aarch64-unknown-linux-musl/release/nfqws2-tools --help
+          python3 scripts/build-rust-full.py arm64 "$version"
+          bundle="dist/rust-full/$version/arm64"
+          (cd "$bundle" && sha256sum --check SHA256SUMS)
+          python3 scripts/test-rust-full.py --verify "$bundle" arm64 target/standalone/aarch64-unknown-linux-musl/release
+          test "$(qemu-aarch64 "$bundle/nfqws2-strategy-rust-linux-arm64" version)" = "$version"
+
+      - name: Save tested ARM package feeds
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-entware-arm
+          path: dist/rust-feeds/
+          if-no-files-found: error
+      - name: Save standalone ARM64 panel and helpers
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-standalone-arm64
+          path: dist/rust-full/
+          if-no-files-found: error
+
+  mips:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - cpu: mipsel
+            arch: mipselsf-k3.4
+          - cpu: mips
+            arch: mipssf-k3.4
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Build and run the static soft-float router binaries
+        env:
+          N2S_MIPS_TARGET: ${{ matrix.cpu }}
+          OPKG_ARCH: ${{ matrix.arch }}
+        run: |
+          rustup toolchain install nightly-2026-07-11 --profile minimal --component rust-src,rust-docs
+          python3 -m pip install ziglang==0.14.1
+          export ZIG="$(python3 -c 'import pathlib,ziglang;print(pathlib.Path(ziglang.__file__).parent / "zig")')"
+          key="${N2S_MIPS_TARGET}_unknown_linux_musl"
+          export "CC_${key}=$PWD/scripts/rust-mips-cc.py"
+          export "AR_${key}=llvm-ar"
+          export "CARGO_TARGET_${key^^}_LINKER=$PWD/scripts/rust-mips-cc.py"
+          sudo apt-get update
+          sudo apt-get install -y qemu-user llvm
+          npm --prefix frontend ci
+          version="$N2S_FEED_VERSION"
+          sh scripts/build-rust-compact.sh "$N2S_MIPS_TARGET" "$OPKG_ARCH" "$version"
+          bin="target/${N2S_MIPS_TARGET}-unknown-linux-musl/release"
+          python3 scripts/test-compact-feed.py --verify-native "dist/rust-feeds/$OPKG_ARCH/$version" "$bin"
+          test "$(qemu-$N2S_MIPS_TARGET "$bin/nfqws2-strategy" version)" = "$version"
+          qemu-$N2S_MIPS_TARGET "$bin/nfqws2-strategy" config | python3 -m json.tool >/dev/null
+          N2S_COMPACT_TOOLS=shared sh scripts/build-rust-compact.sh "$N2S_MIPS_TARGET" "$OPKG_ARCH" "$version"
+          python3 scripts/test-compact-feed.py --verify-native "dist/rust-feeds/$OPKG_ARCH/$version+shared" "$bin"
+          qemu-$N2S_MIPS_TARGET -0 nfqws2-geo "$bin/nfqws2-tools" --help
+      - name: Save tested MIPS package feed
+        uses: actions/upload-artifact@v4
+        with:
+          name: rust-entware-${{ matrix.cpu }}
+          path: dist/rust-feeds/
+          if-no-files-found: error

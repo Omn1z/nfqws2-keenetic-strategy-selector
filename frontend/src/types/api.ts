@@ -269,6 +269,7 @@ export interface TgwsSnapshot {
 }
 
 export interface TgwsConfig {
+  transport?: string;
   enabled: boolean;
   port: number;
   secret: string;
@@ -290,6 +291,7 @@ export interface TgwsConfig {
 }
 
 export interface TgwsStatus {
+  native?: { package: string; can_install: boolean; installed: boolean; requires_go: string[]; last_error: string; vpn_fallback?: boolean | null };
   upstream_version: string;
   running: boolean;
   config: TgwsConfig;
@@ -315,6 +317,7 @@ export interface Socks5Snapshot {
 }
 
 export interface Socks5Status {
+  transport?: "direct";
   running: boolean;
   config: Socks5Config;
   stats: Socks5Snapshot;
@@ -818,6 +821,7 @@ export interface AwgEngineInfo {
 }
 export interface AwgClientStatus {
   running: boolean; iface_present: boolean; last_handshake: number; rx_bytes: number; tx_bytes: number;
+  last_peer_activity?: number; checking_peer?: boolean;
   endpoint: string; address: string; mtu: number; connected: boolean; error?: string;
   endpoint_primary?: string;
   endpoint_candidate?: string;
@@ -844,6 +848,11 @@ export interface AwgDeployServerResult {
   id: string; label: string; ok: boolean; result: AwgDeployResult; error?: string;
 }
 export interface Awg2Status {
+  server_deployment?: "wireguard";
+  ssh_host_key_enrollment?: boolean;
+  mtu_only_edit?: boolean;
+  primary_endpoint_edit?: boolean;
+  warp_protocol?: "wireguard";
   persistence_error?: string;
   config_recovered?: boolean;
   /** Global recovery schedule, independent of the profile selected for editing. */
@@ -907,7 +916,15 @@ export interface SystemStats {
   services: ServiceStat[];
 }
 
+export interface StorageUsage {
+  path: string;
+  total_bytes: number;
+  used_bytes: number;
+  available_bytes: number;
+}
+
 export interface AutomationStatus {
+  auto_pick_supported?: boolean;
   mode: "off" | "on" | "auto";
   auto_pick: boolean;
   periodic_scan: boolean;
@@ -943,6 +960,7 @@ export interface Dashboard {
   main_queue: number;
   wan: IfaceBytes[];
   system: SystemStats;
+  storage?: StorageUsage;
   top_devices: Device[];
   trace_counters: TraceCounters;
 }
@@ -1030,6 +1048,9 @@ export interface BlobCapture {
   started_at: number;
   elapsed_ms: number;
   candidates: ClientHelloCandidate[];
+  metadata_only?: boolean;
+  limited?: boolean;
+  observations?: Record<string, { headers: number; record_bytes: number }>;
 }
 
 /** POST /api/devices/{ip}/blobcap → a started capture, or a prompt to install tcpdump. */
@@ -1067,6 +1088,8 @@ export interface TraceConn {
 }
 
 export interface Trace {
+  cancellable?: boolean;
+  limited?: boolean;
   id: string;
   ip: string;
   seconds: number;
@@ -1079,6 +1102,8 @@ export interface Trace {
 }
 
 export interface Pcap {
+  cancellable?: boolean;
+  limited?: boolean;
   id: string;
   ip: string;
   iface: string;
@@ -1093,7 +1118,9 @@ export interface Pcap {
 }
 
 /** POST /api/devices/{ip}/pcap → a started capture, or a prompt to install tcpdump first. */
-export type PcapStart = Pcap | { need_install: true; package: string };
+export type DiagnosticPackage = "tcpdump" | "nfqws2-strategy-trace";
+export type NeedDiagnosticPackage = { need_install: true; package: DiagnosticPackage };
+export type PcapStart = Pcap | NeedDiagnosticPackage;
 
 /** POST /api/system/install → apk/opkg result. */
 export interface InstallResult {

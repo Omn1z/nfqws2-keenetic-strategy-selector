@@ -103,6 +103,27 @@ func TestCFH2PoolFailedPreflightCooldownAndWSFallback(t *testing.T) {
 	}
 }
 
+func TestCFH2ActivePreflightTimeoutCountsWithoutCoolingTheOrigin(t *testing.T) {
+	var requests atomic.Int64
+	p := cfH2PoolFixture(t, func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		<-r.Context().Done()
+	})
+	for range 2 {
+		if channel, err := p.open(context.Background(), 2, "test"); channel != nil || err != nil {
+			t.Fatalf("expected fallback during setup cooldown, got %v %v", channel, err)
+		}
+	}
+	if requests.Load() != 1 || p.stats.h2Errors.Load() != 1 {
+		t.Fatal("active preflight timeout should count exactly once")
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if len(p.failedUntil) != 0 || len(p.setupRetry) != 1 || !time.Now().Before(p.setupRetry[2]) {
+		t.Fatal("group timeout should cool down only the affected DC")
+	}
+}
+
 func TestCFH2PoolCancellationDuringPreflight(t *testing.T) {
 	started := make(chan struct{})
 	p := cfH2PoolFixture(t, func(w http.ResponseWriter, r *http.Request) { close(started); <-r.Context().Done() })

@@ -2,13 +2,21 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { renderToStaticMarkup } from "react-dom/server";
 import type { AwgClientStatus } from "@/types/api";
-import RecoveryStatus, { recoveryPhaseLabel } from "./RecoveryStatus";
+import RecoveryStatus, { peerActivityLabel, recoveryPhaseLabel } from "./RecoveryStatus";
 
 const client: AwgClientStatus = {
   running: true, iface_present: true, last_handshake: 0, rx_bytes: 0, tx_bytes: 0,
   endpoint: "192.0.2.1:2408", address: "10.0.0.2/32", mtu: 1420, connected: false,
   recovering: true, retry_count: 2, verification_until: 1020, retry_at: 1025,
 };
+
+test("a fresh receive sample distinguishes a busy tunnel from a stale handshake", () => {
+  const live = { ...client, last_handshake: 580, last_peer_activity: 998 };
+  assert.equal(peerActivityLabel(live, 1000), "Хендшейк 7 мин назад · Входящий трафик 2 с назад");
+  assert.equal(peerActivityLabel({ ...live, last_peer_activity: 580 }, 1000), "Хендшейк 7 мин назад");
+  assert.equal(peerActivityLabel(client, 1000), "Хендшейка ещё не было");
+  assert.equal(recoveryPhaseLabel({ ...live, checking_peer: true }, 1000), "ждём ответ пира");
+});
 
 test("recovery cards distinguish the handshake window from its later retry pause", () => {
   assert.equal(recoveryPhaseLabel(client, 1000), "ожидаем handshake: ещё 20 с");

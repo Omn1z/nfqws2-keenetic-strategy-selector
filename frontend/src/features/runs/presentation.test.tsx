@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { renderToStaticMarkup } from "react-dom/server";
-import Runs, { RunLog, RunResultRow, RunSummary } from "./Runs";
+import { LegacyRuns, RunLog, RunResultRow, RunSummary } from "./Runs";
+import { CheckResults, CurrentRuns } from "./CurrentRuns";
 import { StoreProvider } from "@/providers/StoreProvider";
 import type { Run, StrategyResult } from "@/types/api";
 
@@ -36,7 +37,19 @@ test("the run log keeps chronological completions, errors and complete engine di
 
 test("the initial runs screen exposes source modes, all selectors, search and a log without starting work", (t) => {
   const request = t.mock.method(globalThis, "fetch", () => { throw new Error("initial render must not start work"); });
-  const html = renderToStaticMarkup(<StoreProvider><Runs /></StoreProvider>);
+  const html = renderToStaticMarkup(<StoreProvider><LegacyRuns /></StoreProvider>);
   for (const value of ["Запустить прогон", "Список", "GeoSite/GeoIP", "Текст", "Потоков", "Автоподбор", "Стратегии", "Фейк-пейлоад", "DNS", "Лог прогона", "Результаты прогона", "Поиск результатов прогона", "Фильтр результатов по успешным целям", "Запустите прогон."]) assert.ok(html.includes(value), value);
   assert.equal(request.mock.callCount(), 0);
+});
+
+test("the current configuration uses HTTPS status and first-byte timing with domain or list inputs", () => {
+  const html = renderToStaticMarkup(<StoreProvider><CurrentRuns caps={{modes:["current_https"],max_targets:64,max_threads:8,installed:true}}/></StoreProvider>);
+  for(const value of ["Проверка текущей конфигурации","HTTPS HEAD","Ввести домены","64 за прогон","Запустить проверку"]) assert.ok(html.includes(value),value);
+  assert.doesNotMatch(html,/Автоподбор|Фейк-пейлоад|GeoSite\/GeoIP/);
+  const result=renderToStaticMarkup(<CheckResults report={{mode:"current_https",id:"one",list_name:"Fixture",started_at:1,status:"cancelled",threads:2,done:2,total:3,
+    checks:[{host:"one.test",ok:true,code:204,ttfb_ms:21},{host:"two.test",ok:false,code:0,ttfb_ms:0,error:"TLS failure"}]}}/>);
+  for (const value of ["Отменён","HTTP 204","21 мс","TLS failure","2/3"]) assert.ok(result.includes(value),value);
+  assert.doesNotMatch(result,/КБ\/с|Применить|Коэф/);
+  const missing=renderToStaticMarkup(<StoreProvider><CurrentRuns caps={{modes:["current_https"],max_targets:64,max_threads:8,installed:false}}/></StoreProvider>);
+  assert.match(missing,/nfqws2-strategy-runs/);
 });

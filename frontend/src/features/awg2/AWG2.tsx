@@ -14,7 +14,7 @@ import { Field, Input, Select, Textarea } from "@/components/ui/form";
 import ServerPane from "./ServerPane";
 import FailoverPane, { ConnectionFailoverBadge } from "./FailoverPane";
 import GeneralPane from "./GeneralPane";
-import RecoveryStatus from "./RecoveryStatus";
+import RecoveryStatus, { peerActivityLabel } from "./RecoveryStatus";
 import { EndpointSelectionStatus } from "./EndpointBackupsPane";
 import ConfigPersistenceNotice from "./ConfigPersistenceNotice";
 import PeerShareModal from "./PeerShareModal";
@@ -50,11 +50,6 @@ const human = (n: number) => {
   while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
   return `${v.toFixed(v < 10 && i > 0 ? 1 : 0)} ${u[i]}`;
 };
-const ago = (t: number) => {
-  if (!t) return "нет";
-  const s = Math.max(0, Math.floor(Date.now() / 1000) - t);
-  return s < 60 ? `${s} с` : s < 3600 ? `${Math.floor(s / 60)} мин` : `${Math.floor(s / 3600)} ч`;
-};
 
 function MiniSpinner() {
   return <span className="inline-block h-3 w-3 animate-spin rounded-full border-2 border-current border-r-transparent align-[-1px]" />;
@@ -73,6 +68,7 @@ function tunnelLine(srv: Awg2ServerSummary) {
   const cl = srv.client;
   if (!srv.enabled) return { kind: "neutral" as const, label: "туннель выкл" };
   if (srv.failover?.standby && !srv.failover.activated) return { kind: "neutral" as const, label: "резерв ожидает сбоя" };
+  if (cl?.checking_peer) return { kind: "warn" as const, label: "проверка связи" };
   if (cl?.recovering) return { kind: "warn" as const, label: "переподключение" };
   if (srv.connected) return { kind: "ok" as const, label: "connected" };
   if (!srv.deployed && !srv.imported) return { kind: "neutral" as const, label: "черновик" };
@@ -475,7 +471,7 @@ export default function AWG2() {
   const statusText = `${activeTunnelCount > 0 ? `${connectedCount}/${activeTunnelCount} активных туннелей` : enabledCount > 0 ? "Нет активных туннелей" : "туннели выключены"}${waitingReserveCount ? ` · резервов в ожидании: ${waitingReserveCount}` : ""}`;
   const newConnectionSubmitLabel =
     newMode === "import" ? "Добавить подключение" :
-    newMode === "warp" ? "Создать WARP" :
+    newMode === "warp" ? "Принять условия Cloudflare и создать WARP" :
     "Развернуть сервер";
   const newEngineIssue = newMode === "selfhosted" ? vpnEngineIssue(st.engine, newConn.trafficObfuscation) : "";
 
@@ -592,7 +588,7 @@ export default function AWG2() {
                 </div>
                 {cl?.running && (
                   <div className="mt-2 text-[11.5px] text-muted">
-                    Хендшейк: {ago(cl.last_handshake)} назад · ↓ {human(cl.rx_bytes)} / ↑ {human(cl.tx_bytes)} · MTU {cl.mtu || "—"}
+                    {peerActivityLabel(cl, Math.floor(Date.now() / 1000))} · ↓ {human(cl.rx_bytes)} / ↑ {human(cl.tx_bytes)} · MTU {cl.mtu || "—"}
                   </div>
                 )}
                 {srv.enabled && cl && <RecoveryStatus client={cl} />}
@@ -728,7 +724,7 @@ export default function AWG2() {
             )}
 
             {newMode === "warp" && (
-              <Field label="Endpoint">
+              <Field label="Endpoint" hint={st.warp_protocol === "wireguard" ? "Cloudflare получит публичный ключ роутера. Для нового подключения используется WireGuard." : undefined}>
                 <Input
                   value={newConn.warpEndpoint}
                   placeholder="auto"

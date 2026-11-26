@@ -1,0 +1,10 @@
+#!/bin/sh
+[ -z "${IPKG_INSTROOT:-}" ] && [ "${N2S_INSTALLING_COMPACT:-0}" != 1 ] || exit 0
+guard=/var/run/nfqws2-strategy-apk.lock
+if [ -r "$guard" ] && read -r owner < "$guard" && [ "$owner" = "$PPID" ]; then
+  flock -n "$guard" true || exit 0
+fi
+[ "$(readlink /usr/bin/n2s)" = /usr/lib/nfqws2-strategy/n2s-compact ] || exit 0
+init=/etc/init.d/nfqws2-strategy
+[ -x "$init" ] && "$init" running >/dev/null 2>&1 || exit 0
+"$init" restart

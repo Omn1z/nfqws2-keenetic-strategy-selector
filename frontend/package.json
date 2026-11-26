@@ -8,6 +8,7 @@
     "test": "node scripts/test.mjs",
     "audit:security": "node scripts/audit-security.mjs",
     "build": "tsc --noEmit && vite build",
+    "build:compact": "tsc --noEmit && vite build --mode compact && node scripts/stage-compact.mjs",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

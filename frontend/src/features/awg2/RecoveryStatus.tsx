@@ -1,6 +1,20 @@
 import type { AwgClientStatus } from "@/types/api";
 
+export function peerActivityLabel(client: AwgClientStatus, now: number): string {
+  const age = (timestamp: number) => {
+    const seconds = Math.max(0, Math.floor(now - timestamp));
+    if (seconds < 60) return `${seconds} с назад`;
+    if (seconds < 3600) return `${Math.floor(seconds / 60)} мин назад`;
+    return `${Math.floor(seconds / 3600)} ч назад`;
+  };
+  const handshake = client.last_handshake > 0 ? `Хендшейк ${age(client.last_handshake)}` : "Хендшейка ещё не было";
+  return client.last_peer_activity && client.last_peer_activity > client.last_handshake
+    ? `${handshake} · Входящий трафик ${age(client.last_peer_activity)}`
+    : handshake;
+}
+
 export function recoveryPhaseLabel(client: AwgClientStatus, nowSeconds: number): string {
+  if (client.checking_peer) return "ждём ответ пира";
   const verification = Math.max(0, (client.verification_until || 0) - nowSeconds);
   if (verification > 0) return `ожидаем handshake: ещё ${verification} с`;
   const retry = Math.max(0, (client.retry_at || 0) - nowSeconds);

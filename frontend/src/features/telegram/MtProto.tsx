@@ -4,10 +4,11 @@ import { usePoll } from "@/lib/hooks";
 import { toast } from "@/components/ui/Toast";
 import { confirmDialog } from "@/components/ui/Confirm";
 import { Card } from "@/components/ui/Card";
+import { Button } from "@/components/ui/Button";
 import { PageHeader, compactCard } from "@/components/ui/FeaturePage";
 import AwgFallback from "./AwgFallback";
 import { MtProtoContent } from "./MtProtoPresentation";
-import type { TgwsConfig, TgwsStatus } from "@/types/api";
+import type { InstallResult, TgwsConfig, TgwsStatus } from "@/types/api";
 
 export interface Form {
   port: string;
@@ -33,10 +34,10 @@ const parseDC = (text: string): Record<string, string> => {
   for (const line of text.split("\n")) {
     const t = line.trim();
     if (!t) continue;
-    const p = t.split(/[=:]/);
-    if (p.length >= 2) {
-      const dc = parseInt(p[0].trim(), 10);
-      const ip = p[1].trim();
+    const separator = t.search(/[=:]/);
+    if (separator > 0) {
+      const dc = parseInt(t.slice(0, separator).trim(), 10);
+      const ip = t.slice(separator + 1).trim();
       if (dc && ip) out[String(dc)] = ip;
     }
   }
@@ -62,6 +63,7 @@ export const collect = (f: Form) => ({
 export default function MtProto() {
   const [form, setForm] = useState<Form | null>(null);
   const [live, setLive] = useState<TgwsStatus | null>(null);
+  const [installing, setInstalling] = useState(false);
   const loaded = useRef(false);
 
   const apply = (st: TgwsStatus) => { setLive(st); setForm(toForm(st.config)); };
@@ -80,5 +82,25 @@ export default function MtProto() {
   const copy = async () => { const v = live?.link; if (!v) return; try { await navigator.clipboard.writeText(v); toast("Ссылка скопирована", "ok"); } catch { toast("Скопируйте вручную", "err"); } };
 
   if (!form || !live) return <div className="flex min-w-0 flex-col gap-4"><PageHeader title="Telegram MTProto" description="Прокси на роутере с резервными путями подключения." /><Card className={compactCard}><span role="status" className="text-xs text-muted">Загрузка…</span></Card></div>;
-  return <MtProtoContent live={live} form={form} set={set} onToggle={toggle} onSave={save} onNewSecret={newSecret} onCopy={copy} fallback={<AwgFallback />} />;
+  const native = live.native;
+  const install = async () => {
+    if (!native) return;
+    setInstalling(true);
+    try {
+      const result = await api<InstallResult>("POST", "/api/system/install", { package: native.package });
+      if (!result.ok) throw new Error(result.error || "Не удалось установить TG WS");
+      setLive(await api<TgwsStatus>("GET", "/api/tgws"));
+      toast("Модуль TG WS установлен", "ok");
+    } catch (e) { toast((e as Error).message, "err"); }
+    finally { setInstalling(false); }
+  };
+  const nativeInfo = native && (!native.installed || native.requires_go.length > 0 || native.last_error || native.vpn_fallback === false) && (
+    <Card className={compactCard}>
+      {!native.installed && <p>Модуль TG WS отсутствует. {native.can_install && <Button onClick={install} disabled={installing}>{installing ? "Установка…" : "Установить TG WS"}</Button>}</p>}
+      {native.requires_go.length > 0 && <p>Для настроек «{native.requires_go.join(", ")}» требуется Go-версия. Для прямого WSS отключите их и сохраните настройки.</p>}
+      {native.last_error && <p role="status">{native.last_error}</p>}
+      {native.vpn_fallback === false && <p>Для резервного подключения через VPN обновите пакет TG WS.</p>}
+    </Card>
+  );
+  return <MtProtoContent live={live} form={form} set={set} onToggle={toggle} onSave={save} onNewSecret={newSecret} onCopy={copy} fallback={<>{nativeInfo}<AwgFallback /></>} />;
 }

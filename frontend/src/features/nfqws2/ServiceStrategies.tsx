@@ -3,6 +3,7 @@ import { api, ApiHTTPError } from "@/lib/api";
 import { cn } from "@/lib/cn";
 import { Badge } from "@/components/ui/Badge";
 import { Button } from "@/components/ui/Button";
+import { MissingModule } from "@/components/ui/MissingModule";
 import { Card } from "@/components/ui/Card";
 import { confirmDialog } from "@/components/ui/Confirm";
 import { Field, Input, Textarea } from "@/components/ui/form";
@@ -31,6 +32,7 @@ export function ServiceStrategies({ restart, canRestart = true }: { restart: () 
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
   const [loadError, setLoadError] = useState("");
+  const [missingModule, setMissingModule] = useState(false);
   const [saveError, setSaveError] = useState("");
   const [stale, setStale] = useState(false);
   const [needsRestart, setNeedsRestart] = useState(false);
@@ -70,9 +72,13 @@ export function ServiceStrategies({ restart, canRestart = true }: { restart: () 
         setStale(false); setSaveError("");
       }
       setNeedsRestart(data.restart_required);
+      setMissingModule(false);
       setLoadError("");
     } catch (error) {
-      if (request === loadSequence.current) setLoadError((error as Error).message);
+      if (request === loadSequence.current) {
+        setMissingModule(error instanceof ApiHTTPError && error.status === 503);
+        setLoadError((error as Error).message);
+      }
     } finally {
       if (request === loadSequence.current) setLoading(false);
     }
@@ -182,6 +188,7 @@ export function ServiceStrategies({ restart, canRestart = true }: { restart: () 
     finally { if (request === checkSequence.current) setChecking(false); }
   };
 
+  if (services === null && missingModule) return <Card title="Стратегии сервисов"><MissingModule name="strategies" /></Card>;
   if (services === null) return <Card title="Стратегии сервисов"><p className="text-sm text-muted" role="status">{loadError || "Загрузка сервисов…"}</p>{loadError && <Button className="mt-3" onClick={() => void load()} disabled={loading}>Повторить</Button>}</Card>;
 
   return <>

@@ -177,9 +177,13 @@ func cmdServe(args []string) {
 	}
 
 	// Tee logs into the in-memory ring (UI "Логи" tab) while still writing to the
-	// -log file / stderr. SetFlags(0) since logbuf prepends its own timestamp.
+	// -log file / stderr. Keep proxy diagnostics in a separate, bounded file.
+	proxyLogPath := ""
+	if logPath != "" {
+		proxyLogPath = logPath + ".proxy"
+	}
 	log.SetFlags(0)
-	log.SetOutput(logbuf.Init(os.Stderr))
+	log.SetOutput(logbuf.Init(os.Stderr, proxyLogPath))
 
 	a, err := app.New(cfg)
 	if err != nil {
@@ -269,7 +273,15 @@ func cmdSelftest(args []string) {
 	}
 
 	cfg := loadConfig()
-	cat := catalog.Builtin()
+	cat, err := catalog.Builtin()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	if len(cat) == 0 {
+		fmt.Fprintln(os.Stderr, "install the nfqws2-strategy-strategies package to use the builtin catalog")
+		os.Exit(2)
+	}
 	if stratIdx < 0 || stratIdx >= len(cat) {
 		fmt.Fprintf(os.Stderr, "strategy index out of range (0..%d)\n", len(cat)-1)
 		os.Exit(2)

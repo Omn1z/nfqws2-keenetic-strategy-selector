@@ -62,7 +62,7 @@ export function BlockCheckResults({ targets, query, filter, onQuery, onFilter, r
 }
 
 export default function BlockCheck() {
-  const { lists, geo } = useStore();
+  const { lists, geo } = useStore({ geo: true });
   const srcRef = useRef<SourceSelectorHandle>(null);
   const [threads, setThreads] = useState("4");
   const [bc, setBc] = useState<BC | null>(null);

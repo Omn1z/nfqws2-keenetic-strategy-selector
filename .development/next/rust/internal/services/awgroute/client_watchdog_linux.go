@@ -1,0 +1,272 @@
+//go:build linux
+
+package awgroute
+
+import (
+	"context"
+	"encoding/base64"
+	"encoding/hex"
+	"fmt"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"nfqws2strategy/internal/services/awg"
+)
+
+func clientSupervisorSupported() bool { return true }
+
+func (d systemClientDriver) repairDoubleTunnel(inner, outer *awg.Manager) error {
+	return d.svc.repairDoubleTunnelTransportOS(inner, outer)
+}
+
+func (d systemClientDriver) recoverWithExistingPeer(am *awg.Manager) error {
+	return d.svc.awgRestartLocalClientOS(am)
+}
+
+func (d systemClientDriver) clientDataUnanswered(am *awg.Manager) bool {
+	client := am.RuntimeClientStatus()
+	return client.HasPeer && probeClientDataTimeout(d.svc.clientOpContext(), clientIfaceName(client.ClientIface), client.AllowedIPs)
+}
+
+var clientEnginePIDs sync.Map // iface -> pid; executable and argv rechecked on use
+
+func awgClientCurrentEngineOS(cfg awg.ServerConfig) bool {
+	return awgClientCurrentEngineIfaceOS(awgClientIfaceName(cfg))
+}
+
+func awgClientCurrentEngineIfaceOS(iface string) bool {
+	installed, err := os.Stat(awgGoBin())
+	if err != nil {
+		return false
+	}
+	check := func(pid string) bool {
+		cmd, err := os.ReadFile(filepath.Join("/proc", pid, "cmdline"))
+		if err != nil {
+			return false
+		}
+		if !clientCommandMatches(cmd, iface) {
+			return false
+		}
+		live, err := os.Stat(filepath.Join("/proc", pid, "exe"))
+		return err == nil && os.SameFile(installed, live)
+	}
+	if cached, ok := clientEnginePIDs.Load(iface); ok && check(cached.(string)) {
+		return true
+	}
+	entries, _ := os.ReadDir("/proc")
+	for _, e := range entries {
+		if _, err := strconv.Atoi(e.Name()); err != nil {
+			continue
+		}
+		if check(e.Name()) {
+			clientEnginePIDs.Store(iface, e.Name())
+			return true
+		}
+	}
+	clientEnginePIDs.Delete(iface)
+	return false
+}
+
+// Only the peer's keepalive setting is touched. Sending the same nonzero value
+// does not trigger SendKeepalive in amneziawg-go; its 0 -> nonzero transition
+// does. Restore it even if shutdown/down cancels the probe between requests.
+func (svc *Service) awgProbeClientOS(am *awg.Manager) error {
+	cfg := am.RuntimeConfig()
+	p, ok := am.RouterPeer()
+	if !ok {
+		return fmt.Errorf("пир роутера отсутствует")
+	}
+	key, err := base64.StdEncoding.DecodeString(strings.TrimSpace(cfg.PublicKey))
+	if err != nil || len(key) != 32 {
+		return fmt.Errorf("некорректный публичный ключ сервера")
+	}
+	prefix := "set=1\npublic_key=" + hex.EncodeToString(key) + "\npersistent_keepalive_interval="
+	iface := awgClientIfaceName(cfg)
+	resp, err := uapiRequestIfaceContext(svc.clientOpContext(), iface, prefix+"0\n\n")
+	if err != nil || !strings.Contains(resp, "errno=0") {
+		return fmt.Errorf("keepalive probe: %v %s", err, strings.TrimSpace(resp))
+	}
+	interval := cfg.PeerKeepaliveValue(p)
+	restoreInterval := interval
+	if interval == "0" || interval == "" {
+		interval = "25"
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	resp, err = uapiRequestIfaceContext(ctx, iface, prefix+interval+"\n\n")
+	if err != nil || !strings.Contains(resp, "errno=0") {
+		return fmt.Errorf("keepalive restore: %v %s", err, strings.TrimSpace(resp))
+	}
+	if restoreInterval == "0" {
+		resp, err = uapiRequestIfaceContext(ctx, iface, prefix+"0\n\n")
+		if err != nil || !strings.Contains(resp, "errno=0") {
+			return fmt.Errorf("keepalive disable restore: %v %s", err, strings.TrimSpace(resp))
+		}
+	}
+	return nil
+}
+
+func (svc *Service) awgRecoverClientOS(am *awg.Manager) error {
+	ctx := svc.clientOpContext()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if !awgShouldAutostartClient(am.RuntimeConfig()) {
+		return fmt.Errorf("туннель выключен")
+	}
+	if _, changed, err := am.EnsureRouterPeer(ctx); err != nil {
+		return err
+	} else if changed {
+		if err := svc.awgSaveErr(); err != nil {
+			return err
+		}
+	}
+	return svc.awgRestartLocalClientOS(am)
+}
+
+func (svc *Service) awgRestartLocalClientOS(am *awg.Manager) error {
+	if err := svc.awgClientUpManagerOS(am); err != nil {
+		return err
+	}
+	if err := svc.clientOpContext().Err(); err != nil {
+		return err
+	}
+	return svc.awgRestoreClientRoutesOS(am)
+}
+
+// Recovering one interface does not stop DNS, flush learned ipsets, change the
+// selected profile, or toggle committed routing. Re-pin endpoints and restore
+// device routes lost by ip link del, then re-render the existing hook in place.
+func (svc *Service) awgRestoreClientRoutesOS(am *awg.Manager) (restoreErr error) {
+	if am == nil {
+		return nil
+	}
+	if err := svc.clientOpContext().Err(); err != nil {
+		return err
+	}
+	if outer := svc.doubleTunnelOuter(am); outer != nil {
+		if err := svc.repairDoubleTunnelTransportOS(am, outer); err != nil {
+			return err
+		}
+	}
+	if !awgShouldRestoreRouting(am.RuntimeConfig()) {
+		return nil
+	}
+	rules, tunnels := svc.awgBuildMultiPolicyCached()
+	if len(rules) == 0 || len(tunnels) == 0 {
+		if am == svc.awgActive() && am.RuntimeConfig().Routing.Mode == "full" {
+			return svc.awgRestoreLegacyClientRoutesOS(am)
+		}
+		return nil
+	}
+	return svc.awgRestoreMultiPolicyOS(rules, tunnels)
+}
+
+// Failover changes the selected tunnel while domain intent and learned sets
+// stay intact. Share recovery's in-place refresh instead of clearing all sets.
+func (svc *Service) awgRestoreMultiPolicyOS(rules []awgMultiRule, tunnels []awgMultiTunnel) (restoreErr error) {
+	wasReady := svc.RoutingDNSReadiness().Ready
+	finishDNS := svc.routingDNSGate.begin(false)
+	defer func() { finishDNS(restoreErr) }()
+	if err := svc.awgBeginAccelerationTransition(); err != nil {
+		return err
+	}
+	_, missing := os.Stat(awgMultiHookPath)
+	// A failed apply can leave the hook file present but its sets incomplete.
+	// Healthy tunnel recovery keeps learned sets; failed readiness repairs them.
+	if err := awgRestoreRoutingSets(missing != nil, wasReady, func() error { return awgWriteMultiSets(rules) }); err != nil {
+		return err
+	}
+	if err := svc.awgInstallMultiRoutes(tunnels); err != nil {
+		return err
+	}
+	svc.route.mu.Lock()
+	proxy := svc.route.dnsProxy
+	svc.route.mu.Unlock()
+	dnsOn := proxy != nil && proxy.Running()
+	if !dnsOn || missing != nil || !wasReady {
+		dnsOn = svc.awgEnsureMultiDNSProxy(rules)
+	}
+	if awgMultiDynamicRuleCount(rules) > 0 && !dnsOn {
+		return fmt.Errorf("multi-routing: DNS route learner failed to start")
+	}
+	if err := svc.awgWriteMultiHook(tunnels, rules, dnsOn); err != nil {
+		return err
+	}
+	if err := svc.awgFinishAccelerationTransition(); err != nil {
+		return err
+	}
+	// Recovery may resolve a new engine endpoint or choose a new fallback.
+	// Replace the watchdog's installed-policy snapshot too; keeping the old
+	// snapshot would reassert the previous endpoint/rules on its next tick.
+	svc.awgStartMultiPolicyRefresh(rules, tunnels)
+	return nil
+}
+
+// The legacy full-tunnel mode has no zones and therefore no multi-policy
+// rules. Preserve its committed datapath without resetting DNS/learned sets.
+func (svc *Service) awgRestoreLegacyClientRoutesOS(am *awg.Manager) (restoreErr error) {
+	cfg := am.RuntimeConfig()
+	endpointIP := svc.cachedPolicyEndpointIP(hostOf(cfg.Endpoint))
+	gw, dev := awgEndpointDefaultRoute(endpointIP)
+	if endpointIP == "" || dev == "" {
+		return fmt.Errorf("не удалось определить WAN-маршрут до endpoint")
+	}
+	wasReady := svc.RoutingDNSReadiness().Ready
+	finishDNS := svc.routingDNSGate.begin(false)
+	defer func() { finishDNS(restoreErr) }()
+	if err := svc.awgBeginAccelerationTransition(); err != nil {
+		return err
+	}
+	_, missing := os.Stat(awgHookPath)
+	if err := awgRestoreRoutingSets(missing != nil, wasReady, func() error {
+		// Full mode needs only empty set definitions; packet routing is in
+		// the blanket firewall rule, not a bulk resolution of old zones.
+		if err := svc.awgBuildRecoveryFullSets(); err != nil {
+			return err
+		}
+		if awgUsesDNSProxy(&cfg) {
+			awgRestoreSets()
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	if err := awgRunCheck(awgEndpointRouteCmd(endpointIP, gw, dev)); err != nil {
+		return err
+	}
+	iface := awgClientIfaceName(cfg)
+	if err := svc.awgInstallLegacyPolicyRoutes(cfg, true); err != nil {
+		return err
+	}
+	svc.route.mu.Lock()
+	dnsOn := svc.route.dnsProxy != nil
+	refreshing := svc.route.stopRefresh != nil
+	svc.route.active = true
+	svc.route.mu.Unlock()
+	if !dnsOn {
+		dnsOn = svc.awgEnsureDNSProxy(&cfg)
+	}
+	permanent := cfg.Client.DoubleTunnelMode == awg.DoubleTunnelPermanent
+	if err := awgWriteHook(iface, awgEffectiveMode(cfg.Routing), endpointIP, dev, awgActiveTunnelMTU(cfg), dnsOn, permanent || awgTunnelV6Reaches(), permanent, cfg.Routing.Zones, svc.awgLegacyHookEndpoints(am, cfg)...); err != nil {
+		return err
+	}
+	if !refreshing {
+		svc.awgStartRefresh()
+	}
+	return nil
+}
+
+func (svc *Service) awgBuildRecoveryFullSets() error {
+	var b strings.Builder
+	for _, set := range []string{awgSetInc, awgSetExc} {
+		b.WriteString("create " + set + " hash:net family inet -exist\n")
+		b.WriteString("create " + set + "_6 hash:net family inet6 -exist\n")
+	}
+	_, err := awgRunStdin("ipset restore -exist", b.String())
+	return err
+}

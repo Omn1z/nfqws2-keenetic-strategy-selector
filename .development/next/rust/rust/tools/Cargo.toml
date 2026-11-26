@@ -1,0 +1,15 @@
+[package]
+name = "nfqws2-tools"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+nfqws2-blockcheck = { path = "../blockcheck" }
+nfqws2-geo = { path = "../geo" }
+nfqws2-runs = { path = "../runs" }
+nfqws2-strategies = { path = "../service-strategies" }
+
+[dev-dependencies]
+serde_json.workspace = true
+tempfile = "3"

@@ -1,0 +1,412 @@
+import { useEffect, useRef, useState } from "react";
+import { api, downloadFile, uploadForm } from "@/lib/api";
+import { cn } from "@/lib/cn";
+import { usePoll } from "@/lib/hooks";
+import { useStore } from "@/providers/StoreProvider";
+import { toast } from "@/components/ui/Toast";
+import { confirmDialog } from "@/components/ui/Confirm";
+import { Card } from "@/components/ui/Card";
+import { Badge } from "@/components/ui/Badge";
+import { PageHeader, StatsStrip, compactCard } from "@/components/ui/FeaturePage";
+import { Button } from "@/components/ui/Button";
+import { Modal } from "@/components/ui/Modal";
+import { Dropzone } from "@/components/ui/Dropzone";
+import { Field, Input, Select } from "@/components/ui/form";
+import { Pager, pageSlice } from "@/components/ui/Pager";
+import { EmptyRow, SortTh, TableWrap, nextSort, tableCls, tdCls, thBase } from "@/components/ui/Table";
+import type { Sort } from "@/components/ui/Table";
+import type { BlobCapture, BlobCaptureStart, ClientHelloCandidate, Device, InstallResult } from "@/types/api";
+import { availableBlobSelection, blobCatalog, blobRows, type BlobSource } from "./blobCatalog";
+
+const blobName = (sni: string, fallback = "site") => `clienthello_${(sni || fallback).replace(/[^\w.-]+/g, "_")}.bin`;
+
+const ALPN_OPTS = [
+  { v: "h2,http/1.1", l: "h2 + http/1.1" },
+  { v: "h2", l: "только h2" },
+  { v: "http/1.1", l: "только http/1.1" },
+  { v: "", l: "без ALPN" },
+];
+const VER_OPTS = [
+  { v: "0", l: "авто (1.2–1.3)" },
+  { v: "771", l: "TLS 1.2" },
+  { v: "772", l: "TLS 1.3" },
+];
+
+// One captured ClientHello: shows its SNI/destination and saves it under an editable name.
+function CandidateRow({ c, index, onSave, disabled }: { c: ClientHelloCandidate; index: number; onSave: (i: number, name: string) => void; disabled?: boolean }) {
+  const [name, setName] = useState(blobName(c.sni, c.dst_ip));
+  return (
+    <div className="min-w-0 border-t border-line-soft py-2 [overflow-wrap:anywhere] first:border-t-0">
+      <div className="flex flex-wrap items-center gap-2">
+        <span className={cn("text-xs font-bold", c.valid ? "text-ok" : "text-bad")} title={c.detail}>{c.valid ? "✓" : "✗"}</span>
+        <span className="max-w-full font-mono text-xs font-semibold">{c.sni || "(без SNI)"}</span>
+        <span className="max-w-full text-xs text-muted">→ {c.dst_ip.includes(":") ? `[${c.dst_ip}]` : c.dst_ip}:{c.dst_port} · {c.size} Б</span>
+        <Input aria-label={`Имя блоба для кандидата ${index + 1}`} className="min-w-0 flex-1 basis-full sm:basis-48" value={name} disabled={disabled} onChange={(e) => setName(e.target.value)} />
+        <Button mini disabled={disabled} onClick={() => onSave(index, name)}>Сохранить</Button>
+      </div>
+      <div className={cn("mt-0.5 text-[11px]", c.valid ? "text-muted" : "text-bad")}>{c.detail}</div>
+    </div>
+  );
+}
+
+function helloCount(capture: BlobCapture) {
+  return capture.metadata_only
+    ? Object.values(capture.observations ?? {}).reduce((total, row) => total + row.headers, 0)
+    : (capture.candidates ?? []).length;
+}
+
+export default function Blobs() {
+  const { blobs, reloadBlobs } = useStore();
+  const [sel, setSel] = useState<Set<string>>(new Set());
+  const [status, setStatus] = useState("");
+  const [busy, setBusy] = useState<string | null>(null);
+  const pending = useRef(false);
+
+  const [mode, setMode] = useState<"capture" | "generate">("capture");
+  const [genSni, setGenSni] = useState("");
+  const [genAlpn, setGenAlpn] = useState(ALPN_OPTS[0].v);
+  const [genVer, setGenVer] = useState(VER_OPTS[0].v);
+  const [genName, setGenName] = useState("");
+  const [generating, setGenerating] = useState(false);
+
+  const [devices, setDevices] = useState<Device[]>([]);
+  const [capIP, setCapIP] = useState("");
+  const [capSecs, setCapSecs] = useState(20);
+  const [cap, setCap] = useState<BlobCapture | null>(null);
+  const [capturing, setCapturing] = useState(false);
+  const [installPackage, setInstallPackage] = useState<"tcpdump" | "nfqws2-strategy-trace" | null>(null);
+  const [installing, setInstalling] = useState(false);
+
+  const [blobQ, setBlobQ] = useState("");
+  const [blobSource, setBlobSource] = useState<BlobSource>("all");
+  const [blobSort, setBlobSort] = useState<Sort>({ key: "name", dir: 1 });
+  const [blobPage, setBlobPage] = useState(1);
+  const [blobPageSize, setBlobPageSize] = useState("20");
+  const [trashQ, setTrashQ] = useState("");
+  const [trashPage, setTrashPage] = useState(1);
+  const [trashPageSize, setTrashPageSize] = useState("20");
+
+  usePoll(async () => {
+    try { const v = await api<{ devices: Device[] }>("GET", "/api/devices"); setDevices(v.devices ?? []); } catch { /* ignore */ }
+  }, 15000);
+  useEffect(() => { if (!capIP && devices.length) setCapIP(devices[0].ip); }, [capIP, devices]);
+
+  usePoll(async () => {
+    if (!cap) return;
+    try {
+      const c = await api<BlobCapture>("GET", `/api/blobcap/${cap.id}`);
+      setCap(c);
+      if (c.status !== "running") {
+        setCapturing(false);
+        const n = helloCount(c);
+        toast(c.status === "error" ? `Захват: ${c.error}` : `Поймано ClientHello: ${n}`, c.status === "error" ? "err" : n ? "ok" : "warn");
+      }
+    } catch (e) { setCapturing(false); toast((e as Error).message, "err"); }
+  }, 1000, capturing);
+
+  const all = blobCatalog(blobs);
+  const shadowed = blobs.system.some(name => blobs.custom.includes(name));
+  const shown = blobRows(all, blobQ, blobSource, blobSort);
+  useEffect(() => { setSel(selection => availableBlobSelection(selection, blobCatalog(blobs))); }, [blobs.custom, blobs.system]);
+  const allShownSelected = shown.length > 0 && shown.every((b) => sel.has(b.name));
+  const toggle = (n: string) => setSel((s) => { const x = new Set(s); if (x.has(n)) x.delete(n); else x.add(n); return x; });
+  const toggleAll = () => setSel((s) => { const x = new Set(s); shown.forEach((b) => (allShownSelected ? x.delete(b.name) : x.add(b.name))); return x; });
+  const selCustom = () => [...sel].filter((n) => blobs.custom.includes(n));
+
+  const tq = trashQ.trim().toLowerCase();
+  const shownTrash = tq ? blobs.trash.filter((n) => n.toLowerCase().includes(tq)) : blobs.trash;
+
+  const perform = async (key: string, operation: () => Promise<void>) => {
+    if (pending.current) return;
+    pending.current = true; setBusy(key);
+    try { await operation(); }
+    catch (error) { toast((error as Error).message, "err"); }
+    finally { pending.current = false; setBusy(null); }
+  };
+  const disabled = busy !== null;
+
+  const validate = async (name: string) => {
+    try { const r = await api<{ valid: boolean; detail: string }>("GET", `/api/blobs/${encodeURIComponent(name)}/validate`); toast(`${name}: ${r.detail}`, r.valid ? "ok" : "warn"); }
+    catch (e) { toast((e as Error).message, "err"); }
+  };
+
+  const upload = async (files: FileList) => {
+    const arr = Array.from(files);
+    if (!arr.length) return;
+    const existing = new Set(blobs.custom.map((n) => n.toLowerCase()));
+    const dups: string[] = [];
+    const queue = arr.filter((f) => {
+      if (/\.zip$/i.test(f.name)) return true;
+      if (existing.has(f.name.toLowerCase())) { dups.push(f.name); return false; }
+      return true;
+    });
+    if (dups.length) toast(`Пропущены дубликаты (${dups.length}): ${dups.join(", ")}`, "warn");
+    if (!queue.length) { setStatus(`дубликаты пропущены: ${dups.length}`); return; }
+    let ok = 0;
+    for (const file of queue) {
+      setStatus(`Загрузка: ${file.name}`);
+      const zip = /\.zip$/i.test(file.name);
+      const fd = new FormData();
+      fd.append("file", file);
+      try { const d = await uploadForm<{ imported?: number }>(zip ? "/api/blobs/zip" : "/api/blobs", fd); ok += zip ? (d.imported ?? 0) : 1; }
+      catch (e) { toast(`${file.name}: ${(e as Error).message}`, "err"); }
+    }
+    setStatus(`✓ загружено: ${ok}${dups.length ? ` · пропущено дубликатов: ${dups.length}` : ""}`);
+    if (ok) toast(`Блобы загружены: ${ok}`, "ok");
+    await reloadBlobs();
+    setSel(new Set());
+  };
+
+  // Delete is reversible (moves to the trash), so no confirm — restore from «Корзина».
+  const del = async (name: string) => {
+    try { await api("DELETE", `/api/blobs/${encodeURIComponent(name)}`); toast(`«${name}» в корзине`, "ok"); await reloadBlobs(); }
+    catch (e) { toast((e as Error).message, "err"); }
+  };
+  const delSel = async () => {
+    const names = selCustom();
+    if (!names.length) { toast("Выберите пользовательские блобы", "err"); return; }
+    for (const n of names) { try { await api("DELETE", `/api/blobs/${encodeURIComponent(n)}`); } catch (e) { toast(`${n}: ${(e as Error).message}`, "err"); } }
+    toast(`В корзину: ${names.length}`, "ok");
+    await reloadBlobs();
+    setSel(new Set());
+  };
+  const exportSel = async () => {
+    const names = [...sel];
+    if (!names.length) { toast("Выберите блобы для экспорта", "err"); return; }
+    await downloadFile("/api/blobs/export", "blobs.zip", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ names }) }).catch((e) => toast((e as Error).message, "err"));
+  };
+
+  const restore = async (name: string) => {
+    try { await api("POST", `/api/blobs/${encodeURIComponent(name)}/restore`); toast(`«${name}» восстановлен`, "ok"); await reloadBlobs(); }
+    catch (e) { toast((e as Error).message, "err"); }
+  };
+  const purge = async (name: string) => {
+    if (!(await confirmDialog({ title: `Удалить «${name}» навсегда?`, body: "Это действие необратимо.", confirmLabel: "Удалить навсегда", danger: true }))) return;
+    try { await api("DELETE", `/api/blobs/trash/${encodeURIComponent(name)}`); toast("Удалено навсегда", "ok"); await reloadBlobs(); }
+    catch (e) { toast((e as Error).message, "err"); }
+  };
+  const emptyTrash = async () => {
+    if (!(await confirmDialog({ title: `Очистить корзину (${blobs.trash.length})?`, body: "Это действие необратимо.", confirmLabel: "Очистить", danger: true }))) return;
+    try { await api("POST", "/api/blobs/trash/empty"); toast("Корзина очищена", "ok"); await reloadBlobs(); }
+    catch (e) { toast((e as Error).message, "err"); }
+  };
+
+  const doGenerate = async () => {
+    const sni = genSni.trim();
+    if (!sni) { toast("Укажите домен (SNI)", "err"); return; }
+    const name = genName.trim() || blobName(sni);
+    setGenerating(true);
+    try {
+      await api("POST", "/api/blobs/generate", { sni, alpn: genAlpn ? genAlpn.split(",") : [], min_version: Number(genVer), name });
+      toast(`Блоб «${name}» создан`, "ok");
+      setGenSni(""); setGenName("");
+      await reloadBlobs();
+    } catch (e) { toast((e as Error).message, "err"); }
+    finally { setGenerating(false); }
+  };
+
+  const beginCapture = async (ip: string) => {
+    if (!ip) { toast("Выберите устройство", "err"); return; }
+    try {
+      const r = await api<BlobCaptureStart>("POST", `/api/devices/${encodeURIComponent(ip)}/blobcap`, { seconds: capSecs });
+      if ("need_install" in r) {
+        if (r.package === "tcpdump" || r.package === "nfqws2-strategy-trace") setInstallPackage(r.package);
+        else toast("Сервер запросил неизвестный модуль", "err");
+        return;
+      }
+      setCap(r); setCapturing(true); toast(`Захват ClientHello на ${ip} (${r.seconds} с)`, "ok");
+    } catch (e) { toast((e as Error).message, "err"); }
+  };
+  const confirmInstall = async () => {
+    if (!installPackage) return;
+    setInstalling(true);
+    try {
+      const r = await api<InstallResult>("POST", "/api/system/install", { package: installPackage });
+      if (!r.ok) { toast(`Не удалось установить ${installPackage}: ${r.error ?? ""}`, "err"); return; }
+      toast(`Пакет ${installPackage} установлен`, "ok"); setInstallPackage(null); await beginCapture(capIP);
+    } catch (e) { toast((e as Error).message, "err"); }
+    finally { setInstalling(false); }
+  };
+  const saveCandidate = async (index: number, name: string) => {
+    if (!cap) return;
+    const nm = name.trim();
+    if (!nm) { toast("Укажите имя блоба", "err"); return; }
+    try { await api("POST", `/api/blobcap/${cap.id}/save`, { index, name: nm }); toast(`Блоб «${nm}» сохранён`, "ok"); await reloadBlobs(); }
+    catch (e) { toast((e as Error).message, "err"); }
+  };
+
+  const cb = "h-4 w-4 rounded-[4px] accent-[var(--c-accent)] outline-none focus-visible:ring-2 focus-visible:ring-ring/40";
+  const seg = (m: "capture" | "generate", label: string) => (
+    <Button mini variant="ghost" aria-pressed={mode === m} disabled={disabled} onClick={() => setMode(m)} className={mode === m ? "bg-panel shadow-sm" : "text-muted"}>{label}</Button>
+  );
+
+  return (
+    <div className="flex min-w-0 flex-col gap-4">
+      <PageHeader title="Блобы" description="Бинарные файлы для фейковых пакетов: захват, генерация и каталог дампов." />
+      <StatsStrip label="Сводка блобов" items={[
+        { label: "Каталог", value: all.length, hint: "Доступные уникальные имена" },
+        { label: "Пользовательские", value: blobs.custom.length, hint: "Загруженные и созданные файлы" },
+        { label: "Системные", value: blobs.system.length, hint: "Файлы из поставки nfqws2" },
+        { label: "Корзина", value: blobs.trash.length, hint: "Можно восстановить" },
+        { label: "ClientHello", value: cap ? helloCount(cap) : "—", hint: capturing ? "Идёт наблюдение" : cap ? "Последний замер" : "Замеров ещё нет" },
+      ]} />
+      <div className="grid min-w-0 gap-4 xl:grid-cols-2">
+      <Card title="TLS ClientHello" className={compactCard}>
+        <div role="group" aria-label="Способ создания блоба" className="mb-3 inline-flex max-w-full flex-wrap gap-0.5 rounded-md border border-line bg-line-soft p-0.5">{seg("capture", "С трафика")}{seg("generate", "Генератор")}</div>
+
+        {mode === "capture" ? (
+          <>
+            <div className="grid min-w-0 items-end gap-3 sm:grid-cols-3">
+              <Field label="Устройство" className="min-w-0 sm:col-span-2">
+                <Select value={capIP} disabled={disabled || capturing} onChange={(e) => setCapIP(e.target.value)}>
+                  {!devices.length && <option value="">нет устройств</option>}
+                  {devices.map((d) => <option key={d.ip} value={d.ip}>{d.ip}{d.mac ? ` · ${d.mac}` : ""}</option>)}
+                </Select>
+              </Field>
+              <Field label="Длительность" className="min-w-0">
+                <Select value={String(capSecs)} disabled={disabled || capturing} onChange={(e) => setCapSecs(Number(e.target.value))}>
+                  <option value="10">10 секунд</option>
+                  <option value="20">20 секунд</option>
+                  <option value="30">30 секунд</option>
+                </Select>
+              </Field>
+            </div>
+            <p className="mt-2 text-xs text-muted">Запустите захват и откройте нужный сайт на выбранном устройстве — поймаем его ClientHello.</p>
+            <div className="mt-3 border-t border-line-soft pt-3"><Button variant="primary" onClick={() => { void perform("capture", () => beginCapture(capIP)); }} disabled={disabled || capturing || installing || !capIP}>{capturing || busy === "capture" ? "Захват…" : "Начать захват"}</Button></div>
+            {cap && (
+              <div className="mt-3 rounded-lg border border-line bg-input p-3">
+                <div className="mb-2 flex flex-wrap items-center gap-3 text-xs text-ink-soft">
+                  <span className="max-w-full font-mono [overflow-wrap:anywhere]">{cap.ip} · {cap.iface}</span>
+                  <span className="max-w-full [overflow-wrap:anywhere]">{capturing ? "идёт захват…" : cap.status === "error" ? `ошибка: ${cap.error}` : `готово · ${(cap.elapsed_ms / 1000).toFixed(1)} с`}</span>
+                  <Button mini variant="ghost" className="ml-auto" onClick={() => { setCap(null); setCapturing(false); }}>Закрыть</Button>
+                </div>
+                {capturing && (
+                  <div className="mb-2 h-2 overflow-hidden rounded-full bg-line">
+                    <div className="h-full rounded-full bg-accent transition-[width]" style={{ width: `${Math.min(100, (Date.now() / 1000 - cap.started_at) / cap.seconds * 100)}%` }} />
+                  </div>
+                )}
+                {cap.metadata_only && <p className="my-2 text-xs text-muted">Показаны адреса назначения и число наблюдавшихся заголовков ClientHello. {cap.limited && "Достигнут лимит наблюдения."}</p>}
+                {Object.entries(cap.observations ?? {}).map(([address, row]) => (
+                  <p key={address} className="border-t border-line-soft py-2 font-mono text-xs">{address} · {row.headers} ClientHello · {row.record_bytes} Б по заголовкам TLS</p>
+                ))}
+                {!capturing && cap.status === "done" && helloCount(cap) === 0 && (
+                  <p className="text-xs text-muted">Ничего не поймано. Откройте нужный сайт на устройстве и повторите захват.</p>
+                )}
+                <div className="max-h-80 min-w-0 overflow-y-auto">{(cap.candidates ?? []).map((c, i) => <CandidateRow key={`${cap.id}:${i}`} c={c} index={i} disabled={disabled} onSave={(index, name) => { void perform(`candidate:${index}`, () => saveCandidate(index, name)); }} />)}</div>
+              </div>
+            )}
+          </>
+        ) : (
+          <fieldset disabled={disabled || generating} className="grid min-w-0 gap-3 sm:grid-cols-2">
+            <Field label="Домен (SNI)"><Input value={genSni} onChange={(e) => setGenSni(e.target.value)} placeholder="www.google.com" /></Field>
+            <Field label="ALPN"><Select value={genAlpn} onChange={(e) => setGenAlpn(e.target.value)}>{ALPN_OPTS.map((o) => <option key={o.v} value={o.v}>{o.l}</option>)}</Select></Field>
+            <Field label="Версия TLS"><Select value={genVer} onChange={(e) => setGenVer(e.target.value)}>{VER_OPTS.map((o) => <option key={o.v} value={o.v}>{o.l}</option>)}</Select></Field>
+            <Field label="Имя блоба"><Input value={genName} onChange={(e) => setGenName(e.target.value)} placeholder={blobName(genSni)} /></Field>
+            <div className="border-t border-line-soft pt-3 sm:col-span-2"><Button variant="primary" onClick={() => { void perform("generate", doGenerate); }}>{generating ? "Создание…" : "Создать"}</Button></div>
+          </fieldset>
+        )}
+      </Card>
+
+      <Card title="Загрузка дампов" sub="Файлы .bin / ZIP" className={compactCard}>
+        <p className="mb-3 text-xs text-muted">Можно загрузить несколько файлов сразу или ZIP-архив. Уже существующие пользовательские имена файлов пропускаются.</p>
+        <fieldset disabled={disabled} className="min-w-0">
+        <Dropzone multiple onFiles={files => { void perform("upload", () => upload(files)); }}>
+          <svg className="mx-auto mb-2 text-accent" viewBox="0 0 24 24" width="34" height="34" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 16V4m0 0 4 4m-4-4L8 8M5 16v2a2 2 0 0 0 2 2h10a2 2 0 0 0 2-2v-2" /></svg>
+          <div className="text-xs"><b className="text-ink">Перетащите файлы или ZIP</b> или нажмите, чтобы выбрать</div>
+          <div role="status" className="mt-1.5 min-h-4 text-xs font-medium text-ink-soft [overflow-wrap:anywhere]">{status}</div>
+        </Dropzone>
+        </fieldset>
+        <p className="mt-3 border-t border-line-soft pt-3 text-[11px] text-muted [overflow-wrap:anywhere]">Синтаксис в стратегии: <code>--blob=имя:@/путь</code></p>
+      </Card>
+      </div>
+
+      <Card
+        title="Хранилище дампов"
+        sub={`${shown.length} из ${all.length}`}
+        className={compactCard}
+        head={<span className="text-xs text-muted">Выбрано: {sel.size}</span>}
+      >
+        <div className="mb-3 flex flex-wrap items-center gap-2.5">
+          <Input type="search" aria-label="Поиск блобов" value={blobQ} onChange={(e) => { setBlobQ(e.target.value); setBlobPage(1); }} placeholder="Поиск по имени блоба…" className="min-w-0 flex-1 basis-full sm:basis-60" />
+          <Select aria-label="Источник блобов" value={blobSource} onChange={event => { setBlobSource(event.target.value as BlobSource); setBlobPage(1); }} className="w-full sm:w-40"><option value="all">Все источники</option><option value="custom">Пользовательские</option><option value="system">Системные</option></Select>
+          <Button mini disabled={disabled || !sel.size} onClick={() => { void perform("export", exportSel); }}>{busy === "export" ? "Экспорт…" : "Экспорт выбранных (ZIP)"}</Button>
+          <Button mini variant="danger" disabled={disabled || !selCustom().length} onClick={() => { void perform("delete-selected", delSel); }}>В корзину</Button>
+        </div>
+        {shadowed && <p className="mb-3 text-[11px] leading-relaxed text-muted">Своя версия заменяет встроенный файл с тем же именем. В каталоге каждое имя показано один раз.</p>}
+        <TableWrap scrollable>
+          <table className={cn(tableCls, "min-w-[660px]")}>
+            <thead><tr><th className={cn(thBase, "w-8")}><input type="checkbox" aria-label="Выбрать все отфильтрованные блобы" className={cb} checked={allShownSelected} disabled={disabled || !shown.length} onChange={toggleAll} /></th><SortTh label="Имя файла" k="name" sort={blobSort} onSort={key => setBlobSort(sort => nextSort(sort, key, 1))} /><SortTh label="Тип" k="type" sort={blobSort} onSort={key => setBlobSort(sort => nextSort(sort, key, 1))} /><th className={cn(thBase, "text-right")}>Действия</th></tr></thead>
+            <tbody>
+              {shown.length === 0 && <EmptyRow colSpan={4}>{all.length ? "Ничего не найдено." : "Нет блобов."}</EmptyRow>}
+              {pageSlice(shown, blobPage, blobPageSize).map((b) => (
+                <tr key={b.name} className="hover:bg-line-soft">
+                  <td className={cn(tdCls, "align-middle")}><input type="checkbox" aria-label={`Выбрать ${b.name}`} className={cb} checked={sel.has(b.name)} disabled={disabled} onChange={() => toggle(b.name)} /></td>
+                  <td className={cn(tdCls, "min-w-48 max-w-96 font-mono text-xs [overflow-wrap:anywhere]")}>{b.name}</td>
+                  <td className={tdCls}><Badge>{b.custom ? "свой" : "системный"}</Badge></td>
+                  <td className={cn(tdCls, "text-right")}>
+                    <div className="flex flex-wrap justify-end gap-1.5">
+                      <Button mini variant="ghost" disabled={disabled} onClick={() => { void perform(`validate:${b.name}`, () => validate(b.name)); }}>{busy === `validate:${b.name}` ? "Проверка…" : "Проверить"}</Button>
+                      {b.custom && <Button mini variant="danger" title={`Переместить ${b.name} в корзину`} aria-label={`В корзину ${b.name}`} disabled={disabled} onClick={() => { void perform(`delete:${b.name}`, () => del(b.name)); }}>В корзину</Button>}
+                    </div>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </TableWrap>
+        <div className="mt-3 border-t border-line-soft pt-0.5"><Pager total={shown.length} page={blobPage} setPage={setBlobPage} pageSize={blobPageSize} setPageSize={setBlobPageSize} /></div>
+      </Card>
+
+      {blobs.trash.length > 0 && (
+        <Card
+          title="Корзина"
+          sub={`${blobs.trash.length}`}
+          className={compactCard}
+          head={
+            <div className="flex flex-wrap items-center gap-2">
+              <Button mini variant="danger" disabled={disabled} onClick={() => { void perform("empty-trash", emptyTrash); }}>Очистить корзину</Button>
+            </div>
+          }
+        >
+          <p className="mb-3 text-xs text-muted">Удалённые блобы хранятся здесь — можно восстановить или удалить навсегда.</p>
+          <Input type="search" aria-label="Поиск в корзине блобов" value={trashQ} onChange={(e) => { setTrashQ(e.target.value); setTrashPage(1); }} placeholder="Поиск по имени…" className="mb-3 min-w-0 w-full sm:max-w-sm" />
+          <TableWrap scrollable>
+            <table className={cn(tableCls, "min-w-[540px]")}>
+              <thead><tr><th className={thBase}>Имя файла</th><th className={cn(thBase, "w-56 text-right")}>Действия</th></tr></thead>
+              <tbody>
+                {shownTrash.length === 0 && <EmptyRow colSpan={2}>Ничего не найдено.</EmptyRow>}
+                {pageSlice(shownTrash, trashPage, trashPageSize).map((n) => (
+                  <tr key={n} className="hover:bg-line-soft">
+                    <td className={cn(tdCls, "max-w-96 font-mono text-xs [overflow-wrap:anywhere]")}>{n}</td>
+                    <td className={cn(tdCls, "text-right")}>
+                      <div className="flex flex-wrap justify-end gap-2">
+                        <Button mini disabled={disabled} onClick={() => { void perform(`restore:${n}`, () => restore(n)); }}>Восстановить</Button>
+                        <Button mini variant="danger" disabled={disabled} onClick={() => { void perform(`purge:${n}`, () => purge(n)); }}>Удалить навсегда</Button>
+                      </div>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </TableWrap>
+          <Pager total={shownTrash.length} page={trashPage} setPage={setTrashPage} pageSize={trashPageSize} setPageSize={setTrashPageSize} />
+        </Card>
+      )}
+
+      {installPackage && (
+        <Modal
+          title={`Нужен пакет ${installPackage}`}
+          onClose={() => { if (!installing) setInstallPackage(null); }}
+          actions={
+            <>
+              <Button variant="ghost" onClick={() => setInstallPackage(null)} disabled={installing}>Отмена</Button>
+              <Button variant="primary" onClick={() => { void perform("install", confirmInstall); }} disabled={disabled || installing}>{installing ? "Установка…" : "Установить"}</Button>
+            </>
+          }
+        >
+          <p>После установки <b>{installPackage}</b> панель повторит запрос диагностики для выбранного устройства.</p>
+        </Modal>
+      )}
+    </div>
+  );
+}

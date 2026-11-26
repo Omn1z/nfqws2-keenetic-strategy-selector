@@ -1,0 +1,20 @@
+[package]
+name="nfqws2-awg-rules"
+version="0.1.0"
+edition="2021"
+publish=false
+
+[dependencies]
+serde={workspace=true,features=["rc"]}
+serde_json={workspace=true,features=["raw_value"]}
+sha2="0.11"
+regex-syntax={version="0.8",default-features=false,features=["std"]}
+base64ct={version="1",features=["alloc"]}
+nfqws2-awg-profile={path="../awg-profile"}
+nfqws2-store={path="../store"}
+nfqws2-router-command={path="../router-command"}
+regex-lite = "0.1.9"
+flate2 = "1"
+
+[dev-dependencies]
+tempfile="3"

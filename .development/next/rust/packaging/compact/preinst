@@ -1,0 +1,12 @@
+#!/bin/sh
+# The first Go-to-Rust upgrade needs the old program and modules intact until
+# the unified installer records the running service and saves its rollback copy.
+set -eu
+[ -z "${IPKG_INSTROOT:-}" ] && [ "${N2S_INSTALLING_COMPACT:-0}" != 1 ] || exit 0
+bin=/opt/usr/bin/n2s
+[ "$(readlink "$bin" 2>/dev/null || true)" = /opt/lib/nfqws2-strategy/n2s-compact ] && [ -x "$bin" ] || exit 0
+if [ "$("$bin" prepare-go-routing --supported 2>/dev/null || true)" = go-routing-v1 ]; then
+  exit 0
+fi
+echo 'Run the Rust compact install.sh to upgrade the existing Go panel with settings and rollback.' >&2
+exit 1

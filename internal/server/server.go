@@ -5,11 +5,9 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
-	"embed"
 	"encoding/json"
 	"errors"
 	"io"
-	"io/fs"
 	"log"
 	"net/http"
 	"os"
@@ -29,9 +27,6 @@ import (
 	"nfqws2strategy/internal/tools/dns"
 	"nfqws2strategy/internal/tools/logbuf"
 )
-
-//go:embed all:web
-var webAssets embed.FS
 
 type Server struct {
 	app     *app.App
@@ -444,11 +439,7 @@ func (s *Server) routes() {
 
 // ---------- handlers ----------
 
-// serveIndex serves the single inlined index.html (JS+CSS embedded by the Vite
-// build). It is served with no-store — the whole UI is one file, so there are no
-// sub-assets to cache-bust, and a self-update is reflected immediately. The
-// response is gzipped when the client accepts it (the inlined file is ~280 KB
-// → ~84 KB on the wire).
+// serveIndex handles both static panel assets and browser deep links.
 func (s *Server) serveIndex(w http.ResponseWriter, r *http.Request) {
 	// Retired or unknown API endpoints must not look like successful JSON
 	// requests merely because the SPA accepts every browser navigation path.
@@ -456,22 +447,7 @@ func (s *Server) serveIndex(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	b, err := fs.ReadFile(webAssets, "web/index.html")
-	if err != nil {
-		http.Error(w, "index missing", 500)
-		return
-	}
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-store")
-	if strings.Contains(r.Header.Get("Accept-Encoding"), "gzip") {
-		w.Header().Set("Content-Encoding", "gzip")
-		gz := gzipWriterPool.Get().(*gzip.Writer)
-		gz.Reset(w)
-		defer func() { _ = gz.Close(); gzipWriterPool.Put(gz) }()
-		_, _ = gz.Write(b)
-		return
-	}
-	_, _ = w.Write(b)
+	servePanelAsset(w, r)
 }
 
 func (s *Server) getConfig(w http.ResponseWriter, r *http.Request) {
@@ -691,7 +667,12 @@ func (s *Server) clearLogs(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) getStrategies(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, 200, s.app.Strategies())
+	items, err := s.app.Strategies()
+	if err != nil {
+		httpErr(w, 500, err)
+		return
+	}
+	writeJSON(w, 200, items)
 }
 
 func (s *Server) saveStrategy(w http.ResponseWriter, r *http.Request) {
@@ -1024,27 +1005,17 @@ func (s *Server) getGeo(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) uploadGeo(w http.ResponseWriter, r *http.Request) {
-	if err := r.ParseMultipartForm(16 << 20); err != nil {
-		httpErr(w, 400, err)
-		return
-	}
-	kind := r.FormValue("kind")
-	f, hdr, err := r.FormFile("file")
+	form, err := r.MultipartReader()
 	if err != nil {
 		httpErr(w, 400, err)
 		return
 	}
-	defer f.Close()
-	data, err := io.ReadAll(io.LimitReader(f, 16<<20))
+	name, kind, err := s.app.SaveGeoUpload(form, r.URL.Query().Get("kind"))
 	if err != nil {
 		httpErr(w, 400, err)
 		return
 	}
-	if err := s.app.SaveGeoFile(hdr.Filename, kind, data); err != nil {
-		httpErr(w, 400, err)
-		return
-	}
-	writeJSON(w, 200, map[string]string{"name": hdr.Filename, "kind": kind})
+	writeJSON(w, 200, map[string]string{"name": name, "kind": kind})
 }
 
 func (s *Server) deleteGeo(w http.ResponseWriter, r *http.Request) {
@@ -1854,7 +1825,7 @@ func (s *Server) awg2SpeedTest(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(200)
 	_ = awgroute.JSONLine(w, map[string]any{"phase": "init", "url": url, "max_bytes": in.MaxBytes})
 
-	s.app.AWG2SpeedTest(ctx, awgroute.SpeedTestOptions{
+	result := s.app.AWG2SpeedTest(ctx, awgroute.SpeedTestOptions{
 		URL:      url,
 		Iface:    iface,
 		MaxBytes: in.MaxBytes,
@@ -1863,6 +1834,7 @@ func (s *Server) awg2SpeedTest(w http.ResponseWriter, r *http.Request) {
 			_ = awgroute.JSONLine(w, evt)
 		},
 	})
+	_ = awgroute.JSONLine(w, awgroute.SpeedEvent{Phase: "result", Result: &result})
 }
 
 func (s *Server) nfqws2StartSvc(w http.ResponseWriter, r *http.Request) {

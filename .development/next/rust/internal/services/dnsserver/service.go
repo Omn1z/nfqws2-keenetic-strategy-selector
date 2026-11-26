@@ -1,0 +1,594 @@
+package dnsserver
+
+import (
+	"context"
+	"fmt"
+	"net"
+	"os"
+	"reflect"
+	"strconv"
+	"sync"
+	"time"
+
+	mdns "github.com/miekg/dns"
+	"nfqws2strategy/internal/services/dnsroute"
+	"nfqws2strategy/internal/services/openwrtdns"
+	"nfqws2strategy/internal/tools/logbuf"
+	"nfqws2strategy/internal/tools/store"
+)
+
+const configFile = "dnsserver.json"
+
+type Stats struct {
+	BlockedTotal    uint64 `json:"blocked_total"`
+	BlockedAds      uint64 `json:"blocked_ads"`
+	BlockedTrackers uint64 `json:"blocked_trackers"`
+	BlockedMixed    uint64 `json:"blocked_mixed"`
+	Queries         uint64 `json:"queries"`
+	CacheHits       uint64 `json:"cache_hits"`
+	SharedResponses uint64 `json:"shared_responses"`
+	NFQWSSuccess    uint64 `json:"nfqws_success"`
+	AWGSuccess      uint64 `json:"awg_success"`
+	ShadowSuccess   uint64 `json:"shadow_success"`
+	Failures        uint64 `json:"failures"`
+	LastDomain      string `json:"last_domain"`
+	LastRoute       string `json:"last_route"`
+	LastUpstream    string `json:"last_upstream"`
+	LastCached      bool   `json:"last_cached"`
+	LastShared      bool   `json:"last_shared"`
+	LastError       string `json:"last_error"`
+	LastClientIP    string `json:"last_client_ip"`
+	LastSource      string `json:"last_source"`
+	LastTransport   string `json:"last_transport"`
+}
+type Endpoints struct {
+	DNS string `json:"dns"`
+}
+type Status struct {
+	ConfigHash    string           `json:"config_hash"`
+	ConfigError   string           `json:"config_error,omitempty"`
+	ConfigWarning string           `json:"config_warning,omitempty"`
+	ShadowDNS     ShadowDNSStatus  `json:"shadow_dns"`
+	Filtering     FilteringStatus  `json:"filtering"`
+	Config        Config           `json:"config"`
+	Running       bool             `json:"running"`
+	ListenHost    string           `json:"listen_host"`
+	Endpoints     Endpoints        `json:"endpoints"`
+	LastError     string           `json:"last_error"`
+	Stats         Stats            `json:"stats"`
+	Cache         CacheStatus      `json:"cache"`
+	FastDNS       FastDNSStatus    `json:"fast_dns"`
+	Routes        []dnsroute.Route `json:"routes"`
+}
+type serviceRun struct {
+	cancel    context.CancelFunc
+	listeners *Listeners
+	resolver  *Resolver
+	failure   chan error
+}
+
+type Service struct {
+	opMu          sync.Mutex
+	mu            sync.RWMutex
+	store         *store.Store
+	saveConfig    func(Config) error // optional per-instance persistence fault seam
+	backend       Backend
+	resolveHost   func(string) (string, error)
+	cfg           Config
+	configLoadErr error
+	configWarning string
+	host          string
+	lastError     string
+	stats         Stats
+	logs          *LogBuffer
+	scheduler     *Scheduler
+	filtering     *FilterManager
+	active        *serviceRun
+	controlCancel context.CancelFunc
+	openwrt       openWrtDNSManager
+}
+
+func New(st *store.Store, backend Backend, resolveHost func(string) (string, error)) *Service {
+	cfg := Default()
+	s := &Service{store: st, backend: backend, resolveHost: resolveHost, cfg: cfg, logs: NewLogBuffer(), scheduler: NewScheduler()}
+	s.openwrt = openwrtdns.New(st.Path(""))
+	if loaded, legacy, recovered, err := s.loadStoredConfig(); err == nil {
+		s.cfg = loaded
+		if recovered {
+			s.configWarning = "Настройки DNS восстановлены из резервной копии"
+		}
+		if legacy {
+			if err := st.Save(configFile, loaded); err != nil {
+				s.lastError = err.Error()
+			}
+		}
+	} else if os.IsNotExist(err) {
+		if err := st.Save(configFile, cfg); err != nil {
+			s.lastError = err.Error()
+		}
+	} else {
+		s.configLoadErr = err
+		s.lastError = err.Error()
+	}
+	var filterErr error
+	s.filtering, filterErr = NewFilterManager(st, s.cfg.Filtering)
+	if filterErr != nil {
+		s.lastError = "загрузка DNS-фильтров: " + filterErr.Error()
+	}
+	s.host, _ = s.resolveHost(s.cfg.ListenHost)
+	s.logs.SetEnabled(s.cfg.LoggingEnabled)
+	if s.lastError != "" {
+		s.logs.Append(LogEntry{Level: "error", Event: "config", Message: s.lastError})
+	}
+	return s
+}
+
+func (s *Service) Config() Config { s.mu.RLock(); defer s.mu.RUnlock(); return cloneConfig(s.cfg) }
+
+func (s *Service) Status() Status {
+	s.mu.RLock()
+	st := Status{Config: cloneConfig(s.cfg), Running: s.active != nil, ListenHost: s.host, LastError: s.lastError, Stats: s.stats}
+	st.ConfigWarning = s.configWarning
+	if s.configLoadErr != nil {
+		st.ConfigError = s.configLoadErr.Error()
+	} else {
+		st.ConfigHash = ConfigEditDigest(s.cfg)
+	}
+	st.Cache = s.cacheStatusLocked()
+	st.ShadowDNS = initialShadowStatus(s.cfg.ShadowDNS)
+	if s.active != nil {
+		st.ShadowDNS = s.active.resolver.ShadowStatus()
+	}
+	st.FastDNS.Enabled = s.cfg.FastDNS
+	if s.active != nil && s.active.resolver.fastDNS != nil {
+		st.FastDNS = s.active.resolver.fastDNS.Snapshot()
+		st.FastDNS.Enabled = s.cfg.FastDNS
+	}
+	s.mu.RUnlock()
+	if backend, ok := s.backend.(shadowRenewBackend); ok && st.Running && st.ShadowDNS.Enabled {
+		st.ShadowDNS.RenewalAvailable = backend.ShadowRenewalAvailable()
+	}
+	if backend, ok := s.backend.(interface {
+		ShadowDiagnostics() dnsroute.ShadowDiagnostics
+	}); ok {
+		diagnostics := backend.ShadowDiagnostics()
+		st.ShadowDNS.Diagnostics = &diagnostics
+	}
+	st.Filtering = s.filtering.Status()
+	st.Routes = s.backend.Routes()
+	if st.Routes == nil {
+		st.Routes = []dnsroute.Route{}
+	}
+	host := st.ListenHost
+	if host != "" {
+		st.Endpoints.DNS = net.JoinHostPort(host, strconv.Itoa(st.Config.DNSPort))
+	}
+	return st
+}
+
+func (s *Service) SetConfig(cfg Config) error {
+	s.opMu.Lock()
+	defer s.opMu.Unlock()
+	return s.setConfigLocked(cfg)
+}
+
+func (s *Service) setConfigLocked(cfg Config) (result error) {
+	if err := s.configurationErrorLocked(); err != nil {
+		return err
+	}
+	err := s.applyConfigLocked(cfg, s.persistConfigLocked)
+	return s.persistenceErrorLocked(err)
+}
+
+func (s *Service) applyConfigLocked(cfg Config, persist func(Config) error) (result error) {
+	cfg = cloneConfig(cfg)
+	if err := cfg.NormalizeValidate(); err != nil {
+		return err
+	}
+	host, err := s.resolveHost(cfg.ListenHost)
+	if err != nil {
+		return err
+	}
+	if err := validateNoSelfUpstream(cfg, host); err != nil {
+		return err
+	}
+	s.mu.RLock()
+	run := s.active
+	unchanged := cfg.Enabled && (s.lastError == "" || persist == nil) && s.controlCancel != nil && host == s.host && reflect.DeepEqual(cfg, s.cfg) &&
+		run != nil && run.resolver.lifetime.Err() == nil && run.listeners.ctx.Err() == nil
+	s.mu.RUnlock()
+	if unchanged {
+		// An identical save or repeated start must not discard live answers,
+		// counters or transports. Failed/stopped runs still take the retry path.
+		return nil
+	}
+	restored, err := s.reconcileOpenWrtDNSLocked(cfg, host)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if restored && result != nil {
+			result = fmt.Errorf("%w; %s", result, openWrtRestoreNotice)
+		}
+	}()
+	var persistCurrent func() error
+	if persist != nil {
+		persistCurrent = func() error { return persist(cfg) }
+	}
+	if err := s.filtering.ConfigurePersist(cfg.Filtering, persistCurrent); err != nil {
+		return err
+	}
+	s.stopLocked()
+	s.mu.Lock()
+	s.cfg = cloneConfig(cfg)
+	s.host = host
+	s.lastError = ""
+	s.mu.Unlock()
+	s.logs.SetEnabled(cfg.LoggingEnabled)
+	if cfg.Enabled {
+		s.startControlLocked()
+		if restored {
+			s.mu.RLock()
+			failed, detail := s.active == nil, s.lastError
+			s.mu.RUnlock()
+			if failed {
+				s.setError(fmt.Errorf("%s; %s", detail, openWrtRestoreNotice))
+			}
+		}
+	}
+	return nil
+}
+
+func (s *Service) SetEnabled(enabled bool) error {
+	s.opMu.Lock()
+	defer s.opMu.Unlock()
+	cfg := s.Config()
+	cfg.Enabled = enabled
+	return s.setConfigLocked(cfg)
+}
+
+func (s *Service) StartEnabled() {
+	s.opMu.Lock()
+	defer s.opMu.Unlock()
+	cfg := s.Config()
+	if !cfg.Enabled {
+		// A removed or manually disabled config must not leave the native
+		// forwarder pointing at a listener that will never start.
+		if _, err := s.reconcileOpenWrtDNSLocked(cfg, ""); err != nil {
+			s.setError(err)
+		}
+		return
+	}
+	if s.controlCancel == nil {
+		s.startControlLocked()
+	}
+}
+
+func (s *Service) startControlLocked() {
+	ctx, cancel := context.WithCancel(context.Background())
+	s.controlCancel = cancel
+	if err := s.startRunLocked(ctx); err != nil {
+		s.setError(err)
+	}
+	go s.supervise(ctx)
+}
+
+func (s *Service) supervise(ctx context.Context) {
+	ticker := time.NewTicker(15 * time.Second)
+	defer ticker.Stop()
+	for {
+		s.mu.RLock()
+		run := s.active
+		s.mu.RUnlock()
+		var failures <-chan error
+		if run != nil {
+			failures = run.failure
+		}
+		var cause error
+		select {
+		case <-ctx.Done():
+			return
+		case cause = <-failures:
+		case <-ticker.C:
+		}
+		s.opMu.Lock()
+		if ctx.Err() != nil {
+			s.opMu.Unlock()
+			return
+		}
+		if cause != nil {
+			s.setError(cause)
+			s.stopRunLocked()
+		}
+		s.mu.RLock()
+		running := s.active != nil
+		s.mu.RUnlock()
+		if !running {
+			if err := s.startRunLocked(ctx); err != nil {
+				s.setError(err)
+			}
+		}
+		s.opMu.Unlock()
+	}
+}
+
+func (s *Service) startRunLocked(parent context.Context) (result error) {
+	cfg := s.Config()
+	host, err := s.resolveHost(cfg.ListenHost)
+	if err != nil {
+		return err
+	}
+	if err := validateNoSelfUpstream(cfg, host); err != nil {
+		return err
+	}
+	restored, err := s.reconcileOpenWrtDNSLocked(cfg, host)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if restored && result != nil {
+			result = fmt.Errorf("%w; %s", result, openWrtRestoreNotice)
+		}
+	}()
+	ctx, cancel := context.WithCancel(parent)
+	run := &serviceRun{cancel: cancel, failure: make(chan error, 1)}
+	cfg.ListenHost = host // concrete bind address also protects upstream dialing from loops
+	run.resolver = NewResolver(cfg, s.backend)
+	run.resolver.SetBlocker(s.filtering.Blocker())
+	run.resolver.SetScheduler(s.scheduler)
+	run.resolver.SetAttemptObserver(s.recordAttempt)
+	run.resolver.SetCancellationObserver(s.recordCancellations)
+	opts := ListenerOptions{BindHost: host, DNSPort: cfg.DNSPort, RequestTimeout: 27 * time.Second,
+		AllowClient: allowLANClients(host), Exchange: func(ctx context.Context, q []byte) ([]byte, error) {
+			b, _, err := s.exchange(ctx, run, q)
+			return b, err
+		},
+		OnError: func(err error) {
+			if ctx.Err() == nil {
+				select {
+				case run.failure <- err:
+				default:
+				}
+			}
+		}}
+	// Bind before opening firewall access; a conflict cannot leave a partial
+	// listener service or redirect the router's existing DNS/HTTPS service.
+	run.listeners, err = StartListeners(ctx, opts)
+	if err == nil {
+		err = s.backend.Prepare(ctx, dnsroute.ListenOptions{Host: host, DNSPort: cfg.DNSPort, DisableNFQWS: cfg.RouteMode == RouteModeVPNOnly})
+	}
+	if err != nil {
+		cancel()
+		if run.listeners != nil {
+			run.listeners.Close()
+		}
+		run.resolver.Close()
+		_ = s.backend.Close()
+		return err
+	}
+	s.mu.Lock()
+	s.active = run
+	s.host = host
+	s.lastError = ""
+	s.stats = Stats{}
+	s.mu.Unlock()
+	logbuf.Append("dnsserver", "info", "DNS Server запущен на "+host)
+	s.logs.Append(LogEntry{Level: "info", Event: "start", Message: "DNS запущен на " + net.JoinHostPort(host, strconv.Itoa(cfg.DNSPort))})
+	run.resolver.StartMaintenance()
+	s.filtering.Start(ctx, run.resolver)
+	return nil
+}
+
+func allowLANClients(host string) func(net.IP) bool {
+	ip := net.ParseIP(host)
+	var subnet *net.IPNet
+	if ifaces, err := net.Interfaces(); err == nil {
+		for _, iface := range ifaces {
+			addrs, _ := iface.Addrs()
+			for _, addr := range addrs {
+				a, n, e := net.ParseCIDR(addr.String())
+				if e == nil && a.Equal(ip) {
+					subnet = n
+				}
+			}
+		}
+	}
+	return func(peer net.IP) bool {
+		return peer != nil && (peer.IsLoopback() || peer.Equal(ip) || subnet != nil && subnet.Contains(peer))
+	}
+}
+
+func (s *Service) exchange(ctx context.Context, run *serviceRun, q []byte) ([]byte, Outcome, error) {
+	started := time.Now()
+	origin := requestOriginFromContext(ctx)
+	resp, out, err := run.resolver.Resolve(ctx, q)
+	if err == nil && !out.Blocked {
+		resp, err = s.backend.ObserveAnswer(ctx, out.Domain, resp, ContextClientIP(ctx))
+	}
+	if err != nil {
+		out.Error = err.Error()
+		resp = errorReply(q, mdns.RcodeServerFailure)
+	}
+	s.mu.Lock()
+	if s.active == run {
+		s.stats.Queries++
+		s.stats.LastDomain = out.Domain
+		s.stats.LastRoute = out.Route
+		s.stats.LastUpstream = out.Upstream
+		s.stats.LastCached = err == nil && !out.Blocked && out.Cached
+		s.stats.LastShared = err == nil && !out.Blocked && !out.Cached && out.Shared
+		s.stats.LastError = out.Error
+		s.stats.LastClientIP, s.stats.LastSource, s.stats.LastTransport = origin.ClientIP, origin.Source, origin.Transport
+		if err != nil {
+			s.stats.Failures++
+		} else if out.Blocked {
+			s.stats.BlockedTotal++
+			switch out.BlockCategory {
+			case BlockCategoryAds:
+				s.stats.BlockedAds++
+			case BlockCategoryTrackers:
+				s.stats.BlockedTrackers++
+			default:
+				s.stats.BlockedMixed++
+			}
+		} else if out.Cached {
+			s.stats.CacheHits++
+		} else if out.Shared {
+			s.stats.SharedResponses++
+		} else if out.Route == "nfqws" {
+			s.stats.NFQWSSuccess++
+		} else if out.Route == shadowRoute {
+			s.stats.ShadowSuccess++
+		} else {
+			s.stats.AWGSuccess++
+		}
+	}
+	s.mu.Unlock()
+	if s.logs.Enabled() {
+		entry := LogEntry{Level: "info", Event: "answer", Domain: out.Domain, Upstream: out.Upstream, Route: out.Route, ClientIP: origin.ClientIP, Source: origin.Source, Transport: origin.Transport, DurationMS: time.Since(started).Milliseconds()}
+		if parsed, _, e := parseQuery(q); e == nil {
+			entry.QType = mdns.TypeToString[parsed.Question[0].Qtype]
+		}
+		if err != nil {
+			entry.Level, entry.Event, entry.Message = "error", "error", err.Error()
+		} else if out.Blocked {
+			entry.Event = "blocked"
+			entry.BlockCategory, entry.BlockRule, entry.BlockSource = out.BlockCategory, out.BlockRule, out.BlockSource
+			entry.BlockDomain = out.BlockDomain
+		} else if out.Cached {
+			entry.Event = "cache"
+		} else if out.Shared {
+			entry.Event, entry.Message = "shared", "Ответ получен из совместного DNS-запроса"
+		}
+		s.logs.Append(entry)
+	}
+	// Transport succeeded even for SERVFAIL: clients receive a DNS error, and
+	// the next query continues recovery instead of losing the listener.
+	return resp, out, nil
+}
+
+func (s *Service) setError(err error) {
+	s.mu.Lock()
+	s.lastError = err.Error()
+	s.mu.Unlock()
+	logbuf.Append("dnsserver", "warn", err.Error())
+	s.logs.Append(LogEntry{Level: "error", Event: "service", Message: err.Error()})
+}
+
+func (s *Service) stopRunLocked() {
+	s.mu.Lock()
+	run := s.active
+	s.active = nil
+	s.mu.Unlock()
+	if run != nil {
+		run.cancel()
+		run.listeners.Close()
+		run.resolver.Close()
+		s.logs.Append(LogEntry{Level: "info", Event: "stop", Message: "DNS остановлен"})
+	}
+	_ = s.backend.Close()
+}
+func (s *Service) stopLocked() {
+	if s.controlCancel != nil {
+		s.controlCancel()
+		s.controlCancel = nil
+	}
+	s.stopRunLocked()
+}
+func (s *Service) Close() { s.opMu.Lock(); defer s.opMu.Unlock(); s.stopLocked() }
+
+type TestResult struct {
+	Blocked       bool     `json:"blocked"`
+	BlockCategory string   `json:"block_category,omitempty"`
+	BlockRule     string   `json:"block_rule,omitempty"`
+	BlockSource   string   `json:"block_source,omitempty"`
+	BlockDomain   string   `json:"block_domain,omitempty"`
+	OK            bool     `json:"ok"`
+	Cached        bool     `json:"cached"`
+	Shared        bool     `json:"shared"`
+	Domain        string   `json:"domain"`
+	Type          string   `json:"type"`
+	Route         string   `json:"route"`
+	Upstream      string   `json:"upstream"`
+	Answers       []string `json:"answers"`
+	DurationMS    int64    `json:"duration_ms"`
+	Error         string   `json:"error,omitempty"`
+	ClientIP      string   `json:"client_ip,omitempty"`
+	Source        string   `json:"source"`
+	Transport     string   `json:"transport"`
+}
+
+func (s *Service) Test(ctx context.Context, domain, kind string) TestResult {
+	started := time.Now()
+	origin := requestOrigin{Source: "diagnostic", Transport: "api"}
+	if ip := ContextClientIP(ctx); ip != nil {
+		origin.ClientIP = ip.String()
+	}
+	ctx = withRequestOrigin(ctx, origin)
+	result := TestResult{Domain: domain, Type: kind, Answers: []string{}, ClientIP: origin.ClientIP, Source: origin.Source, Transport: origin.Transport}
+	name, err := normalizeDomain(domain)
+	if err != nil {
+		result.Error = err.Error()
+		return result
+	}
+	if kind == "" {
+		kind = "A"
+	}
+	typeCode, validType := mdns.StringToType[kind]
+	if !validType || (typeCode != mdns.TypeA && typeCode != mdns.TypeAAAA && typeCode != mdns.TypeCNAME && typeCode != mdns.TypeHTTPS && typeCode != mdns.TypeSVCB) {
+		result.Error = "тип должен быть A, AAAA, CNAME, HTTPS или SVCB"
+		return result
+	}
+	s.mu.RLock()
+	run := s.active
+	s.mu.RUnlock()
+	if run == nil {
+		result.Error = "DNS-сервис выключен или запускается"
+		return result
+	}
+	q := new(mdns.Msg)
+	q.SetQuestion(mdns.Fqdn(name), typeCode)
+	raw, _ := q.Pack()
+	resp, out, err := s.exchange(ctx, run, raw)
+	result.Domain = name
+	result.Type = mdns.TypeToString[typeCode]
+	result.Route = out.Route
+	result.Upstream = out.Upstream
+	result.Blocked, result.BlockCategory, result.BlockRule, result.BlockSource = out.Blocked, out.BlockCategory, out.BlockRule, out.BlockSource
+	result.BlockDomain = out.BlockDomain
+	result.Error = out.Error
+	result.DurationMS = time.Since(started).Milliseconds()
+	if err != nil {
+		result.Error = err.Error()
+		return result
+	}
+	var msg mdns.Msg
+	if err := msg.Unpack(resp); err != nil {
+		result.Error = err.Error()
+		return result
+	}
+	for _, rr := range msg.Answer {
+		result.Answers = append(result.Answers, rr.String())
+	}
+	result.OK = result.Error == "" && (msg.Rcode == mdns.RcodeSuccess || msg.Rcode == mdns.RcodeNameError)
+	result.Cached = result.OK && !result.Blocked && out.Cached
+	result.Shared = result.OK && !result.Blocked && !out.Cached && out.Shared
+	return result
+}
+
+// UpdateFiltering queues an update without holding the HTTP request open.
+func (s *Service) UpdateFiltering() error {
+	s.opMu.Lock()
+	defer s.opMu.Unlock()
+	s.mu.RLock()
+	run := s.active
+	s.mu.RUnlock()
+	if run == nil {
+		return fmt.Errorf("включите DNS-сервер перед обновлением списков")
+	}
+	if !s.filtering.Status().Enabled {
+		return fmt.Errorf("включите и сохраните блокировку рекламы и трекеров")
+	}
+	s.filtering.Trigger(run.resolver.lifetime, run.resolver)
+	return nil
+}

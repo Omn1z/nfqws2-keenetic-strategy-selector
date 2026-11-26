@@ -24,20 +24,45 @@ interface Store {
   reloadConfig: () => Promise<void>;
   reloadLists: () => Promise<void>;
   reloadStrategies: () => Promise<void>;
+  loadStrategies: () => Promise<void>;
   reloadDns: () => Promise<void>;
   reloadGeo: () => Promise<void>;
+  loadGeo: () => Promise<void>;
   reloadBlobs: () => Promise<void>;
 }
 
 const StoreCtx = createContext<Store | null>(null);
 
-export function useStore(): Store {
+export function useStore({ geo = false, strategies = false }: { geo?: boolean; strategies?: boolean } = {}): Store {
   const ctx = useContext(StoreCtx);
   if (!ctx) throw new Error("useStore must be used within <StoreProvider>");
+  const { loadGeo, loadStrategies } = ctx;
+  useEffect(() => {
+    if (geo) void loadGeo();
+    if (strategies) void loadStrategies();
+  }, [geo, strategies, loadGeo, loadStrategies]);
   return ctx;
 }
 
 const err = (e: unknown) => toast((e as Error).message, "err");
+
+// A successful read is shared across tabs. A mutation forces a new read, whose
+// result takes precedence even when an older request finishes afterwards.
+export function lazyCatalog<T>(read: () => Promise<T[] | null>, publish: (items: T[]) => void, onError?: (cause: unknown) => void) {
+  let current: Promise<void> | undefined;
+  function reload(): Promise<void> {
+    const request = read().then(items => {
+      if (current === request) publish(items ?? []);
+    }).catch(cause => {
+      if (current !== request) return;
+      current = undefined;
+      onError?.(cause);
+    });
+    current = request;
+    return request;
+  }
+  return { load: () => current ?? reload(), reload };
+}
 
 export function StoreProvider({ children }: { children: ReactNode }) {
   const [config, setConfig] = useState<Config | null>(null);
@@ -52,9 +77,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
 
   const reloadConfig = useCallback(async () => { try { setConfig(await api<Config>("GET", "/api/config")); } catch { /* non-fatal */ } }, []);
   const reloadLists = useCallback(async () => { try { setLists((await api<List[] | null>("GET", "/api/lists")) ?? []); } catch (e) { err(e); } }, []);
-  const reloadStrategies = useCallback(async () => { try { setStrategies((await api<Strategy[] | null>("GET", "/api/strategies")) ?? []); } catch (e) { err(e); } }, []);
+  const [strategyCatalog] = useState(() => lazyCatalog(() => api<Strategy[] | null>("GET", "/api/strategies"), setStrategies, err));
   const reloadDns = useCallback(async () => { try { setDns((await api<DnsServer[] | null>("GET", "/api/dns")) ?? []); } catch (e) { err(e); } }, []);
-  const reloadGeo = useCallback(async () => { try { setGeo((await api<GeoFile[] | null>("GET", "/api/geo")) ?? []); } catch { /* non-fatal */ } }, []);
+  const [geoCatalog] = useState(() => lazyCatalog(() => api<GeoFile[] | null>("GET", "/api/geo"), setGeo));
   const reloadBlobs = useCallback(async () => {
     try {
       const b = await api<Blobs>("GET", "/api/blobs");
@@ -63,9 +88,8 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   }, []);
 
   useEffect(() => {
-    void reloadConfig(); void reloadLists(); void reloadStrategies();
-    void reloadDns(); void reloadGeo(); void reloadBlobs();
-  }, [reloadConfig, reloadLists, reloadStrategies, reloadDns, reloadGeo, reloadBlobs]);
+    void reloadConfig(); void reloadLists(); void reloadDns(); void reloadBlobs();
+  }, [reloadConfig, reloadLists, reloadDns, reloadBlobs]);
 
   // Active-run poll lives here (not in the Runs tab) so the run keeps updating and
   // is still shown after switching tabs.
@@ -106,7 +130,9 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     config, lists, strategies, dns, geo, blobs,
     activeRun, runActive, startRun, cancelRun, addRunThread,
     pendingTargets, setPendingTargets,
-    reloadConfig, reloadLists, reloadStrategies, reloadDns, reloadGeo, reloadBlobs,
+    reloadConfig, reloadLists, reloadDns, reloadBlobs,
+    loadGeo: geoCatalog.load, reloadGeo: geoCatalog.reload,
+    loadStrategies: strategyCatalog.load, reloadStrategies: strategyCatalog.reload,
   };
   return <StoreCtx.Provider value={value}>{children}</StoreCtx.Provider>;
 }

@@ -63,6 +63,9 @@ func TestCFH2MultiplexesWithoutResponseHeadOfLineBlocking(t *testing.T) {
 		if r.URL.Path != "/api" {
 			t.Errorf("path %s", r.URL.Path)
 		}
+		if r.UserAgent() != "Go-http-client/2.0" {
+			t.Error("unexpected HTTP/2 user agent")
+		}
 		if r.Method == http.MethodHead {
 			w.WriteHeader(405)
 			return

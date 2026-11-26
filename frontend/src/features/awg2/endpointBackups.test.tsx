@@ -135,3 +135,38 @@ test("backup IPs inherit the deployed primary port while a different server endp
   assert.match(html, /deployed\.example:2408/);
   assert.doesNotMatch(html, /pending\.example:51820/);
 });
+
+test("imported profiles show the native primary address editor when advertised", () => {
+  const render = (st: Awg2Status) => renderToStaticMarkup(<ServerPane st={st} reload={async () => {}} acceptStatus={() => {}} deployActive={async () => true} deploying={false} onFormatBusyChange={() => {}} onBusyChange={() => {}} externalBusy={false} onOpenEngineSettings={() => {}} />);
+  const st = fixture({ endpoint: "[2001:db8::2]:2408" });
+  assert.doesNotMatch(render(st), /Сохранить адрес/);
+  st.primary_endpoint_edit = true;
+  const html = render(st);
+  assert.match(html, /Основной адрес VPN/);
+  assert.match(html, /value="\[2001:db8::2\]:2408"/);
+  assert.match(html, /<button[^>]*disabled=""[^>]*>Сохранить адрес<\/button>/);
+  assert.doesNotMatch(render({ ...st, config: { ...st.config, install: "apt" } }), /Сохранить адрес/);
+});
+
+test("SSH host trust requires an explicit action on a managed profile with a missing pin", t => {
+  const request = t.mock.method(globalThis, "fetch", () => { throw new Error("render must not enroll a host"); });
+  const render = (st: Awg2Status) => renderToStaticMarkup(<ServerPane st={st} reload={async () => {}} acceptStatus={() => {}} deployActive={async () => true} deploying={false} onFormatBusyChange={() => {}} onBusyChange={() => {}} externalBusy={false} onOpenEngineSettings={() => {}} />);
+  const st = fixture({ install: "userspace" });
+  const button = /<button[^>]*>Доверять первому SSH-ключу<\/button>/;
+  assert.doesNotMatch(render(st), button);
+  st.ssh_host_key_enrollment = true;
+  const disabled = /\s(?:disabled|aria-disabled)=/;
+  assert.match(render(st).match(button)?.[0] || "", disabled);
+  st.has_password = true;
+  const enabled = render(st).match(button)?.[0];
+  assert.ok(enabled);
+  assert.doesNotMatch(enabled, disabled);
+  assert.doesNotMatch(render({ ...st, active_server_id: "" }), button);
+  assert.doesNotMatch(render({ ...st, config: { ...st.config, install: "imported" } }), button);
+  st.config.conn.known_key = "fixture";
+  assert.doesNotMatch(render(st), button);
+  st.server_deployment = "wireguard";
+  assert.match(render(st), /На VPS нужны WireGuard, wg-quick/);
+  assert.match(render(st), /выберите системный WireGuard/);
+  assert.equal(request.mock.callCount(), 0);
+});

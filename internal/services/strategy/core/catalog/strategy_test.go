@@ -2,6 +2,7 @@ package catalog
 
 import (
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
 	"testing"
@@ -14,7 +15,15 @@ import (
 // not fooling on its own, nor does tcp_ack reliably protect timestamp-less
 // clients. See upstream docs/manual.md#standard-fooling and #fakedsplit.
 func TestCatalogProtectsEachTCPFake(t *testing.T) {
-	for name, strategies := range map[string][]Strategy{"builtin": Builtin(), "auto": AutoCandidates()} {
+	builtin, err := os.ReadFile("builtin.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	items, err := parseBuiltin(builtin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for name, strategies := range map[string][]Strategy{"builtin": items, "auto": AutoCandidates()} {
 		t.Run(name, func(t *testing.T) {
 			seen := make(map[string]bool)
 			for _, strategy := range strategies {

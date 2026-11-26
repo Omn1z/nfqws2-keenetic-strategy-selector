@@ -3,8 +3,9 @@ import test from "node:test";
 import { listCategory } from "./listCategory";
 import { folderEntries, uploadPath, type Asset } from "./fileExplorerModel";
 
-test("only the final list-opkg suffix selects originals without hiding other list formats", () => {
-  for (const path of ["user.list-opkg", "lists/auto.list-opkg", "lists/nested/ipset.LIST-OPKG", "lists/nested/auto.list-opkg.gz"]) assert.equal(listCategory(path), "original", path);
+test("opkg and apk distribution copies are classified by their final suffix", () => {
+  for (const path of ["user.list-opkg", "lists/auto.list-opkg", "lists/nested/ipset.LIST-OPKG", "lists/nested/auto.list-opkg.gz", "user.list.apk-new", "lists/nested/auto.list.apk-new.gz"]) assert.equal(listCategory(path), "original", path);
+  assert.equal(listCategory("lists/custom.list.apk-new/user.list"), "current");
   for (const path of ["user.list", "lists/userlist.txt", "lists/user.list.gz", "lists/user.list-opkg.bak", "lists/archive.list-opkg/user.list", "lists/user.opkg", "lists/user-list-opkg"]) assert.equal(listCategory(path), "current", path);
 });
 

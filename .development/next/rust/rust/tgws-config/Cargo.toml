@@ -1,0 +1,16 @@
+[package]
+name = "nfqws2-tgws-config"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+serde.workspace = true
+getrandom = "0.2"
+tokio = { version = "1", features = ["macros","net","time"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt","test-util"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+socket2 = { version = "0.6", features = ["all"] }

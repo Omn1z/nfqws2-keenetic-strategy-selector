@@ -1,0 +1,466 @@
+package tgws
+
+import (
+	"bufio"
+	"context"
+	"crypto/rand"
+	"crypto/tls"
+	"encoding/base64"
+	"encoding/binary"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"nfqws2strategy/internal/tools/tlsroots"
+)
+
+// wsHandshakeError carries the HTTP status from a failed WS upgrade so the
+// caller can distinguish redirects (try the next domain) from hard failures.
+type wsHandshakeError struct {
+	statusCode int
+	statusLine string
+	location   string
+}
+
+func (e *wsHandshakeError) Error() string {
+	return fmt.Sprintf("HTTP %d: %s", e.statusCode, e.statusLine)
+}
+
+func (e *wsHandshakeError) isRedirect() bool {
+	switch e.statusCode {
+	case 301, 302, 303, 307, 308:
+		return true
+	}
+	return false
+}
+
+// wsIdleTimeout caps how long recv() waits for the next upstream frame. After the
+// WS handshake there is otherwise NO read deadline, so a silently-dead or stalled
+// upstream (a flaky relay, a half-open TCP) would wedge the bridge goroutine — and
+// the client's download — forever ("бесконечная загрузка"). On timeout recv()
+// errors, the bridge tears down and the Telegram client reconnects/retries.
+// Telegram keeps active WS links warm with sub-minute pings, so 180s of total
+// silence means the link is dead.
+const wsIdleTimeout = 180 * time.Second
+
+const wsMaxMessageLen = 16 * 1024 * 1024
+const wsIdleProbeTimeout = 2 * time.Millisecond
+
+// Share bounded session tickets across native, CF and Worker endpoints. Pool
+// rotation and client reconnects can resume TLS without another full key exchange.
+var wsTLSSessions = tls.NewLRUClientSessionCache(64)
+var wsFrontedTLSSessions = tls.NewLRUClientSessionCache(8)
+
+// rawWebSocket is a bare-bones RFC 6455 client: binary frames, masked
+// client->server, fragmented messages, ping/pong handling and bounded frames.
+type rawWebSocket struct {
+	conn        net.Conn
+	r           *bufio.Reader
+	domain      string // immutable HTTP Host used for the successful upgrade
+	sni         string // immutable TLS server name; may differ when fronting
+	wmu         sync.Mutex
+	closed      atomic.Bool
+	idleTimeout time.Duration // per-frame read deadline; 0 = none
+}
+
+func applyConnOptions(conn net.Conn, bufferSize int) {
+	tcp, ok := conn.(*net.TCPConn)
+	if !ok {
+		return
+	}
+	_ = tcp.SetNoDelay(true)
+	if bufferSize > 0 {
+		_ = tcp.SetReadBuffer(bufferSize)
+		_ = tcp.SetWriteBuffer(bufferSize)
+	}
+}
+
+// connectWS opens a secure WebSocket connection to host:443 presenting
+// sniDomain as both the SNI and HTTP Host. The optional secure argument keeps
+// old internal callers source-compatible while exposing upstream's
+// --no-secure fallback (plain WebSocket over host:80).
+func connectWS(ctx context.Context, host, sniDomain string, timeout time.Duration, path string, bufferSize int, secure ...bool) (*rawWebSocket, error) {
+	return connectWSWithSNI(ctx, host, sniDomain, timeout, path, bufferSize, sniDomain, secure...)
+}
+
+// connectWSWithSNI keeps the HTTP Host independent from the TLS server name,
+// as required by the upstream domain-fronting fallback.
+func connectWSWithSNI(ctx context.Context, host, domain string, timeout time.Duration, path string, bufferSize int, sni string, secure ...bool) (*rawWebSocket, error) {
+	useTLS := true
+	if len(secure) > 0 {
+		useTLS = secure[0]
+	}
+	var tlsTemplate *tls.Config
+	if useTLS {
+		sessions := wsTLSSessions
+		if sni != domain {
+			// Never mix tickets issued under different verification policies.
+			sessions = wsFrontedTLSSessions
+		}
+		tlsTemplate = &tls.Config{RootCAs: tlsroots.Pool(), ClientSessionCache: sessions}
+	}
+	return connectWSWithTLSConfig(ctx, host, domain, timeout, path, bufferSize, sni, useTLS, tlsTemplate)
+}
+
+// A template supplies immutable trust and session storage. Endpoint identity
+// and ordinary certificate verification remain controlled by the connection.
+func connectWSWithTLSConfig(ctx context.Context, host, domain string, timeout time.Duration, path string, bufferSize int, sni string, useTLS bool, tlsTemplate *tls.Config) (*rawWebSocket, error) {
+	if timeout <= 0 || timeout > 10*time.Second {
+		timeout = 10 * time.Second
+	}
+	// Waiting for local capacity must not consume the endpoint's network
+	// timeout and make a healthy upstream appear to have timed out.
+	queueTimeout := min(timeout, time.Second)
+	queueCtx, cancelQueue := context.WithTimeout(ctx, queueTimeout)
+	releaseHandshake, err := wsHandshakes.acquire(queueCtx)
+	cancelQueue()
+	if err != nil {
+		return nil, err
+	}
+	defer releaseHandshake()
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	dialer := &net.Dialer{Timeout: timeout}
+	port := "80"
+	if useTLS {
+		port = "443"
+	}
+	address := net.JoinHostPort(host, port)
+	// Tests and local relays may supply an explicit port. Production callers
+	// pass a bare IP/domain and continue to use 443/80 above.
+	if h, p, splitErr := net.SplitHostPort(host); splitErr == nil && h != "" && p != "" {
+		address = net.JoinHostPort(h, p)
+	}
+	raw, err := dialer.DialContext(ctx, "tcp", address)
+	if err != nil {
+		return nil, err
+	}
+	stopClose := context.AfterFunc(ctx, func() { _ = raw.Close() })
+	defer stopClose()
+	adopted := false
+	defer func() {
+		if !adopted {
+			_ = raw.Close()
+		}
+	}()
+	deadline, _ := ctx.Deadline()
+	if err := raw.SetDeadline(deadline); err != nil {
+		return nil, err
+	}
+	applyConnOptions(raw, bufferSize)
+
+	var conn net.Conn = raw
+	if useTLS {
+		// Normal endpoints now verify the certificate like upstream v1.10.4.
+		// Domain-fronted attempts deliberately use a different SNI and retain
+		// compatibility with fronts whose certificate does not match Telegram's
+		// HTTP Host header.
+		tlsConfig := &tls.Config{}
+		if tlsTemplate != nil {
+			tlsConfig = tlsTemplate.Clone()
+		}
+		tlsConfig.ServerName, tlsConfig.InsecureSkipVerify = sni, sni != domain
+		tconn := tls.Client(raw, tlsConfig)
+		if err := tconn.HandshakeContext(ctx); err != nil {
+			_ = raw.Close()
+			return nil, err
+		}
+		conn = tconn
+	}
+
+	keyRaw := make([]byte, 16)
+	_, _ = rand.Read(keyRaw)
+	wsKey := base64.StdEncoding.EncodeToString(keyRaw)
+	req := "GET " + path + " HTTP/1.1\r\n" +
+		"Host: " + domain + "\r\n" +
+		"Upgrade: websocket\r\n" +
+		"Connection: Upgrade\r\n" +
+		"Sec-WebSocket-Key: " + wsKey + "\r\n" +
+		"Sec-WebSocket-Version: 13\r\n" +
+		"Sec-WebSocket-Protocol: binary\r\n\r\n"
+	if n, err := conn.Write([]byte(req)); err != nil || n != len(req) {
+		_ = conn.Close()
+		if err == nil {
+			err = io.ErrShortWrite
+		}
+		return nil, err
+	}
+
+	br := bufio.NewReaderSize(conn, 64*1024)
+	statusCode, statusLine, headers, err := readWSResponse(br)
+	if err != nil {
+		_ = conn.Close()
+		return nil, err
+	}
+	if statusCode == 101 {
+		// Cancelled setup must not transfer a socket whose cancellation
+		// callback is already closing it to a bridge or the warm pool.
+		if !stopClose() {
+			return nil, ctx.Err()
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		if err := conn.SetDeadline(time.Time{}); err != nil {
+			return nil, err
+		}
+		adopted = true
+		return &rawWebSocket{conn: conn, r: br, domain: domain, sni: sni, idleTimeout: wsIdleTimeout}, nil
+	}
+	_ = conn.Close()
+	return nil, &wsHandshakeError{statusCode: statusCode, statusLine: statusLine, location: headers["location"]}
+}
+
+func readWSResponse(br *bufio.Reader) (int, string, map[string]string, error) {
+	var lines []string
+	var line []byte
+	total := 0
+	for {
+		part, err := br.ReadSlice('\n')
+		total += len(part)
+		if total > 64*1024 {
+			return 0, "", nil, fmt.Errorf("WS response headers exceed 64 KiB")
+		}
+		line = append(line, part...)
+		if err == bufio.ErrBufferFull {
+			continue
+		}
+		if err != nil {
+			return 0, "", nil, err
+		}
+		trimmed := strings.TrimRight(string(line), "\r\n")
+		line = line[:0]
+		if trimmed == "" {
+			break
+		}
+		lines = append(lines, trimmed)
+	}
+	if len(lines) == 0 {
+		return 0, "empty response", map[string]string{}, nil
+	}
+	statusCode := 0
+	if parts := strings.SplitN(lines[0], " ", 3); len(parts) >= 2 {
+		statusCode, _ = strconv.Atoi(parts[1])
+	}
+	headers := map[string]string{}
+	for _, hl := range lines[1:] {
+		if i := strings.Index(hl, ":"); i >= 0 {
+			headers[strings.ToLower(strings.TrimSpace(hl[:i]))] = strings.TrimSpace(hl[i+1:])
+		}
+	}
+	return statusCode, lines[0], headers, nil
+}
+
+func (ws *rawWebSocket) isClosed() bool { return ws.closed.Load() }
+
+// idleHealthy is called only while borrowing an idle pooled socket, before any
+// bridge reads it. Unlike asyncio's transport, net.Conn does not notice a peer
+// closing until somebody reads. Peek preserves all received bytes, including
+// ping/data frames, and clears bufio's transient error on a short read. Go TLS
+// retains partial records across temporary read timeouts; permanent errors must
+// discard the socket instead. The caller owns closing a rejected connection.
+func (ws *rawWebSocket) idleHealthy() bool {
+	if ws.isClosed() {
+		return false
+	}
+	if err := ws.conn.SetReadDeadline(time.Now().Add(wsIdleProbeTimeout)); err != nil {
+		ws.closed.Store(true)
+		return false
+	}
+	defer ws.conn.SetReadDeadline(time.Time{})
+	header, err := ws.r.Peek(2)
+	if len(header) > 0 && header[0]&0x0f == wsOpClose {
+		ws.closed.Store(true)
+		return false
+	}
+	if err == nil {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() && netErr.Temporary() {
+		return true
+	}
+	ws.closed.Store(true)
+	return false
+}
+
+func (ws *rawWebSocket) send(data []byte) error {
+	ws.wmu.Lock()
+	defer ws.wmu.Unlock()
+	if ws.closed.Load() {
+		return io.ErrClosedPipe
+	}
+	_ = ws.conn.SetWriteDeadline(time.Now().Add(wsIdleTimeout))
+	_, err := ws.conn.Write(buildFrame(wsOpBinary, data))
+	_ = ws.conn.SetWriteDeadline(time.Time{})
+	return err
+}
+
+func (ws *rawWebSocket) sendBatch(parts [][]byte) error {
+	ws.wmu.Lock()
+	defer ws.wmu.Unlock()
+	if ws.closed.Load() {
+		return io.ErrClosedPipe
+	}
+	_ = ws.conn.SetWriteDeadline(time.Now().Add(wsIdleTimeout))
+	defer ws.conn.SetWriteDeadline(time.Time{})
+	buf := bufio.NewWriterSize(ws.conn, 64*1024)
+	for _, p := range parts {
+		if _, err := buf.Write(buildFrame(wsOpBinary, p)); err != nil {
+			return err
+		}
+	}
+	return buf.Flush()
+}
+
+// recv blocks until a binary/text frame arrives and returns its payload.
+// Returns io.EOF when the peer closes.
+func (ws *rawWebSocket) recv() ([]byte, error) {
+	var fragments []byte
+	fragmented := false
+	for !ws.closed.Load() {
+		if ws.idleTimeout > 0 {
+			_ = ws.conn.SetReadDeadline(time.Now().Add(ws.idleTimeout))
+		}
+		opcode, payload, fin, err := ws.readFrame()
+		if err != nil {
+			return nil, err
+		}
+		switch opcode {
+		case wsOpClose:
+			ws.closed.Store(true)
+			echo := []byte{}
+			if len(payload) >= 2 {
+				echo = payload[:2]
+			}
+			// The sender may be blocked while the peer asks us to close.
+			// Echo only when the write lock is immediately available.
+			if ws.wmu.TryLock() {
+				_ = ws.conn.SetWriteDeadline(time.Now().Add(100 * time.Millisecond))
+				_, _ = ws.conn.Write(buildFrame(wsOpClose, echo))
+				ws.wmu.Unlock()
+			}
+			_ = ws.conn.Close()
+			return nil, io.EOF
+		case wsOpPing:
+			ws.writeControl(wsOpPong, payload)
+		case wsOpPong:
+			// ignore
+		case wsOpCont, wsOpText, wsOpBinary:
+			if fin && !fragmented {
+				return payload, nil
+			}
+			if len(fragments)+len(payload) > wsMaxMessageLen {
+				return nil, fmt.Errorf("WS message exceeds %d bytes", wsMaxMessageLen)
+			}
+			fragments = append(fragments, payload...)
+			fragmented = true
+			if fin {
+				return fragments, nil
+			}
+		}
+	}
+	return nil, io.EOF
+}
+
+func (ws *rawWebSocket) writeControl(opcode int, data []byte) {
+	ws.wmu.Lock()
+	defer ws.wmu.Unlock()
+	if ws.closed.Load() && opcode != wsOpClose {
+		return
+	}
+	_ = ws.conn.SetWriteDeadline(time.Now().Add(time.Second))
+	_, _ = ws.conn.Write(buildFrame(opcode, data))
+	_ = ws.conn.SetWriteDeadline(time.Time{})
+}
+
+func (ws *rawWebSocket) close() error {
+	alreadyClosed := ws.closed.Swap(true)
+	// A bridge can stop while send is blocked. Never wait for its write lock:
+	// closing the transport must unblock both bridge directions immediately.
+	if !alreadyClosed && ws.wmu.TryLock() {
+		_ = ws.conn.SetWriteDeadline(time.Now().Add(100 * time.Millisecond))
+		_, _ = ws.conn.Write(buildFrame(wsOpClose, nil))
+		ws.wmu.Unlock()
+	}
+	return ws.conn.Close()
+}
+
+func buildFrame(opcode int, data []byte) []byte {
+	length := len(data)
+	flags := byte(wsFinBit | opcode)
+	mask := make([]byte, 4)
+	_, _ = rand.Read(mask)
+
+	var head []byte
+	switch {
+	case length < 126:
+		head = []byte{flags, byte(wsMaskBit | length)}
+	case length < 65536:
+		head = []byte{flags, byte(wsMaskBit | 126), byte(length >> 8), byte(length)}
+	default:
+		head = make([]byte, 10)
+		head[0] = flags
+		head[1] = byte(wsMaskBit | 127)
+		binary.BigEndian.PutUint64(head[2:], uint64(length))
+	}
+	out := make([]byte, 0, len(head)+4+length)
+	out = append(out, head...)
+	out = append(out, mask...)
+	for i := 0; i < length; i++ {
+		out = append(out, data[i]^mask[i&3])
+	}
+	return out
+}
+
+func (ws *rawWebSocket) readFrame() (int, []byte, bool, error) {
+	header := make([]byte, 2)
+	if _, err := io.ReadFull(ws.r, header); err != nil {
+		return 0, nil, false, err
+	}
+	opcode := int(header[0] & 0x0F)
+	fin := header[0]&wsFinBit != 0
+	length := uint64(header[1] & 0x7F)
+	switch length {
+	case 126:
+		b := make([]byte, 2)
+		if _, err := io.ReadFull(ws.r, b); err != nil {
+			return 0, nil, false, err
+		}
+		length = uint64(binary.BigEndian.Uint16(b))
+	case 127:
+		b := make([]byte, 8)
+		if _, err := io.ReadFull(ws.r, b); err != nil {
+			return 0, nil, false, err
+		}
+		length = binary.BigEndian.Uint64(b)
+	}
+	// Check before conversion/allocation, including on 32-bit Keenetic targets.
+	if length > wsMaxMessageLen {
+		return 0, nil, false, fmt.Errorf("WS frame too large: %d bytes", length)
+	}
+
+	var mask []byte
+	if header[1]&wsMaskBit != 0 {
+		mask = make([]byte, 4)
+		if _, err := io.ReadFull(ws.r, mask); err != nil {
+			return 0, nil, false, err
+		}
+	}
+	payload := make([]byte, int(length))
+	if _, err := io.ReadFull(ws.r, payload); err != nil {
+		return 0, nil, false, err
+	}
+	if mask != nil {
+		for i := range payload {
+			payload[i] ^= mask[i&3]
+		}
+	}
+	return opcode, payload, fin, nil
+}

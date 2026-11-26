@@ -1,0 +1,13 @@
+//go:build !linux
+
+package awgroute
+
+func (svc *Service) awgApplyFallbackPolicyOSErr() error { return nil }
+
+func (svc *Service) awgApplyConnectionFailoverPolicyOS() error { return nil }
+
+func (svc *Service) awgApplyMultiHostRoutesOS()          {}
+func (svc *Service) awgApplyMultiHostRoutesOSErr() error { return nil }
+func (svc *Service) awgClearMultiHostRoutesOS()          {}
+func (svc *Service) awgApplyMultiPolicyOS() error        { return nil }
+func (svc *Service) awgClearMultiPolicyOS()              {}

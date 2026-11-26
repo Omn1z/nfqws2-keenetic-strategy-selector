@@ -15,7 +15,7 @@ interface Form {
   enabled: boolean; protocol: string;
   protocol_version: string; traffic_obfuscation: boolean;
   host: string; port: string; user: string; auth_kind: string;
-  password: string; key_pem: string; key_pass: string; known_key: string;
+  password: string; key_pem: string; key_pass: string; known_key: string; original_known_key: string;
   install: string;
   listen_port: string; address: string; subnet: string; mtu: string; dns: string; wan_iface: string; endpoint: string;
   jc: string; jmin: string; jmax: string; s1: string; s2: string; s3: string; s4: string;
@@ -41,7 +41,7 @@ const toForm = (c: AwgServerConfig): Form => ({
   enabled: c.enabled !== false, protocol: c.protocol || "awg",
   protocol_version: c.protocol_version || "", traffic_obfuscation: c.traffic_obfuscation ?? c.protocol !== "wireguard",
   host: c.conn.host || "", port: S(c.conn.port || 22), user: c.conn.user || "root", auth_kind: c.conn.auth_kind || "password",
-  password: "", key_pem: "", key_pass: "", known_key: c.conn.known_key || "",
+  password: "", key_pem: "", key_pass: "", known_key: c.conn.known_key || "", original_known_key: c.conn.known_key || "",
   install: c.install || "apt",
   listen_port: S(c.listen_port || 51820), address: c.address || "", subnet: c.subnet || "", mtu: S(c.mtu || 1420),
   dns: c.dns || "", wan_iface: c.wan_iface || "", endpoint: c.endpoint || "",
@@ -54,13 +54,18 @@ const toForm = (c: AwgServerConfig): Form => ({
   random_trailers: !!c.obf.random_trailers, disable_cookies: !!c.obf.disable_cookies,
 });
 const int = (s: string) => parseInt(s, 10) || 0;
-const collect = (f: Form) => ({
+const collect = (f: Form, nativePin = false) => ({
   enabled: f.enabled,
   protocol: f.protocol || "awg",
   protocol_version: f.protocol_version || undefined,
   traffic_obfuscation: f.traffic_obfuscation,
   install: f.install,
-  conn: { host: f.host.trim(), port: int(f.port) || 22, user: f.user.trim() || "root", auth_kind: f.auth_kind, password: f.password, key_pem: f.key_pem, key_pass: f.key_pass, known_key: f.known_key },
+  conn: {
+    host: f.host.trim(), port: int(f.port) || 22, user: f.user.trim() || "root", auth_kind: f.auth_kind,
+    password: f.password, key_pem: f.key_pem, key_pass: f.key_pass,
+    known_key: !nativePin || f.known_key !== f.original_known_key ? f.known_key : undefined,
+    expected_known_key: nativePin && f.known_key !== f.original_known_key ? f.original_known_key : undefined,
+  },
   listen_port: int(f.listen_port) || 51820, address: f.address.trim(), subnet: f.subnet.trim(), mtu: int(f.mtu) || 1420,
   dns: f.dns.trim(), wan_iface: f.wan_iface.trim(), endpoint: f.endpoint.trim(),
   obf: {
@@ -82,6 +87,7 @@ export default function ServerPane({ st, reload, acceptStatus, deployActive, dep
   const [endpointSaving, setEndpointSaving] = useState(false);
   const [advanced, setAdvanced] = useState(false);
   const [passwordOpen, setPasswordOpen] = useState(false);
+  const [trustingHost, setTrustingHost] = useState(false);
   useEffect(() => {
     setForm(toForm(st.config));
     setDirty(false);
@@ -90,9 +96,12 @@ export default function ServerPane({ st, reload, acceptStatus, deployActive, dep
   const activeServer = st.servers.find((s) => s.id === st.active_server_id);
   const deploymentNeeded = !!st.deployment_pending;
   const awg3 = form.protocol_version === "3.1";
-  const engineIssue = imported ? "" : vpnEngineIssue(st.engine, form.traffic_obfuscation && awg3);
+  const nativeDeploy = st.server_deployment === "wireguard";
+  const deployIssue = nativeDeploy && (form.traffic_obfuscation || form.install === "userspace") ? "Для развёртывания выберите системный WireGuard и выключите обфускацию."
+    : nativeDeploy && !st.config.conn.known_key ? "Сохраните SSH-доступ и подтвердите ключ сервера." : "";
+  const engineIssue = imported || (nativeDeploy && !st.config.client.enabled) ? "" : vpnEngineIssue(st.engine, form.traffic_obfuscation && awg3);
   const formatChanged = !imported && formatKey(form) !== formatKey(toForm(st.config));
-  const ownWorking = saving || deploying || applyingFormat || endpointSaving;
+  const ownWorking = saving || deploying || applyingFormat || endpointSaving || trustingHost;
   const working = ownWorking || externalBusy;
   const set = <K extends keyof Form>(k: K, v: Form[K]) => { if (working) return; setDirty(true); setForm((f) => ({ ...f, [k]: v })); };
   useEffect(() => { onBusyChange(ownWorking); }, [ownWorking, onBusyChange]);
@@ -102,15 +111,20 @@ export default function ServerPane({ st, reload, acceptStatus, deployActive, dep
     if (!dirty && !working) setForm(toForm(st.config));
   }, [configKey, dirty, working]);
 
-  const saveConfig = async (): Promise<Awg2Status | null> => {
+  const saveConfig = async (field?: "mtu" | "endpoint"): Promise<Awg2Status | null> => {
     setSaving(true);
     try {
-      const next = await api<Awg2Status>("POST", "/api/awg2/config", collect(form));
+      const input = field === "mtu" ? { mtu: int(form.mtu) || 1420 }
+        : field === "endpoint" ? { endpoint: form.endpoint.trim() }
+        : collect(form, st.ssh_host_key_enrollment);
+      const next = await api<Awg2Status>("POST", "/api/awg2/config", input);
       // Keep the acknowledged configuration even if the follow-up read fails.
       // The parent also invalidates status reads started before this write.
       acceptStatus(next);
-      setForm(toForm(next.config));
-      setDirty(false);
+      const saved = toForm(next.config);
+      const draft = field ? { ...form, [field]: saved[field] } : saved;
+      setForm(draft);
+      setDirty(!!field && JSON.stringify(draft) !== JSON.stringify(saved));
       await reload();
       return next;
     } catch (e) {
@@ -120,14 +134,29 @@ export default function ServerPane({ st, reload, acceptStatus, deployActive, dep
       setSaving(false);
     }
   };
-  const save = async () => {
-    if (working || formatChanged) return;
-    const next = await saveConfig();
+  const saveFields = async (field?: "mtu" | "endpoint") => {
+    if (working || (formatChanged && !nativeDeploy)) return;
+    const next = await saveConfig(field);
     if (next) toast(next.deployment_pending ? "Настройки сохранены; для применения разверните сервер" : "Настройки VPN сохранены", "ok");
+  };
+  const save = () => saveFields();
+  const saveMtu = () => saveFields(st.mtu_only_edit ? "mtu" : undefined);
+  const trustHost = async () => {
+    if (working || dirty || imported || !st.config.conn.host || st.config.conn.known_key) return;
+    setTrustingHost(true);
+    try {
+      await api("POST", "/api/awg2/status/refresh", { trust_on_first_use: true, server_id: st.active_server_id }, { timeoutMs: 30_000 });
+      await reload();
+      toast("SSH-ключ сервера закреплён", "ok");
+    } catch (e) {
+      toast((e as Error).message, "err");
+    } finally {
+      setTrustingHost(false);
+    }
   };
   const saveAndDeploy = async () => {
     if (working || imported) return;
-    if (engineIssue) { toast(engineIssue, "err"); return; }
+    if (deployIssue || engineIssue) { toast(deployIssue || engineIssue, "err"); return; }
     if (st.deployed && formatChanged && !(await confirmDialog({
       title: "Изменить формат VPN и развернуть сервер?",
       body: "VPN-соединение прервётся на время развёртывания. На роутере применятся новые параметры; на остальных устройствах нужно заново импортировать клиентские конфиги.",
@@ -153,9 +182,10 @@ export default function ServerPane({ st, reload, acceptStatus, deployActive, dep
       {!imported && (
         <Card
           title="Развертывание VPS"
-          sub="обычно достаточно адреса и пароля"
-          head={<Button mini variant="primary" onClick={() => { void deployActive(); }} disabled={working || formatChanged || !st.config.enabled || !st.config.conn.host}>{deploying ? "Деплой..." : st.deployed ? "Переразвернуть этот сервер" : "Развернуть этот сервер"}</Button>}
+          sub={nativeDeploy ? "На VPS нужны WireGuard, wg-quick с systemd, iproute2, Python 3, flock и маршрутизация для клиентов." : "обычно достаточно адреса и пароля"}
+          head={<Button mini variant="primary" onClick={() => { void deployActive(); }} disabled={working || formatChanged || (nativeDeploy && dirty) || !!deployIssue || !st.config.enabled || !st.config.conn.host}>{deploying ? "Деплой..." : st.deployed ? "Переразвернуть этот сервер" : "Развернуть этот сервер"}</Button>}
         >
+          {deployIssue && <p className="mb-3 text-xs text-muted">{deployIssue}</p>}
           <div className="grid gap-3 lg:grid-cols-[minmax(180px,1fr)_110px_140px_auto] lg:items-end">
             <Field label="Адрес VPS">
               <Input value={form.host} placeholder="1.2.3.4 или vpn.example.com" onChange={(e) => set("host", e.target.value)} />
@@ -170,6 +200,10 @@ export default function ServerPane({ st, reload, acceptStatus, deployActive, dep
           </div>
           <div className="mt-3 flex flex-wrap items-center gap-2">
             <Badge kind={st.has_password || st.has_key ? "ok" : "warn"}>{st.has_password || st.has_key ? "доступ сохранён" : "нужен доступ SSH"}</Badge>
+            {st.ssh_host_key_enrollment && st.active_server_id && st.config.conn.host && !st.config.conn.known_key &&
+              <Button mini onClick={trustHost} disabled={working || dirty || !(form.auth_kind === "key" ? st.has_key : st.has_password)}>
+                {trustingHost ? "Проверка SSH…" : "Доверять первому SSH-ключу"}
+              </Button>}
             {st.has_password && !passwordOpen ? <Button mini onClick={() => setPasswordOpen(true)}>Обновить пароль</Button> : null}
             <Button mini variant="ghost" onClick={() => setAdvanced((v) => !v)}>{advanced ? "Скрыть тонкие настройки" : "Тонкие настройки"}</Button>
           </div>
@@ -203,7 +237,8 @@ export default function ServerPane({ st, reload, acceptStatus, deployActive, dep
             {(formatChanged || deploymentNeeded) && <p className="mt-3 rounded-lg bg-warn-bg px-3 py-2 text-xs text-warn">{deploymentNeeded ? "Настройки сохранены, но успешное развёртывание не подтверждено. Роутер и экспорт используют последнюю успешно развёрнутую конфигурацию. Повторите развёртывание." : "Изменения формата применятся после сохранения и развёртывания сервера."} После успешного развёртывания обновите клиентские конфиги на остальных устройствах.</p>}
             {engineIssue && <div className="mt-3 rounded-lg bg-warn-bg px-3 py-2 text-xs text-warn"><p>{engineIssue}</p><Button mini className="mt-2" onClick={onOpenEngineSettings} disabled={working}>Настройки движка</Button></div>}
             <div className="mt-3 flex flex-wrap items-center gap-2">
-              <Button variant="primary" onClick={saveAndDeploy} disabled={working || !!engineIssue || !form.host.trim() || !st.config.enabled || (!formatChanged && !deploymentNeeded)}>{applyingFormat ? "Развёртывание…" : "Сохранить и развернуть"}</Button>
+              {nativeDeploy && dirty && <Button onClick={save} disabled={working}>Сохранить настройки</Button>}
+              <Button variant="primary" onClick={saveAndDeploy} disabled={working || !!deployIssue || !!engineIssue || !form.host.trim() || !st.config.enabled || (!formatChanged && !deploymentNeeded)}>{applyingFormat ? "Развёртывание…" : "Сохранить и развернуть"}</Button>
               <Button mini variant="ghost" onClick={() => setAdvanced((v) => !v)}>{advanced ? "Скрыть параметры" : "Тонкие настройки"}</Button>
             </div>
           </>
@@ -219,8 +254,18 @@ export default function ServerPane({ st, reload, acceptStatus, deployActive, dep
           <Field label="MTU">
             <Input type="number" min={1280} max={1500} value={form.mtu} onChange={(e) => set("mtu", e.target.value)} />
           </Field>
-          <Button variant="primary" onClick={save} disabled={working || formatChanged}>{saving ? "Сохранение…" : "Сохранить MTU"}</Button>
+          <Button variant="primary" onClick={saveMtu} disabled={working || formatChanged}>{saving ? "Сохранение…" : "Сохранить MTU"}</Button>
         </div>
+        {imported && st.primary_endpoint_edit && (
+          <div className="mt-3 grid gap-3 sm:grid-cols-[minmax(180px,1fr)_auto] sm:items-end">
+            <Field label="Основной адрес VPN" hint="Имя или IP с портом. IPv6 в квадратных скобках.">
+              <Input value={form.endpoint} onChange={(e) => set("endpoint", e.target.value)} />
+            </Field>
+            <Button onClick={() => saveFields("endpoint")} disabled={working || !form.endpoint.trim() || form.endpoint.trim() === st.config.endpoint}>
+              Сохранить адрес
+            </Button>
+          </div>
+        )}
       </Card>
 
       <EndpointBackupsPane key={st.active_server_id} st={st} acceptStatus={acceptStatus} onBusyChange={setEndpointSaving} externalBusy={working} />
@@ -248,7 +293,7 @@ export default function ServerPane({ st, reload, acceptStatus, deployActive, dep
         )}
         {form.known_key && <p className="text-[11px] text-muted [overflow-wrap:anywhere]">Ключ хоста закреплён (TOFU): <code>{form.known_key.slice(0, 48)}…</code> <Button mini variant="ghost" onClick={() => set("known_key", "")}>Сбросить</Button></p>}
         <div className="mt-1 flex flex-wrap gap-4">
-          <Field label="Метод установки" className="w-64 shrink-0"><Select value={form.install} onChange={(e) => set("install", e.target.value)}><option value="apt">apt (модуль ядра) + fallback</option><option value="userspace">userspace amneziawg-go</option><option value="imported">imported (без SSH-деплоя)</option></Select></Field>
+          <Field label="Метод установки" className="w-64 shrink-0"><Select value={form.install} onChange={(e) => set("install", e.target.value)}><option value="apt">{nativeDeploy ? "Системный WireGuard (wg-quick)" : "apt (модуль ядра) + fallback"}</option><option value="userspace" disabled={nativeDeploy}>userspace amneziawg-go</option><option value="imported">imported (без SSH-деплоя)</option></Select></Field>
         </div>
       </Card>
       )}
@@ -306,7 +351,7 @@ export default function ServerPane({ st, reload, acceptStatus, deployActive, dep
             </div>
           </div>
         )}
-        <div className="mt-3 flex flex-wrap items-center gap-2.5"><Button variant="primary" onClick={saveAndDeploy} disabled={working || !!engineIssue || !form.host.trim() || !st.config.enabled || (!formatChanged && !deploymentNeeded)}>{applyingFormat ? "Развёртывание…" : "Сохранить и развернуть"}</Button></div>
+        <div className="mt-3 flex flex-wrap items-center gap-2.5"><Button variant="primary" onClick={saveAndDeploy} disabled={working || !!deployIssue || !!engineIssue || !form.host.trim() || !st.config.enabled || (!formatChanged && !deploymentNeeded)}>{applyingFormat ? "Развёртывание…" : "Сохранить и развернуть"}</Button></div>
       </Card>
       ) : null}
     </fieldset>

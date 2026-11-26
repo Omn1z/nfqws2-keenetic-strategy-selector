@@ -1,0 +1,331 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"log"
+	"os"
+	"os/signal"
+	"runtime/debug"
+	"strconv"
+	"syscall"
+	"time"
+
+	"nfqws2strategy/internal/app"
+	"nfqws2strategy/internal/server"
+	"nfqws2strategy/internal/services/openwrtdns"
+	"nfqws2strategy/internal/services/strategy/core/catalog"
+	"nfqws2strategy/internal/services/strategy/core/engine"
+	"nfqws2strategy/internal/tools/config"
+	"nfqws2strategy/internal/tools/logbuf"
+	routerpath "nfqws2strategy/internal/tools/path"
+	"nfqws2strategy/internal/tools/probe"
+)
+
+func init() {
+	// Router-side runtime tuning. BE7000 has ~800 MiB RAM shared with vendor
+	// daemons and other router services — Go's default GC pacing (GOGC=100, no soft
+	// memory ceiling) is happy to keep doubling the heap, which on a router can
+	// trigger OOM-kill cascades. Two knobs:
+	//
+	//   GOMEMLIMIT=250MiB — soft ceiling. The runtime starts GC'ing harder as
+	//   the heap approaches this; on a process that idles around 50-100 MiB
+	//   live this keeps peak well under control without throttling normal ops.
+	//
+	//   GOGC=75 — slightly more aggressive than default (100). Costs a bit of
+	//   CPU but trims tail-allocation spikes a router can't afford.
+	//
+	// Both are overridable via env vars (debug.Set* honours envs), so a future
+	// dev who needs different limits can just export them.
+	if v, ok := os.LookupEnv("GOMEMLIMIT"); !ok || v == "" {
+		debug.SetMemoryLimit(250 << 20)
+	}
+	if v, ok := os.LookupEnv("GOGC"); !ok || v == "" {
+		debug.SetGCPercent(75)
+	}
+}
+
+// version is set at build time via -ldflags "-X main.version=...".
+var version = "dev"
+
+// repo is the GitHub owner/name used for self-update checks and downloads.
+var repo = "Omn1z/nfqws2-keenetic-strategy-selector"
+
+func main() {
+	if len(os.Args) < 2 {
+		usage()
+		os.Exit(2)
+	}
+	switch os.Args[1] {
+	case "version", "-v", "--version":
+		fmt.Println(version)
+	case "serve":
+		cmdServe(os.Args[2:])
+	case "selftest":
+		cmdSelftest(os.Args[2:])
+	case "config":
+		cmdConfig()
+	case "checkupdate":
+		cmdCheckUpdate()
+	case "update":
+		cmdUpdate()
+	case "openwrt-dns-restore":
+		if err := restoreOpenWrtDNS(); err != nil {
+			fmt.Fprintln(os.Stderr, "restore OpenWrt DNS failed:", err)
+			os.Exit(1)
+		}
+	default:
+		usage()
+		os.Exit(2)
+	}
+}
+
+// Restore without creating the application: uninstall also needs this when
+// the DNS listener is stopped or its saved application configuration is broken.
+func restoreOpenWrtDNS() error {
+	if !routerpath.IsOpenWrt() {
+		return nil
+	}
+	cfg := loadConfig()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	return openwrtdns.New(cfg.DataDir).Restore(ctx, "")
+}
+
+func cmdCheckUpdate() {
+	a, err := app.New(loadConfig())
+	if err != nil {
+		log.Fatalln("init:", err)
+	}
+	info, err := a.CheckUpdate()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "check failed:", err)
+		os.Exit(1)
+	}
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	_ = enc.Encode(info)
+}
+
+func cmdUpdate() {
+	a, err := app.New(loadConfig())
+	if err != nil {
+		log.Fatalln("init:", err)
+	}
+	info, err := a.SelfUpdate()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "update failed:", err)
+		os.Exit(1)
+	}
+	fmt.Printf("updating %s -> %s; service will restart\n", info.Current, info.Latest)
+}
+
+func usage() {
+	fmt.Fprintln(os.Stderr, "usage:")
+	fmt.Fprintln(os.Stderr, "  nfqws2-strategy serve [-l <addr>] [--ignore-saved-port]             run web UI + API (default :8090; saved System port takes precedence)")
+	fmt.Fprintln(os.Stderr, "  nfqws2-strategy selftest [-s <strategyIndex>] <host> [host...]   run one strategy against hosts, print JSON")
+	fmt.Fprintln(os.Stderr, "  nfqws2-strategy config                                          print resolved config")
+	fmt.Fprintln(os.Stderr, "  nfqws2-strategy checkupdate                                     check GitHub for a newer release")
+	fmt.Fprintln(os.Stderr, "  nfqws2-strategy update                                          download the latest release and restart")
+	fmt.Fprintln(os.Stderr, "  nfqws2-strategy openwrt-dns-restore                             restore DNS settings managed on OpenWrt (also used by uninstall)")
+}
+
+func cmdServe(args []string) {
+	cfg := loadConfig()
+	daemon := false
+	ignoreSavedPort := false
+	logPath, pidPath := "", ""
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "-l":
+			if i+1 < len(args) {
+				cfg.ListenAddr = args[i+1]
+				i++
+			}
+		case "-d":
+			daemon = true
+		case "--ignore-saved-port":
+			ignoreSavedPort = true
+		case "-log":
+			if i+1 < len(args) {
+				logPath = args[i+1]
+				i++
+			}
+		case "-pid":
+			if i+1 < len(args) {
+				pidPath = args[i+1]
+				i++
+			}
+		}
+	}
+	if !ignoreSavedPort {
+		address, err := app.ResolvePanelListenAddr(cfg.DataDir, cfg.ListenAddr)
+		if err != nil {
+			log.Fatalln("load panel port (use --ignore-saved-port to recover):", err)
+		}
+		cfg.ListenAddr = address
+	}
+	if daemon {
+		isParent, err := maybeDaemonize(logPath, pidPath)
+		if err != nil {
+			log.Fatalln("daemonize:", err)
+		}
+		if isParent {
+			return
+		}
+	}
+
+	// Tee logs into the in-memory ring (UI "Логи" tab) while still writing to the
+	// -log file / stderr. Keep proxy diagnostics in a separate, bounded file.
+	proxyLogPath := ""
+	if logPath != "" {
+		proxyLogPath = logPath + ".proxy"
+	}
+	log.SetFlags(0)
+	log.SetOutput(logbuf.Init(os.Stderr, proxyLogPath))
+
+	a, err := app.New(cfg)
+	if err != nil {
+		log.Fatalln("init:", err)
+	}
+	srv, err := server.NewPanelListener(cfg.ListenAddr, server.New(a).Handler())
+	if err != nil {
+		a.Shutdown()
+		log.Fatalln("serve:", err)
+	}
+	a.SetPanelListener(srv)
+	log.Printf("nfqws2-strategy %s listening on %s (data: %s)", version, srv.Address(), cfg.DataDir)
+	go func() {
+		if err := a.RestoreNfqws2Bypass(); err != nil {
+			log.Printf("NFQUEUE bypass startup restore: %v", err)
+		}
+	}()
+
+	sigc := make(chan os.Signal, 1)
+	signal.Notify(sigc, os.Interrupt, syscall.SIGTERM)
+	select {
+	case <-sigc:
+	case err := <-srv.Errors():
+		log.Println("serve:", err)
+	}
+	log.Println("shutting down...")
+	a.Shutdown()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_ = srv.Shutdown(ctx)
+}
+
+func loadConfig() *config.Config {
+	cfg := config.Default()
+	if err := cfg.LoadFromNfqws2Conf(); err != nil {
+		fmt.Fprintf(os.Stderr, "warn: could not read %s: %v (using defaults)\n", cfg.Nfqws2Conf, err)
+	}
+	if v := os.Getenv("N2S_DATA"); v != "" {
+		cfg.DataDir = v
+	}
+	if v := os.Getenv("N2S_LISTEN"); v != "" {
+		cfg.ListenAddr = v
+	}
+	if v := os.Getenv("N2S_INIT"); v != "" {
+		cfg.InitScript = v
+	}
+	if v := os.Getenv("N2S_NFQWS2_CONF"); v != "" {
+		cfg.Nfqws2Conf = v
+	}
+	if v := os.Getenv("N2S_NFQWS_BIN"); v != "" {
+		cfg.NfqwsBin = v
+	}
+	if v := os.Getenv("N2S_NFQWS2_INIT"); v != "" {
+		cfg.Nfqws2Init = v
+	}
+	if v := os.Getenv("N2S_LUA_DIR"); v != "" {
+		cfg.LuaDir = v
+	}
+	if v := os.Getenv("N2S_SYSTEM_BLOBS_DIR"); v != "" {
+		cfg.SystemBlobsDir = v
+	}
+	cfg.Version = version
+	cfg.Repo = repo
+	return cfg
+}
+
+func cmdConfig() {
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	_ = enc.Encode(loadConfig())
+}
+
+func cmdSelftest(args []string) {
+	stratIdx := 0
+	var hosts []string
+	for i := 0; i < len(args); i++ {
+		if args[i] == "-s" && i+1 < len(args) {
+			stratIdx, _ = strconv.Atoi(args[i+1])
+			i++
+			continue
+		}
+		hosts = append(hosts, args[i])
+	}
+	if len(hosts) == 0 {
+		usage()
+		os.Exit(2)
+	}
+
+	cfg := loadConfig()
+	cat, err := catalog.Builtin()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	if len(cat) == 0 {
+		fmt.Fprintln(os.Stderr, "install the nfqws2-strategy-strategies package to use the builtin catalog")
+		os.Exit(2)
+	}
+	if stratIdx < 0 || stratIdx >= len(cat) {
+		fmt.Fprintf(os.Stderr, "strategy index out of range (0..%d)\n", len(cat)-1)
+		os.Exit(2)
+	}
+	strat := cat[stratIdx]
+
+	sb := engine.NewSandbox(cfg, 0)
+	if err := sb.RulesUp(); err != nil {
+		fmt.Fprintln(os.Stderr, "rules up:", err)
+		os.Exit(1)
+	}
+	// Always clean up, even on Ctrl-C.
+	cleanup := func() {
+		sb.StopNfqws()
+		sb.RulesDown()
+	}
+	sigc := make(chan os.Signal, 1)
+	signal.Notify(sigc, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-sigc
+		cleanup()
+		os.Exit(130)
+	}()
+	defer cleanup()
+
+	if err := sb.StartNfqws(nil, strat.Args()); err != nil {
+		fmt.Fprintln(os.Stderr, "start nfqws:", err)
+		fmt.Fprintln(os.Stderr, sb.Diagnostics())
+		os.Exit(1)
+	}
+
+	pr := probe.New(sb.PortLo, sb.PortHi)
+	results := make([]probe.Result, 0, len(hosts))
+	for _, h := range hosts {
+		results = append(results, pr.Probe(context.Background(), h))
+	}
+
+	out := map[string]any{
+		"strategy": strat,
+		"queue":    sb.QNum,
+		"ports":    fmt.Sprintf("%d-%d", sb.PortLo, sb.PortHi),
+		"results":  results,
+	}
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	_ = enc.Encode(out)
+}

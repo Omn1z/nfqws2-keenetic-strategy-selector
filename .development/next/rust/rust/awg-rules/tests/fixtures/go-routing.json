@@ -1,0 +1,49 @@
+{
+  "document": {
+    "format": "nfqws2-strategy-routing",
+    "version": 1,
+    "routing": {
+      "mode": "zones",
+      "zones": [
+        {
+          "name": "first \u003cA\u003e \u0026 B",
+          "tunnel_id": "source",
+          "order": 1,
+          "route": "tunnel",
+          "mode": "include",
+          "domains": [
+            "example.org",
+            "[re]^video\\."
+          ],
+          "include_subdomains": true,
+          "ips": [
+            "203.0.113.9/32",
+            "2001:db8::/32"
+          ],
+          "source_ips": [
+            "192.168.3.10/32"
+          ],
+          "enabled": true
+        }
+      ],
+      "mtu": 1420,
+      "killswitch": true,
+      "domain_source": "dnsproxy",
+      "sni_routing": true,
+      "trace_enabled": true,
+      "active": false
+    },
+    "connections": [
+      {
+        "ref": "source",
+        "label": "label source",
+        "endpoint": "VPN.Example.:00443",
+        "client_iface": "awg0",
+        "protocol": "awg/3.1",
+        "server_public_key": "BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc=",
+        "fingerprint": "35f40e46ff90ad7e768fd849be0c6c1d"
+      }
+    ]
+  },
+  "policy_hash": "459ace9208f3a8fa78951d5ae211ad22ff53cedebc7d0e87b6777d43a2c1281d"
+}

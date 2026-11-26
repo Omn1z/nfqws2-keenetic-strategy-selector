@@ -1,0 +1,9 @@
+[package]
+name = "nfqws2-router-command"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+tempfile = "3"

@@ -15,7 +15,7 @@ import { filterStrategies, StrategyCatalog, strategyL7Options } from "./Strategy
 const EMPTY = { id: "", name: "", l7: "tls", args: "" };
 
 export default function Strategies() {
-  const { strategies, reloadStrategies, reloadBlobs } = useStore();
+  const { strategies, reloadStrategies, reloadBlobs } = useStore({ strategies: true });
   const [form, setForm] = useState(EMPTY);
   const [search, setSearch] = useState("");
   const [l7, setL7] = useState("");

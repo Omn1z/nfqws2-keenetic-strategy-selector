@@ -1,0 +1,38 @@
+[package]
+name = "nfqws2-tgws"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+portable-atomic.workspace = true
+nfqws2-tgws-config = { path = "../tgws-config" }
+nfqws2-tgws-transport = { path = "../tgws-transport" }
+nfqws2-tls-roots = { path = "../tls-roots" }
+serde.workspace = true
+serde_json.workspace = true
+aes = "0.8"
+ctr = "0.9"
+sha2 = "0.11"
+ring = "0.17"
+flate2 = "1"
+subtle = "2"
+getrandom = "0.2"
+rand = "0.9"
+tokio = { version = "1", features = ["rt", "net", "io-util", "io-std", "macros", "time", "sync"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring","tls12"] }
+tokio-util = { version = "0.7", default-features = false }
+tokio-tungstenite = { version = "0.28", default-features = false, features = ["handshake"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink","std"] }
+h2 = "0.4"
+bytes = "1"
+http = "1"
+hyper = { version = "1", default-features = false, features = ["client","http1"] }
+hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
+http-body-util = "0.1"
+
+[dev-dependencies]
+socket2 = { version = "0.6", features = ["all"] }
+tempfile = "3"
+tokio = { version = "1", features = ["test-util"] }
+rcgen = { version = "0.14", default-features = false, features=["ring","crypto"] }

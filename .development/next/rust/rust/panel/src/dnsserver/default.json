@@ -1,0 +1,169 @@
+{
+  "shadow_dns": {
+    "enabled": false,
+    "servers": [],
+    "domains": [
+      {
+        "domain": "ru",
+        "include_subdomains": true
+      },
+      {
+        "domain": "xn--p1ai",
+        "include_subdomains": true
+      },
+      {
+        "domain": "vk.*",
+        "include_subdomains": true
+      },
+      {
+        "domain": "avito.*",
+        "include_subdomains": true
+      }
+    ]
+  },
+  "enabled": false,
+  "listen_host": "auto",
+  "dns_port": 5355,
+  "default_upstream": {
+    "address": "https://1.1.1.1/dns-query",
+    "bootstrap_ips": []
+  },
+  "default_pool": [],
+  "logging_enabled": true,
+  "fast_dns": true,
+  "scheduler_enabled": true,
+  "awg_fallback": "auto",
+  "route_mode": "auto",
+  "filtering": {
+    "enabled": false,
+    "lists": [
+      "adguard-dns"
+    ],
+    "custom_rules": [
+      {
+        "domain": "report.appmetrica.yandex.net",
+        "category": "ads"
+      },
+      {
+        "domain": "ep1.adtrafficquality.google",
+        "category": "ads"
+      },
+      {
+        "domain": "ogads-pa.clients6.google.com",
+        "category": "ads"
+      },
+      {
+        "domain": "rosenberg.appmetrica.yandex.net",
+        "category": "ads"
+      },
+      {
+        "domain": "ca.iadsdk.apple.com",
+        "category": "ads"
+      },
+      {
+        "domain": "www.tns-counter.ru",
+        "category": "trackers"
+      },
+      {
+        "domain": "inapps.appsflyersdk.com",
+        "category": "trackers"
+      },
+      {
+        "domain": "app-analytics-services.com",
+        "category": "trackers"
+      },
+      {
+        "domain": "app-measurement.com",
+        "category": "trackers"
+      },
+      {
+        "domain": "r0.mradx.net",
+        "category": "trackers"
+      },
+      {
+        "domain": "top-fwz1.mail.ru",
+        "category": "trackers"
+      },
+      {
+        "domain": "sdk-api.apptracer.ru",
+        "category": "trackers"
+      },
+      {
+        "domain": "stats.vk-portal.net",
+        "category": "trackers"
+      },
+      {
+        "domain": "c.msn.com",
+        "category": "trackers"
+      },
+      {
+        "domain": "events.statsigapi.net",
+        "category": "trackers"
+      },
+      {
+        "domain": "gx-target-experiments-frontend-api.gx.nvidia.com",
+        "category": "trackers"
+      },
+      {
+        "domain": "ampltd2.medal.tv",
+        "category": "trackers"
+      },
+      {
+        "domain": "events.launchdarkly.com",
+        "category": "trackers"
+      },
+      {
+        "domain": "spade.twitch.tv",
+        "category": "trackers"
+      },
+      {
+        "domain": "*-netseer-ipaddr-assoc.xy.fbcdn.net",
+        "category": "trackers"
+      },
+      {
+        "domain": "*-netseer-ipaddr-assoc.xz.fbcdn.net",
+        "category": "trackers"
+      }
+    ],
+    "allowlist": []
+  },
+  "timeout_seconds": 3,
+  "cache_size": 512,
+  "cache_ttl_seconds": 3600,
+  "rules": [
+    {
+      "id": "rule-1",
+      "enabled": true,
+      "domain": "claude.com",
+      "include_subdomains": true,
+      "upstream": {
+        "address": "https://xbox-dns.ru/dns-query",
+        "bootstrap_ips": []
+      },
+      "pool": []
+    },
+    {
+      "id": "rule-2",
+      "enabled": true,
+      "domain": "grok.com",
+      "include_subdomains": true,
+      "upstream": {
+        "address": "https://xbox-dns.ru/dns-query",
+        "bootstrap_ips": []
+      },
+      "pool": []
+    },
+    {
+      "id": "rule-3",
+      "enabled": true,
+      "domain": "claude.ai",
+      "include_subdomains": true,
+      "upstream": {
+        "address": "https://xbox-dns.ru/dns-query",
+        "bootstrap_ips": []
+      },
+      "pool": []
+    }
+  ],
+  "disabled_methods": []
+}

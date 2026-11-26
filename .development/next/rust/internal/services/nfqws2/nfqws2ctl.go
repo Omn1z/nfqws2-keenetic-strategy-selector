@@ -1,0 +1,892 @@
+// Package nfqws2 ports the file-management + version/update surface of the
+// upstream nfqws-keenetic-web (the lighttpd+PHP UI on port 90) into our panel:
+// editing the live nfqws2 engine's config, Lua DPI scripts and domain/IP lists,
+// plus showing/updating the engine package version and reloading it (SIGHUP).
+// The on-disk layout mirrors the upstream PHP (dev/router-nfqws-web-index.php):
+// conf in /opt/etc/nfqws2, lists in /opt/etc/nfqws2/lists, lua in the configured
+// lua dir (all .lua.gz here).
+//
+// SECURITY: this runs as root on the router, so the path model is deliberately
+// strict — the client only picks a KIND ("conf"|"list"|"lua"); the server owns
+// the directory. Names are reduced to a basename and validated against a
+// per-kind anchored regex (stem + allowed extension). No client-supplied value
+// can redirect the directory or escape it.
+package nfqws2
+
+import (
+	"bytes"
+	"compress/gzip"
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"os"
+	"os/exec"
+	stdpath "path"
+	"regexp"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"nfqws2strategy/internal/tools/config"
+	"nfqws2strategy/internal/tools/logbuf"
+	routerpath "nfqws2strategy/internal/tools/path"
+	"nfqws2strategy/internal/tools/shell"
+	"nfqws2strategy/internal/tools/strs"
+)
+
+// Manager owns the nfqws2 engine's on-disk files + package version/update/reload.
+type Manager struct {
+	cfg                *config.Config
+	bypassMu           sync.Mutex
+	assetsMu           sync.Mutex      // serialize managed assets, imports and snapshots
+	transportEndpoints func() []string // guarded by bypassMu; no lifecycle calls
+}
+
+// New builds a Manager reading the live app config (router paths + package name).
+func New(cfg *config.Config) *Manager { return &Manager{cfg: cfg} }
+
+// File is one managed file (collapsed to its base name; a .gz variant is surfaced
+// via Gz, not as a second entry).
+type File struct {
+	Name      string `json:"name"`
+	Kind      string `json:"kind"`
+	Size      int64  `json:"size"`
+	Gz        bool   `json:"gz"`        // stored gzipped (read transparently gunzips)
+	Protected bool   `json:"protected"` // cannot be deleted (engine relies on it)
+}
+
+// VersionInfo reports the installed engine version and (optionally) the latest
+// available release.
+type VersionInfo struct {
+	Package       string `json:"package"`         // apk/opkg package version, never the binary version
+	PackageStatus string `json:"package_status"`  // installed, missing, or unknown (query failed)
+	Engine        string `json:"engine"`          // binary --version, e.g. "v0.9.5.1"
+	Latest        string `json:"latest"`          // newest release (v-stripped)
+	Available     bool   `json:"available"`       // Latest newer than Package
+	URL           string `json:"url"`             // release page
+	Error         string `json:"error,omitempty"` // soft local-query or network error
+}
+
+const (
+	readCap   = 8 << 20  // cap a single in-editor read
+	uploadCap = 16 << 20 // cap an upload
+)
+
+// allowed base extensions per kind (without the leading dot, .gz already stripped).
+var exts = map[string][]string{
+	"conf":   {"conf", "conf-opkg", "conf-old", "apk-new"},
+	"list":   {"list", "list-opkg", "list-old"},
+	"bypass": {"list"},
+	"lua":    {"lua"},
+}
+
+var bypassFiles = map[string]bool{
+	"nfqueue_bypass_domains.list": true,
+	"nfqueue_bypass_ips.list":     true,
+}
+
+// anchored per-kind validators: stem [A-Za-z0-9_-]+ then one allowed extension.
+var nameRe = func() map[string]*regexp.Regexp {
+	m := map[string]*regexp.Regexp{}
+	for kind, ex := range exts {
+		m[kind] = regexp.MustCompile(`^[A-Za-z0-9_-]+\.(` + strings.Join(ex, "|") + `)$`)
+	}
+	return m
+}()
+
+// dir maps a kind to its server-owned directory (always forward-slash so it's
+// correct regardless of the build OS — these are router paths).
+func (m *Manager) dir(kind string) (string, bool) {
+	confDir := stdpath.Dir(m.cfg.Nfqws2Conf) // /opt/etc/nfqws2
+	switch kind {
+	case "conf":
+		return confDir, true
+	case "list":
+		return confDir + "/lists", true
+	case "bypass":
+		return confDir + "/lists", true
+	case "lua":
+		return m.cfg.LuaDir, true
+	}
+	return "", false
+}
+
+// resolve validates (kind, name) and returns the absolute base path (the non-.gz
+// path inside the kind dir) plus the validated base name.
+func (m *Manager) resolve(kind, name string) (basePath, base string, err error) {
+	dir, ok := m.dir(kind)
+	if !ok {
+		return "", "", fmt.Errorf("неизвестный тип файла: %q", kind)
+	}
+	base = stdpath.Base(strings.TrimSpace(name))
+	base = strings.TrimSuffix(base, ".gz")
+	re := nameRe[kind]
+	if re == nil || !re.MatchString(base) {
+		return "", "", fmt.Errorf("недопустимое имя файла: %q", name)
+	}
+	if kind == "bypass" && !bypassFiles[base] {
+		return "", "", fmt.Errorf("недопустимый файл NFQUEUE bypass: %q", name)
+	}
+	return dir + "/" + base, base, nil
+}
+
+func isProtected(kind, base string) bool {
+	switch kind {
+	case "conf":
+		return base == "nfqws2.conf"
+	case "list":
+		if managedServiceList(base) {
+			return true
+		}
+		switch base {
+		case "user.list", "auto.list", "exclude.list", "ipset.list", "ipset_exclude.list":
+			return true
+		}
+	case "bypass":
+		return bypassFiles[base]
+	}
+	return false
+}
+
+// List returns the managed files of a kind, collapsing x.lua + x.lua.gz to a
+// single base entry (a plain file shadows its .gz), sorted like the upstream.
+func (m *Manager) List(kind string) ([]File, error) {
+	dir, ok := m.dir(kind)
+	if !ok {
+		return nil, fmt.Errorf("неизвестный тип файла: %q", kind)
+	}
+	re := nameRe[kind]
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	type acc struct {
+		plain *int64
+		gz    *int64
+	}
+	byBase := map[string]*acc{}
+	for _, e := range entries {
+		if e.IsDir() {
+			continue
+		}
+		name := e.Name()
+		isGz := strings.HasSuffix(name, ".gz")
+		base := strings.TrimSuffix(name, ".gz")
+		if !re.MatchString(base) {
+			continue
+		}
+		if kind == "list" && bypassFiles[base] {
+			continue
+		}
+		if kind == "bypass" && !bypassFiles[base] {
+			continue
+		}
+		info, ierr := e.Info()
+		if ierr != nil {
+			continue
+		}
+		sz := info.Size()
+		a2 := byBase[base]
+		if a2 == nil {
+			a2 = &acc{}
+			byBase[base] = a2
+		}
+		if isGz {
+			a2.gz = &sz
+		} else {
+			a2.plain = &sz
+		}
+	}
+	out := make([]File, 0, len(byBase))
+	for base, a2 := range byBase {
+		f := File{Name: base, Kind: kind, Protected: isProtected(kind, base)}
+		if a2.plain != nil {
+			f.Size = *a2.plain
+		} else if a2.gz != nil {
+			f.Size = *a2.gz
+			f.Gz = true
+		}
+		out = append(out, f)
+	}
+	if kind == "bypass" {
+		for base := range bypassFiles {
+			if _, ok := byBase[base]; ok {
+				continue
+			}
+			out = append(out, File{Name: base, Kind: kind, Protected: true})
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		pi, pj := sortPriority(out[i].Name), sortPriority(out[j].Name)
+		if pi != pj {
+			return pi < pj
+		}
+		return out[i].Name < out[j].Name
+	})
+	return out, nil
+}
+
+// sortPriority mirrors the upstream ordering (router-nfqws-web-index.php).
+func sortPriority(name string) int {
+	switch name {
+	case "nfqws2.conf":
+		return -81
+	case "user.list":
+		return -64
+	case "exclude.list":
+		return -63
+	case "auto.list":
+		return -62
+	case "ipset.list":
+		return -61
+	case "ipset_exclude.list":
+		return -60
+	case "nfqueue_bypass_domains.list":
+		return -59
+	case "nfqueue_bypass_ips.list":
+		return -58
+	}
+	switch {
+	case strings.HasSuffix(name, ".conf"):
+		return -70
+	case strings.HasSuffix(name, ".list"):
+		return -50
+	case strings.HasSuffix(name, ".lua"):
+		return -30
+	}
+	return 10
+}
+
+func readCapped(p string) ([]byte, error) {
+	f, err := os.Open(p)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	return readEditorLimited(f)
+}
+
+func readEditorLimited(r io.Reader) ([]byte, error) {
+	data, err := io.ReadAll(io.LimitReader(r, readCap+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > readCap {
+		return nil, fmt.Errorf("файл больше 8 МиБ: откройте его через File Explorer, редактор не будет обрезать содержимое")
+	}
+	return data, nil
+}
+
+// Read returns the file content, transparently gunzipping a .gz variant. A
+// missing file yields "" (upstream parity), not an error.
+func (m *Manager) Read(kind, name string) (string, error) {
+	basePath, _, err := m.resolve(kind, name)
+	if err != nil {
+		return "", err
+	}
+	if _, e := os.Stat(basePath); e == nil {
+		b, rerr := readCapped(basePath)
+		return string(b), rerr
+	}
+	gzPath := basePath + ".gz"
+	if _, e := os.Stat(gzPath); e == nil {
+		f, oerr := os.Open(gzPath)
+		if oerr != nil {
+			return "", oerr
+		}
+		defer f.Close()
+		zr, zerr := gzip.NewReader(f)
+		if zerr != nil {
+			return "", zerr
+		}
+		defer zr.Close()
+		b, rerr := readEditorLimited(zr)
+		return string(b), rerr
+	}
+	return "", nil
+}
+
+// normalize mirrors the upstream normalizeString: LF endings, no runaway blank
+// lines, single trailing newline.
+func normalize(s string) string {
+	s = strings.TrimPrefix(s, "\ufeff")
+	s = strings.ReplaceAll(s, "\r\n", "\n")
+	s = strings.ReplaceAll(s, "\r", "\n")
+	s = regexp.MustCompile(`\n{3,}`).ReplaceAllString(s, "\n\n")
+	if s != "" && !strings.HasSuffix(s, "\n") {
+		s += "\n"
+	}
+	return s
+}
+
+// Save writes content to the uncompressed base path (mirrors the PHP: a pre-
+// existing .gz is left in place and now shadowed by the plain file). Write goes
+// via a temp file + rename in the same dir so a partial write can't corrupt a
+// live config.
+func (m *Manager) Save(kind, name, content string) error {
+	m.assetsMu.Lock()
+	defer m.assetsMu.Unlock()
+	basePath, base, err := m.resolve(kind, name)
+	if err != nil {
+		return err
+	}
+	if kind == "list" && managedServiceList(base) {
+		return errManagedServiceList
+	}
+	data := []byte(normalize(content))
+	if kind == "conf" {
+		data, _, err = prepareAssetData(kind, base, data)
+		if err != nil {
+			return err
+		}
+	}
+	var owner *assetOwner
+	if _, statErr := os.Lstat(basePath); os.IsNotExist(statErr) && kind == "list" {
+		owner, err = m.currentAutolistOwner("lists/" + base)
+		if err != nil {
+			return err
+		}
+	}
+	if err := writeAssetLocation(assetLocation{stdpath.Dir(basePath), stdpath.Base(basePath), kind}, data, 0o644, owner); err != nil {
+		return err
+	}
+	logbuf.Append("nfqws2", "info", "сохранён "+kind+"/"+base)
+	return nil
+}
+
+// Create creates an empty file; fails if a plain or .gz variant exists.
+func (m *Manager) Create(kind, name string) error {
+	m.assetsMu.Lock()
+	defer m.assetsMu.Unlock()
+	basePath, base, err := m.resolve(kind, name)
+	if err != nil {
+		return err
+	}
+	if kind == "list" && managedServiceList(base) {
+		return errManagedServiceList
+	}
+	if _, e := os.Stat(basePath); e == nil {
+		return fmt.Errorf("файл уже существует: %s", base)
+	}
+	if _, e := os.Stat(basePath + ".gz"); e == nil {
+		return fmt.Errorf("файл уже существует: %s", base)
+	}
+	var owner *assetOwner
+	if kind == "list" {
+		owner, err = m.currentAutolistOwner("lists/" + base)
+		if err != nil {
+			return err
+		}
+	}
+	f, err := os.OpenFile(basePath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+	if err != nil {
+		return err
+	}
+	if owner != nil {
+		if err = initializeAssetOwner(f, owner); err != nil {
+			f.Close()
+			_ = os.Remove(basePath)
+			return err
+		}
+	}
+	if err = f.Close(); err != nil {
+		return err
+	}
+	logbuf.Append("nfqws2", "info", "создан "+kind+"/"+base)
+	return nil
+}
+
+// Delete removes the base AND its .gz variant (so a deleted lua can't resurrect
+// from its .gz). Protected files are refused.
+func (m *Manager) Delete(kind, name string) error {
+	m.assetsMu.Lock()
+	defer m.assetsMu.Unlock()
+	basePath, base, err := m.resolve(kind, name)
+	if err != nil {
+		return err
+	}
+	if isProtected(kind, base) {
+		return fmt.Errorf("файл защищён от удаления: %s", base)
+	}
+	existed := false
+	if err := os.Remove(basePath); err == nil {
+		existed = true
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	if err := os.Remove(basePath + ".gz"); err == nil {
+		existed = true
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	if !existed {
+		return fmt.Errorf("файл не найден: %s", base)
+	}
+	logbuf.Append("nfqws2", "info", "удалён "+kind+"/"+base)
+	return nil
+}
+
+// Upload stores an uploaded file. Gzipped uploads are auto-decompressed (by
+// magic, regardless of name) so the result is editable plain text.
+func (m *Manager) Upload(kind, filename string, data []byte) error {
+	if len(data) > uploadCap {
+		return fmt.Errorf("файл превышает предел 16 МиБ")
+	}
+	if len(data) >= 2 && data[0] == 0x1f && data[1] == 0x8b {
+		zr, err := gzip.NewReader(bytes.NewReader(data))
+		if err != nil {
+			return fmt.Errorf("не удалось открыть gzip: %w", err)
+		}
+		dec, err := readEditorLimited(zr)
+		_ = zr.Close()
+		if err != nil {
+			return err
+		}
+		data = dec
+	}
+	if len(data) > readCap {
+		return fmt.Errorf("файл больше 8 МиБ: загрузите его через File Explorer")
+	}
+	var err error
+	data, _, err = prepareAssetData(kind, strings.TrimSuffix(filename, ".gz"), data)
+	if err != nil {
+		return err
+	}
+	return m.Save(kind, filename, string(data))
+}
+
+// Bytes returns the file as stored for download (a .gz with no plain sibling is
+// returned raw, named ".gz"); otherwise the plain bytes.
+func (m *Manager) Bytes(kind, name string) (data []byte, dlName string, err error) {
+	basePath, base, rerr := m.resolve(kind, name)
+	if rerr != nil {
+		return nil, "", rerr
+	}
+	if b, e := readCapped(basePath); e == nil {
+		return b, base, nil
+	} else if !os.IsNotExist(e) {
+		return nil, "", e
+	}
+	if b, e := readCapped(basePath + ".gz"); e == nil {
+		return b, base + ".gz", nil
+	} else if !os.IsNotExist(e) {
+		return nil, "", e
+	}
+	return nil, "", fmt.Errorf("файл не найден: %s", base)
+}
+
+// ApplyBypass resolves domains with bounded concurrency, then rebuilds the
+// NFQWS2 chains and reapplies the out-of-band NFQUEUE bypass rules. The
+// firewall hooks read only the resolved cache, so Keenetic netfilter reloads
+// do not spend minutes resolving the list before bypass starts working.
+func (m *Manager) ApplyBypass() error {
+	m.bypassMu.Lock()
+	defer m.bypassMu.Unlock()
+	return m.applyBypass()
+}
+
+func (m *Manager) applyBypass() error {
+	if _, _, err := m.syncTransportEndpoints(); err != nil {
+		return err
+	}
+	if _, err := m.PrepareWANInterfaces(); err != nil {
+		return fmt.Errorf("prepare NFQUEUE bypass interfaces: %w", err)
+	}
+	confDir := stdpath.Dir(m.cfg.Nfqws2Conf)
+	bypassScript := stdpath.Join(confDir, "nfqws-strategy-bypass.sh")
+	initScript := m.cfg.Nfqws2Init
+	// Keep the package-owned helper separate from the vendor's much slower
+	// nfqws-bypass.sh. The latter is preserved for other consumers.
+	if err := ensureBypassScript(bypassScript); err != nil {
+		return fmt.Errorf("prepare NFQUEUE bypass script: %w", err)
+	}
+	resolved, failed, invalid, err := prepareBypassResolved(confDir, net.DefaultResolver.LookupIPAddr)
+	if err != nil {
+		return fmt.Errorf("resolve NFQUEUE bypass domains: %w", err)
+	}
+	if failed > 0 || invalid > 0 {
+		logbuf.Append("nfqws2", "warn", fmt.Sprintf("NFQUEUE bypass: %d DNS failures, %d invalid domains", failed, invalid))
+	}
+	if err := ensureBypassPersistence(confDir, initScript, bypassScript); err != nil {
+		return fmt.Errorf("prepare NFQUEUE bypass firewall hook: %w", err)
+	}
+	if err := ensureBypassInitHook(initScript, bypassScript); err != nil {
+		return fmt.Errorf("prepare NFQUEUE bypass restart hook: %w", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	cmd := nfqws2BypassApplyCommand(initScript, bypassScript)
+	out, err := exec.CommandContext(ctx, "sh", "-c", cmd).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("NFQUEUE bypass apply failed: %v: %s", err, strings.TrimSpace(string(out)))
+	}
+	logbuf.Append("nfqws2", "info", fmt.Sprintf("NFQUEUE bypass applied (%d resolved IPs)", resolved))
+	return nil
+}
+
+func nfqws2BypassApplyCommand(initScript, bypassScript string) string {
+	init := shell.Quote(initScript)
+	helper := shell.Quote(bypassScript)
+	// The IPv6 command is a successful no-op when IPV6_ENABLED=0. When enabled,
+	// create its nfqws chains before the helper tries to attach bypass jumps.
+	return init + " firewall_iptables && " + init + " firewall_ip6tables && " +
+		helper + " iptables && " + helper + " ip6tables"
+}
+
+// RestoreBypass repairs hooks after a panel self-update or router restart. A
+// current resolved cache is reused immediately; an old/missing cache triggers
+// the full apply. This lets upgrades from the vendor helper become effective
+// without asking the user to revisit the Bypass tab.
+func (m *Manager) RestoreBypass() error {
+	m.bypassMu.Lock()
+	_, _, transportErr := m.syncTransportEndpoints()
+	m.bypassMu.Unlock()
+	if transportErr != nil {
+		return transportErr
+	}
+	interfacesChanged, err := m.PrepareWANInterfaces()
+	if err != nil {
+		return fmt.Errorf("prepare NFQUEUE bypass interfaces: %w", err)
+	}
+	confDir := stdpath.Dir(m.cfg.Nfqws2Conf)
+	listDir := stdpath.Join(confDir, "lists")
+	domains := stdpath.Join(listDir, "nfqueue_bypass_domains.list")
+	ipList := stdpath.Join(listDir, "nfqueue_bypass_ips.list")
+	cache := stdpath.Join(listDir, "nfqueue_bypass_resolved.list")
+	hasList := false
+	for _, name := range []string{domains, ipList, stdpath.Join(confDir, transportEndpointsFile)} {
+		if _, err := os.Stat(name); err == nil {
+			hasList = true
+		} else if !os.IsNotExist(err) {
+			return err
+		}
+	}
+	if !hasList {
+		return nil
+	}
+	cacheInfo, err := os.Stat(cache)
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	domainInfo, domainErr := os.Stat(domains)
+	if domainErr != nil && !os.IsNotExist(domainErr) {
+		return domainErr
+	}
+	if os.IsNotExist(err) || (os.IsNotExist(domainErr) && cacheInfo.Size() > 0) || (domainErr == nil &&
+		(domainInfo.ModTime().After(cacheInfo.ModTime()) || (domainInfo.Size() > 0 && cacheInfo.Size() == 0))) {
+		return m.ApplyBypass()
+	}
+	m.bypassMu.Lock()
+	defer m.bypassMu.Unlock()
+	bypassScript := stdpath.Join(confDir, "nfqws-strategy-bypass.sh")
+	if err := ensureBypassScript(bypassScript); err != nil {
+		return err
+	}
+	if err := ensureBypassPersistence(confDir, m.cfg.Nfqws2Init, bypassScript); err != nil {
+		return err
+	}
+	if err := ensureBypassInitHook(m.cfg.Nfqws2Init, bypassScript); err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	cmd := shell.Quote(bypassScript) + " iptables && " + shell.Quote(bypassScript) + " ip6tables"
+	if interfacesChanged {
+		// Upstream may already have attempted to rebuild its parent chains with
+		// the old comma-separated value before the panel started. Repair those
+		// too, while reusing the valid resolved-IP cache.
+		cmd = nfqws2BypassApplyCommand(m.cfg.Nfqws2Init, bypassScript)
+	}
+	out, err := exec.CommandContext(ctx, "sh", "-c", cmd).CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("NFQUEUE bypass restore failed: %v: %s", err, strings.TrimSpace(string(out)))
+	}
+	logbuf.Append("nfqws2", "info", "NFQUEUE bypass restored from resolved cache")
+	return nil
+}
+
+func packageManager() (string, bool) {
+	if _, err := exec.LookPath("apk"); err == nil {
+		return "apk", true
+	}
+	if opkg := routerpath.Path(routerpath.EntwareOpkg); opkg != "" {
+		if _, err := os.Stat(opkg); err == nil {
+			return opkg, false
+		}
+	}
+	if _, err := exec.LookPath("opkg"); err == nil {
+		return "opkg", false
+	}
+	return "", false
+}
+
+func parseAPKPackageVersion(output, pkg string) string {
+	lines := strings.Split(output, "\n")
+	versionLine := func(raw string) string {
+		line := strings.TrimSpace(raw)
+		if len(line) > 1 && line[0] >= '0' && line[0] <= '9' && strings.HasSuffix(line, ":") {
+			return strings.TrimSpace(strings.TrimSuffix(line, ":"))
+		}
+		return ""
+	}
+	// When repositories contain a newer candidate, `apk policy` can list it
+	// before the installed version. Prefer the version explicitly marked by
+	// the local database.
+	for i, raw := range lines {
+		if !strings.Contains(raw, "lib/apk/db/installed") {
+			continue
+		}
+		for j := i - 1; j >= 0; j-- {
+			if version := versionLine(lines[j]); version != "" {
+				return version
+			}
+		}
+	}
+	for _, raw := range lines {
+		line := strings.TrimSpace(raw)
+		if version := versionLine(line); version != "" {
+			return version
+		}
+		prefix := pkg + "-"
+		if strings.HasPrefix(line, prefix) {
+			rest := strings.TrimSpace(strings.TrimPrefix(line, prefix))
+			if i := strings.IndexByte(rest, ' '); i > 0 {
+				rest = rest[:i]
+			}
+			if strings.HasSuffix(rest, "description:") {
+				rest = strings.TrimSpace(strings.TrimSuffix(rest, "description:"))
+			}
+			if rest != "" {
+				return rest
+			}
+		}
+	}
+	return ""
+}
+
+func parseAPKInstalledVersion(output string) string {
+	lines := strings.Split(output, "\n")
+	for i, raw := range lines {
+		if !strings.Contains(raw, "lib/apk/db/installed") {
+			continue
+		}
+		for j := i - 1; j >= 0; j-- {
+			line := strings.TrimSpace(lines[j])
+			if strings.HasSuffix(line, ":") {
+				// The nearest version heading owns this database marker. Never
+				// skip an invalid installed heading and return a repository candidate.
+				if len(line) > 1 && line[0] >= '0' && line[0] <= '9' {
+					return strings.TrimSpace(strings.TrimSuffix(line, ":"))
+				}
+				return ""
+			}
+		}
+	}
+	return ""
+}
+
+// CheckUpdate adds the latest GitHub release to the local version info and flags
+// whether it is newer than the installed package (mirrors selfupdate).
+func (m *Manager) CheckUpdate() VersionInfo {
+	info := m.Version()
+	if info.PackageStatus == packageUnknown {
+		return info
+	}
+	if m.cfg.Nfqws2Repo == "" {
+		info.Error = "repo not configured"
+		return info
+	}
+	req, err := http.NewRequest("GET", "https://api.github.com/repos/"+m.cfg.Nfqws2Repo+"/releases/latest", nil)
+	if err != nil {
+		info.Error = err.Error()
+		return info
+	}
+	req.Header.Set("User-Agent", "nfqws2-strategy")
+	req.Header.Set("Accept", "application/vnd.github+json")
+	resp, err := (&http.Client{Timeout: 12 * time.Second}).Do(req)
+	if err != nil {
+		info.Error = err.Error()
+		return info
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		info.Error = fmt.Sprintf("github api status %d", resp.StatusCode)
+		return info
+	}
+	var rel struct {
+		TagName string `json:"tag_name"`
+		HTMLURL string `json:"html_url"`
+	}
+	if derr := json.NewDecoder(io.LimitReader(resp.Body, 1<<20)).Decode(&rel); derr != nil {
+		info.Error = derr.Error()
+		return info
+	}
+	info.applyRelease(rel.TagName, rel.HTMLURL)
+	return info
+}
+
+// Update upgrades ONLY the engine package via the platform package manager (never the abandoned web
+// package, never a router reboot). It briefly bounces nfqws2. Returns trimmed
+// command output.
+func (m *Manager) Update() (string, error) {
+	if _, err := m.PrepareWANInterfaces(); err != nil {
+		return "", err
+	}
+	pm, apk := packageManager()
+	if pm == "" {
+		return "", fmt.Errorf("package manager not found (apk/opkg)")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 600*time.Second)
+	defer cancel()
+	if apk {
+		if err := ensureAPKFeed(ctx, m.cfg.Nfqws2Repo); err != nil {
+			return "", err
+		}
+	}
+	script, label := nfqws2InstallCommand(pm, m.cfg.Nfqws2Pkg, apk)
+	logbuf.Append("nfqws2", "info", label+"…")
+	out, err := exec.CommandContext(ctx, "sh", "-c", script).CombinedOutput()
+	detail := strs.LastLines(strings.TrimSpace(string(out)), 20)
+	if err != nil {
+		logbuf.Append("nfqws2", "error", label+": "+err.Error())
+		return detail, fmt.Errorf("%s (%v)", strs.LastLines(detail, 4), err)
+	}
+	if err := m.reapplyBypassAfterUpdate(); err != nil {
+		logbuf.Append("nfqws2", "warn", "NFQUEUE bypass после обновления: "+err.Error())
+		return detail, fmt.Errorf("NFQUEUE bypass после обновления: %w", err)
+	}
+	logbuf.Append("nfqws2", "info", label+": готово")
+	return detail, nil
+}
+
+// nfqws2InstallCommand installs NFQWS2's runtime modules and concrete nft
+// providers before the engine on OpenWrt 25. The upstream package declares
+// only virtual iptables/busybox dependencies, which omit NFQUEUE/connbytes
+// modules and cannot be resolved by apk on a fresh router.
+func nfqws2InstallCommand(pm, pkg string, apk bool) (script, label string) {
+	manager := shell.Quote(pm)
+	if !apk {
+		return manager + " update && " + manager + " install " + shell.Quote(pkg), "opkg install/upgrade " + pkg
+	}
+	// Keep this list aligned with packaging/install.sh so the panel's Install
+	// button and the unified installer work on the same fresh OpenWrt image.
+	const dependencies = "ca-certificates curl ip-full ipset kmod-ipt-ipset kmod-tun " +
+		"iptables-nft iptables-mod-nfqueue iptables-mod-conntrack-extra iptables-mod-ipopt " +
+		"iptables-mod-extra iptables-mod-filter ip6tables-nft ip6tables-extra ip6tables-mod-nat"
+	return manager + " update && " + manager + " add " + dependencies +
+		" && " + manager + " add --upgrade " + shell.Quote(pkg), "apk install/upgrade " + pkg
+}
+
+// reapplyBypassAfterUpdate repairs the upstream NFQWS2 init script after a
+// package update on either router family and restores the configured bypass.
+func (m *Manager) reapplyBypassAfterUpdate() error {
+	confDir := stdpath.Dir(m.cfg.Nfqws2Conf)
+	bypass := stdpath.Join(confDir, "nfqws-strategy-bypass.sh")
+	for _, name := range []string{bypass, stdpath.Join(confDir, "lists", "nfqueue_bypass_domains.list"), stdpath.Join(confDir, "lists", "nfqueue_bypass_ips.list")} {
+		if _, err := os.Stat(name); err == nil {
+			return m.ApplyBypass()
+		} else if !os.IsNotExist(err) {
+			return err
+		}
+	}
+	return nil
+}
+
+// ensureAPKFeed makes the signed NFQWS2 repository available to a panel that
+// predates the unified installer.  It is intentionally idempotent and leaves
+// all firmware-provided repositories untouched.
+func ensureAPKFeed(ctx context.Context, repo string) error {
+	parts := strings.SplitN(strings.TrimSpace(repo), "/", 2)
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return fmt.Errorf("invalid NFQWS2 repository: %q", repo)
+	}
+	base := "https://" + parts[0] + ".github.io/" + parts[1]
+	keyPath := routerpath.Path(routerpath.EtcDir, "apk", "keys", "nfqws2-keenetic.pem")
+	keyURL := base + "/openwrt/nfqws2-keenetic.pem"
+	if _, err := os.Stat(keyPath); os.IsNotExist(err) {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, keyURL, nil)
+		if err != nil {
+			return fmt.Errorf("NFQWS2 repository key: %w", err)
+		}
+		req.Header.Set("User-Agent", "nfqws2-strategy")
+		resp, err := (&http.Client{Timeout: 30 * time.Second}).Do(req)
+		if err != nil {
+			return fmt.Errorf("NFQWS2 repository key: %w", err)
+		}
+		data, readErr := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK || readErr != nil || len(data) == 0 {
+			if readErr != nil {
+				return fmt.Errorf("NFQWS2 repository key: %w", readErr)
+			}
+			return fmt.Errorf("NFQWS2 repository key: HTTP %d", resp.StatusCode)
+		}
+		if err := os.MkdirAll(stdpath.Dir(keyPath), 0o755); err != nil {
+			return err
+		}
+		tmp := keyPath + ".new"
+		if err := os.WriteFile(tmp, data, 0o644); err != nil {
+			return err
+		}
+		if err := os.Rename(tmp, keyPath); err != nil {
+			_ = os.Remove(tmp)
+			return err
+		}
+	}
+	repoPath := routerpath.Path(routerpath.EtcDir, "apk", "repositories.d", "nfqws2-keenetic.list")
+	line := base + "/openwrt/packages.adb\n"
+	old, err := os.ReadFile(repoPath)
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	if !strings.Contains(string(old), base+"/openwrt/packages.adb") {
+		if err := os.MkdirAll(stdpath.Dir(repoPath), 0o755); err != nil {
+			return err
+		}
+		if len(old) > 0 && old[len(old)-1] != '\n' {
+			old = append(old, '\n')
+		}
+		if err := os.WriteFile(repoPath, append(old, []byte(line)...), 0o644); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// Reload sends SIGHUP to the live nfqws2 daemon so it re-reads its config and
+// lists WITHOUT dropping NFQUEUE 300 (no DPI blip). It refuses to signal unless
+// the pid in the pidfile is verified to be the real engine and NOT our own
+// nfqws2-strategy (guards the S51 pgrep-collision bug).
+func (m *Manager) Reload() error {
+	pid, err := readPid()
+	if err != nil {
+		return fmt.Errorf("не удалось прочитать pid nfqws2: %w", err)
+	}
+	if err := verifyPid(pid); err != nil {
+		return err
+	}
+	if err := sighup(pid); err != nil {
+		return err
+	}
+	logbuf.Append("nfqws2", "info", fmt.Sprintf("reload (SIGHUP pid %d)", pid))
+	return nil
+}
+
+// readPid reads the engine pidfile (portable: file read only).
+func readPid() (int, error) {
+	pidPath := routerpath.Path(routerpath.Nfqws2PID)
+	b, err := os.ReadFile(pidPath)
+	if err != nil {
+		return 0, err
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(b)))
+	if err != nil || pid <= 0 {
+		return 0, fmt.Errorf("некорректный pid в %s", pidPath)
+	}
+	return pid, nil
+}

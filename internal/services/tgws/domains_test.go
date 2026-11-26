@@ -51,6 +51,25 @@ func TestEmptyDomainListsClearLegacyValues(t *testing.T) {
 	}
 }
 
+func TestLegacyCFDomainSeparatorsAndSimpleLowercase(t *testing.T) {
+	cfg := Default()
+	cfg.CFProxyUserDomain = "One.example,İ-K.example;Two.example\t THREE.example\r\nONE.example"
+	cfg.CFProxyWorkerDomains = []string{"K.worker.example\r\nİ.worker.example"}
+	cfg.Normalize()
+	if !reflect.DeepEqual(cfg.CFProxyUserDomains, []string{"one.example", "i-k.example", "two.example", "three.example"}) ||
+		!reflect.DeepEqual(cfg.CFProxyWorkerDomains, []string{"k.worker.example", "i.worker.example"}) || len(cfg.Validate()) != 0 {
+		t.Fatal("legacy relay domain normalization changed")
+	}
+	for _, domain := range []string{"one.example\u00a0two.example", "one.example\vtwo.example", "one.example\ftwo.example", "one.example\u2028two.example", "ſ.example"} {
+		cfg := Default()
+		cfg.CFProxyWorkerDomains = []string{domain}
+		cfg.Normalize()
+		if len(cfg.Validate()) == 0 {
+			t.Fatalf("accepted invalid relay domain %q", domain)
+		}
+	}
+}
+
 func TestDomainValidation(t *testing.T) {
 	for _, domain := range []string{"proxy.example", "A-1.example", "xn--p1ai.example"} {
 		if !validDomain(domain) {

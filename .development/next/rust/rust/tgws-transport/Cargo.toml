@@ -1,0 +1,29 @@
+[package]
+name = "nfqws2-tgws-transport"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+nfqws2-tls-roots = { path = "../tls-roots" }
+portable-atomic.workspace = true
+aes = "0.8"
+ctr = "0.9"
+httparse = "1"
+socket2 = { version = "0.6", features = ["all"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink","std"] }
+tokio = { version = "1", features = ["net","io-util","macros","time","sync"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring","tls12"] }
+tokio-tungstenite = { version = "0.28", default-features = false, features = ["handshake"] }
+tokio-util = { version = "0.7", default-features = false }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["fs","process"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Networking_WinSock"] }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["rt","time","test-util"] }
+rcgen = { version = "0.14", default-features = false, features = ["ring","crypto"] }

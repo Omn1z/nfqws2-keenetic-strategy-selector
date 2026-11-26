@@ -1,0 +1,26 @@
+/dist/
+/target/
+/internal/server/compactweb/
+*.exe
+# Claude Code session/harness artifacts
+/.claude/
+# dev/ holds device-specific helpers (kssh has the router password, spikes have the
+# router IP) and extracted GPL lua — not for redistribution.
+/dev/
+/tmp/
+# React/Vite frontend deps (source + package-lock are committed; the built
+# single-file internal/server/web/index.html is committed and embedded).
+/frontend/node_modules/
+__pycache__/
+*.py[cod]
+.idea
+build/
+/.engine-build/
+# Local upstream research and device compatibility harnesses.
+/.codex/upstream/
+/.codex/awg31-compat/
+/.codex/engine-smoke/
+/.codex/recovery-smoke/
+# Local router backups, credentials, diagnostics and temporary test runtimes.
+/.tools/
+/.codex/

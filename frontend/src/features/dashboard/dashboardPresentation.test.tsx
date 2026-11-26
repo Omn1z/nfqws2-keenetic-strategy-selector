@@ -59,6 +59,15 @@ test("system and device rows expose all sensor, process, memory and address data
   assert.doesNotMatch(html, /truncate|line-clamp/);
 });
 
+test("dashboard shows actual disk availability and computes usage without reserved filesystem blocks", () => {
+  const data = dashboard();
+  data.storage = { path: "/opt", total_bytes: 100576 * 1024, used_bytes: 84776 * 1024, available_bytes: 10964 * 1024 };
+  const html = renderToStaticMarkup(overview(data));
+  for (const value of ["Накопитель", "/opt", "Свободно", "10.7 MB", "Занято", "82.8 MB", "Всего", "98.2 MB"]) assert.ok(html.includes(value), value);
+  assert.match(html, /role="meter"[^>]*aria-valuenow="89"/);
+  assert.doesNotMatch(renderToStaticMarkup(overview()), /Накопитель/);
+});
+
 test("missing channels, inactive DNS and queue, unavailable system data and empty devices remain explicit", () => {
   const data = dashboard(); data.awg = []; data.wan = []; data.queues = []; data.top_devices = []; data.system = undefined as unknown as DashboardData["system"];
   data.dnsserver.running = false; data.dnsserver.last_error = "DNS listener failed";

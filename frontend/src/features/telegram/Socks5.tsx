@@ -54,11 +54,12 @@ export default function Socks5() {
   if (!form || !live) return <Card><span className="text-xs text-muted">Загрузка…</span></Card>;
   const { connections: cc, traffic: t } = live.stats;
   const noAuth = !form.user.trim();
+  const direct = live.transport === "direct";
 
   return (
     <>
       <Card title="Telegram SOCKS5 прокси" head={<Badge kind={live.running ? "ok" : "bad"}>{live.running ? "работает" : "остановлен"}</Badge>}>
-        <p className="mb-3 text-xs text-muted">SOCKS5 для Telegram: трафик к дата-центрам Telegram туннелируется по WSS к <code>web.telegram.org</code> (обходит блокировку по IP), остальные адреса проксируются напрямую. Подключается в Telegram → Настройки → Данные и память → Прокси → SOCKS5.</p>
+        <p className="mb-3 text-xs text-muted">{direct ? "Роутер подключается к запрошенному адресу напрямую по TCP." : <>Трафик к дата-центрам Telegram туннелируется по WSS к <code>web.telegram.org</code>, остальные адреса проксируются напрямую.</>} Подключается в Telegram → Настройки → Данные и память → Прокси → SOCKS5.</p>
         <div className="flex flex-wrap items-center gap-4">
           <div className="flex h-[38px] items-center"><Switch checked={live.config.enabled} onChange={toggle} label="Прокси включён" /></div>
           <span className="text-xs text-muted">{live.running ? `слушает порт ${form.port}` : live.config.enabled ? "не удалось запустить" : ""}</span>
@@ -91,10 +92,10 @@ export default function Socks5() {
         <table className={tableCls}>
           <tbody>
             <StatRow l="Соединения (всего / активны)" v={`${cc.total} / ${cc.active}`} />
-            <StatRow l="Telegram (WSS) / прямые" v={`${cc.telegram} / ${cc.direct}`} />
+            <StatRow l={direct ? "Telegram через VPN / прямые" : "Telegram (WSS) / прямые"} v={`${cc.telegram} / ${cc.direct}`} />
             <StatRow l="Отклонено (handshake)" v={cc.bad} />
             <StatRow l="Трафик ↑ / ↓" v={`${t.human_up || "0.0B"} / ${t.human_down || "0.0B"}`} />
-            <StatRow l="Последний DC" v={live.stats.last_dc || "—"} />
+            {!direct && <StatRow l="Последний DC" v={live.stats.last_dc || "—"} />}
           </tbody>
         </table>
       </Card>

@@ -75,12 +75,21 @@ type DashboardView struct {
 
 	// System health snapshot (CPU / RAM / temp / uptime / load).
 	System netmon.SystemStats `json:"system"`
+	// Storage is the filesystem containing the panel's persistent data.
+	Storage *StorageUsage `json:"storage,omitempty"`
 
 	// Top-talking LAN devices by bytes (sum of up+down). Capped to 8.
 	TopDevices []netmon.Device `json:"top_devices"`
 
 	// AWG2 trace counters (lifetime totals; UI computes RPS by diffing samples).
 	TraceCounters awgroute.TraceCounters `json:"trace_counters"`
+}
+
+type StorageUsage struct {
+	Path           string `json:"path"`
+	TotalBytes     uint64 `json:"total_bytes"`
+	UsedBytes      uint64 `json:"used_bytes"`
+	AvailableBytes uint64 `json:"available_bytes"`
 }
 
 // Dashboard assembles the home view. The TG WS card works on any platform; the
@@ -135,6 +144,7 @@ func (s *Service) Dashboard(host string) DashboardView {
 
 	// System + top-talking devices (best-effort; empty on non-Linux dev box).
 	d.System = netmon.System()
+	d.Storage = readStorageUsage(s.cfg.DataDir)
 	if connsErr == nil {
 		arp, _ := netmon.ARP()
 		ndp, _ := netmon.NDP()

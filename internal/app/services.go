@@ -95,9 +95,8 @@ func (a *App) restartSocks5() ServiceResult {
 	if !a.proxy.Socks5().Config().Enabled {
 		return ServiceResult{Name: "socks5", OK: false, Detail: "прокси выключен — нечего перезапускать"}
 	}
-	logbuf.Append("system", "info", "restart socks5…")
 	if err := a.proxy.Socks5().Restart(); err != nil {
-		logbuf.Append("system", "error", "restart socks5: "+err.Error())
+		logbuf.Append("socks5", "error", "restart socks5: "+err.Error())
 		return ServiceResult{Name: "socks5", OK: false, Detail: err.Error()}
 	}
 	return ServiceResult{Name: "socks5", OK: true, Detail: "перезапущен"}
@@ -196,9 +195,8 @@ func (a *App) restartTGWS() ServiceResult {
 	if !a.proxy.TGWS().Config().Enabled {
 		return ServiceResult{Name: "tgws", OK: false, Detail: "прокси выключен — нечего перезапускать"}
 	}
-	logbuf.Append("system", "info", "restart tgws…")
 	if err := a.proxy.TGWS().Restart(); err != nil {
-		logbuf.Append("system", "error", "restart tgws: "+err.Error())
+		logbuf.Append("tgws", "error", "restart tgws: "+err.Error())
 		return ServiceResult{Name: "tgws", OK: false, Detail: err.Error()}
 	}
 	return ServiceResult{Name: "tgws", OK: true, Detail: "перезапущен"}

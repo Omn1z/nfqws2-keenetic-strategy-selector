@@ -71,6 +71,7 @@ func (a *App) runDNSChoices(ids []string) []*dns.Server {
 }
 
 func (a *App) loadRuns() {
+	a.runs = make(map[string]*Run)
 	names, _ := a.store.ListFiles("runs")
 	for _, n := range names {
 		if !strings.HasSuffix(n, ".json") {
@@ -93,34 +94,46 @@ func (a *App) loadRuns() {
 
 // Runs returns runs newest-first.
 func (a *App) Runs() []*Run {
+	a.runHistoryOnce.Do(a.loadRuns)
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	out := make([]*Run, 0, len(a.runOrder))
 	for i := len(a.runOrder) - 1; i >= 0; i-- {
-		out = append(out, a.runs[a.runOrder[i]])
+		r := a.runs[a.runOrder[i]]
+		if r == a.active {
+			r = runSnapshot(r)
+		}
+		out = append(out, r)
 	}
 	return out
 }
 
 func (a *App) GetRun(id string) (*Run, bool) {
+	a.runHistoryOnce.Do(a.loadRuns)
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	r, ok := a.runs[id]
 	if !ok {
 		return nil, false
 	}
-	// Snapshot under the lock: workers append to the live run concurrently, so the
-	// caller must not encode the original slices.
+	return runSnapshot(r), true
+}
+
+// Call with a.mu held. Workers append to and sort the live result slice.
+func runSnapshot(r *Run) *Run {
 	cp := *r
 	cp.Results = slices.Clone(r.Results)
 	cp.Baseline = slices.Clone(r.Baseline)
-	return &cp, true
+	return &cp
 }
 
 func (a *App) ActiveRun() *Run {
 	a.mu.Lock()
 	defer a.mu.Unlock()
-	return a.active
+	if a.active == nil {
+		return nil
+	}
+	return runSnapshot(a.active)
 }
 
 // CancelRun cancels the active run if its id matches.
@@ -185,7 +198,10 @@ func (a *App) StartRun(req RunRequest) (*Run, error) {
 	if req.Auto {
 		strategies = catalog.AutoCandidates()
 	} else {
-		all := a.Strategies()
+		all, err := a.Strategies()
+		if err != nil {
+			return nil, err
+		}
 		if len(req.StrategyIDs) == 0 {
 			strategies = all
 		} else {
@@ -232,11 +248,6 @@ func (a *App) StartRun(req RunRequest) (*Run, error) {
 		threads = len(plan)
 	}
 
-	a.mu.Lock()
-	if a.active != nil || a.activeBC != nil {
-		a.mu.Unlock()
-		return nil, fmt.Errorf("a run is already in progress")
-	}
 	run := &Run{
 		ID:        store.NewID(),
 		ListID:    req.ListID,
@@ -249,17 +260,30 @@ func (a *App) StartRun(req RunRequest) (*Run, error) {
 		Targets:   targets,
 		Results:   make([]StrategyResult, 0, len(plan)),
 	}
+	initial := *run
 	ctx, cancel := context.WithCancel(context.Background())
+	if err := a.registerRun(run, cancel); err != nil {
+		cancel()
+		return nil, err
+	}
+	go a.executeRun(ctx, run, list, plan, threads, targets)
+	return &initial, nil
+}
+
+func (a *App) registerRun(run *Run, cancel context.CancelFunc) error {
+	a.runHistoryOnce.Do(a.loadRuns) // retention must include runs from previous boots
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.active != nil || a.activeBC != nil {
+		return fmt.Errorf("a run is already in progress")
+	}
 	a.active = run
 	a.cancel = cancel
 	a.pendingThreads = 0
 	a.runs[run.ID] = run
 	a.runOrder = append(a.runOrder, run.ID)
 	a.trimRunsLocked()
-	a.mu.Unlock()
-
-	go a.executeRun(ctx, run, list, plan, threads, targets)
-	return run, nil
+	return nil
 }
 
 func (a *App) executeRun(ctx context.Context, run *Run, list *List, plan []runJob, threads int, targets []string) {

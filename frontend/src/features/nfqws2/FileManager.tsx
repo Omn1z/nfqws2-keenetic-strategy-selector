@@ -246,7 +246,7 @@ export function FileManager({
       <aside className="w-full shrink-0 lg:w-[260px]">
         {kind === "list" && <div className="mb-3">
           <ListCategories value={category} onChange={setCategory} disabled={busy} counts={{ current: files.filter((file) => listCategory(file.name) === "current").length, original: files.filter((file) => listCategory(file.name) === "original").length }} />
-          <p className="mt-1.5 text-[11px] leading-4 text-muted">{category === "original" ? "Файлы .list-opkg, поставленные пакетом." : "Основные списки и остальные файлы без суффикса .list-opkg."}</p>
+          <p className="mt-1.5 text-[11px] leading-4 text-muted">{category === "original" ? "Копии списков из пакета (.list-opkg и .list.apk-new)." : "Списки, которые используются сейчас."}</p>
         </div>}
         {!allowUpload && kind !== "bypass" && <p className="mb-2 text-xs text-muted">Загрузка файлов доступна на вкладке «Файлы».</p>}
         {allowUpload && (

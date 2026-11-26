@@ -5,7 +5,10 @@ package awgroute
 import (
 	"context"
 	"errors"
+	"os"
 	"os/exec"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -38,6 +41,21 @@ func TestAWGRunShellFeedsStdin(t *testing.T) {
 	out, err := awgRunShell(context.Background(), "cat", "create awgm_000 hash:net\n")
 	if err != nil || out != "create awgm_000 hash:net" {
 		t.Fatalf("shell stdin got output %q, error %v", out, err)
+	}
+}
+
+func TestAWGRunShellInterpretsScriptDirectlyFromStdin(t *testing.T) {
+	bin := t.TempDir()
+	shell := "#!/bin/sh\n[ \"$#\" -eq 0 ] || exit 2\nexec /bin/sh\n"
+	if err := os.WriteFile(filepath.Join(bin, "sh"), []byte(shell), 0700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	// A large DNS membership batch can exceed the per-argument limit.
+	script := strings.Repeat("# padding\n", 16*1024) + "printf 'present\\n'\n"
+	out, err := awgRunShell(context.Background(), "sh", script)
+	if err != nil || out != "present" {
+		t.Fatalf("shell script got output %q, error %v", out, err)
 	}
 }
 

@@ -1,5 +1,7 @@
 # NFQWS2 Strategy Selector для Keenetic/Netcraze и OpenWrt
 
+Основная панель проекта работает на Go. Черновик Rust [сохранён в архиве](.development/next/rust/ARCHIVE.md).
+
 Веб‑инструмент для **автоматического подбора рабочих стратегий обхода DPI** для
 [`nfqws2-keenetic`](https://github.com/nfqws/nfqws2-keenetic) (движок
 [zapret2](https://github.com/bol-van/zapret2), Lua). Запускается прямо на роутере,

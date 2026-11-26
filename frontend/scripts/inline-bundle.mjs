@@ -1,6 +1,6 @@
 // The router serves one embedded HTML file. Inline only build-owned assets,
 // and fail if any new external chunk/asset would make that file incomplete.
-export function inlineRouterBundle(bundle) {
+export function checkRouterDependencies(bundle) {
   // The narrowly scoped npm advisory exception is valid only while this chain
   // stays in build tooling. Module IDs retain dependency paths even when the
   // code is minified; pnpm's nested node_modules and Windows paths count too.
@@ -13,6 +13,10 @@ export function inlineRouterBundle(bundle) {
       }
     }
   }
+}
+
+export function inlineRouterBundle(bundle) {
+  checkRouterDependencies(bundle);
   const html = bundle["index.html"];
   if (!html || html.type !== "asset" || typeof html.source !== "string") throw new Error("Missing index.html build asset");
   const consumed = new Set(["index.html"]);

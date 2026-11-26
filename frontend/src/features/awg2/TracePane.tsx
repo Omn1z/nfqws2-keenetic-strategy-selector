@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { api } from "@/lib/api";
+import type { InstallResult } from "@/types/api";
 import { usePoll } from "@/lib/hooks";
 import { cn } from "@/lib/cn";
 import { Card } from "@/components/ui/Card";
@@ -34,7 +35,11 @@ type TraceEntry = {
   tunnel_iface?: string;
 };
 
-type TraceStatus = { enabled: boolean; count: number; cap: number };
+type TraceStatus = {
+  enabled: boolean; count: number; cap: number;
+  source?: "tunnel_headers" | "dns_and_tunnel_headers" | "dns_and_conntrack"; need_install?: boolean; observed_interfaces?: number;
+  limited?: boolean; error?: string; sni_interfaces?: number; sni_error?: string;
+};
 type TraceListResp = { status: TraceStatus; entries: TraceEntry[] };
 type TraceKind = TraceEntry["kind"];
 type TraceMode = "off" | "auto" | "always";
@@ -70,9 +75,9 @@ const DECISION: Record<TraceEntry["decision"], { k: "ok" | "neutral" | "bad" | "
 // Sort-arrow glyph for a column header. Inactive columns show a neutral pair.
 const sortGlyph = (key: SortKey, k: SortKey, d: SortDir) => (k === key ? (d === "asc" ? " ▲" : " ▼") : " ⇅");
 
-const traceType = (e: TraceEntry) => {
+const traceType = (e: TraceEntry, tunnelHeaders = false) => {
   if (e.kind !== "flow") return e.qtype || "";
-  const proto = e.proto === "udp" && e.dport === 443 ? "QUIC" : (e.proto || "").toUpperCase();
+  const proto = !tunnelHeaders && e.proto === "udp" && e.dport === 443 ? "QUIC" : (e.proto || "").toUpperCase();
   const port = e.dport ? `/${e.dport}` : "";
   const state = e.state ? ` ${e.state}` : "";
   const event = e.event ? ` ${e.event}` : "";
@@ -119,6 +124,9 @@ export default function TracePane({ externalBusy, runMutation, reload }: {
     return () => { mounted.current = false; readRevision.current++; };
   }, []);
   const [status, setStatus] = useState<TraceStatus | null>(null);
+  const tunnelHeaders = status?.source === "tunnel_headers";
+  const conntrackTrace = status?.source === "dns_and_conntrack";
+  const nativeTrace = conntrackTrace || status?.source === "dns_and_tunnel_headers";
   const [entries, setEntries] = useState<TraceEntry[]>([]);
   const [filterSrc, setFilterSrc] = useState("");
   const [filterName, setFilterName] = useState("");
@@ -161,7 +169,7 @@ export default function TracePane({ externalBusy, runMutation, reload }: {
       setIpToHost(map);
     } catch { /* keep last */ }
   };
-  usePoll(refreshDeviceMap, 15_000, !externalBusy);
+  usePoll(refreshDeviceMap, 15_000, !externalBusy && !tunnelHeaders);
 
   const fetchOnce = async (signal?: AbortSignal) => {
     if (fetching.current || !mounted.current) return;
@@ -197,15 +205,17 @@ export default function TracePane({ externalBusy, runMutation, reload }: {
         setMode(effectiveMode);
         if (effectiveMode === "auto") {
           const nextStatus = await api<TraceStatus>("POST", "/api/awg2/trace/enabled", { enabled: true }, { timeoutMs: 30_000 });
-          weEnabledRef.current = true;
+          weEnabledRef.current = nextStatus.enabled;
           setStatus(nextStatus);
-          toast("Трассировка включена до закрытия вкладки", "ok");
+          if (nextStatus.enabled) toast("Трассировка включена до закрытия вкладки", "ok");
           await fetchOnce();
         } else {
           weEnabledRef.current = false;
           const nextStatus = await api<TraceStatus>("GET", "/api/awg2/trace/status");
           setStatus(nextStatus);
-          toast(effectiveMode === "always" ? "Трассировка пишет постоянно" : "Трассировка выключена", "ok");
+          if (effectiveMode === "off" || nextStatus.enabled) {
+            toast(effectiveMode === "always" ? "Трассировка пишет постоянно" : "Трассировка выключена", "ok");
+          }
         }
         await reload();
       });
@@ -231,11 +241,11 @@ export default function TracePane({ externalBusy, runMutation, reload }: {
       const s = await api<TraceStatus>("GET", "/api/awg2/trace/status", undefined, { signal: controller.signal });
       if (cancelled) return;
       setStatus(s);
-      if (sys.trace_mode === "auto" && !s.enabled) {
+      if (sys.trace_mode === "auto" && !s.enabled && (!s.need_install || s.source === "dns_and_tunnel_headers")) {
         const next = await api<TraceStatus>("POST", "/api/awg2/trace/enabled", { enabled: true }, { timeoutMs: 30_000 });
         // The write can finish after unmount. Its queued cleanup still owns
         // this flag and must turn auto recording off before the next mount.
-        weEnabledRef.current = true;
+        weEnabledRef.current = next.enabled;
         if (cancelled) return;
         setStatus(next);
       }
@@ -253,6 +263,28 @@ export default function TracePane({ externalBusy, runMutation, reload }: {
     /* eslint-disable-next-line react-hooks/exhaustive-deps */
   }, [runMutation]);
   usePoll(fetchOnce, 2000, live && !externalBusy);
+
+  const installTrace = async () => {
+    if (writing.current || blockedRef.current) return;
+    writing.current = true;
+    setModeBusy(true);
+    try {
+      await runMutation(async () => {
+        const result = await api<InstallResult>("POST", "/api/system/install", { package: "nfqws2-strategy-trace" }, { timeoutMs: 190_000 });
+        if (!result.ok) throw new Error(result.error || "Не удалось установить модуль трассировки");
+        if (mounted.current && mode !== "off") {
+          const next = await api<TraceStatus>("POST", "/api/awg2/trace/enabled", { enabled: true });
+          if (mode === "auto") weEnabledRef.current = next.enabled;
+        }
+        await fetchOnce();
+      });
+    } catch (e) {
+      toast((e as Error).message, "err");
+    } finally {
+      if (mounted.current) setModeBusy(false);
+      writing.current = false;
+    }
+  };
 
   const onQuickRule = async (name: string, route: "tunnel" | "direct") => {
     if (writing.current || blockedRef.current) return;
@@ -314,18 +346,18 @@ export default function TracePane({ externalBusy, runMutation, reload }: {
     const nm = filterName.trim().toLowerCase();
     const tp = filterType.trim().toLowerCase();
     return entries.filter((e) => {
-      if (!selectedKinds.has(e.kind)) return false;
+      if (tunnelHeaders ? e.kind !== "flow" : !selectedKinds.has(e.kind)) return false;
       if (filterDecision !== "all" && e.decision !== filterDecision) return false;
       if (sn) {
         const src = (e.src ?? "").toLowerCase();
-        const host = (ipToHost[e.src ?? ""] ?? "").toLowerCase();
+        const host = tunnelHeaders ? "" : (ipToHost[e.src ?? ""] ?? "").toLowerCase();
         if (!src.includes(sn) && !host.includes(sn)) return false;
       }
       if (nm && !e.name.toLowerCase().includes(nm) && !traceDst(e).toLowerCase().includes(nm)) return false;
-      if (tp && !traceType(e).toLowerCase().includes(tp)) return false;
+      if (tp && !traceType(e, tunnelHeaders).toLowerCase().includes(tp)) return false;
       return true;
     });
-  }, [entries, filterSrc, filterName, filterType, selectedKinds, filterDecision, ipToHost]);
+  }, [entries, filterSrc, filterName, filterType, selectedKinds, filterDecision, ipToHost, tunnelHeaders]);
 
   const sorted = useMemo(() => {
     const cmp = (a: TraceEntry, b: TraceEntry): number => {
@@ -372,9 +404,9 @@ export default function TracePane({ externalBusy, runMutation, reload }: {
           "rounded px-2 py-0.5 text-[11px] font-medium",
           status?.enabled ? "bg-good-bg text-good" : "bg-panel-soft text-muted",
         )}>
-          {mode === "off"     && "режим: выкл (только счётчики)"}
+          {mode === "off"     && (tunnelHeaders ? "Запись выключена" : "режим: выкл (только счётчики)")}
           {mode === "auto"    && (status?.enabled ? "режим: авто — пишу" : "режим: авто — пауза")}
-          {mode === "always"  && "режим: всегда писать"}
+          {mode === "always"  && (tunnelHeaders && !status?.enabled ? "Постоянная запись приостановлена" : "режим: всегда писать")}
           {mode === null      && "режим: …"}
         </span>
         <span className="text-[12px] text-muted">Запись:</span>
@@ -397,6 +429,8 @@ export default function TracePane({ externalBusy, runMutation, reload }: {
           ))}
         </div>
         <Button mini variant="ghost" onClick={onClear}>Очистить</Button>
+        {status?.need_install && <Button mini variant="primary" onClick={() => void installTrace()} disabled={externalBusy || modeBusy}>Установить модуль трассировки</Button>}
+        {!tunnelHeaders && <>
         <span className="ml-2 text-[12px] text-muted">Тип:</span>
         <details className="relative">
           <summary className="flex h-7 min-w-[116px] cursor-pointer list-none items-center justify-between gap-2 rounded border border-line bg-panel px-2 text-[12px] select-none [&::-webkit-details-marker]:hidden">
@@ -435,6 +469,7 @@ export default function TracePane({ externalBusy, runMutation, reload }: {
           <option value="blocked">blocked</option>
           <option value="cdn-skip">cdn-skip</option>
         </Select>
+        </>}
         <span className="ml-auto text-[12px] text-muted">
           Show
           <Select value={pageSize} onChange={(e) => { setPageSize(parseInt(e.target.value, 10)); setPage(1); }} className="mx-1 h-7 min-h-7 w-auto text-[12px]">
@@ -454,17 +489,17 @@ export default function TracePane({ externalBusy, runMutation, reload }: {
               <Th onClick={() => onSort("kind")} className="hidden md:table-cell">Kind{sortGlyph("kind", sortKey, sortDir)}</Th>
               <Th className="hidden lg:table-cell">Type</Th>
               <Th onClick={() => onSort("name")}>Name{sortGlyph("name", sortKey, sortDir)}</Th>
-              <Th onClick={() => onSort("src")} className="hidden sm:table-cell">Client{sortGlyph("src", sortKey, sortDir)}</Th>
+              <Th onClick={() => onSort("src")} className="hidden sm:table-cell">{tunnelHeaders ? "Источник" : "Client"}{sortGlyph("src", sortKey, sortDir)}</Th>
               <Th onClick={() => onSort("dst")} className="hidden lg:table-cell">Dst{sortGlyph("dst", sortKey, sortDir)}</Th>
               <Th onClick={() => onSort("decision")}>Решение{sortGlyph("decision", sortKey, sortDir)}</Th>
-              <Th className="w-[110px] text-right">Действия</Th>
+              <Th className="w-[110px] text-right">{tunnelHeaders ? "Интерфейс" : nativeTrace ? "Интерфейс / Действия" : "Действия"}</Th>
             </tr>
           </thead>
           <tbody>
             {slice.length === 0 && (
               <tr>
                 <td colSpan={9} className="px-2 py-6 text-center text-muted">
-                  {status?.enabled ? "Ждём трафика…" : "Запись выключена. Выбери «Авто» или «Всегда» в переключателе записи сверху."}
+                  {status?.need_install && !nativeTrace ? "Для записи установите модуль трассировки." : status?.enabled ? "Ждём трафика…" : "Запись выключена. Выбери «Авто» или «Всегда» в переключателе записи сверху."}
                 </td>
               </tr>
             )}
@@ -483,14 +518,14 @@ export default function TracePane({ externalBusy, runMutation, reload }: {
                     )} title={ds.l}>{ds.icon}</span>
                   </td>
                   <td className="hidden whitespace-nowrap px-2 py-1 uppercase md:table-cell">{e.kind}</td>
-                  <td className="hidden whitespace-nowrap px-2 py-1 lg:table-cell">{traceType(e)}</td>
+                  <td className="hidden whitespace-nowrap px-2 py-1 lg:table-cell">{traceType(e, tunnelHeaders)}</td>
                   <td className="px-2 py-1 font-mono">
                     <div className="truncate" title={e.reason || ""}>{e.name}</div>
                   </td>
                   <td className="hidden whitespace-nowrap px-2 py-1 sm:table-cell">
                     {e.src
                       ? (() => {
-                          const host = ipToHost[e.src];
+                          const host = tunnelHeaders ? undefined : ipToHost[e.src];
                           return host
                             ? <span title={e.src}><b className="text-ink">{host}</b> <span className="text-[10px] text-muted">{e.src.includes(":") ? "v6" : "v4"}</span></span>
                             : <span className="font-mono">{e.src}</span>;
@@ -506,6 +541,7 @@ export default function TracePane({ externalBusy, runMutation, reload }: {
                     <span title={e.reason || ds.l}><Badge kind={ds.k}>{ds.l}</Badge></span>
                   </td>
                   <td className="whitespace-nowrap px-2 py-1 text-right">
+                    {(tunnelHeaders || (nativeTrace && e.kind === "flow")) && <span className="font-mono" title={e.tunnel_id}>{e.tunnel_iface}</span>}
                     {/* Context-aware: don't offer the action that matches the row's
                         current decision (already routed that way). For blocked /
                         cdn-skip rows the routing isn't actually applied to the dst,
@@ -534,13 +570,13 @@ export default function TracePane({ externalBusy, runMutation, reload }: {
               <td className="px-2 py-1" />
               <td className="px-2 py-1 text-[11px] uppercase text-muted">Kind</td>
               <td className="px-2 py-1">
-                <Input value={filterType} onChange={(e) => { setFilterType(e.target.value); setPage(1); }} placeholder="A/AAAA/tcp/udp/quic" className="h-7 text-[12px]" />
+                <Input value={filterType} onChange={(e) => { setFilterType(e.target.value); setPage(1); }} placeholder={tunnelHeaders ? "TCP/UDP/ICMP" : "A/AAAA/tcp/udp/quic"} className="h-7 text-[12px]" />
               </td>
               <td className="px-2 py-1">
                 <Input value={filterName} onChange={(e) => { setFilterName(e.target.value); setPage(1); }} placeholder="Name / dst IP" className="h-7 text-[12px]" />
               </td>
               <td className="px-2 py-1">
-                <Input value={filterSrc} onChange={(e) => { setFilterSrc(e.target.value); setPage(1); }} placeholder="Client" className="h-7 text-[12px]" />
+                <Input value={filterSrc} onChange={(e) => { setFilterSrc(e.target.value); setPage(1); }} placeholder={tunnelHeaders ? "IP" : "Client"} className="h-7 text-[12px]" />
               </td>
               <td className="px-2 py-1" />
               <td className="px-2 py-1 text-[11px] uppercase text-muted">Решение</td>
@@ -564,11 +600,18 @@ export default function TracePane({ externalBusy, runMutation, reload }: {
         </div>
       </div>
 
-      <p className="mt-3 text-[11px] text-muted">
+      {tunnelHeaders || nativeTrace ? <p className="mt-3 text-xs text-muted">
+        {nativeTrace && "DNS показывает ответы, обработанные маршрутизацией AWG. "}
+        {conntrackTrace ? "Состояния соединений LAN читаются из conntrack." : status?.need_install ? "Для записи заголовков туннелей нужен модуль трассировки." : <>Активных интерфейсов AWG в записи: {status?.observed_interfaces ?? 0}.</>}
+        {!!status?.sni_interfaces && <> Интерфейсов LAN с SNI-наблюдением: {status.sni_interfaces}.</>}
+        {status?.limited && (conntrackTrace ? " Достигнут лимит записи, часть потоков пропущена." : " Достигнут лимит записи, часть пакетов пропущена.")}
+        {status?.error && <span className="text-bad"> {status.error}</span>}
+        {status?.sni_error && <span className="text-bad"> {status.sni_error}</span>}
+      </p> : <p className="mt-3 text-[11px] text-muted">
         DNS-строки видны только когда трафик идёт через наш :5354 (LAN → router DNS).
         Для DoH/DoT-клиентов работает SNI-сниффер (включается в зонах).
         Src=127.0.0.1 означает запрос от локального DNS-прокси; исходное устройство может быть неизвестно.
-      </p>
+      </p>}
     </Card>
   );
 }

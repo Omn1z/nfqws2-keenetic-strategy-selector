@@ -35,7 +35,7 @@ export function SavedListStrategyRow({ strategy: s, disabled, onExport }: { stra
 }
 
 export default function Lists() {
-  const { lists, reloadLists, geo } = useStore();
+  const { lists, reloadLists, geo } = useStore({ geo: true });
   const [sel, setSel] = useState<List | null>(null);
   const [page, setPage] = useState(1);
   const [pageSize, setPageSize] = useState("20");

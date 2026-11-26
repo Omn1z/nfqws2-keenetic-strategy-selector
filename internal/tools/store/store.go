@@ -142,10 +142,12 @@ func (s *Store) Move(srcRel, dstRel string) error {
 			return err
 		}
 		if err := syncDirectory(filepath.Dir(dst)); err != nil {
-			return err
+			return &CommitError{Err: err}
 		}
 		if filepath.Dir(src) != filepath.Dir(dst) {
-			return syncDirectory(filepath.Dir(src))
+			if err := syncDirectory(filepath.Dir(src)); err != nil {
+				return &CommitError{Err: err}
+			}
 		}
 		return nil
 	})

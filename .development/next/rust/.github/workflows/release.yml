@@ -1,0 +1,191 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.11'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Test and vet Go packages
+        run: |
+          go test ./...
+          go vet ./...
+      - name: Check DNS, TG WS and TLS root concurrency
+        run: go test -race ./internal/services/dnsroute ./internal/services/dnsserver ./internal/services/tgws ./internal/tools/tlsroots
+      - name: Check service controls and routing history concurrency
+        run: |
+          go test -race ./internal/tools/store ./internal/tools/backup
+          go test -race ./internal/app -run 'Nfqws2|BackupRestore'
+          go test -race ./internal/services/awgroute -run 'Discover|Learned|Learning|RoutingHistory|TraceCache|TraceAppendObserves'
+      - name: Test installation hooks
+        run: |
+          sh packaging/test-bypass-hooks.sh
+          sh packaging/test-install-deps.sh
+          sh packaging/test-download-fallback.sh
+          sh packaging/test-update.sh
+      - name: Check reachable Go vulnerabilities for Linux
+        env:
+          GOOS: linux
+          GOARCH: arm64
+          CGO_ENABLED: '0'
+        run: |
+          GOARCH=amd64 go install golang.org/x/vuln/cmd/govulncheck@v1.8.0
+          govulncheck ./cmd/... ./internal/...
+      - name: Build frontend and all architectures
+        run: sh scripts/build.sh "${GITHUB_REF_NAME:-dev}"
+      - name: Audit frontend dependencies
+        working-directory: frontend
+        run: |
+          node --test scripts/audit-security.test.mjs
+          npm run audit:security
+      - name: Include upstream license
+        run: |
+          cp internal/services/tgws/LICENSE.upstream dist/TGWS-LICENSE.txt
+          cat THIRD_PARTY_NOTICES.md THIRD_PARTY_LICENSES/Frontend-LICENSES.txt > dist/THIRD-PARTY-NOTICES.txt
+          cp THIRD_PARTY_LICENSES/AdGuard-urlfilter-GPL-3.0.txt dist/ADGUARD-URLFILTER-LICENSE.txt
+      - name: Upload panel artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-panel
+          path: |
+            dist/nfqws2-strategy-linux-arm64
+            dist/nfqws2-strategy-linux-arm
+            dist/nfqws2-strategy-linux-mipsle
+            dist/nfqws2-strategy-linux-mips
+            dist/nfqws2-strategy-linux-amd64
+            dist/TGWS-LICENSE.txt
+            dist/THIRD-PARTY-NOTICES.txt
+            dist/ADGUARD-URLFILTER-LICENSE.txt
+          if-no-files-found: error
+          compression-level: 0
+
+  # Pure-Go AmneziaWG 3.1 engine; no C tools or musl are needed on the router.
+  build-engine:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.11'
+      - name: Install vulnerability scanner
+        run: go install golang.org/x/vuln/cmd/govulncheck@v1.8.0
+      - name: Test the engine memory overlay generator
+        run: cargo test --locked -p nfqws2-engine-overlay
+      - name: Build AmneziaWG 3.1 engine
+        run: GOVULNCHECK="$(go env GOPATH)/bin/govulncheck" sh scripts/build-engine.sh
+      - name: Verify router memory profile in every engine binary
+        run: |
+          for arch in arm64 arm mipsle mips; do
+            AWG_ENGINE_CURRENT_TEST_BINARY="$GITHUB_WORKSPACE/.engine-build/stage-$arch/amneziawg-go" \
+              go test ./internal/services/awgroute -run '^TestInspectEngineRouterProfileBuildFixtures$'
+          done
+      - name: Test upstream engine on Linux with patched dependencies
+        run: |
+          cd .engine-build/amneziawg-go
+          # Upstream's ranged-header ping test also times out with its original
+          # toolchain/dependencies on Linux. Keep all other core tests enabled.
+          go test -overlay="$GITHUB_WORKSPACE/.engine-build/router-memory/overlay.json" -modfile="$GITHUB_WORKSPACE/internal/services/awg/engine-deps.mod" -mod=readonly -skip '^TestAWGDevicePing$' ./device ./conn ./ipc ./ratelimiter ./replay
+      - name: Include upstream license
+        run: cp .engine-build/amneziawg-go/LICENSE dist/AMNEZIAWG-LICENSE.txt
+      - name: Upload engine artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-awg-engine
+          path: |
+            dist/awg-engine-linux-*.tar.gz
+            dist/awg-engine-linux-*.tar.gz.sha256
+            dist/AMNEZIAWG-LICENSE.txt
+          if-no-files-found: error
+          compression-level: 0
+
+  publish:
+    needs: [build-release, build-engine]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      RELEASE_TAG: ${{ github.ref_name }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+      - name: Include installation scripts
+        run: |
+          for script in install update uninstall; do
+            sh -n "packaging/$script.sh"
+            cp "packaging/$script.sh" "dist/$script.sh"
+          done
+      - name: Extract changelog and verify release files
+        run: |
+          sh scripts/release-notes.sh "$RELEASE_TAG" CHANGELOG.md > release-notes.md
+          cd dist
+          for arch in arm64 arm mipsle mips; do
+            test -s "nfqws2-strategy-linux-$arch"
+            test -s "awg-engine-linux-$arch.tar.gz"
+            test -s "awg-engine-linux-$arch.tar.gz.sha256"
+            sha256sum --check "awg-engine-linux-$arch.tar.gz.sha256"
+          done
+          # The panel is also published for x86_64 OpenWrt hosts. The
+          # userspace AWG engine remains limited to router architectures
+          # supported by its runtime integration.
+          test -s nfqws2-strategy-linux-amd64
+          test -s TGWS-LICENSE.txt
+          test -s AMNEZIAWG-LICENSE.txt
+          test -s THIRD-PARTY-NOTICES.txt
+          test -s ADGUARD-URLFILTER-LICENSE.txt
+          for script in install update uninstall; do
+            test -s "$script.sh"
+          done
+          test "$(find . -maxdepth 1 -type f | wc -l)" -eq 20
+          sha256sum nfqws2-strategy-linux-* awg-engine-linux-*.tar.gz \
+            TGWS-LICENSE.txt AMNEZIAWG-LICENSE.txt THIRD-PARTY-NOTICES.txt \
+            ADGUARD-URLFILTER-LICENSE.txt \
+            install.sh update.sh uninstall.sh > SHA256SUMS
+      - name: Upload all assets to a draft and publish
+        run: |
+          prerelease=(--prerelease=false)
+          latest=(--latest)
+          if [[ "$RELEASE_TAG" == *-* ]]; then
+            prerelease=(--prerelease)
+            latest=(--latest=false)
+          fi
+          if is_draft=$(gh release view "$RELEASE_TAG" --json isDraft --jq '.isDraft'); then
+            if [[ "$is_draft" != true ]]; then
+              echo "Release $RELEASE_TAG is already published; refusing to replace its assets." >&2
+              exit 1
+            fi
+            gh release edit "$RELEASE_TAG" --title "$RELEASE_TAG" \
+              --notes-file release-notes.md "${prerelease[@]}" --latest=false
+            gh release upload "$RELEASE_TAG" dist/* --clobber
+          else
+            gh release create "$RELEASE_TAG" dist/* --verify-tag --draft \
+              --title "$RELEASE_TAG" --notes-file release-notes.md "${prerelease[@]}" --latest=false
+          fi
+          find dist -maxdepth 1 -type f -printf '%f\n' | sort > expected-assets.txt
+          gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name' | sort > uploaded-assets.txt
+          diff -u expected-assets.txt uploaded-assets.txt
+          gh release edit "$RELEASE_TAG" --draft=false "${prerelease[@]}" "${latest[@]}"

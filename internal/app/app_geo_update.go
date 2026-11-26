@@ -2,7 +2,6 @@ package app
 
 import (
 	"fmt"
-	"io"
 	"net/http"
 	"strings"
 	"sync"
@@ -91,7 +90,12 @@ func (a *App) SetGeoAuto(in *GeoAutoConfig) error {
 	if strings.TrimSpace(cfg.GeoIPURL) == "" {
 		cfg.GeoIPURL = defaultGeoIPURL
 	}
-	return a.store.Save(geoAutoFile, cfg)
+	a.geoAuto.mu.Lock()
+	defer a.geoAuto.mu.Unlock()
+	current := a.GeoAuto()
+	current.Enabled, current.IntervalHours = cfg.Enabled, cfg.IntervalHours
+	current.GeoSiteURL, current.GeoIPURL = cfg.GeoSiteURL, cfg.GeoIPURL
+	return a.store.Save(geoAutoFile, current)
 }
 
 // FetchGeoNow runs one synchronous fetch cycle and updates the persisted status.
@@ -99,44 +103,52 @@ func (a *App) SetGeoAuto(in *GeoAutoConfig) error {
 // other kind (geosite failure does not skip geoip and vice versa).
 func (a *App) FetchGeoNow() (*GeoAutoConfig, error) {
 	cfg := a.GeoAuto()
-	a.geoAuto.mu.Lock()
-	since := time.Since(a.geoAuto.last)
-	a.geoAuto.mu.Unlock()
-	if since > 0 && since < geoFetchMinInterval {
-		return cfg, fmt.Errorf("слишком часто: подождите %s между запросами", geoFetchMinInterval-since)
+	if !geoModuleAvailable() {
+		err := fmt.Errorf("модуль GeoSite/GeoIP не установлен")
+		cfg.LastError = err.Error()
+		return cfg, err
 	}
 	a.geoAuto.mu.Lock()
+	since := time.Since(a.geoAuto.last)
+	if since > 0 && since < geoFetchMinInterval {
+		a.geoAuto.mu.Unlock()
+		return cfg, fmt.Errorf("слишком часто: подождите %s между запросами", geoFetchMinInterval-since)
+	}
 	a.geoAuto.last = time.Now()
 	a.geoAuto.mu.Unlock()
 
 	var errs []string
 	if u := strings.TrimSpace(cfg.GeoSiteURL); u != "" {
-		if data, err := httpGet(u); err != nil {
+		if size, err := a.fetchGeoFile(u, "geosite.dat", geo.KindGeoSite); err != nil {
 			errs = append(errs, "geosite: "+err.Error())
-		} else if err := a.SaveGeoFile("geosite.dat", geo.KindGeoSite, data); err != nil {
-			errs = append(errs, "geosite save: "+err.Error())
 		} else {
 			cfg.LastGeoSiteAt = time.Now().Unix()
-			cfg.LastGeoSiteLen = int64(len(data))
+			cfg.LastGeoSiteLen = size
 		}
 	}
 	if u := strings.TrimSpace(cfg.GeoIPURL); u != "" {
-		if data, err := httpGet(u); err != nil {
+		if size, err := a.fetchGeoFile(u, "geoip.dat", geo.KindGeoIP); err != nil {
 			errs = append(errs, "geoip: "+err.Error())
-		} else if err := a.SaveGeoFile("geoip.dat", geo.KindGeoIP, data); err != nil {
-			errs = append(errs, "geoip save: "+err.Error())
 		} else {
 			cfg.LastGeoIPAt = time.Now().Unix()
-			cfg.LastGeoIPLen = int64(len(data))
+			cfg.LastGeoIPLen = size
 		}
 	}
-	cfg.LastFetchedAt = time.Now().Unix()
-	cfg.LastError = strings.Join(errs, "; ")
-	_ = a.store.Save(geoAutoFile, cfg)
-	if len(errs) > 0 {
-		return cfg, fmt.Errorf("%s", cfg.LastError)
+	// Keep settings edited while either HTTP request was in flight.
+	a.geoAuto.mu.Lock()
+	defer a.geoAuto.mu.Unlock()
+	current := a.GeoAuto()
+	current.LastGeoSiteAt, current.LastGeoSiteLen = cfg.LastGeoSiteAt, cfg.LastGeoSiteLen
+	current.LastGeoIPAt, current.LastGeoIPLen = cfg.LastGeoIPAt, cfg.LastGeoIPLen
+	current.LastFetchedAt = time.Now().Unix()
+	current.LastError = strings.Join(errs, "; ")
+	if err := a.store.Save(geoAutoFile, current); err != nil {
+		return current, err
 	}
-	return cfg, nil
+	if current.LastError != "" {
+		return current, fmt.Errorf("%s", current.LastError)
+	}
+	return current, nil
 }
 
 // startGeoAutoLoop runs a background ticker that calls FetchGeoNow when Enabled
@@ -148,7 +160,8 @@ func (a *App) startGeoAutoLoop() {
 		return
 	}
 	a.geoAuto.running = true
-	a.geoAuto.stop = make(chan struct{})
+	stop := make(chan struct{})
+	a.geoAuto.stop = stop
 	a.geoAuto.mu.Unlock()
 
 	go func() {
@@ -158,25 +171,24 @@ func (a *App) startGeoAutoLoop() {
 		defer t.Stop()
 		for {
 			select {
-			case <-a.geoAuto.stop:
+			case <-stop:
 				return
 			case <-t.C:
-				cfg := a.GeoAuto()
-				if !cfg.Enabled {
-					continue
-				}
-				due := cfg.LastFetchedAt == 0 ||
-					time.Since(time.Unix(cfg.LastFetchedAt, 0)) >= time.Duration(cfg.IntervalHours)*time.Hour
-				if !due {
-					continue
-				}
-				if _, err := a.FetchGeoNow(); err != nil {
-					// Already recorded in LastError; no need to log spam.
-					_ = err
-				}
+				a.checkGeoAuto()
 			}
 		}
 	}()
+}
+
+func (a *App) checkGeoAuto() {
+	if !geoModuleAvailable() {
+		return
+	}
+	cfg := a.GeoAuto()
+	if cfg.Enabled && (cfg.LastFetchedAt == 0 ||
+		time.Since(time.Unix(cfg.LastFetchedAt, 0)) >= time.Duration(cfg.IntervalHours)*time.Hour) {
+		_, _ = a.FetchGeoNow()
+	}
 }
 
 // stopGeoAutoLoop is called from App.Shutdown.
@@ -189,20 +201,31 @@ func (a *App) stopGeoAutoLoop() {
 	a.geoAuto.mu.Unlock()
 }
 
-func httpGet(url string) ([]byte, error) {
+func (a *App) fetchGeoFile(url, name, kind string) (int64, error) {
 	c := &http.Client{Timeout: geoFetchTimeout}
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
-		return nil, err
+		return 0, err
 	}
 	req.Header.Set("User-Agent", "nfqws2-strategy/geo-auto")
 	resp, err := c.Do(req)
 	if err != nil {
-		return nil, err
+		return 0, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode/100 != 2 {
-		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
+		return 0, fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
-	return io.ReadAll(resp.Body)
+	if resp.StatusCode == http.StatusPartialContent || resp.Header.Get("Content-Range") != "" {
+		return 0, fmt.Errorf("incomplete Geo download: server returned a byte range")
+	}
+	file, err := a.store.StageBlob("geo", resp.Body)
+	if err != nil {
+		return 0, err
+	}
+	defer file.Discard()
+	if file.Size == 0 || (resp.ContentLength > 0 && file.Size != resp.ContentLength) {
+		return 0, fmt.Errorf("incomplete Geo download (%d bytes)", file.Size)
+	}
+	return file.Size, a.commitGeoFile(file, name, kind)
 }

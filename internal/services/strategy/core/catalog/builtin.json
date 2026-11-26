@@ -1,0 +1,58 @@
+[
+  {
+    "id": "tls-fake-multisplit-google",
+    "name": "fake(tls google,seq-10000)+multisplit midsld seqovl",
+    "l7": "tls",
+    "args": "--filter-tcp=443 --filter-l7=tls --payload=tls_client_hello --lua-desync=fake:blob=tls_clienthello:tls_mod=rnd,dupsid,sni=www.google.com:tcp_seq=-10000 --lua-desync=multisplit:pos=1,midsld:seqovl=1:seqovl_pattern=tls_clienthello",
+    "source": "builtin"
+  },
+  {
+    "id": "tls-fake-ack-multisplit",
+    "name": "fake(0x0,seq-10000,ack-66000)+multisplit",
+    "l7": "tls",
+    "args": "--filter-tcp=443 --filter-l7=tls --payload=tls_client_hello --lua-desync=fake:blob=0x00000000:tcp_seq=-10000:tcp_ack=-66000:tls_mod=rnd,dupsid,sni=www.google.com:repeats=2 --lua-desync=multisplit:pos=1,midsld",
+    "source": "builtin"
+  },
+  {
+    "id": "tls-multisplit-sniext",
+    "name": "multisplit at sniext+midsld",
+    "l7": "tls",
+    "args": "--filter-tcp=443 --filter-l7=tls --payload=tls_client_hello --lua-desync=multisplit:pos=1,sniext,midsld",
+    "source": "builtin"
+  },
+  {
+    "id": "tls-multidisorder-midsld",
+    "name": "multidisorder at midsld",
+    "l7": "tls",
+    "args": "--filter-tcp=443 --filter-l7=tls --payload=tls_client_hello --lua-desync=multidisorder:pos=1,midsld",
+    "source": "builtin"
+  },
+  {
+    "id": "tls-fake-badsum-multisplit",
+    "name": "fake(badsum)+multisplit midsld",
+    "l7": "tls",
+    "args": "--filter-tcp=443 --filter-l7=tls --payload=tls_client_hello --lua-desync=fake:blob=tls_clienthello:badsum --lua-desync=multisplit:pos=1,midsld:seqovl=1:seqovl_pattern=tls_clienthello",
+    "source": "builtin"
+  },
+  {
+    "id": "tls-fakedsplit-midsld",
+    "name": "fakedsplit midsld seqovl fake seq-10000",
+    "l7": "tls",
+    "args": "--filter-tcp=443 --filter-l7=tls --payload=tls_client_hello --lua-desync=fakedsplit:pos=midsld:seqovl=1:seqovl_pattern=tls_clienthello:tcp_seq=-10000",
+    "source": "builtin"
+  },
+  {
+    "id": "tls-fake-md5-multisplit",
+    "name": "fake(tcp_md5)+multisplit midsld",
+    "l7": "tls",
+    "args": "--filter-tcp=443 --filter-l7=tls --payload=tls_client_hello --lua-desync=fake:blob=tls_clienthello:tcp_md5 --lua-desync=multisplit:pos=1,midsld",
+    "source": "builtin"
+  },
+  {
+    "id": "http-methodeol",
+    "name": "http_methodeol badsum",
+    "l7": "http",
+    "args": "--filter-tcp=80 --filter-l7=http --payload=http_req --lua-desync=http_methodeol:badsum",
+    "source": "builtin"
+  }
+]

@@ -37,6 +37,7 @@ const updateStageText: Record<string, string> = {
   checking: "Проверяем последнюю версию…",
   checked: "Версия найдена, начинаем скачивание…",
   downloading: "Скачиваем новую версию…",
+  installing: "Устанавливаем панель и выбранные модули…",
   replacing: "Заменяем бинарь панели…",
   restarting: "Перезапускаем сервис…",
   error: "Обновление остановилось с ошибкой.",
@@ -58,7 +59,7 @@ export function TopBar({ authEnabled, onMenu }: { authEnabled: boolean; onMenu: 
   const check = async (manual: boolean) => {
     setChecking(true);
     try {
-      const u = await api<UpdateInfo>("GET", "/api/update/check");
+      const u = await api<UpdateInfo>("GET", "/api/update/check", undefined, { timeoutMs: 150_000 });
       if (u.error) { if (manual) toast("Проверка: " + u.error, "err"); }
       else if (u.available) { setLatest(u.latest); if (manual) toast("Доступно обновление панели: " + u.latest, "ok"); }
       else { setLatest(""); }
@@ -93,9 +94,11 @@ export function TopBar({ authEnabled, onMenu }: { authEnabled: boolean; onMenu: 
     }
     for (let i = 0; i < 240; i++) {
       await sleep(1500);
+      let packageConfirmed = false;
       try {
         const st = await api<SelfUpdateStatus>("GET", "/api/update/status");
         target = st.latest || target;
+        packageConfirmed = st.stage === "done" && !st.running;
         if (st.error) {
           setUpdating(null);
           toast("Обновление панели: " + st.error, "err");
@@ -106,7 +109,8 @@ export function TopBar({ authEnabled, onMenu }: { authEnabled: boolean; onMenu: 
       } catch { /* server may be restarting */ }
       try {
         const st = await api<{ version: string }>("GET", "/api/auth/status");
-        if (st.version === target) { setUpdating({ target, msg: "Готово, перезагружаем…" }); setTimeout(() => location.reload(), 1000); return; }
+        const matches = (value: string) => value.replace(/^v(?=\d)/, "") === target.replace(/^v(?=\d)/, "");
+        if (matches(st.version) && (!matches(version) || packageConfirmed)) { setUpdating({ target, msg: "Готово, перезагружаем…" }); setTimeout(() => location.reload(), 1000); return; }
       } catch { /* server restarting */ }
     }
     setUpdating({ target, msg: "Перезапуск занимает дольше обычного. Обновите страницу вручную." });
@@ -147,7 +151,7 @@ export function TopBar({ authEnabled, onMenu }: { authEnabled: boolean; onMenu: 
         <div className="flex items-center gap-2 rounded-md border border-line bg-panel py-0.5 pl-2.5 pr-1">
           <span className="hidden text-xs text-muted sm:inline">версия</span>
           <span className="font-semibold tabular-nums">{version}</span>
-          <button className={cn(iconBtn, "hidden sm:grid", checking && "animate-spin")} title="Проверить обновления" onClick={recheck}>
+          <button className={cn(iconBtn, checking && "animate-spin")} title="Проверить обновления" onClick={recheck}>
             <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36M21 3v6h-6" /></svg>
           </button>
         </div>

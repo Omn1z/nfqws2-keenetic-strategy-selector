@@ -4,19 +4,19 @@ package awgroute
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
-	"strings"
 	"syscall"
 	"time"
+
+	"nfqws2strategy/internal/tools/tlsroots"
 )
 
-// RunSpeedTest pulls the same payload twice — once through awg0 (tunnel),
-// once through the WAN device (direct). The only difference is SO_BINDTODEVICE
-// on the dialer. The downloaded bytes are written to io.Discard, never to
-// disk — there's no temp file. Progress is reported via opts.OnEvent.
+// RunSpeedTest samples the same URL through the selected tunnel and through
+// WAN. The body is counted and discarded as it streams.
 func (svc *Service) RunSpeedTest(ctx context.Context, opts SpeedTestOptions) SpeedTestResult {
 	if opts.MaxBytes <= 0 {
 		opts.MaxBytes = 10 * 1024 * 1024
@@ -35,10 +35,6 @@ func (svc *Service) RunSpeedTest(ctx context.Context, opts SpeedTestOptions) Spe
 		tunIface = awgIface // active tunnel by default
 	}
 	_, wanDev := awgDefaultRoute()
-	if wanDev == "" {
-		res.Err = "не найден WAN-интерфейс (ip route show default пусто)"
-		return res
-	}
 
 	emit := func(e SpeedEvent) {
 		if opts.OnEvent != nil {
@@ -54,23 +50,27 @@ func (svc *Service) RunSpeedTest(ctx context.Context, opts SpeedTestOptions) Spe
 	emit(SpeedEvent{Phase: "tunnel_done", Sample: &tunnelSample})
 
 	emit(SpeedEvent{Phase: "direct_start"})
-	res.ViaDirect = doStreamSample(ctx, opts.URL, wanDev, opts.Timeout, opts.MaxBytes, func(b int64, el time.Duration, rate float64) {
-		emit(SpeedEvent{Phase: "direct_progress", Bytes: b, Elapsed: el.Milliseconds(), Rate: rate})
-	})
+	if wanDev == "" {
+		res.ViaDirect.Error = "не найден WAN-интерфейс"
+	} else {
+		res.ViaDirect = doStreamSample(ctx, opts.URL, wanDev, opts.Timeout, opts.MaxBytes, func(b int64, el time.Duration, rate float64) {
+			emit(SpeedEvent{Phase: "direct_progress", Bytes: b, Elapsed: el.Milliseconds(), Rate: rate})
+		})
+	}
 	directSample := res.ViaDirect
 	emit(SpeedEvent{Phase: "direct_done", Sample: &directSample})
 
-	if res.ViaDirect.RxBytesPerSec > 0 && res.ViaTunnel.RxBytesPerSec > 0 {
+	res.Comparable = res.ViaDirect.Error == "" && res.ViaTunnel.Error == "" &&
+		res.ViaDirect.RxBytes > 0 && res.ViaDirect.RxBytes == res.ViaTunnel.RxBytes
+	if res.Comparable {
 		gain := (res.ViaTunnel.RxBytesPerSec - res.ViaDirect.RxBytesPerSec) / res.ViaDirect.RxBytesPerSec * 100
 		res.TunnelGainPC = int(gain)
 	}
-	emit(SpeedEvent{Phase: "result", Result: &res})
 	return res
 }
 
-// doStreamSample downloads via the given iface, calling progress every ~250ms
-// with the running byte count. Writes to io.Discard so there is NEVER a temp
-// file on disk — bytes are dropped as they're read.
+// doStreamSample downloads via the given iface and reports bytes read at
+// most every 250 ms.
 func doStreamSample(parent context.Context, url, iface string, timeout time.Duration, maxBytes int64, progress func(b int64, el time.Duration, rate float64)) SpeedSample {
 	ctx, cancel := context.WithTimeout(parent, timeout)
 	defer cancel()
@@ -85,22 +85,31 @@ func doStreamSample(parent context.Context, url, iface string, timeout time.Dura
 		DialContext: func(ctx context.Context, _, addr string) (net.Conn, error) {
 			return d.DialContext(ctx, "tcp4", addr)
 		},
-		MaxConnsPerHost:       1,
 		DisableKeepAlives:     true,
-		ResponseHeaderTimeout: 4 * time.Second,
+		DisableCompression:    true,
+		ResponseHeaderTimeout: 10 * time.Second,
+		TLSHandshakeTimeout:   8 * time.Second,
+		TLSClientConfig:       &tls.Config{RootCAs: tlsroots.Pool(), MinVersion: tls.VersionTLS12},
 	}
 	defer tr.CloseIdleConnections()
-	cli := &http.Client{Transport: tr, Timeout: timeout}
+	cli := &http.Client{Transport: tr}
 
-	req, _ := http.NewRequestWithContext(ctx, "GET", url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return SpeedSample{Error: err.Error()}
+	}
 	req.Header.Set("User-Agent", "nfqws2-strategy/speedtest")
+	req.Header.Set("Range", fmt.Sprintf("bytes=0-%d", maxBytes-1))
 
 	start := time.Now()
 	resp, err := cli.Do(req)
 	if err != nil {
-		return SpeedSample{Error: fmt.Sprintf("dial-bound %s: %v", iface, err)}
+		return SpeedSample{DurationMS: time.Since(start).Milliseconds(), Error: fmt.Sprintf("HTTP-запрос через %s: %v", iface, err)}
 	}
 	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
+		return SpeedSample{HTTPStatus: resp.StatusCode, DurationMS: time.Since(start).Milliseconds(), Error: "источник вернул " + resp.Status}
+	}
 
 	pw := &countingDiscard{onTick: progress, tickEvery: 250 * time.Millisecond, started: start}
 	n, err := io.Copy(pw, io.LimitReader(resp.Body, maxBytes))
@@ -115,8 +124,10 @@ func doStreamSample(parent context.Context, url, iface string, timeout time.Dura
 		RxBytesPerSec: bps,
 		HTTPStatus:    resp.StatusCode,
 	}
-	if err != nil && err != io.EOF && err != context.DeadlineExceeded {
-		out.Error = err.Error()
+	if err != nil {
+		out.Error = fmt.Sprintf("загрузка через %s прервана: %v", iface, err)
+	} else if n == 0 {
+		out.Error = "источник вернул пустой ответ"
 	}
 	return out
 }
@@ -183,19 +194,4 @@ func bindToDeviceControl(iface string) func(network, address string, c syscall.R
 		}
 		return opErr
 	}
-}
-
-// ValidateSpeedTestURL accepts only http:// URLs (TLS handshake would skew
-// the numbers asymmetrically across paths, plus DPI sometimes only impacts
-// SNI inspection). It also drops absurd URLs early.
-func ValidateSpeedTestURL(raw string) (string, error) {
-	raw = strings.TrimSpace(raw)
-	if !strings.HasPrefix(raw, "http://") {
-		return "", fmt.Errorf("URL должен начинаться с http:// (https искажает результат)")
-	}
-	// Bare host or query is fine, but at least 12 chars total.
-	if len(raw) < 12 {
-		return "", fmt.Errorf("URL слишком короткий")
-	}
-	return raw, nil
 }

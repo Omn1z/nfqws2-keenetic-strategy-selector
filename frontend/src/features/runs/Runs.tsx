@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
-import { exportStrategy } from "@/lib/api";
+import { api, ApiHTTPError, exportStrategy } from "@/lib/api";
+import { CurrentRuns, type RunCapabilities } from "./CurrentRuns";
 import { cn } from "@/lib/cn";
 import { kb } from "@/lib/format";
 import { baselineCheckMessage, summarizeTargetChecks } from "@/lib/targetChecks";
@@ -103,7 +104,37 @@ export function RunResultRow({ result: r }: { result: StrategyResult }) {
 }
 
 export default function Runs() {
-  const { lists, geo, strategies, blobs, dns, activeRun, runActive, startRun, cancelRun, addRunThread, pendingTargets, setPendingTargets } = useStore();
+  const [caps, setCaps] = useState<RunCapabilities | "legacy" | null>(null);
+  const [error, setError] = useState("");
+  const [attempt, setAttempt] = useState(0);
+  const [strategyMatrix, setStrategyMatrix] = useState(true);
+  useEffect(() => {
+    const abort = new AbortController();
+    void api<RunCapabilities>("GET", "/api/runs/capabilities", undefined, { signal: abort.signal })
+      .then(result => {
+        if (!result.modes?.includes("current_https")) throw new Error("Неизвестный режим прогонов.");
+        if (!abort.signal.aborted) setCaps(result);
+      }).catch((e: unknown) => {
+        if (abort.signal.aborted) return;
+        if (e instanceof ApiHTTPError && e.status === 404) setCaps("legacy");
+        else setError(e instanceof Error ? e.message : "Не удалось получить режим прогонов.");
+      });
+    return () => abort.abort();
+  }, [attempt]);
+  if (caps === "legacy") return <LegacyRuns />;
+  if (caps?.modes.includes("strategy_matrix")) return <div className="flex min-w-0 flex-col gap-4">
+    <div className="flex flex-wrap gap-2" role="group" aria-label="Вид прогона">
+      <Button variant={strategyMatrix ? "primary" : undefined} aria-pressed={strategyMatrix} onClick={() => setStrategyMatrix(true)}>Прогоны стратегий</Button>
+      <Button variant={!strategyMatrix ? "primary" : undefined} aria-pressed={!strategyMatrix} onClick={() => setStrategyMatrix(false)}>Текущая проверка HTTPS</Button>
+    </div>
+    {strategyMatrix ? <LegacyRuns /> : <CurrentRuns caps={caps} />}
+  </div>;
+  if (caps) return <CurrentRuns caps={caps} />;
+  return <PageHeader title="Прогоны" description={error || "Загрузка режима прогонов…"} actions={error && <Button onClick={() => {setError(""); setAttempt(v => v + 1);}}>Повторить</Button>} />;
+}
+
+export function LegacyRuns() {
+  const { lists, geo, strategies, blobs, dns, activeRun, runActive, startRun, cancelRun, addRunThread, pendingTargets, setPendingTargets } = useStore({ geo: true, strategies: true });
   const srcRef = useRef<SourceSelectorHandle>(null);
   const [initialText] = useState(() => pendingTargets?.join("\n") ?? "");
   useEffect(() => { if (pendingTargets) setPendingTargets(null); /* consume hand-off once */ }, []); // eslint-disable-line react-hooks/exhaustive-deps

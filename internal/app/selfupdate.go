@@ -16,6 +16,7 @@ import (
 	"golang.org/x/mod/semver"
 
 	"nfqws2strategy/internal/tools/logbuf"
+	"nfqws2strategy/internal/tools/modules"
 )
 
 // UpdateInfo describes the result of an update check.
@@ -50,6 +51,13 @@ type SelfUpdateStatus struct {
 // CheckUpdate prefers GitHub Releases, with the official verified Pages mirror
 // as a fallback when the API is rate limited or temporarily unavailable.
 func (a *App) CheckUpdate() (UpdateInfo, error) {
+	if modules.Compact {
+		return UpdateInfo{Current: a.Cfg.Version}, fmt.Errorf("компактная панель обновляется через репозиторий Entware (opkg)")
+	}
+	return a.checkReleaseUpdate()
+}
+
+func (a *App) checkReleaseUpdate() (UpdateInfo, error) {
 	info := UpdateInfo{Current: a.Cfg.Version}
 	if a.Cfg.Repo == "" {
 		return info, fmt.Errorf("repo not configured")
@@ -260,6 +268,9 @@ func selfUpdateVersion(version string) (string, string) {
 // StartSelfUpdate starts a background self-update and returns immediately. The
 // web UI uses this so a slow download never pins the browser request.
 func (a *App) StartSelfUpdate() (SelfUpdateStatus, error) {
+	if modules.Compact {
+		return a.SelfUpdateStatus(), fmt.Errorf("обновите компактную панель и её модули через Entware")
+	}
 	a.selfUpdateMu.Lock()
 	if a.selfUpdate.Running {
 		st := a.selfUpdate
@@ -343,6 +354,9 @@ func (a *App) setSelfUpdateStatus(fn func(*SelfUpdateStatus)) {
 // the running executable, and triggers a detached service restart. The HTTP
 // response returns before the restart fires (the restart is delayed).
 func (a *App) SelfUpdate() (UpdateInfo, error) {
+	if modules.Compact {
+		return a.CheckUpdate()
+	}
 	return a.selfUpdateWithProgress(nil)
 }
 
@@ -350,7 +364,7 @@ func (a *App) selfUpdateWithProgress(progress func(string, UpdateInfo)) (UpdateI
 	if progress != nil {
 		progress("checking", UpdateInfo{Current: a.Cfg.Version})
 	}
-	info, err := a.CheckUpdate()
+	info, err := a.checkReleaseUpdate()
 	if err != nil {
 		return info, err
 	}
